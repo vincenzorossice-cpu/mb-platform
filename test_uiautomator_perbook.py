@@ -1,6 +1,8 @@
 import subprocess
 import sys
 import time
+import os
+import tempfile
 
 BOOKS = [
     ("Stanleybet", "https://m.stanleybet.it"),
@@ -37,8 +39,13 @@ def open_chrome(device_id, url):
 
 def test_uiautomator(device_id):
     try:
+        # Metodo corretto: dump su file, poi cat
+        subprocess.run(
+            ["adb", "-s", device_id, "shell", "uiautomator", "dump", "/sdcard/ui_dump.xml"],
+            capture_output=True, text=True, timeout=10
+        )
         result = subprocess.run(
-            ["adb", "-s", device_id, "shell", "uiautomator", "dump", "--compressed", "/dev/tty"],
+            ["adb", "-s", device_id, "shell", "cat", "/sdcard/ui_dump.xml"],
             capture_output=True, text=True, timeout=10
         )
         xml = result.stdout.strip()
