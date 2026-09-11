@@ -13,7 +13,7 @@ BOOKS = [
     ("Lottomatica", "https://m.lottomatica.it"),
     ("Planetwin365", "https://m.planetwin365.it"),
     ("Betflag", "https://m.betflag.it"),
-    ("Bet365", "https://m.bet365.it"),
+    ("Bet365", "https://www.bet365.it/#/HO/"),
     ("Betfair", "https://mobile.betfair.com"),
 ]
 
