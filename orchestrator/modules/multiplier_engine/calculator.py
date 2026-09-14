@@ -58,11 +58,9 @@ class MultiplierEngine(MultiplierEngineInterface):
         P = back_stake * numerator / denominator
 
         # --- Validazione profitto ---
+        # Il profitto può essere negativo (qualifying loss) — è normale in matched betting
         if P <= 0:
-            return Result.fail(
-                f"Strategia produce profitto negativo: P={P:.2f}",
-                "NEGATIVE_PROFIT"
-            )
+            warnings.append(f"Profitto negativo (qualifying loss): P={P:.2f}")
 
         # --- Calcolo lay_stake per ogni evento ---
         A = P + back_stake  # A_1
@@ -136,13 +134,10 @@ class MultiplierEngine(MultiplierEngineInterface):
         # profitto se back perde (lay vince)
         profit_if_lost = -back_stake + lay_stake * (1 - commission)
 
-        is_valid = profit_if_won > 0 and profit_if_lost > 0
-
-        if not is_valid:
-            return Result.fail(
-                f"Profitto negativo: won={profit_if_won:.2f}, lost={profit_if_lost:.2f}",
-                "NEGATIVE_PROFIT"
-            )
+        is_valid = True
+        warnings = []
+        if profit_if_won <= 0 or profit_if_lost <= 0:
+            warnings.append(f"Profitto negativo (qualifying loss): won={profit_if_won:.2f}, lost={profit_if_lost:.2f}")
 
         calc = SingleCalculation(
             lay_stake=round(lay_stake, 2),

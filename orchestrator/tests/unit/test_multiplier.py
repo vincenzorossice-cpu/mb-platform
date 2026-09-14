@@ -23,16 +23,17 @@ class TestCalculateCascade:
         assert max(profits) - min(profits) < 0.01
         assert all(p > 0 for p in profits)
 
-    def test_negative_profit_detected(self, engine):
-        """Quote lay molto alte su quote back basse → profitto negativo"""
+    def test_negative_profit_allowed(self, engine):
+        """Quote lay molto alte su quote back basse → profitto negativo (qualifying loss)"""
         result = engine.calculate_cascade(
             back_stake=10.0,
             back_odds=[1.1, 1.1, 1.1],
             lay_odds=[5.0, 5.0, 5.0],
             commission=0.045
         )
-        assert not result.success
-        assert result.error_code == "NEGATIVE_PROFIT"
+        assert result.success
+        assert all(p < 0 for p in result.data.profit_per_scenario.values())
+        assert any("qualifying loss" in w.lower() for w in result.data.warnings)
 
     def test_invalid_odds(self, engine):
         """Quote <= 1.0 devono essere rifiutate"""
@@ -112,14 +113,14 @@ class TestCalculateSingle:
         assert result.data.profit_if_won > 0
 
     def test_single_negative_profit(self, engine):
-        """Singola con profitto negativo"""
+        """Singola con profitto negativo (qualifying loss)"""
         result = engine.calculate_single(
             back_stake=10.0,
             back_odds=1.1,
             lay_odds=5.0
         )
-        assert not result.success
-        assert result.error_code == "NEGATIVE_PROFIT"
+        assert result.success
+        assert result.data.profit_if_won <= 0
 
 
 class TestRecalculateFromIndex:
@@ -137,7 +138,7 @@ class TestRecalculateFromIndex:
         assert len(result.data.events) == 2
 
     def test_recalc_negative_profit(self, engine):
-        """Ricalcolo con quote che producono profitto negativo"""
+        """Ricalcolo con quote che producono profitto negativo (qualifying loss)"""
         result = engine.recalculate_from_index(
             back_stake=100.0,
             back_odds=[2.0, 1.1, 1.1],
@@ -145,8 +146,8 @@ class TestRecalculateFromIndex:
             commission=0.045,
             from_index=1
         )
-        assert not result.success
-        assert result.error_code == "ODDS_NEGATIVE_PROFIT"
+        assert result.success
+        assert all(p < 0 for p in result.data.profit_per_scenario.values())
 
     def test_recalc_invalid_index(self, engine):
         """Indice non valido"""

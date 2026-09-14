@@ -1,0 +1,80 @@
+{
+  "signal_1": {
+    "events": [
+      {"lay_stake": 50.25, "liability": 44.22, "profit": -2.01},
+      {"lay_stake": 96.56, "liability": 31.86, "profit": -2.01}
+    ],
+    "profit_all_lost": -2.01
+  },
+  "signal_2": {
+    "events": [
+      {"lay_stake": 49.78, "liability": 13.44, "profit": -2.45},
+      {"lay_stake": 63.86, "liability": 12.13, "profit": -2.45}
+    ],
+    "profit_all_lost": -2.45
+  },
+  "signal_3": {
+    "events": [
+      {"lay_stake": 49.85, "liability": 14.46, "profit": -2.39},
+      {"lay_stake": 64.99, "liability": 7.15, "profit": -2.39}
+    ],
+    "profit_all_lost": -2.39
+  },
+  "signal_4": {
+    "events": [
+      {"lay_stake": 49.41, "liability": 43.97, "profit": -2.82},
+      {"lay_stake": 95.45, "liability": 63.95, "profit": -2.82}
+    ],
+    "profit_all_lost": -2.82
+  },
+  "signal_5": {
+    "events": [
+      {"lay_stake": 43.74, "liability": 27.56, "profit": -8.23},
+      {"lay_stake": 72.60, "liability": 12.34, "profit": -8.23},
+      {"lay_stake": 85.52, "liability": 33.35, "profit": -8.23}
+    ],
+    "profit_all_lost": -8.23
+  },
+  "signal_6": {
+    "events": [
+      {"lay_stake": 41.18, "liability": 25.12, "profit": -10.68},
+      {"lay_stake": 67.48, "liability": 83.68, "profit": -10.68},
+      {"lay_stake": 155.10, "liability": 418.77, "profit": -10.68}
+    ],
+    "profit_all_lost": -10.68
+  },
+  "signal_7": {
+    "events": [
+      {"lay_stake": 44.02, "liability": 8.80, "profit": -7.96},
+      {"lay_stake": 53.24, "liability": 44.19, "profit": -7.96},
+      {"lay_stake": 99.51, "liability": 85.58, "profit": -7.96}
+    ],
+    "profit_all_lost": -7.96
+  },
+  "signal_8": {
+    "events": [
+      {"lay_stake": 43.16, "liability": 15.11, "profit": -8.78},
+      {"lay_stake": 58.98, "liability": 32.44, "profit": -8.78},
+      {"lay_stake": 92.95, "liability": 105.96, "profit": -8.78}
+    ],
+    "profit_all_lost": -8.78
+  },
+  "signal_9": {
+    "events": [
+      {"lay_stake": 41.73, "liability": 20.03, "profit": -10.15},
+      {"lay_stake": 62.70, "liability": 42.64, "profit": -10.15},
+      {"lay_stake": 107.35, "liability": 154.58, "profit": -10.15},
+      {"lay_stake": 269.21, "liability": 425.35, "profit": -10.15}
+    ],
+    "profit_all_lost": -10.15
+  },
+  "signal_10": {
+    "events": [
+      {"lay_stake": 42.27, "liability": 71.01, "profit": -9.63},
+      {"lay_stake": 116.63, "liability": 30.32, "profit": -9.63},
+      {"lay_stake": 148.38, "liability": 62.32, "profit": -9.63},
+      {"lay_stake": 213.64, "liability": 104.68, "profit": -9.63}
+    ],
+    "profit_all_lost": -9.63
+  }
+}
