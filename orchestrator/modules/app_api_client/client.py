@@ -25,10 +25,12 @@ class AppApiClient(AppApiClientInterface):
     NETCAP_PARSE_ERROR = "NETCAP_PARSE_ERROR"
     NETCAP_EMPTY_RESULT = "NETCAP_EMPTY_RESULT"
 
-    def __init__(self, base_url: str = "http://37.221.197.184:3001/api", timeout: int = 30):
+    def __init__(self, base_url: str = "http://37.221.197.184:3001/api", timeout: int = 30, session_token: str = None):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.session = requests.Session()
+        if session_token:
+            self.session.cookies.set("session_token", session_token)
 
     # ------------------------------------------------------------------
     # public
