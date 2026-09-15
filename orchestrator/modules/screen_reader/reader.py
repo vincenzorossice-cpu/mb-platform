@@ -162,12 +162,19 @@ class ScreenReader(ScreenReaderInterface):
     def _uiautomator_dump(self, device_id: str) -> Result[str]:
         try:
             result = subprocess.run(
-                ["adb", "-s", device_id, "shell", "uiautomator", "dump", "--compressed", "/dev/tty"],
+                ["adb", "-s", device_id, "shell", "uiautomator", "dump", "/sdcard/ui_dump.xml"],
                 capture_output=True,
                 text=True,
                 timeout=self.adb_timeout,
             )
 
+            # Leggi il file con cat
+            cat_result = subprocess.run(
+                ["adb", "-s", device_id, "shell", "cat", "/sdcard/ui_dump.xml"],
+                capture_output=True, text=True, timeout=self.adb_timeout,
+            )
+            result.stdout = cat_result.stdout
+            
             if result.returncode != 0:
                 stderr = result.stderr.lower()
                 if "device not found" in stderr or "device offline" in stderr or "no devices" in stderr:
