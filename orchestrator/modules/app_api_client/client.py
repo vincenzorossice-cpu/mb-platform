@@ -1,3 +1,4 @@
+import os
 from datetime import date
 from typing import Optional
 
@@ -29,8 +30,10 @@ class AppApiClient(AppApiClientInterface):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.session = requests.Session()
-        if session_token:
-            self.session.cookies.set("session_token", session_token)
+        # FIX-8: fallback a variabile d'ambiente se session_token non passato esplicitamente
+        token = session_token or os.getenv("NETCAP_SESSION_TOKEN")
+        if token:
+            self.session.cookies.set("session_token", token)
 
     # ------------------------------------------------------------------
     # public
@@ -166,6 +169,19 @@ class AppApiClient(AppApiClientInterface):
     ) -> Result[WriteResult]:
         """POST /operazioni → registra rettifica su Netcap."""
 
+        # FIX-7: controlla se esiste gia' una rettifica identica oggi prima di scrivere
+        # (idempotenza: rilanciare la pipeline non deve duplicare le rettifiche).
+        # Se il controllo fallisce (rete/parsing) si procede comunque con la POST:
+        # un controllo di idempotenza irraggiungibile non deve bloccare la riconciliazione.
+        existing_check = self._find_existing_rettifica(collaboratore_id, bookmaker_id)
+        if existing_check.success and existing_check.data is not None:
+            return Result.ok(WriteResult(
+                success=True,
+                netcap_id=existing_check.data,
+                message="Rettifica già esistente, skip",
+            ))
+
+        idempotency_key = f"rettifica_{collaboratore_id}_{bookmaker_id}_{date.today().isoformat()}"
         body = {
             "nome": "Rettifica riconciliazione",
             "tipologia": rectification.reason,
@@ -176,11 +192,43 @@ class AppApiClient(AppApiClientInterface):
             "stato": "CHIUSO",
             "data_apertura": date.today().isoformat(),
             "colonna": rectification.column,
+            "descrizione": idempotency_key,  # FIX-7: chiave di idempotenza supplementare
         }
         if rectification.bonus_note:
             body["note"] = rectification.bonus_note
 
         return self._write_operazione(body)
+
+    def _find_existing_rettifica(self, collaboratore_id: str, bookmaker_id: int) -> Result[Optional[int]]:
+        """FIX-7: cerca su Netcap una rettifica gia' registrata oggi per lo stesso
+        collaboratore/book, per evitare di scriverla due volte."""
+        url = f"{self.base_url}/operazioni"
+        params = {
+            "collaboratore_id": collaboratore_id,
+            "bookmaker_id": bookmaker_id,
+            "data_apertura": date.today().isoformat(),
+            "nome": "Rettifica riconciliazione",
+        }
+        try:
+            resp = self.session.get(url, params=params, timeout=self.timeout)
+        except requests.ConnectionError as exc:
+            return Result.fail(f"Connessione fallita: {exc}", self.NETCAP_UNREACHABLE)
+        except requests.Timeout:
+            return Result.fail(f"Timeout su {url}", self.NETCAP_TIMEOUT)
+
+        if not resp.ok:
+            return Result.fail(f"HTTP {resp.status_code} da {url}", self.NETCAP_HTTP_ERROR)
+
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            return Result.fail(f"JSON non valido: {exc}", self.NETCAP_PARSE_ERROR)
+
+        if isinstance(data, list) and data:
+            existing = data[0]
+            return Result.ok(existing.get("id") if isinstance(existing, dict) else None)
+
+        return Result.ok(None)
 
     def write_operazione(self, operazione: dict) -> Result[WriteResult]:
         """POST /operazioni → registra operazione generica su Netcap."""

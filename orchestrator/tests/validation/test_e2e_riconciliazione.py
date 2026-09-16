@@ -33,6 +33,7 @@ Uso:
 
 import argparse
 import json
+import os
 import sys
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -47,7 +48,13 @@ from orchestrator.modules.screen_reader.reader import ScreenReader
 from orchestrator.modules.touch_injector.injector import TouchInjector
 
 OPEN_STATI = {"Aperto", "Limitato"}
-DEFAULT_OUTPUT = Path(__file__).parent / "test_e2e_results.json"
+
+
+def _default_output_path() -> Path:
+    # FIX-9: timestamp calcolato al momento della chiamata (non all'import del modulo),
+    # cosi' run diversi non si sovrascrivono a vicenda
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return Path(__file__).parent / f"test_e2e_results_{ts}.json"
 
 
 def is_betfair_book(bookmaker_nome: str) -> bool:
@@ -230,7 +237,7 @@ def print_final_counts(results: list, live: bool) -> None:
         if r["status"] == "error":
             counts["error"] += 1
             continue
-        counts[r["action"]] += 1
+        counts[r["action"]] = counts.get(r["action"], 0) + 1  # FIX-9: evita KeyError su action sconosciuta
         if r["action"] == "adjust" and r.get("rettifica_scritta"):
             rettifiche_scritte += 1
 
@@ -288,9 +295,6 @@ def run_pipeline(
         )
         results.append(record)
 
-    print_summary_table(results)
-    print_final_counts(results, live)
-
     report = {
         "run": {
             "device_id": device_id,
@@ -302,8 +306,16 @@ def run_pipeline(
         },
         "results": results,
     }
-    output_path.write_text(json.dumps(report, indent=2, ensure_ascii=False))
-    print(f"\nReport salvato in: {output_path}")
+    # FIX-9: il report va scritto PRIMA di qualunque stampa, cosi' l'audit trail
+    # delle scritture --live sopravvive anche se il rendering della tabella crasha
+    # (es. un'action non prevista).
+    try:
+        output_path.write_text(json.dumps(report, indent=2, ensure_ascii=False))
+    finally:
+        print(f"\nReport salvato in: {output_path}")
+
+    print_summary_table(results)
+    print_final_counts(results, live)
 
     return not any(r["status"] == "error" for r in results)
 
@@ -314,7 +326,12 @@ def main() -> None:
     )
     parser.add_argument("--device-id", required=True, help="ID del dispositivo ADB (es. emulator-5554 o seriale reale).")
     parser.add_argument("--collaboratore-id", required=True, help="ID del collaboratore su Netcap.")
-    parser.add_argument("--session-token", required=True, help="Token di sessione per autenticarsi su Netcap.")
+    parser.add_argument(
+        "--session-token",
+        required=False,
+        default=None,
+        help="Token di sessione per autenticarsi su Netcap. Se omesso, letto da NETCAP_SESSION_TOKEN.",
+    )  # FIX-8: non piu' obbligatorio, fallback su variabile d'ambiente
     parser.add_argument(
         "--books",
         nargs="*",
@@ -331,18 +348,25 @@ def main() -> None:
     parser.add_argument(
         "--output",
         type=Path,
-        default=DEFAULT_OUTPUT,
-        help=f"Percorso del file JSON di report (default: {DEFAULT_OUTPUT.name} nella cartella dello script).",
+        default=None,
+        help="Percorso del file JSON di report (default: test_e2e_results_<timestamp>.json nella cartella dello script).",
     )
     args = parser.parse_args()
+
+    # FIX-8: fallback a variabile d'ambiente se --session-token non e' stato passato
+    session_token = args.session_token or os.getenv("NETCAP_SESSION_TOKEN")
+    if not session_token:
+        parser.error("--session-token o variabile d'ambiente NETCAP_SESSION_TOKEN richiesti")
+
+    output_path = args.output or _default_output_path()  # FIX-9
 
     ok = run_pipeline(
         device_id=args.device_id,
         collaboratore_id=args.collaboratore_id,
-        session_token=args.session_token,
+        session_token=session_token,
         requested_books=args.books,
         live=args.live,
-        output_path=args.output,
+        output_path=output_path,
     )
     sys.exit(0 if ok else 1)
 

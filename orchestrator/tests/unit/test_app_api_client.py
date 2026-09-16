@@ -179,13 +179,17 @@ class TestWriteRettifica:
     def test_success(self, client: AppApiClient):
         rect = Rectification(amount=5.0, column="BOOK", reason="Differenza riconciliazione: +5.00 EUR")
 
-        with patch.object(client.session, "post", return_value=_mock_post_ok(POST_OPERAZIONE_RESPONSE)) as mock_post:
+        # FIX-7: write_rettifica ora fa prima una GET di controllo idempotenza;
+        # la mockiamo con lista vuota (nessuna rettifica gia' esistente).
+        with patch.object(client.session, "get", return_value=_mock_get_ok([])) as mock_get, \
+                patch.object(client.session, "post", return_value=_mock_post_ok(POST_OPERAZIONE_RESPONSE)) as mock_post:
             result = client.write_rettifica(rect, collaboratore_id="01", bookmaker_id=1)
 
         assert result.success
         assert result.data.success is True
         assert result.data.netcap_id == 999
 
+        mock_get.assert_called_once()
         call_kwargs = mock_post.call_args
         body = call_kwargs.kwargs.get("json") or call_kwargs[1].get("json")
         assert body["bookmaker_id"] == 1
@@ -193,6 +197,20 @@ class TestWriteRettifica:
         assert body["risultato_totale"] == 5.0
         assert body["stato"] == "CHIUSO"
         assert body["categoria"] == "Rettifica"
+
+    def test_skip_if_already_exists(self, client: AppApiClient):
+        """FIX-7: se esiste gia' una rettifica per oggi/collaboratore/book, non ripete la POST."""
+        rect = Rectification(amount=5.0, column="BOOK", reason="Differenza riconciliazione: +5.00 EUR")
+
+        with patch.object(client.session, "get", return_value=_mock_get_ok([{"id": 777}])), \
+                patch.object(client.session, "post") as mock_post:
+            result = client.write_rettifica(rect, collaboratore_id="01", bookmaker_id=1)
+
+        assert result.success
+        assert result.data.success is True
+        assert result.data.netcap_id == 777
+        assert result.data.message == "Rettifica già esistente, skip"
+        mock_post.assert_not_called()
 
 
 class TestNetcapUnreachable:

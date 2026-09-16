@@ -15,6 +15,25 @@ from orchestrator.modules.screen_reader.interface import (
     MovementReading,
 )
 
+# FIX-1: etichette generiche di saldo, in ordine di priorita' di ricerca
+_BALANCE_LABELS = ("saldo", "balance", "disponibile", "wallet", "conto", "fondo", "credito")
+
+# FIX-1: euristiche per-book usate solo se nessuna etichetta generica viene trovata
+_BOOK_LABEL_HINTS = {
+    "betfair": ("wallet balance", "saldo"),
+    "bet365": ("balance",),
+}
+
+# FIX-1/FIX-2: importo in formato italiano (con o senza separatore di migliaia) o inglese,
+# con simbolo euro e segno/parentesi opzionali. Alternative ordinate dalla piu' alla meno specifica.
+_AMOUNT_RE = re.compile(
+    r"[-+]?\(?\s*€?\s*"
+    r"(?:\d{1,3}(?:\.\d{3})+,\d{2}"   # italiano con migliaia: 1.234,56
+    r"|\d+,\d{2}"                      # italiano senza migliaia: 150,75
+    r"|\d+\.\d{2})"                    # inglese: 123.45
+    r"\s*€?\)?"
+)
+
 
 class ScreenReader(ScreenReaderInterface):
     def __init__(
@@ -330,18 +349,84 @@ class ScreenReader(ScreenReaderInterface):
     # --------------------------------------------------------
 
     def _extract_balance(self, texts: list[str], book: str) -> Optional[dict]:
-        for t in texts:
-            t_clean = t.replace("€", "").replace("EUR", "").strip()
-            match = re.search(r"(\d{1,6}[.,]\d{2})", t_clean)
+        # FIX-1: cerca il saldo ancorato a un'etichetta invece di prendere il primo
+        # decimale della pagina (che potrebbe essere una quota, un bonus, ecc.)
+        full_text = " ".join(texts)
+
+        amount = self._find_labeled_amount(full_text, _BALANCE_LABELS)
+
+        if amount is None and book:
+            book_lower = book.lower()
+            for book_key, hints in _BOOK_LABEL_HINTS.items():
+                if book_key in book_lower:
+                    amount = self._find_labeled_amount(full_text, hints)
+                    if amount is not None:
+                        break
+
+        if amount is None:
+            # FIX-1: nessuna etichetta trovata -> non indovinare, ritorna None
+            return None
+
+        if not (-1_000_000 <= amount <= 1_000_000):
+            return None
+
+        return {"raw": amount, "open_bets": 0.0, "real_bonus": 0.0, "wagering_bonus": None}
+
+    def _find_labeled_amount(self, text: str, labels: tuple) -> Optional[float]:
+        # FIX-1: cerca ogni etichetta (in ordine di priorita') e prende il primo importo
+        # trovato entro 50 caratteri dopo di essa, cioe' il piu' vicino all'etichetta
+        text_lower = text.lower()
+        for label in labels:
+            idx = text_lower.find(label.lower())
+            if idx == -1:
+                continue
+            window_start = idx + len(label)
+            window = text[window_start:window_start + 50]
+            match = _AMOUNT_RE.search(window)
             if match:
-                amount_str = match.group(1).replace(",", ".")
-                try:
-                    amount = float(amount_str)
-                    if 0 <= amount <= 1000000:
-                        return {"raw": amount, "open_bets": 0.0, "real_bonus": 0.0, "wagering_bonus": None}
-                except ValueError:
-                    continue
+                value = self._clean_italian_amount(match.group(0))
+                if value is not None:
+                    return value
         return None
+
+    def _clean_italian_amount(self, amount_str: str) -> Optional[float]:
+        # FIX-2: normalizza un importo in formato italiano o inglese, con simbolo euro,
+        # segno negativo o parentesi, in un float
+        s = amount_str.strip()
+        s = s.replace("€", "").replace("EUR", "").replace("eur", "").strip()
+
+        negative = False
+        if s.startswith("(") and s.endswith(")"):
+            negative = True
+            s = s[1:-1].strip()
+        if s.startswith("-"):
+            negative = True
+            s = s[1:].strip()
+        elif s.startswith("+"):
+            s = s[1:].strip()
+
+        has_dot = "." in s
+        has_comma = "," in s
+
+        if has_dot and has_comma:
+            # punto = separatore di migliaia, virgola = decimale
+            s = s.replace(".", "").replace(",", ".")
+        elif has_comma:
+            # solo virgola: e' il decimale
+            s = s.replace(",", ".")
+        elif has_dot:
+            # solo punto: se ci sono 2+ gruppi da 3 cifre e' separatore di migliaia,
+            # altrimenti (un solo punto con 2 cifre finali) e' gia' decimale
+            parts = s.split(".")
+            if len(parts) > 2 or (len(parts) == 2 and len(parts[1]) == 3):
+                s = s.replace(".", "")
+
+        try:
+            value = float(s)
+        except ValueError:
+            return None
+
+        return -value if negative else value
 
     def _extract_amount(self, text: str) -> Optional[float]:
         match = re.search(r"[-+]?\s*(\d{1,6}[.,]\d{2})", text.replace("€", "").replace("EUR", ""))
