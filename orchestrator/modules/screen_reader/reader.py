@@ -34,6 +34,12 @@ _AMOUNT_RE = re.compile(
     r"\s*€?\)?"
 )
 
+# FIX-4: etichette per scommesse aperte, bonus reale (prelevabile) e wagering bonus
+_OPEN_BETS_LABELS = ("scommesse aperte", "open bets", "scommesse in corso", "puntate aperte", "giocate aperte")
+_REAL_BONUS_LABELS = ("bonus reale", "real bonus", "bonus saldo", "bonus disponibile")
+_REAL_BONUS_EXCLUDE_LABELS = ("wagering", "rollover", "bloccato")
+_WAGERING_BONUS_LABELS = ("wagering", "rollover", "bonus bloccato", "bonus in rollover")
+
 
 class ScreenReader(ScreenReaderInterface):
     def __init__(
@@ -53,10 +59,11 @@ class ScreenReader(ScreenReaderInterface):
             elements = self._parse_xml(xml_result.data)
             if elements:
                 detected_type = self._classify_screen(elements) if not screen_type else screen_type
+                confidence = self._validate_screen_confidence(elements, detected_type)  # FIX-3
                 return Result.ok(ScreenContent(
                     elements=elements,
                     screen_type=detected_type,
-                    confidence=1.0,
+                    confidence=confidence,
                     method="uiautomator",
                     screenshot_path=None,
                 ))
@@ -355,33 +362,102 @@ class ScreenReader(ScreenReaderInterface):
             return "movements"
         return "unknown"
 
+    def _validate_screen_confidence(self, elements: list[UIElement], screen_type: str) -> float:
+        # FIX-3: il percorso uiautomator non validava mai il contenuto letto — una
+        # schermata non riconoscibile veniva comunque etichettata confidence=1.0,
+        # bypassando il gate RulesEngine.MIN_CONFIDENCE (0.85)
+        texts = " ".join(e.text.lower() for e in elements if e.text)
+
+        if screen_type == "balance_page":
+            if not any(kw in texts for kw in ("saldo", "balance", "disponibile", "wallet", "conto")):
+                return 0.5
+            if not _AMOUNT_RE.search(texts):
+                return 0.3
+            return 1.0
+
+        if screen_type == "my_bets":
+            if not any(kw in texts for kw in ("scommesse", "bets", "matched", "unsettled")):
+                return 0.5
+            return 1.0
+
+        return 1.0  # altri screen_type: non validabili
+
     # --------------------------------------------------------
     # INTERNAL: Balance extraction
     # --------------------------------------------------------
 
     def _extract_balance(self, texts: list[str], book: str) -> Optional[dict]:
-        # FIX-1: cerca il saldo ancorato a un'etichetta invece di prendere il primo
-        # decimale della pagina (che potrebbe essere una quota, un bonus, ecc.)
-        full_text = " ".join(texts)
+        # FIX-4: estrae raw_balance, open_bets, real_bonus e wagering_bonus in un solo
+        # passaggio sugli elementi, invece di restituire open_bets/real_bonus hardcoded a 0
+        raw_balance = None
+        open_bets = 0.0
+        real_bonus = 0.0
+        wagering_bonus = None
 
-        amount = self._find_labeled_amount(full_text, _BALANCE_LABELS)
+        for i, t in enumerate(texts):
+            t_lower = t.lower()
 
-        if amount is None and book:
+            # Saldo reale (FIX-1/FIX-2: ancorato a etichetta, mai il primo decimale della pagina)
+            if raw_balance is None and any(kw in t_lower for kw in _BALANCE_LABELS):
+                raw_balance = self._extract_amount_near(texts, i)
+
+            # Scommesse aperte
+            if any(kw in t_lower for kw in _OPEN_BETS_LABELS):
+                val = self._extract_amount_near(texts, i)
+                if val is not None:
+                    open_bets = val
+
+            # Bonus reale (esclude wagering/rollover/bloccato: non e' prelevabile)
+            if any(kw in t_lower for kw in _REAL_BONUS_LABELS) and not any(
+                kw in t_lower for kw in _REAL_BONUS_EXCLUDE_LABELS
+            ):
+                val = self._extract_amount_near(texts, i)
+                if val is not None:
+                    real_bonus = val
+
+            # Wagering bonus
+            if any(kw in t_lower for kw in _WAGERING_BONUS_LABELS):
+                val = self._extract_amount_near(texts, i)
+                if val is not None:
+                    wagering_bonus = val
+
+        if raw_balance is None and book:
+            # FIX-1: fallback alle euristiche per-book solo se la scansione per
+            # etichetta generica non ha trovato nulla (invariato da FIX-1/2)
             book_lower = book.lower()
+            full_text = " ".join(texts)
             for book_key, hints in _BOOK_LABEL_HINTS.items():
                 if book_key in book_lower:
-                    amount = self._find_labeled_amount(full_text, hints)
-                    if amount is not None:
+                    raw_balance = self._find_labeled_amount(full_text, hints)
+                    if raw_balance is not None:
                         break
 
-        if amount is None:
+        if raw_balance is None:
             # FIX-1: nessuna etichetta trovata -> non indovinare, ritorna None
             return None
 
-        if not (-1_000_000 <= amount <= 1_000_000):
+        if not (-1_000_000 <= raw_balance <= 1_000_000):
             return None
 
-        return {"raw": amount, "open_bets": 0.0, "real_bonus": 0.0, "wagering_bonus": None}
+        return {
+            "raw": raw_balance,
+            "open_bets": open_bets,
+            "real_bonus": real_bonus,
+            "wagering_bonus": wagering_bonus,
+        }
+
+    def _extract_amount_near(self, texts: list[str], index: int) -> Optional[float]:
+        # FIX-4: l'etichetta e il valore sono spesso su elementi UI separati —
+        # cerca un importo nell'elemento index, poi index+1, poi index+2
+        for i in (index, index + 1, index + 2):
+            if i >= len(texts):
+                break
+            match = _AMOUNT_RE.search(texts[i])
+            if match:
+                value = self._clean_italian_amount(match.group(0))
+                if value is not None:
+                    return value
+        return None
 
     def _find_labeled_amount(self, text: str, labels: tuple) -> Optional[float]:
         # FIX-1: cerca ogni etichetta (in ordine di priorita') e prende il primo importo
