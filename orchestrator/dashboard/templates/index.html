@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="utf-8">
+    <title>MB Platform - HITL Dashboard</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
+        .header { background: #1a1a2e; color: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
+        .section { background: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .section h2 { margin-top: 0; }
+        .item { border: 1px solid #ddd; padding: 15px; margin: 10px 0; border-radius: 4px; }
+        .item.critical { border-left: 4px solid #dc3545; background: #fff5f5; }
+        .item.warning { border-left: 4px solid #ffc107; background: #fff8e1; }
+        .item.info { border-left: 4px solid #17a2b8; background: #e3f2fd; }
+        .empty { color: #777; font-style: italic; }
+        .btn { padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; margin-right: 5px; }
+        .btn-approve { background: #28a745; color: white; }
+        .btn-reject { background: #dc3545; color: white; }
+        .badge { padding: 4px 8px; border-radius: 12px; font-size: 12px; font-weight: bold; }
+        .badge-critical { background: #dc3545; color: white; }
+        .badge-warning { background: #ffc107; color: black; }
+        .badge-info { background: #17a2b8; color: white; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 10px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background: #f8f9fa; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>MB Platform - Mission Control</h1>
+        <p>Human-in-the-Loop Dashboard</p>
+    </div>
+
+    <div class="section">
+        <h2>🔄 Rettifiche Riconciliazione <span class="badge badge-critical">{{ rettifiche|length }}</span></h2>
+        {% if rettifiche %}
+        <table>
+            <tr><th>Collaboratore</th><th>Book</th><th>Saldo Reale</th><th>Saldo Atteso</th><th>Differenza</th><th>Colonna</th><th>Action</th><th></th></tr>
+            {% for r in rettifiche %}
+            <tr class="item {{ r.severity }}">
+                <td>{{ r.collaboratore }}</td>
+                <td>{{ r.book }}</td>
+                <td>{{ r.saldo_reale }}</td>
+                <td>{{ r.saldo_atteso }}</td>
+                <td>{{ r.differenza }}</td>
+                <td>{{ r.colonna }}</td>
+                <td><span class="badge badge-{{ r.severity }}">{{ r.action }}</span></td>
+                <td>
+                    <button class="btn btn-approve" onclick="hitlAction('approve', '{{ r.id }}')">Approva</button>
+                    <button class="btn btn-reject" onclick="hitlAction('reject', '{{ r.id }}')">Rifiuta</button>
+                </td>
+            </tr>
+            {% endfor %}
+        </table>
+        {% else %}
+        <p class="empty">Nessuna rettifica in attesa.</p>
+        {% endif %}
+    </div>
+
+    <div class="section">
+        <h2>💸 Movimenti Importati (HITL) <span class="badge badge-warning">{{ movimenti|length }}</span></h2>
+        {% if movimenti %}
+        <table>
+            <tr><th>Data</th><th>Fonte</th><th>Tipo</th><th>Importo</th><th>Descrizione</th><th>Confidence</th><th></th></tr>
+            {% for m in movimenti %}
+            <tr class="item {{ m.severity }}">
+                <td>{{ m.data }}</td>
+                <td>{{ m.fonte }}</td>
+                <td>{{ m.tipo }}</td>
+                <td>{{ m.importo }}</td>
+                <td>{{ m.descrizione }}</td>
+                <td>{{ m.confidence }}</td>
+                <td>
+                    <button class="btn btn-approve" onclick="hitlAction('approve', '{{ m.id }}')">Approva</button>
+                    <button class="btn btn-reject" onclick="hitlAction('reject', '{{ m.id }}')">Rifiuta</button>
+                </td>
+            </tr>
+            {% endfor %}
+        </table>
+        {% else %}
+        <p class="empty">Nessun movimento in attesa.</p>
+        {% endif %}
+    </div>
+
+    <div class="section">
+        <h2>⚠️ Errori di Sistema <span class="badge badge-critical">{{ errori|length }}</span></h2>
+        {% if errori %}
+        {% for e in errori %}
+        <div class="item {{ e.severity }}">
+            <span class="badge badge-{{ e.severity }}">{{ e.code }}</span>
+            <strong>{{ e.device_id }}</strong> — {{ e.message }}
+            <div><small>{{ e.timestamp }}</small></div>
+        </div>
+        {% endfor %}
+        {% else %}
+        <p class="empty">Nessun errore di sistema registrato.</p>
+        {% endif %}
+    </div>
+
+    <script>
+        function hitlAction(action, itemId) {
+            fetch(`/${action}/${itemId}`, { method: 'POST' });
+        }
+    </script>
+</body>
+</html>
