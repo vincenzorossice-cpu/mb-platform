@@ -26,6 +26,16 @@ class MovementImporter(MovementImporterInterface):
     # FIX-1: "Accredito"/"ricevuto" = soldi entrano in Hype dal book -> prelievo dal book
     PAYPAL_ADDEBITO_RE = re.compile(r"Ti abbiamo addebitato EUR\s+(\d[\d.,]*\d).*?Data.*?(\d{2}/\d{2}/\d{4})", re.DOTALL)
 
+    # FIX-PAYPAL-PARSER: pattern per riconoscere l'elemento-importo (es. "-40 â‚¬", "+87,50 â‚¬")
+    PAYPAL_AMOUNT_RE = re.compile(r"^([+-])\s*([\d.,]+)")
+
+    # FIX-PAYPAL-PARSER: mesi italiani abbreviati come mostrati sullo schermo PayPal ("13 set 2026")
+    ITALIAN_MONTHS = {
+        "gen": "01", "feb": "02", "mar": "03", "apr": "04", "mag": "05", "giu": "06",
+        "lug": "07", "ago": "08", "set": "09", "ott": "10", "nov": "11", "dic": "12",
+    }
+    PAYPAL_DATE_RE = re.compile(r"^(\d{1,2})\s+([a-zA-Zà-ù]{3})\s+(\d{4})$")
+
     def __init__(
         self,
         app_api_client,
@@ -60,27 +70,42 @@ class MovementImporter(MovementImporterInterface):
         if not screen.success:
             return Result.fail(f"Lettura schermo PayPal fallita: {screen.error}", self.PAYPAL_OCR_FAILED)
 
+        # FIX-PAYPAL-PARSER: ogni movimento è un blocco di 4 UIElement consecutivi
+        # [descrizione][importo][data][tipo] — non una singola stringa. Si cerca
+        # l'elemento-importo (unico pattern affidabile: "+"/"-" seguito da cifre)
+        # e si leggono descrizione/data/tipo dagli elementi adiacenti per indice.
+        elements = screen.data.elements
         movements: list[Movement] = []
-        for elem in screen.data.elements:
-            # FIX-2: _extract_amount richiesto esplicitamente dalla spec per il testo OCR/UI
-            # (a differenza di _clean_italian_amount usato per le email Hype)
-            amount = self.screen_reader._extract_amount(elem.text)
-            if amount is None:
+        for i, elem in enumerate(elements):
+            match = self.PAYPAL_AMOUNT_RE.match(elem.text.strip())
+            if not match:
+                continue  # elementi non-importo (menu, filtri, ecc.) saltati naturalmente
+
+            sign, amount_str = match.groups()
+            importo = self.screen_reader._clean_italian_amount(amount_str)
+            if importo is None:
                 continue
-            tipo = self._paypal_tipo_from_text(elem.text)
-            if tipo is None:
-                continue
+            importo = abs(importo)  # il segno vive in tipo, non nell'importo
+
+            descrizione = elements[i - 1].text if i - 1 >= 0 else None
+            data_testo = elements[i + 1].text if i + 1 < len(elements) else None
+            tipo_str = elements[i + 2].text if i + 2 < len(elements) else None
+
+            data_iso = self._parse_italian_date(data_testo) if data_testo else None
+            tipo = self._classify_paypal_tipo(sign, tipo_str)
+
+            confidence = 1.0 if (descrizione and data_iso and tipo is not None) else 0.7
             movements.append(Movement(
-                tipo=tipo,
-                importo=amount,
+                tipo=tipo or "deposito",  # fallback quando non classificabile
+                importo=importo,
                 conto_id=None,
                 bookmaker_id=None,
                 bookmaker_nome=None,
-                data="",
+                data=data_iso or "",
                 collaboratore_id=collaboratore_id,
-                descrizione="Import automatico PayPal",
+                descrizione=descrizione or "Import automatico PayPal",
                 fonte="paypal_ocr",
-                confidence=getattr(elem, "confidence", screen.data.confidence),
+                confidence=confidence,
             ))
         return Result.ok(movements)
 
@@ -185,13 +210,27 @@ class MovementImporter(MovementImporterInterface):
             confidence=0.95,
         )
 
-    def _paypal_tipo_from_text(self, text: str) -> Optional[str]:
-        t = text.lower()
-        if "+" in text or "ricevuto" in t:
-            return "prelievo"  # soldi entrano in PayPal -> escono dal book
-        if "-" in text or "inviato" in t or "pagato" in t:
+    def _classify_paypal_tipo(self, sign: str, tipo_str: Optional[str]) -> Optional[str]:
+        if not tipo_str:
+            return None
+        t = tipo_str.lower()
+        if sign == "-" and "pagamento" in t:
             return "deposito"  # soldi escono da PayPal -> entrano nel book
+        if sign == "+" and "ricevuto" in t:
+            return "prelievo"  # soldi entrano in PayPal -> escono dal book (incl. "denaro ricevuto")
+        if sign == "+" and "pagamento" in t:
+            return "prelievo"  # edge case: pagamento ricevuto senza la parola "ricevuto" isolata
         return None
+
+    def _parse_italian_date(self, text: str) -> Optional[str]:
+        match = self.PAYPAL_DATE_RE.match(text.strip())
+        if not match:
+            return None
+        day, mon_abbr, year = match.groups()
+        month = self.ITALIAN_MONTHS.get(mon_abbr.lower())
+        if month is None:
+            return None
+        return f"{year}-{month}-{int(day):02d}"
 
     def _to_iso_date(self, ddmmyyyy: str) -> str:
         d, m, y = ddmmyyyy.split("/")

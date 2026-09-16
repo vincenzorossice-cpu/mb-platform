@@ -43,6 +43,66 @@ HYPE_DEPOSITO_EMAIL = "Pagamento di EUR 50,00 effettuato da conto verso Bookmake
 HYPE_PRELIEVO_EMAIL = "Ti abbiamo addebitato EUR 30,00 sul tuo conto. Data operazione: 10/09/2026"
 HYPE_MIGLIAIA_EMAIL = "Pagamento di EUR 1.234,56 effettuato da conto verso Bookmaker XYZ in data 01/09/2026"
 
+# FIX-PAYPAL-PARSER: struttura reale osservata via debug — ogni movimento è un blocco di 4
+# elementi consecutivi [descrizione][importo][data][tipo], intervallato da elementi di UI
+# (menu, filtri) che non matchano il pattern importo e vengono naturalmente saltati.
+MOCK_PAYPAL_ELEMENTS = [
+    UIElement(text="Cronologia", bounds=[0, 0, 0, 0]),
+    UIElement(text="Tutto", bounds=[0, 0, 0, 0]),
+    UIElement(text="Questa settimana", bounds=[0, 0, 0, 0]),
+    UIElement(text="TSG Italy S.R.L", bounds=[0, 0, 0, 0]),
+    UIElement(text="-40 â‚¬", bounds=[0, 0, 0, 0]),
+    UIElement(text="13 set 2026", bounds=[0, 0, 0, 0]),
+    UIElement(text="Pagamento", bounds=[0, 0, 0, 0]),
+    UIElement(text="Marathonbet Italy S.r.l", bounds=[0, 0, 0, 0]),
+    UIElement(text="+87,50 â‚¬", bounds=[0, 0, 0, 0]),
+    UIElement(text="13 set 2026", bounds=[0, 0, 0, 0]),
+    UIElement(text="Pagamento ricevuto", bounds=[0, 0, 0, 0]),
+    UIElement(text="Settimana scorsa", bounds=[0, 0, 0, 0]),
+    UIElement(text="BPG SRL", bounds=[0, 0, 0, 0]),
+    UIElement(text="-10 â‚¬", bounds=[0, 0, 0, 0]),
+    UIElement(text="8 set 2026", bounds=[0, 0, 0, 0]),
+    UIElement(text="Pagamento", bounds=[0, 0, 0, 0]),
+    UIElement(text="Sisal", bounds=[0, 0, 0, 0]),
+    UIElement(text="-50 â‚¬", bounds=[0, 0, 0, 0]),
+    UIElement(text="8 set 2026", bounds=[0, 0, 0, 0]),
+    UIElement(text="Pagamento", bounds=[0, 0, 0, 0]),
+    UIElement(text="Vincenzo Gallicola", bounds=[0, 0, 0, 0]),
+    UIElement(text="+50 â‚¬", bounds=[0, 0, 0, 0]),
+    UIElement(text="8 set 2026", bounds=[0, 0, 0, 0]),
+    UIElement(text="Denaro ricevuto", bounds=[0, 0, 0, 0]),
+]
+
+# FIX-PAYPAL-PARSER: struttura reale osservata via debug — ogni movimento è un blocco di 4
+# elementi consecutivi [descrizione][importo][data][tipo], intervallato da elementi di UI
+# (menu, filtri) che non matchano il pattern importo e vengono naturalmente saltati.
+MOCK_PAYPAL_ELEMENTS = [
+    UIElement(text="Cronologia", bounds=[0, 0, 100, 50]),
+    UIElement(text="Tutto", bounds=[0, 0, 100, 50]),
+    UIElement(text="Questa settimana", bounds=[0, 0, 100, 50]),
+    UIElement(text="TSG Italy S.R.L", bounds=[0, 0, 100, 50]),
+    UIElement(text="-40 â‚¬", bounds=[0, 0, 100, 50]),
+    UIElement(text="13 set 2026", bounds=[0, 0, 100, 50]),
+    UIElement(text="Pagamento", bounds=[0, 0, 100, 50]),
+    UIElement(text="Marathonbet Italy S.r.l", bounds=[0, 0, 100, 50]),
+    UIElement(text="+87,50 â‚¬", bounds=[0, 0, 100, 50]),
+    UIElement(text="13 set 2026", bounds=[0, 0, 100, 50]),
+    UIElement(text="Pagamento ricevuto", bounds=[0, 0, 100, 50]),
+    UIElement(text="Settimana scorsa", bounds=[0, 0, 100, 50]),
+    UIElement(text="BPG SRL", bounds=[0, 0, 100, 50]),
+    UIElement(text="-10 â‚¬", bounds=[0, 0, 100, 50]),
+    UIElement(text="8 set 2026", bounds=[0, 0, 100, 50]),
+    UIElement(text="Pagamento", bounds=[0, 0, 100, 50]),
+    UIElement(text="Sisal", bounds=[0, 0, 100, 50]),
+    UIElement(text="-50 â‚¬", bounds=[0, 0, 100, 50]),
+    UIElement(text="8 set 2026", bounds=[0, 0, 100, 50]),
+    UIElement(text="Pagamento", bounds=[0, 0, 100, 50]),
+    UIElement(text="Vincenzo Gallicola", bounds=[0, 0, 100, 50]),
+    UIElement(text="+50 â‚¬", bounds=[0, 0, 100, 50]),
+    UIElement(text="8 set 2026", bounds=[0, 0, 100, 50]),
+    UIElement(text="Denaro ricevuto", bounds=[0, 0, 100, 50]),
+]
+
 
 class TestImportHype:
 
@@ -90,27 +150,67 @@ class TestImportPaypal:
         elements = [UIElement(text=t, bounds=[0, 0, 0, 0]) for t in texts]
         return ScreenContent(elements=elements, screen_type="movements", confidence=0.9, method="uiautomator")
 
-    def test_import_paypal_ocr_success(self, app_api_client, screen_reader):
-        screen_reader.read_screen.return_value = Result.ok(self._screen_content(["Inviato 25,00"]))
+    def test_import_paypal_multiple_movements(self, app_api_client, screen_reader):
+        screen = ScreenContent(elements=MOCK_PAYPAL_ELEMENTS, screen_type="movements", confidence=0.9, method="uiautomator")
+        screen_reader.read_screen.return_value = Result.ok(screen)
         importer = MovementImporter(app_api_client, screen_reader)
         result = importer.import_paypal("device1", "03")
         assert result.success
-        assert len(result.data) == 1
-        assert result.data[0].fonte == "paypal_ocr"
+        assert len(result.data) == 5
 
-    def test_import_paypal_deposito(self, app_api_client, screen_reader):
-        screen_reader.read_screen.return_value = Result.ok(self._screen_content(["Inviato 25,00"]))
+        tsg = next(m for m in result.data if m.descrizione == "TSG Italy S.R.L")
+        assert tsg.importo == 40.0
+        assert tsg.tipo == "deposito"
+        assert tsg.data == "2026-09-13"
+
+        marathonbet = next(m for m in result.data if m.descrizione == "Marathonbet Italy S.r.l")
+        assert marathonbet.importo == 87.50
+        assert marathonbet.tipo == "prelievo"
+
+        gallicola = next(m for m in result.data if m.descrizione == "Vincenzo Gallicola")
+        assert gallicola.importo == 50.0
+        assert gallicola.tipo == "prelievo"  # "Denaro ricevuto"
+
+    def test_import_paypal_negative_amount(self, app_api_client, screen_reader):
+        elements = ["TSG Italy S.R.L", "-40 â‚¬", "13 set 2026", "Pagamento"]
+        screen_reader.read_screen.return_value = Result.ok(self._screen_content(elements))
         importer = MovementImporter(app_api_client, screen_reader)
         result = importer.import_paypal("device1", "03")
         assert result.success
+        assert result.data[0].importo == 40.0
         assert result.data[0].tipo == "deposito"
 
-    def test_import_paypal_prelievo(self, app_api_client, screen_reader):
-        screen_reader.read_screen.return_value = Result.ok(self._screen_content(["Ricevuto 40,00"]))
+    def test_import_paypal_positive_amount(self, app_api_client, screen_reader):
+        elements = ["Marathonbet Italy S.r.l", "+87,50 â‚¬", "13 set 2026", "Pagamento ricevuto"]
+        screen_reader.read_screen.return_value = Result.ok(self._screen_content(elements))
         importer = MovementImporter(app_api_client, screen_reader)
         result = importer.import_paypal("device1", "03")
         assert result.success
+        assert result.data[0].importo == 87.50
         assert result.data[0].tipo == "prelievo"
+
+    def test_import_paypal_italian_date(self, app_api_client, screen_reader):
+        importer = MovementImporter(app_api_client, screen_reader)
+        assert importer._parse_italian_date("13 set 2026") == "2026-09-13"
+        assert importer._parse_italian_date("8 set 2026") == "2026-09-08"
+
+    def test_import_paypal_missing_data(self, app_api_client, screen_reader):
+        # l'importo è l'ultimo elemento della lista: nessun elemento data/tipo successivo
+        elements = ["TSG Italy S.R.L", "-40 â‚¬"]
+        screen_reader.read_screen.return_value = Result.ok(self._screen_content(elements))
+        importer = MovementImporter(app_api_client, screen_reader)
+        result = importer.import_paypal("device1", "03")
+        assert result.success
+        assert result.data[0].confidence == 0.7
+
+    def test_import_paypal_corrupted_euro(self, app_api_client, screen_reader):
+        elements = ["Sisal", "-50 â‚¬", "8 set 2026", "Pagamento"]
+        screen_reader.read_screen.return_value = Result.ok(self._screen_content(elements))
+        importer = MovementImporter(app_api_client, screen_reader)
+        result = importer.import_paypal("device1", "03")
+        assert result.success
+        assert result.data[0].importo == 50.0
+        assert result.data[0].tipo == "deposito"
 
     def test_import_paypal_ocr_failed(self, app_api_client, screen_reader):
         screen_reader.read_screen.return_value = Result.fail("device offline", "DEVICE_OFFLINE")
