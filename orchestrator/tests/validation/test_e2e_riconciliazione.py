@@ -53,8 +53,10 @@ OPEN_STATI = {"Aperto", "Limitato"}
 def _default_output_path() -> Path:
     # FIX-9: timestamp calcolato al momento della chiamata (non all'import del modulo),
     # cosi' run diversi non si sovrascrivono a vicenda
+    # FIX-26.4: i report generati vivono in reports/ (in .gitignore), separati
+    # dai fixture di input version-controlled come ninjabet_results.json
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return Path(__file__).parent / f"test_e2e_results_{ts}.json"
+    return Path(__file__).parent / "reports" / f"test_e2e_results_{ts}.json"
 
 
 def is_betfair_book(bookmaker_nome: str) -> bool:
@@ -65,19 +67,20 @@ def fetch_netcap_data(app_api_client: AppApiClient, collaboratore_id: str):
     """
     Legge saldi attesi e stato book da Netcap una sola volta.
 
-    Ritorna (expected_by_id, book_statuses) oppure solleva SystemExit con un
-    messaggio d'errore se uno dei due fallisce: senza questi dati non si puo'
-    riconciliare nulla, quindi e' un errore fatale (non per-book).
+    Ritorna (expected_by_id, book_statuses) oppure (None, None) se una delle
+    due chiamate fallisce (il chiamante gestisce il caso None): senza questi
+    dati non si puo' riconciliare nulla, ma la funzione resta riutilizzabile
+    e non termina il processo dall'interno.
     """
     expected_result = app_api_client.read_expected_balance(collaboratore_id)
     if not expected_result.success:
         print(f"ERRORE FATALE: read_expected_balance fallita: {expected_result.error} ({expected_result.error_code})")
-        sys.exit(1)
+        return None, None  # FIX-26.1
 
     book_status_result = app_api_client.read_book_status(collaboratore_id)
     if not book_status_result.success:
         print(f"ERRORE FATALE: read_book_status fallita: {book_status_result.error} ({book_status_result.error_code})")
-        sys.exit(1)
+        return None, None  # FIX-26.1
 
     expected_by_id = {eb.bookmaker_id: eb for eb in expected_result.data}
     return expected_by_id, book_status_result.data
@@ -92,14 +95,23 @@ def select_books(
     Determina quali bookmaker_id processare.
 
     Se requested_ids e' dato, usa quelli (avvisando per gli id senza saldo
-    atteso). Altrimenti usa tutti i book con stato in OPEN_STATI che hanno
-    anche un saldo atteso associato.
+    atteso, o con uno stato noto diverso da Aperto/Limitato). Altrimenti usa
+    tutti i book con stato in OPEN_STATI che hanno anche un saldo atteso
+    associato.
     """
+    stato_by_id = {bs.bookmaker_id: bs.stato for bs in book_statuses}  # FIX-26.3
+
     if requested_ids:
         selected = []
         for bid in requested_ids:
             if bid not in expected_by_id:
                 print(f"AVVISO: bookmaker_id {bid} richiesto ma assente in read_expected_balance, saltato.")
+                continue
+            stato = stato_by_id.get(bid)
+            if stato is not None and stato not in OPEN_STATI:
+                # FIX-26.3: un book esplicitamente richiesto ma non Aperto/Limitato
+                # (es. Chiuso) va saltato, non riconciliato
+                print(f"AVVISO: bookmaker_id {bid} richiesto ma ha stato '{stato}' (non Aperto/Limitato), saltato.")
                 continue
             selected.append(bid)
         return selected
@@ -208,7 +220,7 @@ def print_summary_table(results: list) -> None:
             print(f"{r['book']:<20}{'n/d':>14}{r['expected_balance']:>15.2f}{'n/d':>13}{'ERROR':>16}  {r['error']}")
             continue
 
-        real_balance = r["real_balance"]["raw_balance"] + r["real_balance"]["open_bets"] + r["real_balance"]["real_bonus"]
+        real_balance = r["adjusted_balance"]  # FIX-26.2: usa il valore gia' calcolato da RulesEngine
         note = ""
         if r["action"] == "adjust":
             if r.get("rettifica_scritta"):
@@ -270,6 +282,10 @@ def run_pipeline(
     rules_engine = RulesEngine()
 
     expected_by_id, book_statuses = fetch_netcap_data(app_api_client, collaboratore_id)
+    if expected_by_id is None:
+        # FIX-26.1: fallimento fatale nel recupero dati Netcap - la pipeline si ferma,
+        # ma senza terminare il processo dall'interno di un helper
+        return False
     stato_by_id = {bs.bookmaker_id: bs.stato for bs in book_statuses}
 
     bookmaker_ids = select_books(requested_books, expected_by_id, book_statuses)
@@ -309,6 +325,7 @@ def run_pipeline(
     # FIX-9: il report va scritto PRIMA di qualunque stampa, cosi' l'audit trail
     # delle scritture --live sopravvive anche se il rendering della tabella crasha
     # (es. un'action non prevista).
+    output_path.parent.mkdir(parents=True, exist_ok=True)  # FIX-26.4: crea reports/ se manca
     try:
         output_path.write_text(json.dumps(report, indent=2, ensure_ascii=False))
     finally:

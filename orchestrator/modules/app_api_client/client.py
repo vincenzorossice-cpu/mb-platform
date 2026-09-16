@@ -1,5 +1,5 @@
 import os
-from datetime import date
+from datetime import date, datetime
 from typing import Optional
 
 import requests
@@ -147,8 +147,17 @@ class AppApiClient(AppApiClientInterface):
         for item in data:
             if item.get("collaboratore_id") != collaboratore_id:
                 continue
-            if date_from and item.get("data", "") < date_from:
-                continue
+            if date_from:
+                # FIX-19: normalizza sia la data della riga sia date_from (ISO o italiano
+                # DD/MM/YYYY) prima di confrontarle; se una delle due non si riconosce,
+                # ripiega sul confronto stringa originale
+                item_date = self._parse_date(item.get("data", ""))
+                from_date = self._parse_date(date_from)
+                if item_date is not None and from_date is not None:
+                    if item_date < from_date:
+                        continue
+                elif item.get("data", "") < date_from:
+                    continue
             records.append(MovementRecord(
                 id=int(item["id"]),
                 tipo=item["tipo"],
@@ -296,3 +305,15 @@ class AppApiClient(AppApiClientInterface):
             int(bk["id"]): {"nome": bk["nome"], "tipo": bk.get("tipo", "bookmaker")}
             for bk in bookmakers_list
         }
+
+    def _parse_date(self, date_str: str) -> Optional[date]:
+        """FIX-19: converte una data in formato ISO (YYYY-MM-DD) o italiano
+        (DD/MM/YYYY) in un oggetto date. Ritorna None se il formato non e' riconosciuto."""
+        if not date_str:
+            return None
+        for fmt in ("%Y-%m-%d", "%d/%m/%Y"):
+            try:
+                return datetime.strptime(date_str, fmt).date()
+            except ValueError:
+                continue
+        return None

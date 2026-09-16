@@ -1,0 +1,2 @@
+# FIX-26.4: report generati dalla pipeline e2e di riconciliazione, non versionati
+orchestrator/tests/validation/reports/

@@ -66,5 +66,5 @@ class ScreenReaderInterface(ABC):
         pass
 
     @abstractmethod
-    def read_movements(self, device_id: str, app: str) -> Result[list[MovementReading]]:
+    def read_movements(self, device_id: str) -> Result[list[MovementReading]]:  # FIX-BASSA-2: rimosso 'app' inutilizzato
         pass

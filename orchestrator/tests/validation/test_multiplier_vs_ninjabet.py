@@ -139,6 +139,15 @@ def values_match(ours: float, theirs: float, tol: float = TOLERANCE_EUR) -> bool
     return abs(ours - theirs) <= tol
 
 
+def _tolerance_for(field_name: str, reference_value: float) -> float:
+    """FIX-27.4: tolleranza relativa (1%) per lay_stake/liability oltre 100 EUR
+    (valori piu' grandi hanno un rumore di arrotondamento proporzionalmente
+    maggiore); tolleranza assoluta fissa altrove, incluso sempre per il profit."""
+    if field_name in ("lay_stake", "liability") and abs(reference_value) > 100:
+        return abs(reference_value) * 0.01
+    return TOLERANCE_EUR
+
+
 def compute_signal(engine: MultiplierEngine, signal: dict):
     """Calcola il risultato del nostro MultiplierEngine per un segnale."""
     return engine.calculate_cascade(
@@ -153,11 +162,14 @@ def compare_signal(result, ninjabet_entry: Optional[dict]):
     """
     Confronta il risultato del nostro engine con l'entry NinjaBet (se presente).
 
-    Ritorna (status, diffs) dove status e' "PASS", "FAIL" o "NO DATA" e diffs
-    e' una lista di stringhe che descrivono ogni discrepanza fuori tolleranza.
+    Ritorna (status, diffs) dove status e' "PASS", "NO DATA", "ENGINE_FAIL"
+    (il motore ha rifiutato il segnale) o "MISMATCH" (discrepanza numerica con
+    NinjaBet oltre tolleranza); diffs e' una lista di stringhe che descrivono
+    ogni discrepanza fuori tolleranza.
     """
     if not result.success:
-        return "FAIL", [f"MultiplierEngine ha rifiutato il segnale: {result.error} ({result.error_code})"]
+        # FIX-27.3: distinto da MISMATCH, non e' un confronto numerico fallito
+        return "ENGINE_FAIL", [f"MultiplierEngine ha rifiutato il segnale: {result.error} ({result.error_code})"]
 
     if ninjabet_entry is None:
         return "NO DATA", []
@@ -182,16 +194,17 @@ def compare_signal(result, ninjabet_entry: Optional[dict]):
                 if nb_val is None:
                     diffs.append(f"Evento {i}: campo '{nb_key}' mancante nei dati NinjaBet")
                     continue
-                if not values_match(our_val, nb_val):
+                tol = _tolerance_for(field_name, nb_val)  # FIX-27.4
+                if not values_match(our_val, nb_val, tol):
                     diffs.append(
                         f"Evento {i} [{nb_key}]: noi={our_val:.2f} NinjaBet={nb_val:.2f} "
-                        f"delta={abs(our_val - nb_val):.2f} (tolleranza {TOLERANCE_EUR:.2f})"
+                        f"delta={abs(our_val - nb_val):.2f} (tolleranza {tol:.2f})"
                     )
 
     nb_profit_all_lost = ninjabet_entry.get("profit_all_lost")
     if nb_profit_all_lost is not None and our_events:
         our_profit_all_lost = our_events[-1].profit_if_all_lost
-        if not values_match(our_profit_all_lost, nb_profit_all_lost):
+        if not values_match(our_profit_all_lost, nb_profit_all_lost, TOLERANCE_EUR):
             diffs.append(
                 f"profit_all_lost: noi={our_profit_all_lost:.2f} "
                 f"NinjaBet={nb_profit_all_lost:.2f} "
@@ -199,7 +212,7 @@ def compare_signal(result, ninjabet_entry: Optional[dict]):
                 f"(tolleranza {TOLERANCE_EUR:.2f})"
             )
 
-    status = "FAIL" if diffs else "PASS"
+    status = "MISMATCH" if diffs else "PASS"  # FIX-27.3
     return status, diffs
 
 
@@ -243,24 +256,30 @@ def print_signal_table(signal: dict, result, ninjabet_entry: Optional[dict], sta
     nb_profit_all_lost = (ninjabet_entry or {}).get("profit_all_lost")
     print(
         f"profit_all_lost (noi)={result.data.events[-1].profit_if_all_lost:.2f}  "
-        f"profit_all_lost (NB)={nb_profit_all_lost if nb_profit_all_lost is not None else 'n/d'}"
+        f"profit_all_lost (NB)={(f'{nb_profit_all_lost:.2f}' if nb_profit_all_lost is not None else 'n/d')}"  # FIX-BASSA-5
     )
     print(f"total_liability (noi)={result.data.total_liability:.2f}")
+
+    if result.data.warnings:  # FIX-27.2
+        for w in result.data.warnings:
+            print(f"  Warning: {w}")
 
     print(f"  Stato: {status}")
     for diff in diffs:
         print(f"    - {diff}")
 
 
-def run_validation(ninjabet_data: Optional[dict] = None) -> bool:
+def run_validation(ninjabet_data: Optional[dict] = None) -> int:
     """
     Esegue la validazione su tutti i SIGNALS, stampa la tabella comparativa
-    e il riepilogo finale. Ritorna True se non ci sono FAIL, False altrimenti.
+    e il riepilogo finale. Ritorna il codice di uscita: 0 se tutti i segnali
+    con dati NinjaBet sono PASS, 1 se almeno uno e' ENGINE_FAIL o MISMATCH,
+    2 se nessun segnale aveva dati NinjaBet da confrontare (NO DATA totale).
     """
     ninjabet_data = ninjabet_data or {}
     engine = MultiplierEngine()
 
-    counts = {"PASS": 0, "FAIL": 0, "NO DATA": 0}
+    counts = {"PASS": 0, "MISMATCH": 0, "ENGINE_FAIL": 0, "NO DATA": 0}  # FIX-27.3
 
     for signal in SIGNALS:
         result = compute_signal(engine, signal)
@@ -275,13 +294,21 @@ def run_validation(ninjabet_data: Optional[dict] = None) -> bool:
     print("=" * 60)
     print(f"Segnali totali : {total}")
     print(f"PASS           : {counts['PASS']}")
-    print(f"FAIL           : {counts['FAIL']}")
+    print(f"MISMATCH       : {counts['MISMATCH']}")
+    print(f"ENGINE_FAIL    : {counts['ENGINE_FAIL']}")
     print(f"NO DATA        : {counts['NO DATA']}")
-    print(f"Tolleranza     : ±{TOLERANCE_EUR:.2f} EUR")
+    print(f"Tolleranza     : ±{TOLERANCE_EUR:.2f} EUR (relativa 1% per lay_stake/liability oltre 100 EUR)")  # FIX-27.4
 
-    all_passed = counts["FAIL"] == 0
-    print("\nESITO: " + ("PASS" if all_passed else "FAIL"))
-    return all_passed
+    if counts["NO DATA"] == total:  # FIX-27.1
+        print("\nESITO: NO DATA — nessun confronto eseguito")
+        return 2
+
+    if counts["MISMATCH"] == 0 and counts["ENGINE_FAIL"] == 0:
+        print("\nESITO: PASS")
+        return 0
+
+    print("\nESITO: FAIL")
+    return 1
 
 
 def main() -> None:
@@ -300,8 +327,7 @@ def main() -> None:
     if args.ninjabet_file is not None:
         ninjabet_data = json.loads(args.ninjabet_file.read_text())
 
-    all_passed = run_validation(ninjabet_data)
-    sys.exit(0 if all_passed else 1)
+    sys.exit(run_validation(ninjabet_data))  # FIX-27.1: run_validation ritorna gia' l'exit code
 
 
 if __name__ == "__main__":

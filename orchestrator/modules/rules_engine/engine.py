@@ -107,10 +107,13 @@ class RulesEngine(RulesEngineInterface):
 
         abs_diff = abs(difference)
 
+        # FIX-BASSA-6: confini inclusivi verso "adjust" (">" non ">=", "<" non "<=") —
+        # abs_diff == ANOMALY_THRESHOLD (500.00 esatto) NON e' hitl_required
         if abs_diff > self.ANOMALY_THRESHOLD:
             rules_applied.append("anomalous_difference_hitl")
             return "hitl_required", None
 
+        # FIX-BASSA-6: abs_diff == MATERIALITY_THRESHOLD (0.50 esatto) NON e' no_adjustment
         if abs_diff < self.MATERIALITY_THRESHOLD:
             rules_applied.append("below_materiality_threshold")
             return "no_adjustment", None

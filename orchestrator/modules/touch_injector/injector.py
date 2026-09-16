@@ -11,6 +11,10 @@ from orchestrator.modules.touch_injector.interface import (
 )
 from orchestrator.modules.screen_reader.interface import ScreenReaderInterface
 
+# FIX-24: caratteri interpretati dalla shell del device (adb shell input text)
+# che vanno rimossi dal testo prima di inviarlo, per evitare injection
+_DANGEROUS_CHARS_RE = re.compile(r"[;&$`|<>(){}\[\]]")
+
 
 class TouchInjector(TouchInjectorInterface):
     def __init__(
@@ -62,7 +66,8 @@ class TouchInjector(TouchInjectorInterface):
 
             return Result.ok(True)
 
-        return Result.fail(f"Element '{hint}' not found", "TAP_MISSED")
+        # FIX-BASSA-1: rimosso return Result.fail(...) finale, irraggiungibile —
+        # ogni ramo del for sopra ritorna gia' esplicitamente
 
     # --------------------------------------------------------
     # PUBLIC: tap_coordinates
@@ -87,7 +92,8 @@ class TouchInjector(TouchInjectorInterface):
                 )
             time.sleep(0.3)
 
-        escaped = text.replace(" ", "%s").replace("'", "\\'").replace('"', '\\"')
+        sanitized = _DANGEROUS_CHARS_RE.sub("", text)  # FIX-24: rimuove caratteri pericolosi per la shell del device
+        escaped = sanitized.replace(" ", "%s").replace("'", "\\'").replace('"', '\\"')
         try:
             result = subprocess.run(
                 ["adb", "-s", device_id, "shell", "input", "text", escaped],
@@ -127,8 +133,7 @@ class TouchInjector(TouchInjectorInterface):
                 elem = self.screen_reader.find_element(device_id, hint)
                 if elem.success:
                     cx, cy = self._bounds_center(elem.data.bounds)
-                    self._human_tap(device_id, cx, cy)
-                    time.sleep(1.0)
+                    self._human_tap(device_id, cx, cy)  # FIX-BASSA-3: dorme gia' 0.3-1.5s internamente
                     tapped = True
                     break
 

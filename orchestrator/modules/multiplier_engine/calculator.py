@@ -17,6 +17,10 @@ class MultiplierEngine(MultiplierEngineInterface):
         commission: float = 0.045,
         strategy: str = "equal_profit"
     ) -> Result[CascadeCalculation]:
+        # FIX-14: strategy era accettato ma mai validato/usato
+        if strategy != "equal_profit":
+            return Result.fail(f"Strategia non supportata: {strategy}", "UNSUPPORTED_STRATEGY")
+
         # --- Validazione input ---
         if not back_odds or not lay_odds:
             return Result.fail("Quote vuote", "INVALID_ODDS")
@@ -134,10 +138,12 @@ class MultiplierEngine(MultiplierEngineInterface):
         # profitto se back perde (lay vince)
         profit_if_lost = -back_stake + lay_stake * (1 - commission)
 
-        is_valid = True
         warnings = []
         if profit_if_won <= 0 or profit_if_lost <= 0:
             warnings.append(f"Profitto negativo (qualifying loss): won={profit_if_won:.2f}, lost={profit_if_lost:.2f}")
+
+        # FIX-11: is_valid riflette lo stato reale invece di essere hardcoded a True
+        is_valid = profit_if_won > 0 or profit_if_lost > 0
 
         calc = SingleCalculation(
             lay_stake=round(lay_stake, 2),
@@ -145,7 +151,7 @@ class MultiplierEngine(MultiplierEngineInterface):
             profit_if_won=round(profit_if_won, 2),
             profit_if_lost=round(profit_if_lost, 2),
             is_valid=is_valid,
-            warnings=[]
+            warnings=warnings  # FIX-10: passa i warnings costruiti invece di una lista vuota
         )
 
         return Result.ok(calc)
@@ -181,9 +187,9 @@ class MultiplierEngine(MultiplierEngineInterface):
         )
 
         if not result.success:
-            return Result.fail(
-                f"Recalc mostra profitto negativo: {result.error}",
-                "ODDS_NEGATIVE_PROFIT"
-            )
+            # FIX-13: il messaggio/codice precedenti erano fuorvianti — calculate_cascade
+            # ora puo' fallire solo per INVALID_ODDS, mai per profitto negativo
+            error_code = result.error_code if result.error_code == "INVALID_ODDS" else "RECALC_FAILED"
+            return Result.fail(f"Recalc fallito: {result.error}", error_code)
 
         return result

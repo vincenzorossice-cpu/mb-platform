@@ -138,9 +138,9 @@ class ScreenReader(ScreenReaderInterface):
 
         lay_odds = None
         for t in texts:
-            match = re.match(r"^(\d+\.\d{2})$", t.strip())
+            match = re.match(r"^(\d+[.,]\d{2})$", t.strip())  # FIX-20: accetta anche il locale italiano
             if match:
-                val = float(match.group(1))
+                val = float(match.group(1).replace(",", "."))
                 if 1.01 < val < 1000:
                     lay_odds = val
                     break
@@ -151,7 +151,7 @@ class ScreenReader(ScreenReaderInterface):
             confidence=screen.data.confidence,
         ))
 
-    def read_movements(self, device_id: str, app: str) -> Result[list[MovementReading]]:
+    def read_movements(self, device_id: str) -> Result[list[MovementReading]]:  # FIX-BASSA-2: rimosso 'app' inutilizzato
         screen = self.read_screen(device_id, screen_type="movements")
         if not screen.success:
             return Result.fail(f"Cannot read movements: {screen.error}", screen.error_code)
@@ -187,13 +187,10 @@ class ScreenReader(ScreenReaderInterface):
                 timeout=self.adb_timeout,
             )
 
-            # Leggi il file con cat
-            cat_result = subprocess.run(
-                ["adb", "-s", device_id, "shell", "cat", "/sdcard/ui_dump.xml"],
-                capture_output=True, text=True, timeout=self.adb_timeout,
-            )
-            result.stdout = cat_result.stdout
-            
+            # FIX-15: controlla il returncode del dump PRIMA di eseguire il cat,
+            # invece di sovrascrivere result.stdout e continuare a leggere
+            # result.returncode/result.stderr (che restano quelli del dump anche
+            # dopo la sovrascrittura, mascherando un eventuale fallimento del cat)
             if result.returncode != 0:
                 stderr = result.stderr.lower()
                 if "device not found" in stderr or "device offline" in stderr or "no devices" in stderr:
@@ -202,7 +199,21 @@ class ScreenReader(ScreenReaderInterface):
                     return Result.fail(f"uiautomator blocked (FLAG_SECURE): {device_id}", "UIAUTOMATOR_BLOCKED")
                 return Result.fail(f"uiautomator failed: {result.stderr}", "UIAUTOMATOR_BLOCKED")
 
-            xml = result.stdout.strip()
+            # Leggi il file con cat
+            cat_result = subprocess.run(
+                ["adb", "-s", device_id, "shell", "cat", "/sdcard/ui_dump.xml"],
+                capture_output=True, text=True, timeout=self.adb_timeout,
+            )
+            if cat_result.returncode != 0:
+                # FIX-15: dump ok ma cat fallito, ritenta una volta prima di arrendersi
+                cat_result = subprocess.run(
+                    ["adb", "-s", device_id, "shell", "cat", "/sdcard/ui_dump.xml"],
+                    capture_output=True, text=True, timeout=self.adb_timeout,
+                )
+                if cat_result.returncode != 0:
+                    return Result.fail(f"cat fallito dopo retry: {cat_result.stderr}", "ADB_TIMEOUT")
+
+            xml = cat_result.stdout.strip()
             if not xml or "<hierarchy" not in xml.lower():
                 return Result.fail("uiautomator returned empty XML", "UIAUTOMATOR_BLOCKED")
 
@@ -213,11 +224,11 @@ class ScreenReader(ScreenReaderInterface):
         except FileNotFoundError:
             return Result.fail("ADB not found in PATH", "DEVICE_OFFLINE")
         except Exception as e:
-            return Result.fail(f"Unexpected error: {e}", "ADB_TIMEOUT")
+            return Result.fail(f"Unexpected error: {e}", "ADB_ERROR")  # FIX-16
 
     def _screenshot(self, device_id: str) -> Result[str]:
         try:
-            local_path = os.path.join(self.screenshot_dir, f"screen_{device_id}_{int(time.time())}.png")
+            local_path = os.path.join(self.screenshot_dir, f"screen_{device_id}_{int(time.time() * 1000)}.png")  # FIX-BASSA-4
             subprocess.run(
                 ["adb", "-s", device_id, "shell", "screencap", "-p", "/sdcard/screen.png"],
                 capture_output=True, timeout=self.adb_timeout,
@@ -232,7 +243,7 @@ class ScreenReader(ScreenReaderInterface):
         except subprocess.TimeoutExpired:
             return Result.fail("Screenshot timeout", "ADB_TIMEOUT")
         except Exception as e:
-            return Result.fail(f"Screenshot error: {e}", "ADB_TIMEOUT")
+            return Result.fail(f"Screenshot error: {e}", "ADB_ERROR")  # FIX-16
 
     # --------------------------------------------------------
     # INTERNAL: OCR fallback
@@ -314,10 +325,10 @@ class ScreenReader(ScreenReaderInterface):
                     resource_id=resource_id if resource_id else None,
                     class_name=node.get("class", "").strip() or None, confidence=1.0,
                 ))
-        except ET.ParseError:
-            pass
-        except Exception:
-            pass
+        except ET.ParseError as e:
+            print(f"Warning: XML parse error: {e}")  # FIX-17: logga invece di ingoiare in silenzio
+        except Exception as e:
+            print(f"Warning: XML parse error: {e}")  # FIX-17
         return elements
 
     def _parse_bounds(self, bounds_str: str) -> list[int]:
