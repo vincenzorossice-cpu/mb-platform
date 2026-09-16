@@ -1,5 +1,8 @@
+import json
 import os
 import re
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 from orchestrator.core.result import Result
@@ -161,6 +164,45 @@ class MovementImporter(MovementImporterInterface):
             results.append(WriteResult(success=True, netcap_id=netcap_id, message=None))
 
         return Result.ok(results)
+
+    def save_pending_movements(
+        self,
+        movements: list[Movement],
+        collaboratore_id: str,
+        report_dir: str = "orchestrator/tests/validation/reports",
+    ) -> Result[str]:
+        """Salva movimenti pending in un file JSON per la HITL Dashboard."""
+        now = datetime.now(timezone.utc)
+        directory = Path(report_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        file_path = directory / f"movimenti_pending_{collaboratore_id}_{now:%Y%m%d_%H%M%S}.json"
+
+        epoch = int(now.timestamp())
+        movements_data = []
+        for index, movement in enumerate(movements):
+            movements_data.append({
+                "item_id": f"mov_{collaboratore_id}_{index}_{epoch}",
+                "tipo": movement.tipo,
+                "importo": movement.importo,
+                "conto_id": movement.conto_id,
+                "bookmaker_id": movement.bookmaker_id,
+                "bookmaker_nome": movement.bookmaker_nome,
+                "data": movement.data,
+                "collaboratore_id": movement.collaboratore_id,
+                "descrizione": movement.descrizione,
+                "fonte": movement.fonte,
+                "confidence": movement.confidence,
+                "status": "pending",
+            })
+
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "collaboratore_id": collaboratore_id,
+                "imported_at": now.isoformat(),
+                "movements": movements_data,
+            }, f, ensure_ascii=False, indent=2)
+
+        return Result.ok(str(file_path))
 
     # ------------------------------------------------------------------
     # private

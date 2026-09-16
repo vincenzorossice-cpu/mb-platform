@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 import pytest
 from unittest.mock import MagicMock
 
@@ -266,6 +269,36 @@ class TestWriteMovementsToNetcap:
         assert len(result.data) == 3
         assert result.data[0].success and result.data[2].success
         assert not result.data[1].success
+
+
+class TestSavePendingMovements:
+
+    def _movement(self, **overrides):
+        base = dict(
+            tipo="deposito", importo=30.0, conto_id=None, bookmaker_id=None,
+            bookmaker_nome="TSG Italy S.R.L", data="2026-09-13", collaboratore_id="01",
+            descrizione="TSG Italy S.R.L", fonte="paypal_ocr", confidence=1.0,
+        )
+        base.update(overrides)
+        return Movement(**base)
+
+    def test_save_pending_movements(self, app_api_client, screen_reader, tmp_path):
+        movements = [self._movement(), self._movement(importo=15.0, bookmaker_nome="Marathonbet")]
+        importer = MovementImporter(app_api_client, screen_reader)
+
+        result = importer.save_pending_movements(movements, "01", report_dir=str(tmp_path))
+
+        assert result.success
+        file_path = Path(result.data)
+        assert file_path.exists()
+
+        saved = json.loads(file_path.read_text(encoding="utf-8"))
+        assert saved["collaboratore_id"] == "01"
+        assert len(saved["movements"]) == 2
+        item_ids = [m["item_id"] for m in saved["movements"]]
+        assert len(set(item_ids)) == 2  # univoci
+        assert all(m["status"] == "pending" for m in saved["movements"])
+        assert saved["movements"][0]["descrizione"] == "TSG Italy S.R.L"
 
 
 class TestCheckConsentExpiry:

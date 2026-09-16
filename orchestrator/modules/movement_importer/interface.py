@@ -48,3 +48,9 @@ class MovementImporterInterface(ABC):
     @abstractmethod
     def write_movements_to_netcap(self, movements: list[Movement], session_token: str = None) -> Result[list[WriteResult]]:
         """Scrive i movimenti su Netcap via POST /movimentazioni, con deduplicazione."""
+
+    @abstractmethod
+    def save_pending_movements(
+        self, movements: list[Movement], collaboratore_id: str, report_dir: str = "orchestrator/tests/validation/reports"
+    ) -> Result[str]:
+        """Salva movimenti pending in un file JSON per la HITL Dashboard."""

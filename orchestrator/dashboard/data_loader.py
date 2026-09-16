@@ -55,18 +55,18 @@ def load_rettifiche(report_dir: str = DEFAULT_REPORT_DIR) -> list[dict]:
 
 
 def load_movimenti(report_dir: str = DEFAULT_REPORT_DIR) -> list[dict]:
-    """Legge i movimenti importati con confidence < 0.85 o dati mancanti."""
+    """Legge tutti i movimenti pending salvati da MovementImporter.save_pending_movements."""
     movimenti = []
-    for report in _load_json_files(report_dir, "movimenti_*.json"):
-        items = report if isinstance(report, list) else report.get("movimenti", [])
-        for i, movimento in enumerate(items):
-            confidence = movimento.get("confidence")
-            mancante = confidence is None or movimento.get("importo") is None
-            if not mancante and confidence >= MIN_CONFIDENCE:
+    for report in _load_json_files(report_dir, "movimenti_pending_*.json"):
+        collaboratore_id = report.get("collaboratore_id")
+        for movimento in report.get("movements", []):
+            if movimento.get("status") in ("approved", "rejected"):
                 continue
-            severity = "critical" if (confidence is not None and confidence < CRITICAL_CONFIDENCE) else "warning"
+            confidence = movimento.get("confidence")
+            severity = "ok" if (confidence is not None and confidence >= MIN_CONFIDENCE) else "warning"
             movimenti.append({
-                "id": f"movimento-{i}-{movimento.get('data')}",
+                "item_id": movimento.get("item_id"),
+                "collaboratore_id": movimento.get("collaboratore_id", collaboratore_id),
                 "data": movimento.get("data"),
                 "fonte": movimento.get("fonte"),
                 "tipo": movimento.get("tipo"),

@@ -1,9 +1,14 @@
 import json
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
 
-from orchestrator.dashboard.app import app
-from orchestrator.dashboard.data_loader import load_movimenti, load_rettifiche
+from orchestrator.core.result import Result
+from orchestrator.dashboard.app import _find_movement_in_files, app
+from orchestrator.dashboard.data_loader import DEFAULT_REPORT_DIR, load_movimenti, load_rettifiche
+
+REAL_REPORT_DIR = Path(DEFAULT_REPORT_DIR)
 
 
 def _write_report(report_dir, filename, data):
@@ -11,6 +16,14 @@ def _write_report(report_dir, filename, data):
     path = report_dir / filename
     path.write_text(json.dumps(data), encoding="utf-8")
     return path
+
+
+def _pending_report(collaboratore_id="01", movements=None):
+    return {
+        "collaboratore_id": collaboratore_id,
+        "imported_at": "2026-09-16T15:30:00",
+        "movements": movements or [],
+    }
 
 
 def test_load_rettifiche_empty(tmp_path):
@@ -69,32 +82,86 @@ def test_load_movimenti_empty(tmp_path):
     assert movimenti == []
 
 
-def test_load_movimenti_low_confidence(tmp_path):
+def test_load_movimenti_with_pending(tmp_path):
     report_dir = tmp_path / "reports"
-    _write_report(report_dir, "movimenti_20260101.json", [
-        {
-            "data": "2026-01-01",
-            "fonte": "hype_email",
-            "tipo": "deposito",
-            "importo": 50.0,
-            "descrizione": "Pagamento EUR 50,00",
-            "confidence": 0.7,
-        },
-        {
-            "data": "2026-01-02",
-            "fonte": "paypal_ocr",
-            "tipo": "prelievo",
-            "importo": 30.0,
-            "descrizione": "Addebito EUR 30,00",
-            "confidence": 0.95,
-        },
-    ])
+    _write_report(report_dir, "movimenti_pending_01_20260916_153000.json", _pending_report(
+        collaboratore_id="01",
+        movements=[
+            {
+                "item_id": "mov_01_0_1694872200",
+                "tipo": "deposito",
+                "importo": 40.0,
+                "conto_id": None,
+                "bookmaker_id": None,
+                "bookmaker_nome": "TSG Italy S.R.L",
+                "data": "2026-09-13",
+                "collaboratore_id": "01",
+                "descrizione": "TSG Italy S.R.L",
+                "fonte": "paypal_ocr",
+                "confidence": 0.7,
+                "status": "pending",
+            },
+            {
+                "item_id": "mov_01_1_1694872200",
+                "tipo": "prelievo",
+                "importo": 15.0,
+                "conto_id": None,
+                "bookmaker_id": None,
+                "bookmaker_nome": "Marathonbet",
+                "data": "2026-09-13",
+                "collaboratore_id": "01",
+                "descrizione": "Marathonbet",
+                "fonte": "paypal_ocr",
+                "confidence": 1.0,
+                "status": "pending",
+            },
+            {
+                "item_id": "mov_01_2_1694872200",
+                "tipo": "deposito",
+                "importo": 10.0,
+                "conto_id": None,
+                "bookmaker_id": None,
+                "bookmaker_nome": "Sisal",
+                "data": "2026-09-13",
+                "collaboratore_id": "01",
+                "descrizione": "Sisal",
+                "fonte": "paypal_ocr",
+                "confidence": 0.9,
+                "status": "approved",
+            },
+        ],
+    ))
 
     movimenti = load_movimenti(report_dir=str(report_dir))
 
-    assert len(movimenti) == 1
-    assert movimenti[0]["confidence"] == 0.7
-    assert movimenti[0]["severity"] == "warning"
+    assert len(movimenti) == 2  # l'item "approved" è escluso
+    item_ids = {m["item_id"] for m in movimenti}
+    assert item_ids == {"mov_01_0_1694872200", "mov_01_1_1694872200"}
+    pending_low = next(m for m in movimenti if m["item_id"] == "mov_01_0_1694872200")
+    assert pending_low["severity"] == "warning"  # confidence < 0.85
+    pending_high = next(m for m in movimenti if m["item_id"] == "mov_01_1_1694872200")
+    assert pending_high["severity"] == "ok"  # confidence >= 0.85
+
+
+def test_find_movement_in_files(tmp_path):
+    report_dir = tmp_path / "reports"
+    _write_report(report_dir, "movimenti_pending_01_20260916_153000.json", _pending_report(
+        movements=[
+            {"item_id": "mov_01_0_1694872200", "tipo": "deposito", "importo": 40.0,
+             "conto_id": None, "bookmaker_id": None, "bookmaker_nome": "TSG",
+             "data": "2026-09-13", "collaboratore_id": "01", "descrizione": "TSG",
+             "fonte": "paypal_ocr", "confidence": 0.7, "status": "pending"},
+        ],
+    ))
+
+    found = _find_movement_in_files("mov_01_0_1694872200", report_dir=str(report_dir))
+    assert found is not None
+    path, movimento, index = found
+    assert path == report_dir / "movimenti_pending_01_20260916_153000.json"
+    assert movimento["item_id"] == "mov_01_0_1694872200"
+    assert index == 0
+
+    assert _find_movement_in_files("does-not-exist", report_dir=str(report_dir)) is None
 
 
 def test_dashboard_route():
@@ -102,3 +169,63 @@ def test_dashboard_route():
     response = client.get("/")
     assert response.status_code == 200
     assert "HITL Dashboard" in response.text
+
+
+def test_reject_updates_status():
+    filename = "movimenti_pending_test_reject.json"
+    path = _write_report(REAL_REPORT_DIR, filename, _pending_report(
+        collaboratore_id="test",
+        movements=[
+            {"item_id": "mov_test_reject", "tipo": "deposito", "importo": 40.0,
+             "conto_id": None, "bookmaker_id": None, "bookmaker_nome": "TSG",
+             "data": "2026-09-13", "collaboratore_id": "test", "descrizione": "TSG",
+             "fonte": "paypal_ocr", "confidence": 0.7, "status": "pending"},
+        ],
+    ))
+    try:
+        with patch("orchestrator.dashboard.app.AppApiClient") as mock_client_cls:
+            client = TestClient(app)
+            response = client.post("/reject/mov_test_reject")
+
+        assert response.status_code == 200
+        assert response.json() == {"status": "rejected", "id": "mov_test_reject"}
+        mock_client_cls.assert_not_called()
+
+        updated = json.loads(path.read_text(encoding="utf-8"))
+        assert updated["movements"][0]["status"] == "rejected"
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_approve_writes_to_netcap():
+    filename = "movimenti_pending_test_approve.json"
+    path = _write_report(REAL_REPORT_DIR, filename, _pending_report(
+        collaboratore_id="test",
+        movements=[
+            {"item_id": "mov_test_approve", "tipo": "deposito", "importo": 40.0,
+             "conto_id": None, "bookmaker_id": None, "bookmaker_nome": "TSG",
+             "data": "2026-09-13", "collaboratore_id": "test", "descrizione": "TSG",
+             "fonte": "paypal_ocr", "confidence": 0.7, "status": "pending"},
+        ],
+    ))
+    try:
+        with patch("orchestrator.dashboard.app.AppApiClient") as mock_client_cls:
+            mock_instance = MagicMock()
+            mock_instance._get_json.return_value = Result.ok([])
+            mock_instance._post_json.return_value = Result.ok({"id": 501})
+            mock_client_cls.return_value = mock_instance
+
+            client = TestClient(app)
+            response = client.post("/approve/mov_test_approve")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "approved"
+        assert body["id"] == "mov_test_approve"
+        assert body["netcap_result"]["netcap_id"] == 501
+        mock_instance._post_json.assert_called_once()
+
+        updated = json.loads(path.read_text(encoding="utf-8"))
+        assert updated["movements"][0]["status"] == "approved"
+    finally:
+        path.unlink(missing_ok=True)
