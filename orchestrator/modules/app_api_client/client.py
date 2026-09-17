@@ -233,7 +233,7 @@ class AppApiClient(AppApiClientInterface):
         idempotency_key = f"rettifica_{collaboratore_id}_{bookmaker_id}_{date.today().isoformat()}"
         body = {
             "nome": "Rettifica riconciliazione",
-            "tipologia": "Rettifica",
+            "tipologia": "Ricorrenti",
             "categoria": "Sport",
             "bookmaker_id": bookmaker_id,
             "data_apertura": date.today().isoformat(),
@@ -244,6 +244,9 @@ class AppApiClient(AppApiClientInterface):
             return res  # type: ignore[return-value]
 
         operazione_id = res.data.get("id") if isinstance(res.data, dict) else None
+        if operazione_id is None:
+            # FIX-NETCAP-2STEP: risposta Step 1 senza id -> fallimento esplicito
+            return Result.fail(f"Risposta Step 1 senza id: {res.data}", self.NETCAP_PARSE_ERROR)
         return Result.ok(operazione_id)
 
     def _add_riga_rettifica(
@@ -276,6 +279,9 @@ class AppApiClient(AppApiClientInterface):
             return res  # type: ignore[return-value]
 
         riga_id = res.data.get("id") if isinstance(res.data, dict) else None
+        if riga_id is None:
+            # FIX-NETCAP-2STEP: risposta Step 2 senza id -> fallimento esplicito
+            return Result.fail(f"Risposta Step 2 senza id: {res.data}", self.NETCAP_PARSE_ERROR)
         return Result.ok(riga_id)
 
     def write_operazione(self, operazione: dict) -> Result[WriteResult]:
@@ -316,6 +322,8 @@ class AppApiClient(AppApiClientInterface):
             return Result.fail(f"Connessione fallita: {exc}", self.NETCAP_UNREACHABLE)
         except requests.Timeout:
             return Result.fail(f"Timeout su {url}", self.NETCAP_TIMEOUT)
+
+        print(f"[Netcap] POST {url} -> status={resp.status_code} body={resp.text}")  # FIX-NETCAP-2STEP
 
         if not resp.ok:
             return Result.fail(

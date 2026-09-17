@@ -193,7 +193,7 @@ class TestWriteRettifica:
         assert mock_post.call_count == 2
 
         step1_body = mock_post.call_args_list[0].kwargs["json"]
-        assert step1_body["tipologia"] == "Rettifica"
+        assert step1_body["tipologia"] == "Ricorrenti"
         assert step1_body["categoria"] == "Sport"
         assert step1_body["bookmaker_id"] == 6
 
