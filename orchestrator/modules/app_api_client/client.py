@@ -176,47 +176,36 @@ class AppApiClient(AppApiClientInterface):
         collaboratore_id: str,
         bookmaker_id: int,
     ) -> Result[WriteResult]:
-        """POST /operazioni → registra rettifica su Netcap."""
-
-        # FIX-7: controlla se esiste gia' una rettifica identica oggi prima di scrivere
-        # (idempotenza: rilanciare la pipeline non deve duplicare le rettifiche).
-        # Se il controllo fallisce (rete/parsing) si procede comunque con la POST:
-        # un controllo di idempotenza irraggiungibile non deve bloccare la riconciliazione.
-        existing_check = self._find_existing_rettifica(collaboratore_id, bookmaker_id)
+        """Registra una rettifica su Netcap con il flusso a 2 step:
+        1) crea l'operazione contenitore, 2) aggiunge la riga con l'importo."""
+        # FIX-NETCAP-2STEP: Netcap non accetta piu' una rettifica in una sola POST;
+        # richiede POST /operazioni seguita da POST /operazioni/{id}/righe.
+        existing_check = self._find_existing_operazione_rettifica(bookmaker_id)
         if existing_check.success and existing_check.data is not None:
-            return Result.ok(WriteResult(
-                success=True,
-                netcap_id=existing_check.data,
-                message="Rettifica già esistente, skip",
-            ))
+            operazione_id = existing_check.data
+        else:
+            create_res = self._create_operazione_rettifica(bookmaker_id, collaboratore_id)
+            if not create_res.success:
+                return Result.fail(create_res.error, create_res.error_code)
+            operazione_id = create_res.data
 
-        idempotency_key = f"rettifica_{collaboratore_id}_{bookmaker_id}_{date.today().isoformat()}"
-        body = {
-            "nome": "Rettifica riconciliazione",
-            "tipologia": rectification.reason,
-            "categoria": "Rettifica",
-            "bookmaker_id": bookmaker_id,
-            "collaboratori_ids": collaboratore_id,
-            "risultato_totale": round(rectification.amount, 2),
-            "stato": "CHIUSO",
-            "data_apertura": date.today().isoformat(),
-            "colonna": rectification.column,
-            "descrizione": idempotency_key,  # FIX-7: chiave di idempotenza supplementare
-        }
-        if rectification.bonus_note:
-            body["note"] = rectification.bonus_note
+        riga_res = self._add_riga_rettifica(operazione_id, collaboratore_id, bookmaker_id, rectification)
+        if not riga_res.success:
+            return Result.fail(
+                f"Operazione creata (id={operazione_id}) ma riga fallita: {riga_res.error}",
+                riga_res.error_code,
+            )
 
-        return self._write_operazione(body)
+        return Result.ok(WriteResult(success=True, netcap_id=riga_res.data, message="Rettifica scritta"))
 
-    def _find_existing_rettifica(self, collaboratore_id: str, bookmaker_id: int) -> Result[Optional[int]]:
-        """FIX-7: cerca su Netcap una rettifica gia' registrata oggi per lo stesso
-        collaboratore/book, per evitare di scriverla due volte."""
+    def _find_existing_operazione_rettifica(self, bookmaker_id: int) -> Result[Optional[int]]:
+        """FIX-NETCAP-2STEP: cerca un'operazione di rettifica gia' creata oggi per
+        questo bookmaker, per evitare di duplicare lo Step 1 (idempotenza)."""
         url = f"{self.base_url}/operazioni"
         params = {
-            "collaboratore_id": collaboratore_id,
+            "nome": "Rettifica riconciliazione",
             "bookmaker_id": bookmaker_id,
             "data_apertura": date.today().isoformat(),
-            "nome": "Rettifica riconciliazione",
         }
         try:
             resp = self.session.get(url, params=params, timeout=self.timeout)
@@ -238,6 +227,56 @@ class AppApiClient(AppApiClientInterface):
             return Result.ok(existing.get("id") if isinstance(existing, dict) else None)
 
         return Result.ok(None)
+
+    def _create_operazione_rettifica(self, bookmaker_id: int, collaboratore_id: str) -> Result[int]:
+        """FIX-NETCAP-2STEP: Step 1 - crea il contenitore operazione su Netcap."""
+        idempotency_key = f"rettifica_{collaboratore_id}_{bookmaker_id}_{date.today().isoformat()}"
+        body = {
+            "nome": "Rettifica riconciliazione",
+            "tipologia": "Rettifica",
+            "categoria": "Sport",
+            "bookmaker_id": bookmaker_id,
+            "data_apertura": date.today().isoformat(),
+            "note": idempotency_key,
+        }
+        res = self._post_json("/operazioni", body)
+        if not res.success:
+            return res  # type: ignore[return-value]
+
+        operazione_id = res.data.get("id") if isinstance(res.data, dict) else None
+        return Result.ok(operazione_id)
+
+    def _add_riga_rettifica(
+        self,
+        operazione_id: int,
+        collaboratore_id: str,
+        bookmaker_id: int,
+        rectification: Rectification,
+    ) -> Result[int]:
+        """FIX-NETCAP-2STEP: Step 2 - aggiunge la riga con l'importo all'operazione."""
+        amount = round(rectification.amount, 2)
+        profitto_book = amount if rectification.column == "BOOK" else 0
+        profitto_banco = amount if rectification.column == "BANCO" else 0
+
+        note = f"Rettifica riconciliazione automatica - {rectification.reason}"
+        if rectification.bonus_note:
+            note = f"{note} | {rectification.bonus_note}"
+
+        body = {
+            "collaboratore_id": collaboratore_id,
+            "bookmaker_id": bookmaker_id,
+            "tipo_riga": "puntata_e_bancata",
+            "profitto_book": profitto_book,
+            "profitto_banco": profitto_banco,
+            "fee_percentuale": 0,
+            "note": note,
+        }
+        res = self._post_json(f"/operazioni/{operazione_id}/righe", body)
+        if not res.success:
+            return res  # type: ignore[return-value]
+
+        riga_id = res.data.get("id") if isinstance(res.data, dict) else None
+        return Result.ok(riga_id)
 
     def write_operazione(self, operazione: dict) -> Result[WriteResult]:
         """POST /operazioni → registra operazione generica su Netcap."""

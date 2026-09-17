@@ -54,9 +54,6 @@ MOVIMENTAZIONI_RESPONSE = [
     },
 ]
 
-POST_OPERAZIONE_RESPONSE = {"id": 999, "nome": "Rettifica riconciliazione", "stato": "CHIUSO"}
-
-
 def _mock_get_ok(json_data):
     """Crea un mock response con .ok=True e .json() che restituisce json_data."""
     resp = MagicMock()
@@ -175,42 +172,103 @@ class TestReadMovements:
 
 
 class TestWriteRettifica:
+    """FIX-NETCAP-2STEP: write_rettifica ora fa 2 POST in sequenza
+    (POST /operazioni poi POST /operazioni/{id}/righe)."""
 
-    def test_success(self, client: AppApiClient):
-        rect = Rectification(amount=5.0, column="BOOK", reason="Differenza riconciliazione: +5.00 EUR")
+    def test_write_rettifica_success(self, client: AppApiClient):
+        rect = Rectification(amount=190.74, column="BANCO", reason="Differenza riconciliazione: +190.74 EUR")
 
-        # FIX-7: write_rettifica ora fa prima una GET di controllo idempotenza;
-        # la mockiamo con lista vuota (nessuna rettifica gia' esistente).
         with patch.object(client.session, "get", return_value=_mock_get_ok([])) as mock_get, \
-                patch.object(client.session, "post", return_value=_mock_post_ok(POST_OPERAZIONE_RESPONSE)) as mock_post:
-            result = client.write_rettifica(rect, collaboratore_id="01", bookmaker_id=1)
+                patch.object(
+                    client.session, "post",
+                    side_effect=[_mock_post_ok({"id": 145}), _mock_post_ok({"id": 991})],
+                ) as mock_post:
+            result = client.write_rettifica(rect, collaboratore_id="08", bookmaker_id=6)
 
         assert result.success
         assert result.data.success is True
-        assert result.data.netcap_id == 999
+        assert result.data.netcap_id == 991
 
         mock_get.assert_called_once()
-        call_kwargs = mock_post.call_args
-        body = call_kwargs.kwargs.get("json") or call_kwargs[1].get("json")
-        assert body["bookmaker_id"] == 1
-        assert body["collaboratori_ids"] == "01"
-        assert body["risultato_totale"] == 5.0
-        assert body["stato"] == "CHIUSO"
-        assert body["categoria"] == "Rettifica"
+        assert mock_post.call_count == 2
 
-    def test_skip_if_already_exists(self, client: AppApiClient):
-        """FIX-7: se esiste gia' una rettifica per oggi/collaboratore/book, non ripete la POST."""
-        rect = Rectification(amount=5.0, column="BOOK", reason="Differenza riconciliazione: +5.00 EUR")
+        step1_body = mock_post.call_args_list[0].kwargs["json"]
+        assert step1_body["tipologia"] == "Rettifica"
+        assert step1_body["categoria"] == "Sport"
+        assert step1_body["bookmaker_id"] == 6
 
-        with patch.object(client.session, "get", return_value=_mock_get_ok([{"id": 777}])), \
-                patch.object(client.session, "post") as mock_post:
+        step2_url = mock_post.call_args_list[1].args[0]
+        step2_body = mock_post.call_args_list[1].kwargs["json"]
+        assert step2_url.endswith("/operazioni/145/righe")
+        assert step2_body["collaboratore_id"] == "08"
+        assert step2_body["profitto_banco"] == 190.74
+        assert step2_body["profitto_book"] == 0
+
+    def test_write_rettifica_banco(self, client: AppApiClient):
+        rect = Rectification(amount=190.74, column="BANCO", reason="r")
+        with patch.object(client.session, "get", return_value=_mock_get_ok([])), \
+                patch.object(
+                    client.session, "post",
+                    side_effect=[_mock_post_ok({"id": 145}), _mock_post_ok({"id": 991})],
+                ) as mock_post:
+            client.write_rettifica(rect, collaboratore_id="08", bookmaker_id=6)
+
+        step2_body = mock_post.call_args_list[1].kwargs["json"]
+        assert step2_body["profitto_banco"] == 190.74
+        assert step2_body["profitto_book"] == 0
+
+    def test_write_rettifica_book(self, client: AppApiClient):
+        rect = Rectification(amount=117.46, column="BOOK", reason="r")
+        with patch.object(client.session, "get", return_value=_mock_get_ok([])), \
+                patch.object(
+                    client.session, "post",
+                    side_effect=[_mock_post_ok({"id": 200}), _mock_post_ok({"id": 991})],
+                ) as mock_post:
+            client.write_rettifica(rect, collaboratore_id="01", bookmaker_id=42)
+
+        step2_body = mock_post.call_args_list[1].kwargs["json"]
+        assert step2_body["profitto_book"] == 117.46
+        assert step2_body["profitto_banco"] == 0
+
+    def test_write_rettifica_step1_fails(self, client: AppApiClient):
+        rect = Rectification(amount=10.0, column="BOOK", reason="r")
+        with patch.object(client.session, "get", return_value=_mock_get_ok([])), \
+                patch.object(client.session, "post", return_value=_mock_http_error(500)) as mock_post:
+            result = client.write_rettifica(rect, collaboratore_id="01", bookmaker_id=1)
+
+        assert not result.success
+        assert result.error_code == "NETCAP_HTTP_ERROR"
+        mock_post.assert_called_once()
+
+    def test_write_rettifica_step2_fails(self, client: AppApiClient):
+        rect = Rectification(amount=10.0, column="BOOK", reason="r")
+        with patch.object(client.session, "get", return_value=_mock_get_ok([])), \
+                patch.object(
+                    client.session, "post",
+                    side_effect=[_mock_post_ok({"id": 145}), _mock_http_error(500)],
+                ) as mock_post:
+            result = client.write_rettifica(rect, collaboratore_id="01", bookmaker_id=1)
+
+        assert not result.success
+        assert result.error_code == "NETCAP_HTTP_ERROR"
+        assert "Operazione creata" in result.error
+        assert "ma riga fallita" in result.error
+        assert mock_post.call_count == 2
+
+    def test_write_rettifica_idempotent(self, client: AppApiClient):
+        """Se esiste gia' un'operazione oggi per questo bookmaker, salta lo Step 1
+        e usa l'operazione_id esistente per lo Step 2."""
+        rect = Rectification(amount=10.0, column="BOOK", reason="r")
+        with patch.object(client.session, "get", return_value=_mock_get_ok([{"id": 500}])) as mock_get, \
+                patch.object(client.session, "post", return_value=_mock_post_ok({"id": 991})) as mock_post:
             result = client.write_rettifica(rect, collaboratore_id="01", bookmaker_id=1)
 
         assert result.success
-        assert result.data.success is True
-        assert result.data.netcap_id == 777
-        assert result.data.message == "Rettifica già esistente, skip"
-        mock_post.assert_not_called()
+        assert result.data.netcap_id == 991
+        mock_get.assert_called_once()
+        mock_post.assert_called_once()
+        step2_url = mock_post.call_args.args[0]
+        assert step2_url.endswith("/operazioni/500/righe")
 
 
 class TestNetcapUnreachable:
