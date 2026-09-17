@@ -18,15 +18,8 @@ class Signal:
     priority: str                    # "alta" | "media" | "bassa"
     expected_profit: str             # "alto" | "medio" | "basso" o importo
     tc_verified: bool = False
-    tc_discrepancies: list = field(default_factory=list)
+    tc_discrepancies: list[str] = field(default_factory=list)
     status: str = "pending"          # "pending" | "tc_verified" | "tc_discrepancy"
-
-
-@dataclass
-class TcVerification:
-    """Esito della verifica termini & condizioni via RAGSystem."""
-    verified: bool
-    discrepancies: list[str]
 
 
 class SignalParserInterface(ABC):

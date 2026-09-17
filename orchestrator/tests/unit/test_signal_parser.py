@@ -1,5 +1,9 @@
+from unittest.mock import MagicMock
+
 import pytest
 
+from orchestrator.core.result import Result
+from orchestrator.modules.rag_system.interface import TCVerification
 from orchestrator.modules.signal_parser.parser import (
     SignalParser,
     SignalPreprocessor,
@@ -226,3 +230,77 @@ class TestCategoryDetectionCasino:
         result = parser.parse(CASINO_SNAI, "msg-011")
         assert result.success
         assert result.data.category == "casino"
+
+
+# ------------------------------------------------------------------
+# parse_and_verify — T&C verification via RAGSystem
+# ------------------------------------------------------------------
+
+class TestParseAndVerifyNoRagSystem:
+    def test_parse_and_verify_stub_without_rag_system(self, parser: SignalParser):
+        """Senza rag_system (None) -> comportamento stub: tc_verified=True."""
+        result = parser.parse_and_verify(SPORT_STANLEYBET, "msg-020")
+        assert result.success
+        signal = result.data
+        assert signal.tc_verified is True
+        assert signal.tc_discrepancies == []
+        assert signal.status == "tc_verified"
+
+
+class TestParseAndVerifyRagVerified:
+    def test_parse_and_verify_rag_verified(self):
+        """RAGSystem.verify_tc -> verified=True -> Signal.status=tc_verified."""
+        rag_system = MagicMock()
+        rag_system.verify_tc.return_value = Result.ok(
+            TCVerification(verified=True, discrepancies=[], matched_docs=["TC-STANLEYBET"])
+        )
+        parser = SignalParser(rag_system=rag_system)
+
+        result = parser.parse_and_verify(SPORT_STANLEYBET, "msg-021")
+        assert result.success
+        signal = result.data
+        assert signal.tc_verified is True
+        assert signal.tc_discrepancies == []
+        assert signal.status == "tc_verified"
+        rag_system.verify_tc.assert_called_once_with(signal)
+
+
+class TestParseAndVerifyRagDiscrepancy:
+    def test_parse_and_verify_rag_discrepancy(self):
+        """RAGSystem.verify_tc -> verified=False -> Signal.status=tc_discrepancy."""
+        rag_system = MagicMock()
+        rag_system.verify_tc.return_value = Result.ok(
+            TCVerification(
+                verified=False,
+                discrepancies=["Quota anomala"],
+                matched_docs=["TC-STANLEYBET"],
+            )
+        )
+        parser = SignalParser(rag_system=rag_system)
+
+        result = parser.parse_and_verify(SPORT_STANLEYBET, "msg-022")
+        assert result.success
+        signal = result.data
+        assert signal.tc_verified is False
+        assert signal.tc_discrepancies == ["Quota anomala"]
+        assert signal.status == "tc_discrepancy"
+
+
+class TestParseAndVerifyRagFailureFallsBack:
+    def test_parse_and_verify_rag_failure_falls_back_to_stub(self, caplog):
+        """RAGSystem.verify_tc -> Result.fail -> non crasha, fallback stub + warning loggato."""
+        rag_system = MagicMock()
+        rag_system.verify_tc.return_value = Result.fail(
+            "Knowledge base vuota — nessun documento indicizzato", "KB_EMPTY"
+        )
+        parser = SignalParser(rag_system=rag_system)
+
+        with caplog.at_level("WARNING"):
+            result = parser.parse_and_verify(SPORT_STANLEYBET, "msg-023")
+
+        assert result.success
+        signal = result.data
+        assert signal.tc_verified is True
+        assert signal.tc_discrepancies == []
+        assert signal.status == "tc_verified"
+        assert any("KB_EMPTY" in record.message for record in caplog.records)

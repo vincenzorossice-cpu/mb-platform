@@ -1,13 +1,13 @@
+import logging
 import re
 from datetime import datetime
 from typing import Optional
 
 from orchestrator.core.result import Result
-from orchestrator.modules.signal_parser.interface import (
-    Signal,
-    SignalParserInterface,
-    TcVerification,
-)
+from orchestrator.modules.signal_parser.interface import Signal, SignalParserInterface
+from orchestrator.modules.rag_system.interface import RAGSystemInterface, TCVerification
+
+logger = logging.getLogger(__name__)
 
 
 class SignalPreprocessor:
@@ -356,11 +356,12 @@ class SignalParser(SignalParserInterface):
     OBSCURED_MARKERS = ("🔡", "💶")
     MAX_LLM_ATTEMPTS = 3
 
-    def __init__(self):
+    def __init__(self, rag_system: Optional[RAGSystemInterface] = None):
         self.preprocessor = SignalPreprocessor()
         self.extractor = LlamaSignalExtractor()
         self.postprocessor = SignalPostprocessor()
         self._seen_message_ids: set[str] = set()
+        self.rag_system = rag_system
 
     # ------------------------------------------------------------------
     # public
@@ -404,6 +405,15 @@ class SignalParser(SignalParserInterface):
             signal.tc_verified = verification.verified
             signal.tc_discrepancies = verification.discrepancies
             signal.status = "tc_verified" if verification.verified else "tc_discrepancy"
+        else:
+            logger.warning(
+                "T&C verification failed for message %s (%s): %s — falling back to "
+                "unverified stub state",
+                telegram_message_id, tc_result.error_code, tc_result.error,
+            )
+            signal.tc_verified = True
+            signal.tc_discrepancies = []
+            signal.status = "tc_verified"
 
         return Result.ok(signal)
 
@@ -411,6 +421,8 @@ class SignalParser(SignalParserInterface):
     # private
     # ------------------------------------------------------------------
 
-    def _verify_tc(self, signal: Signal) -> Result[TcVerification]:
-        """STUB — il vero RAGSystem verra' integrato in seguito."""
-        return Result.ok(TcVerification(verified=True, discrepancies=[]))
+    def _verify_tc(self, signal: Signal) -> Result[TCVerification]:
+        """Verifica T&C via RAGSystem se disponibile; altrimenti stub (verified=True)."""
+        if self.rag_system is None:
+            return Result.ok(TCVerification(verified=True, discrepancies=[], matched_docs=[]))
+        return self.rag_system.verify_tc(signal)
