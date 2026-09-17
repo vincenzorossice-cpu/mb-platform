@@ -31,9 +31,10 @@ class TouchInjector(TouchInjectorInterface):
     # PUBLIC: tap_element
     # --------------------------------------------------------
 
-    def tap_element(self, device_id: str, hint: str, field: str = "text") -> Result[bool]:
+    def tap_element(self, device_id: str, hint: str, field: str = "text", verify: bool = True) -> Result[bool]:
         """Trova l'elemento via ScreenReader, calcola centro bounds, tap umanizzato.
-        Retry fino a 2 volte con re-identificazione su TAP_MISSED."""
+        Retry fino a 2 volte con re-identificazione su TAP_MISSED.
+        Se verify=True (default), verifica che il tap abbia avuto un effetto reale."""
         max_retries = 2
         backoffs = [1.0, 2.0]
 
@@ -47,24 +48,19 @@ class TouchInjector(TouchInjectorInterface):
 
             elem = elem_result.data
             cx, cy = self._bounds_center(elem.bounds)
+
+            # FIX-6: cattura lo schermo pre-tap (solo se verrà verificato) per poter
+            # confrontare l'effetto del tap
+            pre_screen = self.screen_reader.read_screen(device_id) if verify else None
+
             tap_result = self._human_tap(device_id, cx, cy)
             if not tap_result.success:
                 return tap_result
 
-            # Verifica post-tap: la schermata deve essere cambiata
-            time.sleep(0.5)
-            post_screen = self.screen_reader.read_screen(device_id)
-            if post_screen.success:
-                # Se l'elemento è ancora presente identico, il tap potrebbe non aver avuto effetto
-                post_elem = self.screen_reader.find_element(device_id, hint, field)
-                if not post_elem.success:
-                    # Elemento non più trovato → schermata cambiata, tap riuscito
-                    return Result.ok(True)
-                # Elemento ancora presente — potrebbe essere ok (es. campo di testo),
-                # consideriamo comunque successo al primo tentativo
+            if not verify:
                 return Result.ok(True)
 
-            return Result.ok(True)
+            return self._verify_tap_effect(device_id, hint, field, pre_screen)
 
         # FIX-BASSA-1: rimosso return Result.fail(...) finale, irraggiungibile —
         # ogni ramo del for sopra ritorna gia' esplicitamente
@@ -117,6 +113,7 @@ class TouchInjector(TouchInjectorInterface):
         """Naviga verso una schermata target. Verifica con ScreenReader dopo ogni step.
         Max 5 tentativi di navigazione prima di fallire."""
         max_steps = 5
+        had_successful_tap = False  # FIX-23: tracciato su tutti gli step, per il messaggio finale
 
         for step in range(max_steps):
             screen = self.screen_reader.read_screen(device_id)
@@ -128,16 +125,20 @@ class TouchInjector(TouchInjectorInterface):
 
             # Cerca un elemento che possa portare alla destinazione
             nav_hints = self._navigation_hints(destination, book)
-            tapped = False
+            found_hint = False
             for hint in nav_hints:
                 elem = self.screen_reader.find_element(device_id, hint)
                 if elem.success:
+                    found_hint = True
                     cx, cy = self._bounds_center(elem.data.bounds)
-                    self._human_tap(device_id, cx, cy)  # FIX-BASSA-3: dorme gia' 0.3-1.5s internamente
-                    tapped = True
+                    # FIX-23: cattura l'esito del tap invece di ignorarlo — un tap fallito
+                    # non deve far credere che la navigazione sia avanzata
+                    tap_result = self._human_tap(device_id, cx, cy)
+                    if tap_result.success:
+                        had_successful_tap = True
                     break
 
-            if not tapped:
+            if not found_hint:
                 return Result.fail(
                     f"No navigation path found to '{destination}' on {book}",
                     "NAVIGATION_FAILED",
@@ -147,6 +148,10 @@ class TouchInjector(TouchInjectorInterface):
         final = self.screen_reader.read_screen(device_id)
         if final.success and final.data.screen_type == destination:
             return Result.ok(True)
+
+        if not had_successful_tap:
+            # FIX-23: nessun tap e' mai andato a buon fine in nessuno step
+            return Result.fail("Navigation failed: no successful taps", "NAVIGATION_FAILED")
 
         return Result.fail(
             f"Destination '{destination}' not reached after {max_steps} steps",
@@ -242,6 +247,36 @@ class TouchInjector(TouchInjectorInterface):
         return self._wait_lay_confirmation(device_id, odds, stake)
 
     # --------------------------------------------------------
+    # INTERNAL: tap verification
+    # --------------------------------------------------------
+
+    def _verify_tap_effect(
+        self, device_id: str, hint: str, field: str, pre_screen: Result,
+    ) -> Result[bool]:
+        """FIX-6: verifica che il tap abbia avuto un effetto reale, invece di
+        assumere sempre successo (un tap mancato non deve essere riportato come riuscito)."""
+        time.sleep(0.5)
+        post_screen = self.screen_reader.read_screen(device_id)
+        if not post_screen.success:
+            return Result.fail("Cannot verify tap effect", "TAP_VERIFY_FAILED")
+
+        post_elem = self.screen_reader.find_element(device_id, hint, field)
+        if not post_elem.success:
+            # Elemento non più trovato -> schermata cambiata, il tap ha avuto effetto
+            return Result.ok(True)
+
+        if pre_screen.success and self._same_elements(pre_screen.data.elements, post_screen.data.elements):
+            # Elemento ancora presente e schermo identico -> il tap non ha avuto effetto
+            return Result.fail("Tap had no effect", "TAP_NO_EFFECT")
+
+        # Elemento ancora presente ma schermo cambiato (es. campo di testo) -> tap riuscito
+        return Result.ok(True)
+
+    def _same_elements(self, pre_elements: list, post_elements: list) -> bool:
+        """FIX-6: confronto semplice per testo, per rilevare se lo schermo è rimasto identico."""
+        return [e.text for e in pre_elements] == [e.text for e in post_elements]
+
+    # --------------------------------------------------------
     # INTERNAL: humanized tap
     # --------------------------------------------------------
 
@@ -299,8 +334,11 @@ class TouchInjector(TouchInjectorInterface):
         self, device_id: str, odds: float, stake: float,
     ) -> Result[LayBetResult]:
         """Polling post-conferma per lay bet."""
-        deadline = time.time() + self.bet_confirm_timeout
-        while time.time() < deadline:
+        # FIX-21: time.monotonic() invece di time.time() — un read_bet_status lento
+        # (fino a piu' iterazioni di adb_timeout) non deve far sforare bet_confirm_timeout
+        # in modo silenzioso; il deadline viene ricontrollato prima di ogni iterazione.
+        start = time.monotonic()
+        while time.monotonic() - start < self.bet_confirm_timeout:
             time.sleep(1.0)
             status = self.screen_reader.read_bet_status(device_id, betfair=True)
             if not status.success:
@@ -310,6 +348,13 @@ class TouchInjector(TouchInjectorInterface):
                 return Result.ok(LayBetResult(
                     confirmed=True, bet_id=None, actual_odds=actual_odds, actual_stake=stake,
                 ))
+            if status.data.status == "unknown":
+                # FIX-5: schermata non riconosciuta durante il polling -> stato ambiguo,
+                # mai trattarlo come confirmed
+                return Result.fail(
+                    "Ambiguous lay state while waiting confirmation: unknown",
+                    "AMBIGUOUS_STATE",
+                )
             if status.data.status == "not_found":
                 return Result.fail("Lay bet not placed (verified)", "LAY_NOT_PLACED_RETRY_SAFE")
 
@@ -334,6 +379,13 @@ class TouchInjector(TouchInjectorInterface):
             return Result.ok(LayBetResult(
                 confirmed=True, bet_id=None, actual_odds=actual_odds, actual_stake=stake,
             ))
+
+        if status.data.status == "unknown":
+            # FIX-5: schermata non riconosciuta -> stato ambiguo, mai trattarlo come confirmed
+            return Result.fail(
+                f"Ambiguous lay state after timeout: {status.data.status}",
+                "AMBIGUOUS_STATE",
+            )
 
         if status.data.status == "not_found":
             return Result.fail("Lay bet not placed after timeout (verified)", "LAY_NOT_PLACED_RETRY_SAFE")

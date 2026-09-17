@@ -34,7 +34,7 @@ class BalanceReading:
 
 @dataclass
 class BetStatus:
-    status: str
+    status: str   # FIX-5: "matched" | "unsettled" | "settled_won" | "settled_lost" | "not_found" | "unknown"
     lay_odds: Optional[float]
     confidence: float
 

@@ -141,7 +141,7 @@ class ScreenReader(ScreenReaderInterface):
         elif not texts:
             status = "not_found"
         else:
-            status = "unsettled"
+            status = "unknown"  # FIX-5: schermata non riconosciuta, mai da trattare come "piazzata"
 
         lay_odds = None
         for t in texts:

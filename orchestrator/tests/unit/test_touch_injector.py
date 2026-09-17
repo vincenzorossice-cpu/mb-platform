@@ -95,12 +95,16 @@ class TestTapElement(unittest.TestCase):
     @patch("orchestrator.modules.touch_injector.injector.time.sleep")
     @patch("orchestrator.modules.touch_injector.injector.subprocess.run")
     def test_tap_element_success(self, mock_run, mock_sleep):
-        """Mock ScreenReader.find_element → tap sul centro bounds [100,200,300,400] → centro (200,300)."""
+        """Mock ScreenReader.find_element → tap sul centro bounds [100,200,300,400] → centro (200,300).
+        FIX-6: l'elemento sparisce dopo il tap -> verifica post-tap conferma il successo."""
         mock_run.return_value = MagicMock(returncode=0, stderr="")
 
         reader = MagicMock()
         elem = _make_element("Scommetti", bounds=[100, 200, 300, 400])
-        reader.find_element.return_value = Result.ok(elem)
+        reader.find_element.side_effect = [
+            Result.ok(elem),
+            Result.fail("gone", "NO_ELEMENTS_FOUND"),
+        ]
         reader.read_screen.return_value = Result.ok(_make_screen())
 
         injector = TouchInjector(screen_reader=reader)
@@ -132,6 +136,59 @@ class TestTapElement(unittest.TestCase):
         # find_element chiamato 3 volte (1 + 2 retry)
         self.assertEqual(reader.find_element.call_count, 3)
 
+    @patch("orchestrator.modules.touch_injector.injector.time.sleep")
+    @patch("orchestrator.modules.touch_injector.injector.subprocess.run")
+    def test_tap_no_effect(self, mock_run, mock_sleep):
+        """FIX-6: elemento ancora presente e schermo identico dopo il tap -> TAP_NO_EFFECT."""
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+
+        reader = MagicMock()
+        elem = _make_element("Scommetti", bounds=[100, 200, 300, 400])
+        reader.find_element.return_value = Result.ok(elem)
+        reader.read_screen.return_value = Result.ok(_make_screen(elements=[elem]))
+
+        injector = TouchInjector(screen_reader=reader)
+        result = injector.tap_element(DEVICE, "Scommetti")
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, "TAP_NO_EFFECT")
+
+    @patch("orchestrator.modules.touch_injector.injector.time.sleep")
+    @patch("orchestrator.modules.touch_injector.injector.subprocess.run")
+    def test_tap_verify_failed(self, mock_run, mock_sleep):
+        """FIX-6: la rilettura post-tap fallisce -> non possiamo verificare -> TAP_VERIFY_FAILED."""
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+
+        reader = MagicMock()
+        elem = _make_element("Scommetti", bounds=[100, 200, 300, 400])
+        reader.find_element.return_value = Result.ok(elem)
+        reader.read_screen.side_effect = [
+            Result.ok(_make_screen(elements=[elem])),
+            Result.fail("device offline", "DEVICE_OFFLINE"),
+        ]
+
+        injector = TouchInjector(screen_reader=reader)
+        result = injector.tap_element(DEVICE, "Scommetti")
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, "TAP_VERIFY_FAILED")
+
+    @patch("orchestrator.modules.touch_injector.injector.time.sleep")
+    @patch("orchestrator.modules.touch_injector.injector.subprocess.run")
+    def test_tap_element_verify_false_skips_check(self, mock_run, mock_sleep):
+        """FIX-6: verify=False -> nessuna rilettura post-tap, successo immediato."""
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+
+        reader = MagicMock()
+        elem = _make_element("Scommetti", bounds=[100, 200, 300, 400])
+        reader.find_element.return_value = Result.ok(elem)
+
+        injector = TouchInjector(screen_reader=reader)
+        result = injector.tap_element(DEVICE, "Scommetti", verify=False)
+
+        self.assertTrue(result.success)
+        reader.read_screen.assert_not_called()
+
 
 class TestInputText(unittest.TestCase):
 
@@ -152,13 +209,18 @@ class TestInputText(unittest.TestCase):
     @patch("orchestrator.modules.touch_injector.injector.time.sleep")
     @patch("orchestrator.modules.touch_injector.injector.subprocess.run")
     def test_input_text_with_field_hint(self, mock_run, mock_sleep):
-        """Prima tap sul campo (via find_element), poi input text."""
+        """Prima tap sul campo (via find_element), poi input text.
+        FIX-6: il campo resta visibile dopo il focus, ma lo schermo cambia (es. tastiera) -> tap riuscito."""
         mock_run.return_value = MagicMock(returncode=0, stderr="")
 
         reader = MagicMock()
         elem = _make_element("importo", bounds=[50, 100, 200, 150])
         reader.find_element.return_value = Result.ok(elem)
-        reader.read_screen.return_value = Result.ok(_make_screen())
+        keyboard_elem = _make_element("tastiera", bounds=[0, 400, 1080, 800])
+        reader.read_screen.side_effect = [
+            Result.ok(_make_screen(elements=[elem])),
+            Result.ok(_make_screen(elements=[elem, keyboard_elem])),
+        ]
 
         injector = TouchInjector(screen_reader=reader)
         result = injector.input_text(DEVICE, "25.00", field_hint="importo")
@@ -179,7 +241,20 @@ class TestPlaceLayBetVerifyThenAct(unittest.TestCase):
         reader = MagicMock()
         elem = _make_element("place lay", bounds=[100, 500, 300, 550])
         reader.find_element.return_value = Result.ok(elem)
-        reader.read_screen.return_value = Result.ok(_make_screen())
+
+        # FIX-6: read_screen deve restituire uno schermo diverso ad ogni chiamata, altrimenti
+        # la verifica post-tap di tap_element (usata da input_text per il focus dei campi
+        # odds/stake, prima del vero tap di conferma) rileverebbe "nessun effetto" e
+        # romperebbe il flusso prima ancora di arrivare al tap di conferma che questi test
+        # vogliono esercitare.
+        screen_counter = {"n": 0}
+
+        def _read_screen(*args, **kwargs):
+            screen_counter["n"] += 1
+            return Result.ok(_make_screen(elements=[_make_element(f"screen-{screen_counter['n']}")]))
+
+        reader.read_screen.side_effect = _read_screen
+
         injector = TouchInjector(screen_reader=reader, bet_confirm_timeout=2)
         return injector, reader
 
@@ -252,6 +327,124 @@ class TestPlaceLayBetVerifyThenAct(unittest.TestCase):
 
         self.assertFalse(result.success)
         self.assertEqual(result.error_code, "AMBIGUOUS_STATE")
+
+    @patch("orchestrator.modules.touch_injector.injector.time.sleep")
+    @patch("orchestrator.modules.touch_injector.injector.subprocess.run")
+    def test_place_lay_bet_verify_unknown_status(self, mock_run, mock_sleep):
+        """FIX-5: ADB timeout → read_bet_status='unknown' (schermata non riconosciuta) → AMBIGUOUS_STATE, mai confirmed."""
+        injector, reader = self._make_injector_with_timeout()
+        mock_run.side_effect = self._lay_side_effect_factory()
+
+        reader.read_bet_status.return_value = Result.ok(
+            BetStatus(status="unknown", lay_odds=None, confidence=1.0)
+        )
+
+        result = injector.place_lay_bet(DEVICE, "match_odds", 2.10, 50.0)
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, "AMBIGUOUS_STATE")
+
+
+class TestWaitLayConfirmation(unittest.TestCase):
+    """Test diretti su _wait_lay_confirmation (percorso normale, tap di conferma riuscito)."""
+
+    @patch("orchestrator.modules.touch_injector.injector.time.sleep")
+    def test_wait_lay_confirmation_unknown_status(self, mock_sleep):
+        """FIX-5: status='unknown' durante il polling -> AMBIGUOUS_STATE, non BET_NOT_CONFIRMED
+        e mai confirmed=True."""
+        reader = MagicMock()
+        reader.read_bet_status.return_value = Result.ok(
+            BetStatus(status="unknown", lay_odds=None, confidence=1.0)
+        )
+        injector = TouchInjector(screen_reader=reader, bet_confirm_timeout=15)
+
+        result = injector._wait_lay_confirmation(DEVICE, 2.10, 50.0)
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, "AMBIGUOUS_STATE")
+
+    @patch("orchestrator.modules.touch_injector.injector.time.monotonic")
+    @patch("orchestrator.modules.touch_injector.injector.time.sleep")
+    def test_wait_lay_confirmation_respects_timeout_despite_slow_read(self, mock_sleep, mock_monotonic):
+        """FIX-21: anche se read_bet_status è lenta, il deadline (wall-clock via monotonic)
+        viene rispettato — non si continua a fare polling oltre bet_confirm_timeout."""
+        # start=0, primo check while (0-0=0 < 15) entra nel loop, dopo l'iterazione "lenta"
+        # il secondo check while vede 16-0=16 >= 15 -> esce
+        mock_monotonic.side_effect = [0, 0, 16]
+
+        reader = MagicMock()
+        reader.read_bet_status.return_value = Result.fail("slow/ambiguous read", "OCR_LOW_CONFIDENCE")
+        injector = TouchInjector(screen_reader=reader, bet_confirm_timeout=15)
+
+        result = injector._wait_lay_confirmation(DEVICE, 2.10, 50.0)
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, "BET_NOT_CONFIRMED")
+        # Una sola iterazione eseguita, nonostante bet_confirm_timeout=15 permetterebbe
+        # normalmente ~15 cicli da 1s se il tempo non fosse stato consumato dalla read lenta
+        self.assertEqual(reader.read_bet_status.call_count, 1)
+
+
+class TestNavigateTo(unittest.TestCase):
+    """FIX-23: navigate_to deve tenere conto dell'esito reale del tap, non ignorarlo."""
+
+    def test_navigate_to_reaches_destination_immediately(self):
+        reader = MagicMock()
+        reader.read_screen.return_value = Result.ok(_make_screen(screen_type="balance_page"))
+
+        injector = TouchInjector(screen_reader=reader)
+        result = injector.navigate_to(DEVICE, "balance_page", "Stanleybet")
+
+        self.assertTrue(result.success)
+
+    def test_navigate_to_tap_failure(self):
+        """_human_tap fallisce sempre -> nessun tap va mai a buon fine -> NAVIGATION_FAILED
+        con messaggio dedicato, non si scambia il fallimento per progresso."""
+        reader = MagicMock()
+        reader.read_screen.return_value = Result.ok(_make_screen(screen_type="unknown"))
+        elem = _make_element("saldo", bounds=[100, 200, 300, 400])
+        reader.find_element.return_value = Result.ok(elem)
+
+        injector = TouchInjector(screen_reader=reader)
+        injector._human_tap = MagicMock(return_value=Result.fail("tap missed", "TAP_MISSED"))
+
+        result = injector.navigate_to(DEVICE, "balance_page", "Stanleybet")
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, "NAVIGATION_FAILED")
+        self.assertEqual(result.error, "Navigation failed: no successful taps")
+
+    def test_navigate_to_no_navigation_path(self):
+        """Nessun hint trovato sullo schermo -> fallimento immediato al primo step."""
+        reader = MagicMock()
+        reader.read_screen.return_value = Result.ok(_make_screen(screen_type="unknown"))
+        reader.find_element.return_value = Result.fail("not found", "NO_ELEMENTS_FOUND")
+
+        injector = TouchInjector(screen_reader=reader)
+        injector._human_tap = MagicMock(return_value=Result.ok(True))
+
+        result = injector.navigate_to(DEVICE, "balance_page", "Stanleybet")
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, "NAVIGATION_FAILED")
+        self.assertIn("No navigation path found", result.error)
+
+    def test_navigate_to_destination_not_reached_after_successful_taps(self):
+        """I tap hanno sempre successo ma la destinazione non viene mai raggiunta entro
+        max_steps -> messaggio distinto da quello per 'nessun tap riuscito'."""
+        reader = MagicMock()
+        reader.read_screen.return_value = Result.ok(_make_screen(screen_type="unknown"))
+        elem = _make_element("saldo", bounds=[100, 200, 300, 400])
+        reader.find_element.return_value = Result.ok(elem)
+
+        injector = TouchInjector(screen_reader=reader)
+        injector._human_tap = MagicMock(return_value=Result.ok(True))
+
+        result = injector.navigate_to(DEVICE, "balance_page", "Stanleybet")
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, "NAVIGATION_FAILED")
+        self.assertIn("not reached after", result.error)
 
 
 class TestHumanTapDelay(unittest.TestCase):

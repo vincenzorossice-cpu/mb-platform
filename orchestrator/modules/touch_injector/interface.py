@@ -21,8 +21,9 @@ class LayBetResult:
 
 class TouchInjectorInterface(ABC):
     @abstractmethod
-    def tap_element(self, device_id: str, hint: str, field: str = "text") -> Result[bool]:
-        """Tap su un elemento identificato dal testo o resource-id."""
+    def tap_element(self, device_id: str, hint: str, field: str = "text", verify: bool = True) -> Result[bool]:
+        """Tap su un elemento identificato dal testo o resource-id.
+        Se verify=True (default), verifica che il tap abbia avuto un effetto reale."""
 
     @abstractmethod
     def tap_coordinates(self, device_id: str, x: int, y: int) -> Result[bool]:

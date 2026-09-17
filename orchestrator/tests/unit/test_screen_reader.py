@@ -33,6 +33,14 @@ EMPTY_XML = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
   <node bounds="[0,0][1080,2400]" class="android.widget.FrameLayout" text="" />
 </hierarchy>"""
 
+SAMPLE_XML_MYBETS_UNKNOWN = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node bounds="[0,0][1080,2400]" class="android.widget.FrameLayout" text="">
+    <node bounds="[100,200][800,300]" class="android.widget.TextView" resource-id="" text="Le mie scommesse" />
+    <node bounds="[100,350][800,450]" class="android.widget.TextView" resource-id="" text="Schermata inattesa, nessuna informazione disponibile" />
+  </node>
+</hierarchy>"""
+
 
 class TestUiautomatorDump:
 
@@ -161,6 +169,14 @@ class TestReadBetStatus:
         assert result.success
         assert result.data.status == "matched"
         assert result.data.lay_odds == 2.45
+
+    @patch("orchestrator.modules.screen_reader.reader.subprocess.run")
+    def test_read_bet_status_unknown_screen(self, mock_run, reader):
+        """FIX-5: schermata non riconosciuta -> status='unknown', mai 'unsettled' di default."""
+        mock_run.return_value = MagicMock(returncode=0, stdout=SAMPLE_XML_MYBETS_UNKNOWN, stderr="")
+        result = reader.read_bet_status("device_001", betfair=True)
+        assert result.success
+        assert result.data.status == "unknown"
 
 
 class TestClassifyScreen:
