@@ -40,6 +40,9 @@ _REAL_BONUS_LABELS = ("bonus reale", "real bonus", "bonus saldo", "bonus disponi
 _REAL_BONUS_EXCLUDE_LABELS = ("wagering", "rollover", "bloccato")
 _WAGERING_BONUS_LABELS = ("wagering", "rollover", "bonus bloccato", "bonus in rollover")
 
+# FIX-A: frasi che indicano assenza di scommesse aperte, da NON confondere con "unknown"
+_NO_BETS_PHRASES = ("non sono presenti scommesse", "no open bets", "nessuna scommessa", "no bets found")
+
 
 class ScreenReader(ScreenReaderInterface):
     def __init__(
@@ -52,15 +55,27 @@ class ScreenReader(ScreenReaderInterface):
         self.adb_timeout = adb_timeout
         self.screenshot_dir = screenshot_dir or tempfile.gettempdir()
         self._ocr_engine = None
+        self._screen_cache = {}  # FIX-B: {(device_id, screen_type): (Result, timestamp)}
 
-    def read_screen(self, device_id: str, screen_type: Optional[str] = None) -> Result[ScreenContent]:
+    def read_screen(
+        self, device_id: str, screen_type: Optional[str] = None,
+        use_cache: bool = False, cache_ttl: int = 5,
+    ) -> Result[ScreenContent]:
+        cache_key = (device_id, screen_type)  # FIX-B: chiave per device+tipo, mai uno slot globale
+        if use_cache:
+            cached = self._screen_cache.get(cache_key)
+            if cached is not None:
+                cached_result, cached_at = cached
+                if time.time() - cached_at < cache_ttl:
+                    return cached_result
+
         xml_result = self._uiautomator_dump(device_id)
         if xml_result.success:
             elements = self._parse_xml(xml_result.data)
             if elements:
                 detected_type = self._classify_screen(elements) if not screen_type else screen_type
                 confidence = self._validate_screen_confidence(elements, detected_type)  # FIX-3
-                return Result.ok(ScreenContent(
+                result = Result.ok(ScreenContent(
                     elements=elements,
                     screen_type=detected_type,
                     confidence=confidence,
@@ -68,14 +83,18 @@ class ScreenReader(ScreenReaderInterface):
                     screenshot_path=None,
                 ))
             else:
-                return self._ocr_fallback(device_id, screen_type)
+                result = self._ocr_fallback(device_id, screen_type)
+        elif xml_result.error_code == "ADB_TIMEOUT":
+            result = Result.fail("ADB timeout during uiautomator dump", "ADB_TIMEOUT")
+        elif xml_result.error_code == "DEVICE_OFFLINE":
+            result = Result.fail("Device offline", "DEVICE_OFFLINE")
+        else:
+            result = self._ocr_fallback(device_id, screen_type)
 
-        if xml_result.error_code == "ADB_TIMEOUT":
-            return Result.fail("ADB timeout during uiautomator dump", "ADB_TIMEOUT")
-        if xml_result.error_code == "DEVICE_OFFLINE":
-            return Result.fail("Device offline", "DEVICE_OFFLINE")
+        if use_cache and result.success:  # FIX-B: non cachare i fallimenti (potrebbero essere transitori)
+            self._screen_cache[cache_key] = (result, time.time())
 
-        return self._ocr_fallback(device_id, screen_type)
+        return result
 
     def find_element(self, device_id: str, hint: str, field: str = "text") -> Result[UIElement]:
         screen = self.read_screen(device_id)
@@ -94,7 +113,7 @@ class ScreenReader(ScreenReaderInterface):
         return Result.fail(f"Element '{hint}' not found", "NO_ELEMENTS_FOUND")
 
     def read_balance(self, device_id: str, book: str) -> Result[BalanceReading]:
-        screen = self.read_screen(device_id, screen_type="balance_page")
+        screen = self.read_screen(device_id, screen_type="balance_page", use_cache=True)  # FIX-B
         if not screen.success:
             return Result.fail(f"Cannot read balance: {screen.error}", screen.error_code)
 
@@ -123,12 +142,15 @@ class ScreenReader(ScreenReaderInterface):
         ))
 
     def read_bet_status(self, device_id: str, betfair: bool = False) -> Result[BetStatus]:
-        screen = self.read_screen(device_id, screen_type="my_bets")
+        screen = self.read_screen(device_id, screen_type="my_bets", use_cache=True)  # FIX-B
         if not screen.success:
             return Result.fail(f"Cannot read bet status: {screen.error}", screen.error_code)
 
         texts = [e.text for e in screen.data.elements]
         texts_lower = " ".join(texts).lower()
+
+        if any(p in texts_lower for p in _NO_BETS_PHRASES):  # FIX-A
+            return Result.ok(BetStatus(status="not_found", lay_odds=None, confidence=1.0))
 
         if "matched" in texts_lower:
             status = "matched"

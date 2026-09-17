@@ -41,6 +41,14 @@ SAMPLE_XML_MYBETS_UNKNOWN = """<?xml version='1.0' encoding='UTF-8' standalone='
   </node>
 </hierarchy>"""
 
+SAMPLE_XML_MYBETS_NO_BETS = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node bounds="[0,0][1080,2400]" class="android.widget.FrameLayout" text="">
+    <node bounds="[100,200][800,300]" class="android.widget.TextView" resource-id="" text="Le mie scommesse" />
+    <node bounds="[100,350][800,450]" class="android.widget.TextView" resource-id="" text="Non sono presenti scommesse aperte" />
+  </node>
+</hierarchy>"""
+
 
 class TestUiautomatorDump:
 
@@ -124,6 +132,26 @@ class TestReadScreen:
         assert not result.success
         assert result.error_code == "ADB_TIMEOUT"
 
+    @patch("orchestrator.modules.screen_reader.reader.subprocess.run")
+    def test_read_screen_cache_hit(self, mock_run, reader):
+        """FIX-B: seconda lettura entro la TTL non deve rifare il round-trip ADB."""
+        mock_run.return_value = MagicMock(returncode=0, stdout=SAMPLE_XML, stderr="")
+        first = reader.read_screen("device_001", screen_type="balance_page", use_cache=True)
+        calls_after_first = mock_run.call_count
+        second = reader.read_screen("device_001", screen_type="balance_page", use_cache=True)
+        assert mock_run.call_count == calls_after_first
+        assert second.success
+        assert second.data == first.data
+
+    @patch("orchestrator.modules.screen_reader.reader.subprocess.run")
+    def test_read_screen_cache_expired(self, mock_run, reader):
+        """FIX-B: con cache_ttl=0 la entry e' sempre scaduta -> rilegge da ADB."""
+        mock_run.return_value = MagicMock(returncode=0, stdout=SAMPLE_XML, stderr="")
+        reader.read_screen("device_001", screen_type="balance_page", use_cache=True)
+        calls_after_first = mock_run.call_count
+        reader.read_screen("device_001", screen_type="balance_page", use_cache=True, cache_ttl=0)
+        assert mock_run.call_count > calls_after_first
+
 
 class TestFindElement:
 
@@ -177,6 +205,16 @@ class TestReadBetStatus:
         result = reader.read_bet_status("device_001", betfair=True)
         assert result.success
         assert result.data.status == "unknown"
+
+    @patch("orchestrator.modules.screen_reader.reader.subprocess.run")
+    def test_read_bet_status_no_bets(self, mock_run, reader):
+        """FIX-A: 'nessuna scommessa aperta' -> not_found, non 'unknown'."""
+        mock_run.return_value = MagicMock(returncode=0, stdout=SAMPLE_XML_MYBETS_NO_BETS, stderr="")
+        result = reader.read_bet_status("device_001", betfair=True)
+        assert result.success
+        assert result.data.status == "not_found"
+        assert result.data.lay_odds is None
+        assert result.data.confidence == 1.0
 
 
 class TestClassifyScreen:
