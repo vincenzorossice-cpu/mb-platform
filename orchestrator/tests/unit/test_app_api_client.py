@@ -271,6 +271,231 @@ class TestWriteRettifica:
         assert step2_url.endswith("/operazioni/500/righe")
 
 
+class TestCreateRiconciliazioneOperazione:
+
+    def test_create_success(self, client: AppApiClient):
+        with patch.object(client.session, "post", return_value=_mock_post_ok({"id": 300})) as mock_post:
+            result = client.create_riconciliazione_operazione("2026-09-17")
+
+        assert result.success
+        assert result.data == 300
+
+        body = mock_post.call_args.kwargs["json"]
+        assert body["nome"] == "Riconciliazione 2026-09-17"
+        assert body["tipologia"] == "Ricorrenti"
+        assert body["categoria"] == "Sport"
+        assert body["bookmaker_id"] == 6
+        assert body["data_apertura"] == "2026-09-17"
+
+    def test_create_missing_id(self, client: AppApiClient):
+        with patch.object(client.session, "post", return_value=_mock_post_ok({})):
+            result = client.create_riconciliazione_operazione("2026-09-17")
+
+        assert not result.success
+        assert result.error_code == "NETCAP_PARSE_ERROR"
+
+    def test_create_http_error(self, client: AppApiClient):
+        with patch.object(client.session, "post", return_value=_mock_http_error(500)):
+            result = client.create_riconciliazione_operazione("2026-09-17")
+
+        assert not result.success
+        assert result.error_code == "NETCAP_HTTP_ERROR"
+
+
+class TestAddRigaRettifica:
+
+    def test_add_riga_book_column(self, client: AppApiClient):
+        with patch.object(client.session, "post", return_value=_mock_post_ok({"id": 991})) as mock_post:
+            result = client.add_riga_rettifica(145, "08", 6, 190.74, "BOOK", "Differenza riconciliazione")
+
+        assert result.success
+        assert result.data == 991
+        body = mock_post.call_args.kwargs["json"]
+        assert body["profitto_book"] == 190.74
+        assert body["profitto_banco"] == 0
+        assert body["fee_percentuale"] == 0
+
+    def test_add_riga_banco_column_still_uses_profitto_book(self, client: AppApiClient):
+        """FIX bug #2: anche con column='BANCO' l'importo va sempre in profitto_book,
+        mai in profitto_banco, per evitare che Netcap applichi la fee Betfair."""
+        with patch.object(client.session, "post", return_value=_mock_post_ok({"id": 991})) as mock_post:
+            result = client.add_riga_rettifica(145, "08", 6, 190.74, "BANCO", "Differenza riconciliazione")
+
+        assert result.success
+        body = mock_post.call_args.kwargs["json"]
+        assert body["profitto_book"] == 190.74
+        assert body["profitto_banco"] == 0
+
+    def test_add_riga_note_with_bonus(self, client: AppApiClient):
+        with patch.object(client.session, "post", return_value=_mock_post_ok({"id": 991})) as mock_post:
+            client.add_riga_rettifica(145, "08", 6, 10.0, "BOOK", "reason", bonus_note="BONUS: 5.00")
+
+        body = mock_post.call_args.kwargs["json"]
+        assert body["note"] == "reason | BONUS: 5.00"
+
+    def test_add_riga_note_without_bonus(self, client: AppApiClient):
+        with patch.object(client.session, "post", return_value=_mock_post_ok({"id": 991})) as mock_post:
+            client.add_riga_rettifica(145, "08", 6, 10.0, "BOOK", "reason")
+
+        body = mock_post.call_args.kwargs["json"]
+        assert body["note"] == "reason"
+
+    def test_add_riga_missing_id(self, client: AppApiClient):
+        with patch.object(client.session, "post", return_value=_mock_post_ok({})):
+            result = client.add_riga_rettifica(145, "08", 6, 10.0, "BOOK", "reason")
+
+        assert not result.success
+        assert result.error_code == "NETCAP_PARSE_ERROR"
+
+
+class TestCloseRiga:
+
+    def test_close_riga_success(self, client: AppApiClient):
+        with patch.object(client.session, "post", return_value=_mock_post_ok({})) as mock_post:
+            result = client.close_riga(991)
+
+        assert result.success
+        assert result.data is True
+        url = mock_post.call_args.args[0]
+        assert url.endswith("/operazioni/righe/991/chiudi")
+
+    def test_close_riga_no_json_body_required(self, client: AppApiClient):
+        resp = MagicMock()
+        resp.ok = True
+        resp.status_code = 200
+        resp.json.side_effect = ValueError("no body")
+        with patch.object(client.session, "post", return_value=resp):
+            result = client.close_riga(991)
+
+        assert result.success
+        assert result.data is True
+
+    def test_close_riga_http_error(self, client: AppApiClient):
+        with patch.object(client.session, "post", return_value=_mock_http_error(500)):
+            result = client.close_riga(991)
+
+        assert not result.success
+        assert result.error_code == "NETCAP_HTTP_ERROR"
+
+
+class TestCloseOperazione:
+
+    def test_close_operazione_success(self, client: AppApiClient):
+        with patch.object(client.session, "post", return_value=_mock_post_ok({})) as mock_post:
+            result = client.close_operazione(145)
+
+        assert result.success
+        assert result.data is True
+        url = mock_post.call_args.args[0]
+        assert url.endswith("/operazioni/145/chiudi")
+
+    def test_close_operazione_http_error(self, client: AppApiClient):
+        with patch.object(client.session, "post", return_value=_mock_http_error(500)):
+            result = client.close_operazione(145)
+
+        assert not result.success
+        assert result.error_code == "NETCAP_HTTP_ERROR"
+
+
+class TestVerifyBalanceAfterRettifica:
+
+    def _saldi_response(self, saldo: float):
+        return {
+            "collaboratori": [{"id": "01", "nome": "Test"}],
+            "bookmakers": [{"id": 6, "nome": "BETFAIR", "tipo": "exchange"}],
+            "matrix": {"01": {"6": saldo}},
+        }
+
+    def test_verify_match(self, client: AppApiClient):
+        with patch.object(client.session, "get", return_value=_mock_get_ok(self._saldi_response(100.0))):
+            result = client.verify_balance_after_rettifica("01", 6, 100.0)
+
+        assert result.success
+        assert result.data is True
+
+    def test_verify_mismatch(self, client: AppApiClient):
+        with patch.object(client.session, "get", return_value=_mock_get_ok(self._saldi_response(80.0))):
+            result = client.verify_balance_after_rettifica("01", 6, 100.0)
+
+        assert result.success
+        assert result.data is False
+
+    def test_verify_epsilon_tolerance(self, client: AppApiClient):
+        with patch.object(client.session, "get", return_value=_mock_get_ok(self._saldi_response(100.001))):
+            result = client.verify_balance_after_rettifica("01", 6, 100.0)
+
+        assert result.success
+        assert result.data is True
+
+    def test_verify_collaboratore_not_found(self, client: AppApiClient):
+        with patch.object(client.session, "get", return_value=_mock_get_ok(self._saldi_response(100.0))):
+            result = client.verify_balance_after_rettifica("99", 6, 100.0)
+
+        assert not result.success
+        assert result.error_code == "NETCAP_EMPTY_RESULT"
+
+    def test_verify_bookmaker_not_found(self, client: AppApiClient):
+        with patch.object(client.session, "get", return_value=_mock_get_ok(self._saldi_response(100.0))):
+            result = client.verify_balance_after_rettifica("01", 999, 100.0)
+
+        assert not result.success
+        assert result.error_code == "NETCAP_EMPTY_RESULT"
+
+    def test_verify_get_fails_propagates(self, client: AppApiClient):
+        with patch.object(client.session, "get", side_effect=requests.ConnectionError("refused")):
+            result = client.verify_balance_after_rettifica("01", 6, 100.0)
+
+        assert not result.success
+        assert result.error_code == "NETCAP_UNREACHABLE"
+
+
+class TestRiconciliazioneEndToEndFlow:
+
+    def test_full_flow_create_add_close_close_verify(self, client: AppApiClient):
+        saldi_response = {
+            "collaboratori": [{"id": "08", "nome": "Test"}],
+            "bookmakers": [{"id": 6, "nome": "BETFAIR", "tipo": "exchange"}],
+            "matrix": {"08": {"6": 190.74}},
+        }
+        with patch.object(
+            client.session, "post",
+            side_effect=[
+                _mock_post_ok({"id": 145}),   # create_riconciliazione_operazione
+                _mock_post_ok({"id": 991}),   # add_riga_rettifica
+                _mock_post_ok({}),            # close_riga
+                _mock_post_ok({}),            # close_operazione
+            ],
+        ) as mock_post, patch.object(
+            client.session, "get", return_value=_mock_get_ok(saldi_response),
+        ) as mock_get:
+            create_result = client.create_riconciliazione_operazione("2026-09-17")
+            assert create_result.success
+            operazione_id = create_result.data
+            assert operazione_id == 145
+
+            riga_result = client.add_riga_rettifica(operazione_id, "08", 6, 190.74, "BANCO", "Differenza riconciliazione")
+            assert riga_result.success
+            riga_id = riga_result.data
+            assert riga_id == 991
+
+            close_riga_result = client.close_riga(riga_id)
+            assert close_riga_result.success
+
+            close_op_result = client.close_operazione(operazione_id)
+            assert close_op_result.success
+
+            verify_result = client.verify_balance_after_rettifica("08", 6, 190.74)
+            assert verify_result.success
+            assert verify_result.data is True
+
+        assert mock_post.call_count == 4
+        assert mock_get.call_count == 1
+
+        add_riga_body = mock_post.call_args_list[1].kwargs["json"]
+        assert add_riga_body["profitto_book"] == 190.74
+        assert add_riga_body["profitto_banco"] == 0
+
+
 class TestNetcapUnreachable:
 
     def test_connection_error(self, client: AppApiClient):

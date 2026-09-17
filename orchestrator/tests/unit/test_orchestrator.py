@@ -130,8 +130,8 @@ class TestRunDailyRiconciliazione:
         assert result.success
         assert result.data == {"total": 1, "adjusted": 0, "no_adjustment": 1, "hitl": 0, "errors": []}
 
-    def test_run_daily_riconciliazione_adjust(self, orch):
-        """Differenza > soglia -> action=adjust, dry-run: write_rettifica NON chiamato."""
+    def test_run_daily_riconciliazione_adjust_dry_run_calls_nothing(self, orch):
+        """Differenza > soglia -> action=adjust, dry-run: nessuna chiamata a Netcap."""
         orch.config = _one_identity_config()
         orch.app_api_client.read_expected_balance.return_value = Result.ok([
             ExpectedBalance(collaboratore_id="01", bookmaker_id=6, bookmaker_nome="BETFAIR",
@@ -145,10 +145,168 @@ class TestRunDailyRiconciliazione:
 
         assert result.success
         assert result.data["adjusted"] == 1
-        orch.app_api_client.write_rettifica.assert_not_called()
+        orch.app_api_client.create_riconciliazione_operazione.assert_not_called()
+        orch.app_api_client.add_riga_rettifica.assert_not_called()
+        orch.app_api_client.close_riga.assert_not_called()
+        orch.app_api_client.close_operazione.assert_not_called()
+        orch.app_api_client.verify_balance_after_rettifica.assert_not_called()
 
-    def test_run_daily_riconciliazione_adjust_live(self, orch):
-        """live=True, action=adjust -> write_rettifica chiamato."""
+    def test_run_daily_riconciliazione_adjust_live_full_flow(self, orch):
+        """live=True, action=adjust -> crea operazione, aggiunge riga, chiude riga e
+        operazione, verifica il saldo."""
+        orch.config = _one_identity_config()
+        orch.app_api_client.read_expected_balance.return_value = Result.ok([
+            ExpectedBalance(collaboratore_id="01", bookmaker_id=6, bookmaker_nome="BETFAIR",
+                             saldo_atteso=100.0, importo_impegnato=0.0, is_exchange=True),
+        ])
+        orch.screen_reader.read_balance.return_value = Result.ok(_balance_reading(raw_balance=105.0))
+        rectification = Rectification(amount=5.0, column="BOOK", reason="differenza saldo")
+        reconciliation = _reconciliation_result("adjust", rectification)
+        orch.rules_engine.reconcile.return_value = Result.ok(reconciliation)
+        orch.app_api_client.create_riconciliazione_operazione.return_value = Result.ok(145)
+        orch.app_api_client.add_riga_rettifica.return_value = Result.ok(991)
+        orch.app_api_client.close_riga.return_value = Result.ok(True)
+        orch.app_api_client.close_operazione.return_value = Result.ok(True)
+        orch.app_api_client.verify_balance_after_rettifica.return_value = Result.ok(True)
+
+        result = orch.run_daily_riconciliazione(live=True)
+
+        assert result.success
+        assert result.data["adjusted"] == 1
+        assert result.data["errors"] == []
+        orch.app_api_client.create_riconciliazione_operazione.assert_called_once()
+        orch.app_api_client.add_riga_rettifica.assert_called_once_with(
+            145, "01", 6, rectification.amount, rectification.column, rectification.reason, rectification.bonus_note,
+        )
+        orch.app_api_client.close_riga.assert_called_once_with(991)
+        orch.app_api_client.close_operazione.assert_called_once_with(145)
+        orch.app_api_client.verify_balance_after_rettifica.assert_called_once_with(
+            "01", 6, reconciliation.adjusted_balance,
+        )
+
+    def test_run_daily_riconciliazione_adjust_live_creates_operation_once(self, orch):
+        """2 book da rettificare -> create_riconciliazione_operazione chiamato una sola volta."""
+        orch.config = {
+            "identities": [{
+                "id": "01", "name": "A", "device_id": "dev-1",
+                "books": [
+                    {"bookmaker_id": 6, "name": "BETFAIR", "is_exchange": True},
+                    {"bookmaker_id": 42, "name": "SISAL", "is_exchange": False},
+                ],
+            }],
+        }
+        orch.app_api_client.read_expected_balance.return_value = Result.ok([
+            ExpectedBalance(collaboratore_id="01", bookmaker_id=6, bookmaker_nome="BETFAIR",
+                             saldo_atteso=100.0, importo_impegnato=0.0, is_exchange=True),
+            ExpectedBalance(collaboratore_id="01", bookmaker_id=42, bookmaker_nome="SISAL",
+                             saldo_atteso=50.0, importo_impegnato=0.0, is_exchange=False),
+        ])
+        orch.screen_reader.read_balance.return_value = Result.ok(_balance_reading(raw_balance=105.0))
+        rectification = Rectification(amount=5.0, column="BOOK", reason="differenza saldo")
+        orch.rules_engine.reconcile.return_value = Result.ok(_reconciliation_result("adjust", rectification))
+        orch.app_api_client.create_riconciliazione_operazione.return_value = Result.ok(145)
+        orch.app_api_client.add_riga_rettifica.return_value = Result.ok(991)
+        orch.app_api_client.close_riga.return_value = Result.ok(True)
+        orch.app_api_client.close_operazione.return_value = Result.ok(True)
+        orch.app_api_client.verify_balance_after_rettifica.return_value = Result.ok(True)
+
+        result = orch.run_daily_riconciliazione(live=True)
+
+        assert result.success
+        assert result.data["adjusted"] == 2
+        orch.app_api_client.create_riconciliazione_operazione.assert_called_once()
+        assert orch.app_api_client.add_riga_rettifica.call_count == 2
+        assert orch.app_api_client.close_riga.call_count == 2
+        orch.app_api_client.close_operazione.assert_called_once_with(145)
+
+    def test_run_daily_riconciliazione_live_no_adjustment_books_get_no_riga(self, orch):
+        """Mix adjust/no_adjustment -> add_riga_rettifica chiamato solo per il book da rettificare."""
+        orch.config = {
+            "identities": [{
+                "id": "01", "name": "A", "device_id": "dev-1",
+                "books": [
+                    {"bookmaker_id": 6, "name": "BETFAIR", "is_exchange": True},
+                    {"bookmaker_id": 42, "name": "SISAL", "is_exchange": False},
+                ],
+            }],
+        }
+        orch.app_api_client.read_expected_balance.return_value = Result.ok([
+            ExpectedBalance(collaboratore_id="01", bookmaker_id=6, bookmaker_nome="BETFAIR",
+                             saldo_atteso=100.0, importo_impegnato=0.0, is_exchange=True),
+            ExpectedBalance(collaboratore_id="01", bookmaker_id=42, bookmaker_nome="SISAL",
+                             saldo_atteso=50.0, importo_impegnato=0.0, is_exchange=False),
+        ])
+        orch.screen_reader.read_balance.return_value = Result.ok(_balance_reading())
+        rectification = Rectification(amount=5.0, column="BOOK", reason="differenza saldo")
+        orch.rules_engine.reconcile.side_effect = [
+            Result.ok(_reconciliation_result("adjust", rectification)),
+            Result.ok(_reconciliation_result("no_adjustment")),
+        ]
+        orch.app_api_client.create_riconciliazione_operazione.return_value = Result.ok(145)
+        orch.app_api_client.add_riga_rettifica.return_value = Result.ok(991)
+        orch.app_api_client.close_riga.return_value = Result.ok(True)
+        orch.app_api_client.close_operazione.return_value = Result.ok(True)
+        orch.app_api_client.verify_balance_after_rettifica.return_value = Result.ok(True)
+
+        result = orch.run_daily_riconciliazione(live=True)
+
+        assert result.success
+        assert result.data["adjusted"] == 1
+        assert result.data["no_adjustment"] == 1
+        orch.app_api_client.add_riga_rettifica.assert_called_once()
+
+    def test_run_daily_riconciliazione_zero_adjustments_live_never_creates_operation(self, orch):
+        """live=True ma nessuna rettifica necessaria -> nessuna chiamata a Netcap
+        per creare/chiudere l'operazione (contratto lazy)."""
+        orch.config = _one_identity_config()
+        orch.app_api_client.read_expected_balance.return_value = Result.ok([
+            ExpectedBalance(collaboratore_id="01", bookmaker_id=6, bookmaker_nome="BETFAIR",
+                             saldo_atteso=100.0, importo_impegnato=0.0, is_exchange=True),
+        ])
+        orch.screen_reader.read_balance.return_value = Result.ok(_balance_reading())
+        orch.rules_engine.reconcile.return_value = Result.ok(_reconciliation_result("no_adjustment"))
+
+        result = orch.run_daily_riconciliazione(live=True)
+
+        assert result.success
+        orch.app_api_client.create_riconciliazione_operazione.assert_not_called()
+        orch.app_api_client.close_operazione.assert_not_called()
+        orch.app_api_client.verify_balance_after_rettifica.assert_not_called()
+
+    def test_run_daily_riconciliazione_operation_create_fails_records_error_and_skips_rows(self, orch):
+        """Creazione operazione fallita -> errore registrato, nessuna riga scritta,
+        nessun retry nello stesso ciclo."""
+        orch.config = {
+            "identities": [{
+                "id": "01", "name": "A", "device_id": "dev-1",
+                "books": [
+                    {"bookmaker_id": 6, "name": "BETFAIR", "is_exchange": True},
+                    {"bookmaker_id": 42, "name": "SISAL", "is_exchange": False},
+                ],
+            }],
+        }
+        orch.app_api_client.read_expected_balance.return_value = Result.ok([
+            ExpectedBalance(collaboratore_id="01", bookmaker_id=6, bookmaker_nome="BETFAIR",
+                             saldo_atteso=100.0, importo_impegnato=0.0, is_exchange=True),
+            ExpectedBalance(collaboratore_id="01", bookmaker_id=42, bookmaker_nome="SISAL",
+                             saldo_atteso=50.0, importo_impegnato=0.0, is_exchange=False),
+        ])
+        orch.screen_reader.read_balance.return_value = Result.ok(_balance_reading(raw_balance=105.0))
+        rectification = Rectification(amount=5.0, column="BOOK", reason="differenza saldo")
+        orch.rules_engine.reconcile.return_value = Result.ok(_reconciliation_result("adjust", rectification))
+        orch.app_api_client.create_riconciliazione_operazione.return_value = Result.fail(
+            "Connessione fallita", "NETCAP_UNREACHABLE"
+        )
+
+        result = orch.run_daily_riconciliazione(live=True)
+
+        assert result.success
+        assert len(result.data["errors"]) == 2
+        orch.app_api_client.add_riga_rettifica.assert_not_called()
+        assert orch.app_api_client.create_riconciliazione_operazione.call_count == 1
+
+    def test_run_daily_riconciliazione_add_riga_fails_records_error_no_close_no_verify(self, orch):
+        """add_riga_rettifica fallisce -> errore registrato, close_riga e verifica non chiamati."""
         orch.config = _one_identity_config()
         orch.app_api_client.read_expected_balance.return_value = Result.ok([
             ExpectedBalance(collaboratore_id="01", bookmaker_id=6, bookmaker_nome="BETFAIR",
@@ -157,13 +315,105 @@ class TestRunDailyRiconciliazione:
         orch.screen_reader.read_balance.return_value = Result.ok(_balance_reading(raw_balance=105.0))
         rectification = Rectification(amount=5.0, column="BOOK", reason="differenza saldo")
         orch.rules_engine.reconcile.return_value = Result.ok(_reconciliation_result("adjust", rectification))
-        orch.app_api_client.write_rettifica.return_value = Result.ok(WriteResult(success=True, netcap_id=1, message=None))
+        orch.app_api_client.create_riconciliazione_operazione.return_value = Result.ok(145)
+        orch.app_api_client.add_riga_rettifica.return_value = Result.fail("HTTP 500", "NETCAP_HTTP_ERROR")
 
         result = orch.run_daily_riconciliazione(live=True)
 
         assert result.success
-        assert result.data["adjusted"] == 1
-        orch.app_api_client.write_rettifica.assert_called_once_with(rectification, "01", 6)
+        assert len(result.data["errors"]) == 1
+        orch.app_api_client.close_riga.assert_not_called()
+        orch.app_api_client.verify_balance_after_rettifica.assert_not_called()
+
+    def test_run_daily_riconciliazione_close_riga_fails_still_verifies(self, orch):
+        """close_riga fallisce -> errore registrato ma la riga entra comunque nella verifica finale."""
+        orch.config = _one_identity_config()
+        orch.app_api_client.read_expected_balance.return_value = Result.ok([
+            ExpectedBalance(collaboratore_id="01", bookmaker_id=6, bookmaker_nome="BETFAIR",
+                             saldo_atteso=100.0, importo_impegnato=0.0, is_exchange=True),
+        ])
+        orch.screen_reader.read_balance.return_value = Result.ok(_balance_reading(raw_balance=105.0))
+        rectification = Rectification(amount=5.0, column="BOOK", reason="differenza saldo")
+        reconciliation = _reconciliation_result("adjust", rectification)
+        orch.rules_engine.reconcile.return_value = Result.ok(reconciliation)
+        orch.app_api_client.create_riconciliazione_operazione.return_value = Result.ok(145)
+        orch.app_api_client.add_riga_rettifica.return_value = Result.ok(991)
+        orch.app_api_client.close_riga.return_value = Result.fail("HTTP 500", "NETCAP_HTTP_ERROR")
+        orch.app_api_client.close_operazione.return_value = Result.ok(True)
+        orch.app_api_client.verify_balance_after_rettifica.return_value = Result.ok(True)
+
+        result = orch.run_daily_riconciliazione(live=True)
+
+        assert result.success
+        assert any("Chiusura riga" in e["error"] for e in result.data["errors"])
+        orch.app_api_client.verify_balance_after_rettifica.assert_called_once_with(
+            "01", 6, reconciliation.adjusted_balance,
+        )
+
+    def test_run_daily_riconciliazione_close_operazione_fails_records_error(self, orch):
+        """close_operazione fallisce -> errore registrato, il run resta success."""
+        orch.config = _one_identity_config()
+        orch.app_api_client.read_expected_balance.return_value = Result.ok([
+            ExpectedBalance(collaboratore_id="01", bookmaker_id=6, bookmaker_nome="BETFAIR",
+                             saldo_atteso=100.0, importo_impegnato=0.0, is_exchange=True),
+        ])
+        orch.screen_reader.read_balance.return_value = Result.ok(_balance_reading(raw_balance=105.0))
+        rectification = Rectification(amount=5.0, column="BOOK", reason="differenza saldo")
+        orch.rules_engine.reconcile.return_value = Result.ok(_reconciliation_result("adjust", rectification))
+        orch.app_api_client.create_riconciliazione_operazione.return_value = Result.ok(145)
+        orch.app_api_client.add_riga_rettifica.return_value = Result.ok(991)
+        orch.app_api_client.close_riga.return_value = Result.ok(True)
+        orch.app_api_client.close_operazione.return_value = Result.fail("HTTP 500", "NETCAP_HTTP_ERROR")
+        orch.app_api_client.verify_balance_after_rettifica.return_value = Result.ok(True)
+
+        result = orch.run_daily_riconciliazione(live=True)
+
+        assert result.success
+        assert any("Chiusura operazione" in e["error"] for e in result.data["errors"])
+
+    def test_run_daily_riconciliazione_verify_mismatch_records_error(self, orch):
+        """verify_balance_after_rettifica ritorna False -> errore descrittivo registrato."""
+        orch.config = _one_identity_config()
+        orch.app_api_client.read_expected_balance.return_value = Result.ok([
+            ExpectedBalance(collaboratore_id="01", bookmaker_id=6, bookmaker_nome="BETFAIR",
+                             saldo_atteso=100.0, importo_impegnato=0.0, is_exchange=True),
+        ])
+        orch.screen_reader.read_balance.return_value = Result.ok(_balance_reading(raw_balance=105.0))
+        rectification = Rectification(amount=5.0, column="BOOK", reason="differenza saldo")
+        orch.rules_engine.reconcile.return_value = Result.ok(_reconciliation_result("adjust", rectification))
+        orch.app_api_client.create_riconciliazione_operazione.return_value = Result.ok(145)
+        orch.app_api_client.add_riga_rettifica.return_value = Result.ok(991)
+        orch.app_api_client.close_riga.return_value = Result.ok(True)
+        orch.app_api_client.close_operazione.return_value = Result.ok(True)
+        orch.app_api_client.verify_balance_after_rettifica.return_value = Result.ok(False)
+
+        result = orch.run_daily_riconciliazione(live=True)
+
+        assert result.success
+        assert any("non coincide" in e["error"] for e in result.data["errors"])
+
+    def test_run_daily_riconciliazione_verify_fails_records_error(self, orch):
+        """verify_balance_after_rettifica fallisce (errore infra) -> errore propagato."""
+        orch.config = _one_identity_config()
+        orch.app_api_client.read_expected_balance.return_value = Result.ok([
+            ExpectedBalance(collaboratore_id="01", bookmaker_id=6, bookmaker_nome="BETFAIR",
+                             saldo_atteso=100.0, importo_impegnato=0.0, is_exchange=True),
+        ])
+        orch.screen_reader.read_balance.return_value = Result.ok(_balance_reading(raw_balance=105.0))
+        rectification = Rectification(amount=5.0, column="BOOK", reason="differenza saldo")
+        orch.rules_engine.reconcile.return_value = Result.ok(_reconciliation_result("adjust", rectification))
+        orch.app_api_client.create_riconciliazione_operazione.return_value = Result.ok(145)
+        orch.app_api_client.add_riga_rettifica.return_value = Result.ok(991)
+        orch.app_api_client.close_riga.return_value = Result.ok(True)
+        orch.app_api_client.close_operazione.return_value = Result.ok(True)
+        orch.app_api_client.verify_balance_after_rettifica.return_value = Result.fail(
+            "Connessione fallita", "NETCAP_UNREACHABLE"
+        )
+
+        result = orch.run_daily_riconciliazione(live=True)
+
+        assert result.success
+        assert any("Verifica saldo" in e["error"] for e in result.data["errors"])
 
     def test_run_daily_riconciliazione_hitl(self, orch):
         """confidence bassa -> action=hitl_required, aggiunto a coda HITL."""

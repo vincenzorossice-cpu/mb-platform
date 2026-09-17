@@ -1,5 +1,5 @@
 import os
-from datetime import datetime
+from datetime import date, datetime
 
 from orchestrator.core.config import load_config
 from orchestrator.core.device_manager import DeviceManager
@@ -54,8 +54,15 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     def run_daily_riconciliazione(self, live: bool = False) -> Result[dict]:
-        """Esegue la riconciliazione P6 per tutti gli ID e tutti i book aperti."""
+        """Esegue la riconciliazione P6 per tutti gli ID e tutti i book aperti.
+
+        In modalita' live, tutte le rettifiche del ciclo vengono scritte in
+        un'unica operazione 'Riconciliazione' (creata lazy, alla prima rettifica
+        necessaria), con una riga per rettifica, chiusa subito dopo la scrittura;
+        l'operazione viene chiusa una volta sola a fine ciclo e ogni rettifica
+        scritta viene poi verificata contro il saldo reale del book."""
         summary = {"total": 0, "adjusted": 0, "no_adjustment": 0, "hitl": 0, "errors": []}
+        ctx = {"operazione_id": None, "operazione_create_failed": False, "written": []}
 
         for identity in self.config.get("identities", []):
             identity_id = identity["id"]
@@ -78,12 +85,39 @@ class Orchestrator:
 
             for book in books:
                 summary["total"] += 1
-                self._reconcile_one(identity_id, book, expected_by_bookmaker, live, summary)
+                self._reconcile_one(identity_id, book, expected_by_bookmaker, live, summary, ctx)
+
+        if live and ctx["operazione_id"] is not None:
+            close_op_res = self.app_api_client.close_operazione(ctx["operazione_id"])
+            if not close_op_res.success:
+                summary["errors"].append({
+                    "identity_id": None,
+                    "book": None,
+                    "error": f"Chiusura operazione {ctx['operazione_id']} fallita: {close_op_res.error}",
+                })
+
+        if live:
+            for identity_id, bookmaker_id, book_name, expected_balance in ctx["written"]:
+                verify_res = self.app_api_client.verify_balance_after_rettifica(
+                    identity_id, bookmaker_id, expected_balance
+                )
+                if not verify_res.success:
+                    summary["errors"].append({
+                        "identity_id": identity_id,
+                        "book": book_name,
+                        "error": f"Verifica saldo post-rettifica fallita: {verify_res.error}",
+                    })
+                elif verify_res.data is False:
+                    summary["errors"].append({
+                        "identity_id": identity_id,
+                        "book": book_name,
+                        "error": f"Saldo Netcap non coincide dopo la rettifica: atteso {expected_balance}",
+                    })
 
         return Result.ok(summary)
 
     def _reconcile_one(self, identity_id: str, book: dict, expected_by_bookmaker: dict,
-                        live: bool, summary: dict) -> None:
+                        live: bool, summary: dict, ctx: dict) -> None:
         device_id = None
         try:
             account = Account(
@@ -144,23 +178,18 @@ class Orchestrator:
                 })
                 return
 
-            self._apply_reconciliation(identity_id, book, reconcile_result.data, live, summary)
+            self._apply_reconciliation(identity_id, book, reconcile_result.data, live, summary, ctx)
         finally:
             if device_id is not None:
                 self.device_manager.release_lock(device_id)
 
-    def _apply_reconciliation(self, identity_id: str, book: dict, reconciliation, live: bool, summary: dict) -> None:
+    def _apply_reconciliation(self, identity_id: str, book: dict, reconciliation, live: bool,
+                               summary: dict, ctx: dict) -> None:
         if reconciliation.action == "no_adjustment":
             summary["no_adjustment"] += 1
         elif reconciliation.action == "adjust":
             if live:
-                write_result = self.app_api_client.write_rettifica(
-                    reconciliation.rectification, identity_id, book["bookmaker_id"]
-                )
-                if not write_result.success:
-                    summary["errors"].append({
-                        "identity_id": identity_id, "book": book["name"], "error": write_result.error,
-                    })
+                self._write_rettifica_live(identity_id, book, reconciliation, ctx, summary)
             else:
                 print(
                     f"[DRY-RUN] {identity_id}/{book['name']}: rettifica {reconciliation.rectification}"
@@ -173,6 +202,49 @@ class Orchestrator:
                 severity="warning",
             )
             summary["hitl"] += 1
+
+    def _write_rettifica_live(self, identity_id: str, book: dict, reconciliation,
+                               ctx: dict, summary: dict) -> None:
+        """Scrive la rettifica sull'operazione di riconciliazione condivisa del
+        ciclo, creandola lazy alla prima rettifica necessaria."""
+        if ctx["operazione_id"] is None:
+            if ctx["operazione_create_failed"]:
+                summary["errors"].append({
+                    "identity_id": identity_id, "book": book["name"],
+                    "error": "Operazione riconciliazione non creata (fallita in precedenza in questo ciclo)",
+                })
+                return
+            create_res = self.app_api_client.create_riconciliazione_operazione(date.today().isoformat())
+            if not create_res.success:
+                ctx["operazione_create_failed"] = True
+                summary["errors"].append({
+                    "identity_id": identity_id, "book": book["name"],
+                    "error": f"Creazione operazione riconciliazione fallita: {create_res.error}",
+                })
+                return
+            ctx["operazione_id"] = create_res.data
+
+        rect = reconciliation.rectification
+        riga_res = self.app_api_client.add_riga_rettifica(
+            ctx["operazione_id"], identity_id, book["bookmaker_id"],
+            rect.amount, rect.column, rect.reason, rect.bonus_note,
+        )
+        if not riga_res.success:
+            summary["errors"].append({
+                "identity_id": identity_id, "book": book["name"],
+                "error": f"Scrittura riga rettifica fallita: {riga_res.error}",
+            })
+            return
+
+        close_res = self.app_api_client.close_riga(riga_res.data)
+        if not close_res.success:
+            summary["errors"].append({
+                "identity_id": identity_id, "book": book["name"],
+                "error": f"Chiusura riga {riga_res.data} fallita: {close_res.error}",
+            })
+            # non interrompere: la verifica finale resta comunque significativa
+
+        ctx["written"].append((identity_id, book["bookmaker_id"], book["name"], reconciliation.adjusted_balance))
 
     # ------------------------------------------------------------------
     # P7 — import movimenti

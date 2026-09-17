@@ -176,8 +176,13 @@ class AppApiClient(AppApiClientInterface):
         collaboratore_id: str,
         bookmaker_id: int,
     ) -> Result[WriteResult]:
-        """Registra una rettifica su Netcap con il flusso a 2 step:
-        1) crea l'operazione contenitore, 2) aggiunge la riga con l'importo."""
+        """[DEPRECATED] Non piu' chiamato dall'orchestrator: sostituito dal flusso
+        Riconciliazione unica (create_riconciliazione_operazione / add_riga_rettifica /
+        close_riga / close_operazione / verify_balance_after_rettifica), che apre
+        un'unica operazione per l'intero ciclo invece di una per bookmaker e chiude
+        righe/operazione dopo la scrittura. Mantenuto solo per compatibilita' con
+        eventuali chiamanti esterni. Registra una rettifica su Netcap con il flusso
+        a 2 step: 1) crea l'operazione contenitore, 2) aggiunge la riga con l'importo."""
         # FIX-NETCAP-2STEP: Netcap non accetta piu' una rettifica in una sola POST;
         # richiede POST /operazioni seguita da POST /operazioni/{id}/righe.
         existing_check = self._find_existing_operazione_rettifica(bookmaker_id)
@@ -288,6 +293,129 @@ class AppApiClient(AppApiClientInterface):
         """POST /operazioni → registra operazione generica su Netcap."""
         return self._write_operazione(operazione)
 
+    # bookmaker_id fittizio/placeholder richiesto da Netcap per aprire il contenitore
+    # operazione di riconciliazione (che ospitera' righe di bookmaker diversi);
+    # Betfair, id=6, e' una convenzione arbitraria concordata — non ha significato
+    # contabile per l'operazione in se'.
+    RICONCILIAZIONE_PLACEHOLDER_BOOKMAKER_ID = 6
+
+    def create_riconciliazione_operazione(self, data: str) -> Result[int]:
+        """POST /operazioni: crea l'operazione unica 'Riconciliazione {data}' che
+        conterra' tutte le righe di rettifica del ciclo giornaliero (tutte le
+        identity x tutti i book). Va chiamata al massimo una volta per ciclo,
+        lazy, solo alla prima rettifica effettivamente necessaria."""
+        body = {
+            "nome": f"Riconciliazione {data}",
+            "tipologia": "Ricorrenti",
+            "categoria": "Sport",
+            "bookmaker_id": self.RICONCILIAZIONE_PLACEHOLDER_BOOKMAKER_ID,
+            "data_apertura": data,
+        }
+        res = self._post_json("/operazioni", body)
+        if not res.success:
+            return res  # type: ignore[return-value]
+
+        operazione_id = res.data.get("id") if isinstance(res.data, dict) else None
+        if operazione_id is None:
+            return Result.fail(f"Risposta creazione operazione senza id: {res.data}", self.NETCAP_PARSE_ERROR)
+        return Result.ok(operazione_id)
+
+    def add_riga_rettifica(
+        self,
+        operazione_id: int,
+        collaboratore_id: str,
+        bookmaker_id: int,
+        amount: float,
+        column: str,
+        reason: str,
+        bonus_note: str = None,
+    ) -> Result[int]:
+        """POST /operazioni/{id}/righe: aggiunge una riga di rettifica all'operazione
+        di riconciliazione. L'importo va SEMPRE in profitto_book, MAI in
+        profitto_banco: scriverlo in profitto_banco fa applicare a Netcap la fee
+        Betfair anche a rettifiche non-exchange, corrompendo il saldo risultante.
+        `column` e' accettato solo per coerenza di firma con la Rectification del
+        RulesEngine, ma non seleziona piu' il campo di destinazione."""
+        amt = round(amount, 2)
+        note = f"{reason}"
+        if bonus_note:
+            note = f"{note} | {bonus_note}"
+
+        body = {
+            "collaboratore_id": collaboratore_id,
+            "bookmaker_id": bookmaker_id,
+            "tipo_riga": "puntata_e_bancata",
+            "profitto_book": amt,
+            "profitto_banco": 0,
+            "fee_percentuale": 0,
+            "note": note,
+        }
+        res = self._post_json(f"/operazioni/{operazione_id}/righe", body)
+        if not res.success:
+            return res  # type: ignore[return-value]
+
+        riga_id = res.data.get("id") if isinstance(res.data, dict) else None
+        if riga_id is None:
+            return Result.fail(f"Risposta riga senza id: {res.data}", self.NETCAP_PARSE_ERROR)
+        return Result.ok(riga_id)
+
+    def close_riga(self, riga_id: int) -> Result[bool]:
+        """POST /operazioni/righe/{id}/chiudi: chiude la riga appena scritta."""
+        res = self._post_no_body(f"/operazioni/righe/{riga_id}/chiudi")
+        if not res.success:
+            return res  # type: ignore[return-value]
+        return Result.ok(True)
+
+    def close_operazione(self, operazione_id: int) -> Result[bool]:
+        """POST /operazioni/{id}/chiudi: chiude l'operazione di riconciliazione,
+        da chiamare una sola volta a fine ciclo."""
+        res = self._post_no_body(f"/operazioni/{operazione_id}/chiudi")
+        if not res.success:
+            return res  # type: ignore[return-value]
+        return Result.ok(True)
+
+    def verify_balance_after_rettifica(
+        self,
+        collaboratore_id: str,
+        bookmaker_id: int,
+        expected_balance: float,
+    ) -> Result[bool]:
+        """GET /saldi-bookmaker: verifica che il saldo Netcap post-rettifica
+        coincida con expected_balance (il saldo REALE che il book dovrebbe ora
+        mostrare, tipicamente ReconciliationResult.adjusted_balance). Se la GET
+        fallisce (rete/timeout/HTTP/parse), propaga il fallimento invece di
+        restituire False silenziosamente. Se collaboratore_id o bookmaker_id non
+        compaiono in matrix, fallisce con NETCAP_EMPTY_RESULT ("non verificabile")
+        anziche' restituire Result.ok(False) ("verificato ma sbagliato"), per una
+        diagnostica piu' chiara lato orchestrator."""
+        res = self._get_json("/saldi-bookmaker")
+        if not res.success:
+            return res  # type: ignore[return-value]
+
+        data = res.data
+        try:
+            matrix = data["matrix"]
+        except (KeyError, TypeError) as exc:
+            return Result.fail(f"Struttura inattesa: {exc}", self.NETCAP_PARSE_ERROR)
+
+        coll_matrix = matrix.get(collaboratore_id)
+        if coll_matrix is None:
+            return Result.fail(
+                f"Collaboratore {collaboratore_id} non trovato in matrix (verifica fallita)",
+                self.NETCAP_EMPTY_RESULT,
+            )
+
+        saldo_key = str(bookmaker_id)
+        if saldo_key not in coll_matrix:
+            return Result.fail(
+                f"Bookmaker {bookmaker_id} non trovato in matrix per {collaboratore_id} (verifica fallita)",
+                self.NETCAP_EMPTY_RESULT,
+            )
+
+        saldo_attuale = round(float(coll_matrix[saldo_key]), 2)
+        match = abs(saldo_attuale - round(expected_balance, 2)) < 0.01
+        return Result.ok(match)
+
     # ------------------------------------------------------------------
     # private
     # ------------------------------------------------------------------
@@ -335,6 +463,25 @@ class AppApiClient(AppApiClientInterface):
             return Result.ok(resp.json())
         except ValueError as exc:
             return Result.fail(f"JSON non valido: {exc}", self.NETCAP_PARSE_ERROR)
+
+    def _post_no_body(self, path: str) -> Result[None]:
+        """POST senza aspettarsi un body JSON nella risposta (usato da close_riga/
+        close_operazione, i cui endpoint /chiudi rispondono 200 senza garantire un
+        body JSON)."""
+        url = f"{self.base_url}{path}"
+        try:
+            resp = self.session.post(url, timeout=self.timeout)
+        except requests.ConnectionError as exc:
+            return Result.fail(f"Connessione fallita: {exc}", self.NETCAP_UNREACHABLE)
+        except requests.Timeout:
+            return Result.fail(f"Timeout su {url}", self.NETCAP_TIMEOUT)
+
+        print(f"[Netcap] POST {url} -> status={resp.status_code}")
+
+        if not resp.ok:
+            return Result.fail(f"HTTP {resp.status_code} da {url}", self.NETCAP_HTTP_ERROR)
+
+        return Result.ok(None)
 
     def _write_operazione(self, body: dict) -> Result[WriteResult]:
         """POST /operazioni e wrappa il risultato in WriteResult."""
