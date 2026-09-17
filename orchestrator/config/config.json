@@ -1,0 +1,29 @@
+{
+    "netcap": {
+        "base_url": "http://37.221.197.184:3001/api",
+        "session_token_env": "NETCAP_SESSION_TOKEN"
+    },
+    "identities": [
+        {
+            "id": "01",
+            "name": "Raffaele Maiello",
+            "device_id": "ZE223GVFJ2",
+            "books": [
+                {"bookmaker_id": 6, "name": "BETFAIR", "is_exchange": true},
+                {"bookmaker_id": 42, "name": "SISAL", "is_exchange": false}
+            ]
+        },
+        {
+            "id": "02",
+            "name": "Luigi Polito",
+            "device_id": "ZE223HNBKJ",
+            "books": [
+                {"bookmaker_id": 6, "name": "BETFAIR", "is_exchange": true}
+            ]
+        }
+    ],
+    "schedule": {
+        "riconciliazione": "09:00",
+        "import_movimenti": "10:00"
+    }
+}
