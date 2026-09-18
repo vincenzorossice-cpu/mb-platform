@@ -6,3 +6,11 @@ venv/
 chroma_db/
 *.egg-info/
 .DS_Store
+
+# Temporary test scripts (use orchestrator/tests/ for tests)
+health_check.py
+riconciliazione.py
+*_test*.py
+verify_*.py
+debug_*.py
+write_live_*.py
