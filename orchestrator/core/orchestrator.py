@@ -6,6 +6,7 @@ from orchestrator.core.device_manager import DeviceManager
 from orchestrator.core.result import Result
 
 from orchestrator.modules.app_api_client.client import AppApiClient
+from orchestrator.modules.book_navigator.navigator import BookNavigator
 from orchestrator.modules.cascade_engine.engine import CascadeEngine
 from orchestrator.modules.movement_importer.importer import MovementImporter
 from orchestrator.modules.multiplier_engine.calculator import MultiplierEngine
@@ -28,6 +29,9 @@ class Orchestrator:
         self.device_manager = DeviceManager()
         self.screen_reader = ScreenReader()
         self.touch_injector = TouchInjector(screen_reader=self.screen_reader)
+        self.book_navigator = BookNavigator(
+            screen_reader=self.screen_reader, touch_injector=self.touch_injector
+        )
         self.multiplier_engine = MultiplierEngine()
         self.rules_engine = RulesEngine()
 
