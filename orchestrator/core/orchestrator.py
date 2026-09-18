@@ -58,6 +58,32 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     def run_daily_riconciliazione(self, live: bool = False) -> Result[dict]:
+        # OpSec gate: verifica correlation risk
+        planned_ops = []
+        for identity in self.config.get("identities", []):
+            for book in identity.get("books", []):
+                planned_ops.append({
+                    "identity_id": identity["id"],
+                    "book": book["name"],
+                    "stake_back": 0,
+                    "opened_at": datetime.now().isoformat(),
+                    "operation_type": "riconciliazione"
+                })
+        
+        opsec_result = self.opsec.check_correlation_risk(planned_ops)
+        opsec_info = {"risk_level": "unknown", "warnings": []}
+        if opsec_result.success:
+            check = opsec_result.data
+            opsec_info = {"risk_level": check.risk_level, "warnings": check.warnings}
+            if check.blocked:
+                print("OpSec BLOCKED: " + "; ".join(check.warnings))
+                self.add_hitl_item("opsec_blocked", {
+                    "reason": "; ".join(check.warnings),
+                    "risk_level": check.risk_level
+                }, "critical")
+                return Result.fail("OpSec blocked: " + "; ".join(check.warnings), "OPSEC_BLOCKED")
+            if check.warnings:
+                print("OpSec WARNING: " + "; ".join(check.warnings))
         """Esegue la riconciliazione P6 per tutti gli ID e tutti i book aperti.
 
         In modalita' live, tutte le rettifiche del ciclo vengono scritte in

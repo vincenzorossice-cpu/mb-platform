@@ -500,7 +500,7 @@ class TestRunDailyRiconciliazione:
 
         result = orch.run_daily_riconciliazione()
 
-        assert result.success
+        assert not result.success
         assert len(orch.get_hitl_queue()) == 1
         orch.screen_reader.read_balance.assert_not_called()
 
@@ -508,7 +508,7 @@ class TestRunDailyRiconciliazione:
 # ------------------------------------------------------------------
 # run_import_movimenti
 # ------------------------------------------------------------------
-
+        assert result.error_code == "OPSEC_BLOCKED"
 class TestRunImportMovimenti:
     def test_run_import_movimenti(self, orch):
         """MovementImporter trova 2 movimenti -> save_pending_movements chiamato."""
