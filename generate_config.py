@@ -48,10 +48,8 @@ for collab_id in sorted(matrix.keys()):
         book_info = book_map.get(book_id_str)
         if not book_info:
             continue
-        # Salta book con saldo esattamente 0 (nessun movimento)
-        # Ma tieni i negativi (Betfair può avere saldo negativo)
-        if saldo == 0 or abs(saldo) < 0.01:
-            continue
+        # Includi tutti i book nella matrix (anche saldo 0)
+        # Un book nella matrix significa che ha avuto movimenti
         books.append({
             "bookmaker_id": book_id,
             "name": book_info["name"],
