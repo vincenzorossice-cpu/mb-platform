@@ -9,19 +9,84 @@ from orchestrator.modules.book_navigator.interface import (
 from orchestrator.modules.screen_reader.interface import ScreenReaderInterface
 from orchestrator.modules.touch_injector.interface import TouchInjectorInterface
 
+MAX_NAV_DEPTH = 3
+MIN_NAV_TEXT_LEN = 2
+
+BALANCE_KEYWORDS = ["saldo", "balance", "disponibile", "wallet", "conto"]
+
+NAV_KEYWORDS = [
+    "il mio conto", "account", "profilo", "menu", "saldo",
+    "balance", "conto", "wallet", "pannello", "impostazioni",
+]
+
+GUEST_KEYWORDS = [
+    "cookie", "privacy", "termini", "guida", "contatti",
+    "normativa", "affiliati", "mappa del sito",
+]
+
+LOGIN_KEYWORDS = ["login", "accedi", "log in", "registrati", "sign in"]
+
+MY_BETS_KEYWORDS = ["scommesse", "my bets", "le mie scommesse"]
+
+_AMOUNT_CHARS = ("€", "$", "£")
+
+
+def _looks_like_amount(text: str) -> bool:
+    return any(ch.isdigit() for ch in text) or any(c in text for c in _AMOUNT_CHARS)
+
+
+def _find_direct_balance_element(elements):
+    for elem in elements:
+        if not elem.text:
+            continue
+        lower = elem.text.lower().strip()
+        if any(kw in lower for kw in GUEST_KEYWORDS):
+            continue
+        if any(kw in lower for kw in BALANCE_KEYWORDS) and _looks_like_amount(elem.text):
+            return elem
+    return None
+
+
+def _find_nav_candidate(elements, keywords):
+    for elem in elements:
+        if not elem.text:
+            continue
+        trimmed = elem.text.strip()
+        if len(trimmed) <= MIN_NAV_TEXT_LEN:
+            continue
+        lower = trimmed.lower()
+        if any(kw in lower for kw in GUEST_KEYWORDS):
+            continue
+        if any(kw in lower for kw in keywords):
+            return elem
+    return None
+
 
 class BookNavigator(BookNavigatorInterface):
 
-    # Configurazione per-book
+    # Configurazione per-book: solo URL. Le keyword di navigazione sono
+    # generiche e valgono per qualunque sito (vedi costanti di modulo sopra).
     BOOK_CONFIG = {
-        "BETFAIR": {
-            "url": "https://mobile.betfair.com",
-            "balance_selectors": ["saldo", "balance", "wallet", "€"],
-            "login_selectors": ["login", "accedi", "log in"],
-            "my_bets_selectors": ["scommesse", "my bets", "le mie scommesse"],
-            "needs_login": True,  # Betfair richiede login
-        },
-        # Altri book si aggiungeranno dopo
+        "BETFAIR": {"url": "https://mobile.betfair.com"},
+        "SISAL": {"url": "https://m.sisal.it"},
+        "STANLEYBET": {"url": "https://m.stanleybet.it"},
+        "BET365": {"url": "https://www.bet365.it"},
+        "SNAI": {"url": "https://m.snai.it"},
+        "EUROBET": {"url": "https://m.eurobet.it"},
+        "GOLDBET": {"url": "https://m.goldbet.it"},
+        "LOTTOMATICA": {"url": "https://m.lottomatica.it"},
+        "PLANETWIN": {"url": "https://m.planetwin365.it"},
+        "BETFLAG": {"url": "https://m.betflag.it"},
+        "BWIN": {"url": "https://m.bwin.it"},
+        "BETSSON": {"url": "https://m.betsson.it"},
+        "POKERSTARS": {"url": "https://m.pokerstars.it"},
+        "WILLIAMHILL": {"url": "https://m.williamhill.it"},
+        "UNIBET": {"url": "https://m.unibet.it"},
+        "DAZNBET": {"url": "https://m.daznbet.it"},
+        "LEOVEGAS": {"url": "https://m.leovegas.it"},
+        "NETBET": {"url": "https://m.netbet.it"},
+        "CODERE": {"url": "https://m.codere.it"},
+        "STAKE": {"url": "https://m.stake.it"},
     }
 
     def __init__(
@@ -31,6 +96,12 @@ class BookNavigator(BookNavigatorInterface):
     ):
         self.screen_reader = screen_reader
         self.touch_injector = touch_injector
+
+    def _resolve_url(self, book_upper: str) -> str:
+        config = self.BOOK_CONFIG.get(book_upper)
+        if config:
+            return config["url"]
+        return f"https://m.{book_upper.lower()}.it"
 
     # --------------------------------------------------------
     # PUBLIC: open_chrome
@@ -56,96 +127,71 @@ class BookNavigator(BookNavigatorInterface):
     def navigate_to_balance(self, device_id: str, book: str) -> Result[NavigationResult]:
         """Naviga alla pagina del saldo per il book specificato.
 
-        Flusso:
-        1. Apri Chrome all'URL del book
-        2. Leggi schermo
-        3. Se trova elemento "Login"/"Accedi" -> needs_login=True, return (l'operatore fa login manuale)
-        4. Se già loggato -> verifica se il saldo è visibile
-        5. Se il saldo non è in home -> naviga alla pagina del saldo
-        6. Verifica di essere sulla pagina giusta
+        Approccio generico (nessuna configurazione per-book oltre l'URL):
+        apre Chrome, poi esplora fino a MAX_NAV_DEPTH schermate cercando
+        il saldo direttamente o un elemento di navigazione da tappare.
         """
         book_upper = book.upper()
-        config = self.BOOK_CONFIG.get(book_upper)
-        if not config:
-            return Result.fail(f"Book {book} not configured", "BOOK_NOT_CONFIGURED")
+        url = self._resolve_url(book_upper)
 
-        # 1. Apri Chrome
-        open_result = self.open_chrome(device_id, config["url"])
+        open_result = self.open_chrome(device_id, url)
         if not open_result.success:
             return Result.fail(open_result.error, open_result.error_code)
 
         if self.screen_reader is None:
             return Result.ok(NavigationResult(
                 success=True, current_screen_type="unknown",
-                url=config["url"], needs_login=False,
+                url=url, needs_login=False,
                 message="Chrome aperto, ScreenReader non disponibile per verifica"
             ))
 
-        # 2. Leggi schermo
-        screen = self.screen_reader.read_screen(device_id)
-        if not screen.success:
-            return Result.fail(f"Cannot read screen: {screen.error}", screen.error_code)
+        elements = []
+        screen_type = "unknown"
 
-        elements = screen.data.elements
-        texts_lower = [e.text.lower().strip() for e in elements if e.text]
-        all_text = " ".join(texts_lower)
+        for _depth in range(MAX_NAV_DEPTH):
+            screen = self.screen_reader.read_screen(device_id)
+            if not screen.success:
+                return Result.fail(f"Cannot read screen: {screen.error}", screen.error_code)
 
-        # 3. Check login
-        needs_login = any(sel in all_text for sel in config["login_selectors"])
-        if needs_login:
+            elements = screen.data.elements
+            screen_type = screen.data.screen_type
+
+            if screen_type == "balance_page":
+                return Result.ok(NavigationResult(
+                    success=True, current_screen_type="balance_page",
+                    url=url, needs_login=False,
+                    message=f"Pagina del saldo raggiunta per {book}"
+                ))
+
+            if _find_direct_balance_element(elements) is not None:
+                return Result.ok(NavigationResult(
+                    success=True, current_screen_type=screen_type,
+                    url=url, needs_login=False,
+                    message=f"Saldo individuato direttamente sullo schermo per {book}"
+                ))
+
+            nav_element = _find_nav_candidate(elements, NAV_KEYWORDS)
+            if nav_element is None or self.touch_injector is None:
+                break
+
+            tap_result = self.touch_injector.tap_element(device_id, nav_element.text)
+            if not tap_result.success:
+                break
+
+            time.sleep(3)  # Attendi caricamento
+
+        all_text = " ".join(e.text.lower().strip() for e in elements if e.text)
+        if any(kw in all_text for kw in LOGIN_KEYWORDS):
             return Result.ok(NavigationResult(
                 success=False, current_screen_type="login_page",
-                url=config["url"], needs_login=True,
+                url=url, needs_login=True,
                 message=f"Login richiesto per {book}. L'operatore deve fare login manualmente."
             ))
 
-        # 4. Verifica se saldo è già visibile
-        screen_type = screen.data.screen_type
-        if screen_type == "balance_page":
-            return Result.ok(NavigationResult(
-                success=True, current_screen_type="balance_page",
-                url=config["url"], needs_login=False,
-                message=f"Pagina del saldo raggiunta per {book}"
-            ))
-
-        # 5. Cerca elemento per navigare al saldo
-        for elem in elements:
-            elem_lower = elem.text.lower().strip()
-            if any(kw in elem_lower for kw in ["il mio conto", "account", "saldo", "balance", "wallet", "conto"]):
-                if self.touch_injector:
-                    tap_result = self.touch_injector.tap_element(device_id, elem.text)
-                    if tap_result.success:
-                        time.sleep(3)  # Attendi caricamento
-                        # Verifica di essere sulla pagina del saldo
-                        verify = self.screen_reader.read_screen(device_id)
-                        if verify.success and verify.data.screen_type == "balance_page":
-                            return Result.ok(NavigationResult(
-                                success=True, current_screen_type="balance_page",
-                                url=config["url"], needs_login=False,
-                                message=f"Pagina del saldo raggiunta per {book}"
-                            ))
-
-        # 6. Se non trova il saldo, prova my_bets
-        for elem in elements:
-            elem_lower = elem.text.lower().strip()
-            if any(kw in elem_lower for kw in config["my_bets_selectors"]):
-                if self.touch_injector:
-                    tap_result = self.touch_injector.tap_element(device_id, elem.text)
-                    if tap_result.success:
-                        time.sleep(3)
-                        verify = self.screen_reader.read_screen(device_id)
-                        if verify.success:
-                            return Result.ok(NavigationResult(
-                                success=True, current_screen_type=verify.data.screen_type,
-                                url=config["url"], needs_login=False,
-                                message=f"Navigato a {elem.text} per {book}"
-                            ))
-
-        # 7. Non trovato
         return Result.ok(NavigationResult(
             success=False, current_screen_type=screen_type or "unknown",
-            url=config["url"], needs_login=False,
-            message=f"Pagina del saldo non trovata per {book}. Screen type: {screen_type}"
+            url=url, needs_login=False,
+            message=f"Pagina del saldo non trovata per {book} dopo {MAX_NAV_DEPTH} tentativi. Screen type: {screen_type}"
         ))
 
     # --------------------------------------------------------
@@ -153,76 +199,61 @@ class BookNavigator(BookNavigatorInterface):
     # --------------------------------------------------------
 
     def navigate_to_my_bets(self, device_id: str, book: str) -> Result[NavigationResult]:
-        """Naviga alla pagina My Bets / Scommesse per il book specificato.
-
-        Flusso analogo a navigate_to_balance, ma cerca direttamente gli
-        elementi di my_bets_selectors invece di quelli del saldo.
-        """
+        """Naviga alla pagina My Bets / Scommesse per il book specificato."""
         book_upper = book.upper()
-        config = self.BOOK_CONFIG.get(book_upper)
-        if not config:
-            return Result.fail(f"Book {book} not configured", "BOOK_NOT_CONFIGURED")
+        url = self._resolve_url(book_upper)
 
-        # 1. Apri Chrome
-        open_result = self.open_chrome(device_id, config["url"])
+        open_result = self.open_chrome(device_id, url)
         if not open_result.success:
             return Result.fail(open_result.error, open_result.error_code)
 
         if self.screen_reader is None:
             return Result.ok(NavigationResult(
                 success=True, current_screen_type="unknown",
-                url=config["url"], needs_login=False,
+                url=url, needs_login=False,
                 message="Chrome aperto, ScreenReader non disponibile per verifica"
             ))
 
-        # 2. Leggi schermo
         screen = self.screen_reader.read_screen(device_id)
         if not screen.success:
             return Result.fail(f"Cannot read screen: {screen.error}", screen.error_code)
 
         elements = screen.data.elements
-        texts_lower = [e.text.lower().strip() for e in elements if e.text]
-        all_text = " ".join(texts_lower)
+        all_text = " ".join(e.text.lower().strip() for e in elements if e.text)
 
-        # 3. Check login
-        needs_login = any(sel in all_text for sel in config["login_selectors"])
-        if needs_login:
+        if any(kw in all_text for kw in LOGIN_KEYWORDS):
             return Result.ok(NavigationResult(
                 success=False, current_screen_type="login_page",
-                url=config["url"], needs_login=True,
+                url=url, needs_login=True,
                 message=f"Login richiesto per {book}. L'operatore deve fare login manualmente."
             ))
 
-        # 4. Verifica se la pagina my_bets è già visibile
         screen_type = screen.data.screen_type
         if screen_type == "my_bets":
             return Result.ok(NavigationResult(
                 success=True, current_screen_type="my_bets",
-                url=config["url"], needs_login=False,
+                url=url, needs_login=False,
                 message=f"Pagina Scommesse raggiunta per {book}"
             ))
 
-        # 5. Cerca elemento per navigare a my_bets
-        for elem in elements:
-            elem_lower = elem.text.lower().strip()
-            if any(kw in elem_lower for kw in config["my_bets_selectors"]):
-                if self.touch_injector:
-                    tap_result = self.touch_injector.tap_element(device_id, elem.text)
-                    if tap_result.success:
-                        time.sleep(2)  # Attendi caricamento
-                        verify = self.screen_reader.read_screen(device_id)
-                        if verify.success:
-                            return Result.ok(NavigationResult(
-                                success=verify.data.screen_type == "my_bets",
-                                current_screen_type=verify.data.screen_type,
-                                url=config["url"], needs_login=False,
-                                message=f"Navigato a {elem.text} per {book}"
-                            ))
+        nav_element = _find_nav_candidate(elements, MY_BETS_KEYWORDS)
+        if nav_element is not None and self.touch_injector is not None:
+            tap_result = self.touch_injector.tap_element(device_id, nav_element.text)
+            if tap_result.success:
+                time.sleep(2)  # Attendi caricamento
+                verify = self.screen_reader.read_screen(device_id)
+                if not verify.success:
+                    return Result.fail(f"Cannot read screen: {verify.error}", verify.error_code)
+                return Result.ok(NavigationResult(
+                    success=verify.data.screen_type == "my_bets",
+                    current_screen_type=verify.data.screen_type,
+                    url=url, needs_login=False,
+                    message=f"Navigato a {nav_element.text} per {book}"
+                ))
 
-        # 6. Non trovato
         return Result.ok(NavigationResult(
             success=False, current_screen_type=screen_type or "unknown",
-            url=config["url"], needs_login=False,
+            url=url, needs_login=False,
             message=f"Pagina Scommesse non trovata per {book}. Screen type: {screen_type}"
         ))
 
@@ -239,10 +270,7 @@ class BookNavigator(BookNavigatorInterface):
         if not screen.success:
             return Result.fail(screen.error, screen.error_code)
 
-        texts_lower = [e.text.lower().strip() for e in screen.data.elements if e.text]
-        all_text = " ".join(texts_lower)
-
-        login_keywords = ["login", "accedi", "log in", "sign in"]
-        is_logged_out = any(kw in all_text for kw in login_keywords)
+        all_text = " ".join(e.text.lower().strip() for e in screen.data.elements if e.text)
+        is_logged_out = any(kw in all_text for kw in LOGIN_KEYWORDS)
 
         return Result.ok(not is_logged_out)

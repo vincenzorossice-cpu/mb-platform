@@ -54,7 +54,7 @@ class TestNavigateToBalance(unittest.TestCase):
 
     @patch("orchestrator.modules.book_navigator.navigator.time.sleep")
     @patch("orchestrator.modules.book_navigator.navigator.subprocess.run")
-    def test_navigate_to_balance_already_logged_in(self, mock_run, mock_sleep):
+    def test_navigate_to_balance_already_on_balance_page(self, mock_run, mock_sleep):
         mock_run.return_value = MagicMock(returncode=0, stderr="")
         screen_reader = MagicMock()
         screen_reader.read_screen.return_value = Result.ok(_make_screen(
@@ -69,6 +69,84 @@ class TestNavigateToBalance(unittest.TestCase):
         self.assertTrue(result.data.success)
         self.assertEqual(result.data.current_screen_type, "balance_page")
         self.assertFalse(result.data.needs_login)
+        self.assertEqual(screen_reader.read_screen.call_count, 1)
+
+    @patch("orchestrator.modules.book_navigator.navigator.time.sleep")
+    @patch("orchestrator.modules.book_navigator.navigator.subprocess.run")
+    def test_navigate_to_balance_tap_to_balance(self, mock_run, mock_sleep):
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+        screen_reader = MagicMock()
+        screen_reader.read_screen.side_effect = [
+            Result.ok(_make_screen(
+                elements=[_make_element(text="Account")],
+                screen_type="unknown",
+            )),
+            Result.ok(_make_screen(
+                elements=[_make_element(text="€ 0.68")],
+                screen_type="balance_page",
+            )),
+        ]
+        touch_injector = MagicMock()
+        touch_injector.tap_element.return_value = Result.ok(True)
+        navigator = BookNavigator(screen_reader=screen_reader, touch_injector=touch_injector)
+
+        result = navigator.navigate_to_balance(DEVICE, "BETFAIR")
+
+        self.assertTrue(result.success)
+        self.assertTrue(result.data.success)
+        self.assertEqual(result.data.current_screen_type, "balance_page")
+        touch_injector.tap_element.assert_called_once_with(DEVICE, "Account")
+
+    @patch("orchestrator.modules.book_navigator.navigator.time.sleep")
+    @patch("orchestrator.modules.book_navigator.navigator.subprocess.run")
+    def test_navigate_to_balance_3_levels(self, mock_run, mock_sleep):
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+        screen_reader = MagicMock()
+        screen_reader.read_screen.side_effect = [
+            Result.ok(_make_screen(
+                elements=[_make_element(text="Menu")],
+                screen_type="unknown",
+            )),
+            Result.ok(_make_screen(
+                elements=[_make_element(text="Impostazioni")],
+                screen_type="unknown",
+            )),
+            Result.ok(_make_screen(
+                elements=[_make_element(text="€ 0.68")],
+                screen_type="balance_page",
+            )),
+        ]
+        touch_injector = MagicMock()
+        touch_injector.tap_element.return_value = Result.ok(True)
+        navigator = BookNavigator(screen_reader=screen_reader, touch_injector=touch_injector)
+
+        result = navigator.navigate_to_balance(DEVICE, "BETFAIR")
+
+        self.assertTrue(result.success)
+        self.assertTrue(result.data.success)
+        self.assertEqual(result.data.current_screen_type, "balance_page")
+        self.assertEqual(screen_reader.read_screen.call_count, 3)
+        self.assertEqual(touch_injector.tap_element.call_count, 2)
+
+    @patch("orchestrator.modules.book_navigator.navigator.time.sleep")
+    @patch("orchestrator.modules.book_navigator.navigator.subprocess.run")
+    def test_navigate_to_balance_not_found(self, mock_run, mock_sleep):
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+        screen_reader = MagicMock()
+        screen_reader.read_screen.return_value = Result.ok(_make_screen(
+            elements=[_make_element(text="Menu")],
+            screen_type="unknown",
+        ))
+        touch_injector = MagicMock()
+        touch_injector.tap_element.return_value = Result.ok(True)
+        navigator = BookNavigator(screen_reader=screen_reader, touch_injector=touch_injector)
+
+        result = navigator.navigate_to_balance(DEVICE, "BETFAIR")
+
+        self.assertTrue(result.success)
+        self.assertFalse(result.data.success)
+        self.assertFalse(result.data.needs_login)
+        self.assertEqual(screen_reader.read_screen.call_count, 3)
 
     @patch("orchestrator.modules.book_navigator.navigator.time.sleep")
     @patch("orchestrator.modules.book_navigator.navigator.subprocess.run")
@@ -87,23 +165,29 @@ class TestNavigateToBalance(unittest.TestCase):
         self.assertFalse(result.data.success)
         self.assertTrue(result.data.needs_login)
         self.assertEqual(result.data.current_screen_type, "login_page")
+        self.assertEqual(screen_reader.read_screen.call_count, 1)
 
-    def test_navigate_to_balance_not_configured(self):
+    @patch("orchestrator.modules.book_navigator.navigator.time.sleep")
+    @patch("orchestrator.modules.book_navigator.navigator.subprocess.run")
+    def test_navigate_to_balance_unknown_book(self, mock_run, mock_sleep):
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
         navigator = BookNavigator()
 
         result = navigator.navigate_to_balance(DEVICE, "UNKNOWN")
 
-        self.assertFalse(result.success)
-        self.assertEqual(result.error_code, "BOOK_NOT_CONFIGURED")
+        self.assertTrue(result.success)
+        self.assertEqual(result.data.url, "https://m.unknown.it")
+        cmd = mock_run.call_args[0][0]
+        self.assertEqual(cmd[-1], "https://m.unknown.it")
 
     @patch("orchestrator.modules.book_navigator.navigator.time.sleep")
     @patch("orchestrator.modules.book_navigator.navigator.subprocess.run")
-    def test_navigate_to_balance_tap_to_balance(self, mock_run, mock_sleep):
+    def test_navigate_to_balance_guest_keywords_excluded(self, mock_run, mock_sleep):
         mock_run.return_value = MagicMock(returncode=0, stderr="")
         screen_reader = MagicMock()
         screen_reader.read_screen.side_effect = [
             Result.ok(_make_screen(
-                elements=[_make_element(text="Il mio conto")],
+                elements=[_make_element(text="Privacy"), _make_element(text="Account")],
                 screen_type="unknown",
             )),
             Result.ok(_make_screen(
@@ -117,36 +201,8 @@ class TestNavigateToBalance(unittest.TestCase):
 
         result = navigator.navigate_to_balance(DEVICE, "BETFAIR")
 
-        self.assertTrue(result.success)
         self.assertTrue(result.data.success)
-        self.assertEqual(result.data.current_screen_type, "balance_page")
-        touch_injector.tap_element.assert_called_once_with(DEVICE, "Il mio conto")
-
-    @patch("orchestrator.modules.book_navigator.navigator.time.sleep")
-    @patch("orchestrator.modules.book_navigator.navigator.subprocess.run")
-    def test_navigate_to_balance_tap_my_bets(self, mock_run, mock_sleep):
-        mock_run.return_value = MagicMock(returncode=0, stderr="")
-        screen_reader = MagicMock()
-        screen_reader.read_screen.side_effect = [
-            Result.ok(_make_screen(
-                elements=[_make_element(text="Scommesse")],
-                screen_type="unknown",
-            )),
-            Result.ok(_make_screen(
-                elements=[_make_element(text="Le mie scommesse")],
-                screen_type="my_bets",
-            )),
-        ]
-        touch_injector = MagicMock()
-        touch_injector.tap_element.return_value = Result.ok(True)
-        navigator = BookNavigator(screen_reader=screen_reader, touch_injector=touch_injector)
-
-        result = navigator.navigate_to_balance(DEVICE, "BETFAIR")
-
-        self.assertTrue(result.success)
-        self.assertTrue(result.data.success)
-        self.assertEqual(result.data.current_screen_type, "my_bets")
-        touch_injector.tap_element.assert_called_once_with(DEVICE, "Scommesse")
+        touch_injector.tap_element.assert_called_once_with(DEVICE, "Account")
 
     @patch("orchestrator.modules.book_navigator.navigator.time.sleep")
     @patch("orchestrator.modules.book_navigator.navigator.subprocess.run")
@@ -194,7 +250,7 @@ class TestNavigateToMyBets(unittest.TestCase):
 
     @patch("orchestrator.modules.book_navigator.navigator.time.sleep")
     @patch("orchestrator.modules.book_navigator.navigator.subprocess.run")
-    def test_navigate_to_my_bets_success(self, mock_run, mock_sleep):
+    def test_navigate_to_my_bets_generic(self, mock_run, mock_sleep):
         mock_run.return_value = MagicMock(returncode=0, stderr="")
         screen_reader = MagicMock()
         screen_reader.read_screen.side_effect = [
