@@ -392,47 +392,78 @@ class AppApiClient(AppApiClientInterface):
             return Result.fail(f"Risposta /operazioni non e' una lista: {type(data)}", self.NETCAP_PARSE_ERROR)
         return Result.ok(data)
 
-    def add_riga_giocata_sport(
+    def get_open_operations(self, collaboratore_id: str) -> Result[list[dict]]:
+        """Wrapper su get_operazioni_aperte: stessa chiamata GET, ma mappa il
+        risultato nella forma minimale usata dalla dashboard per popolare il
+        dropdown 'Collega a operazione esistente' (id/nome/stato/bet_gruppo_id)."""
+        res = self.get_operazioni_aperte(collaboratore_id)
+        if not res.success:
+            return res  # type: ignore[return-value]
+
+        operations = [{
+            "id": op.get("id"),
+            "nome": op.get("nome"),
+            "stato": op.get("stato"),
+            "bet_gruppo_id": self._extract_bet_gruppo_id(op),
+        } for op in res.data if isinstance(op, dict)]
+        return Result.ok(operations)
+
+    def _extract_bet_gruppo_id(self, operazione: dict) -> Optional[str]:
+        """Estrazione defensiva del bet_gruppo_id dalle righe annidate di
+        un'operazione Netcap (forma esatta non confermata): None se assente,
+        mai eccezione."""
+        righe = operazione.get("righe")
+        if not isinstance(righe, list):
+            return None
+        for riga in righe:
+            if isinstance(riga, dict):
+                value = riga.get("bet_gruppo_id")
+                if value:
+                    return value
+        return None
+
+    def add_riga_cascata(
         self,
         operazione_id: int,
         collaboratore_id: str,
         bookmaker_id: int,
-        exchange_id: int,
-        punta: float,
-        contropuntata: float,
-        quota_punta: float,
-        quota_contropuntata: float,
-        profitto_book: float,
-        profitto_banco: float,
+        back_stake: float,
+        back_odds: float,
+        lay_stake: float,
+        lay_odds: float,
+        bet_gruppo_id: Optional[str] = None,
         fee_percentuale: float = 4.5,
-    ) -> Result[int]:
-        """POST /operazioni/{id}/righe: riga 'giocata_sport' (bancata reale su
-        un book x exchange, es. Betfair). A differenza di add_riga_rettifica,
-        qui e' corretto che la fee si applichi a profitto_banco: non e' una
-        rettifica, e' un'operazione sportiva reale su exchange."""
+        note: Optional[str] = None,
+    ) -> Result[WriteResult]:
+        """POST /operazioni/{id}/righe: riga 'puntata_e_bancata' (bancata reale
+        su un book x exchange, es. Betfair), schema confermato dal codice
+        sorgente Netcap. back_odds/lay_odds non vengono inviati: l'API non ha
+        campi quota_*, traccia solo gli stake. bet_gruppo_id collega le righe
+        della stessa cascata multipla (stesso valore su tutte)."""
         body = {
-            "operazione_id": operazione_id,
+            "tipo_riga": "puntata_e_bancata",
+            "parent_id": None,
             "collaboratore_id": collaboratore_id,
-            "tipo_riga": "giocata_sport",
             "bookmaker_id": bookmaker_id,
-            "exchange_id": exchange_id,
-            "punta": round(punta, 2),
-            "contropuntata": round(contropuntata, 2),
-            "quota_punta": quota_punta,
-            "quota_contropuntata": quota_contropuntata,
-            "profitto_book": round(profitto_book, 2),
-            "profitto_banco": round(profitto_banco, 2),
+            "exchange_id": self.BETFAIR_EXCHANGE_ID,
+            "banco_collaboratore_id": None,
+            "punta": round(back_stake, 2),
+            "punta_bonus": 0,
+            "contropuntata": round(lay_stake, 2),
+            "profitto_book": 0,
+            "profitto_banco": 0,
             "fee_percentuale": fee_percentuale,
-            "stato": "in_corso",
+            "note": note,
+            "bet_gruppo_id": bet_gruppo_id,
         }
         res = self._post_json(f"/operazioni/{operazione_id}/righe", body)
         if not res.success:
-            return res  # type: ignore[return-value]
+            return Result.ok(WriteResult(success=False, netcap_id=None, message=res.error))
 
         riga_id = res.data.get("id") if isinstance(res.data, dict) else None
         if riga_id is None:
-            return Result.fail(f"Risposta riga senza id: {res.data}", self.NETCAP_PARSE_ERROR)
-        return Result.ok(riga_id)
+            return Result.ok(WriteResult(success=False, netcap_id=None, message=f"Risposta riga senza id: {res.data}"))
+        return Result.ok(WriteResult(success=True, netcap_id=riga_id, message=None))
 
     def close_riga(self, riga_id: int) -> Result[bool]:
         """POST /operazioni/righe/{id}/chiudi: chiude la riga appena scritta."""

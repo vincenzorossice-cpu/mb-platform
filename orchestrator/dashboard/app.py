@@ -1,6 +1,6 @@
 import json
 from dataclasses import asdict
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 
@@ -146,6 +146,17 @@ def _update_unregistered_alert(file_path: Path, index: int, status: str) -> bool
         return False
 
 
+@app.get("/open_operations/{collaboratore_id}")
+async def get_open_operations(collaboratore_id: str):
+    """Operazioni APERTO per un collaboratore, per popolare il dropdown
+    'Collega a operazione esistente' della sezione Operazioni non registrate."""
+    app_api_client = AppApiClient()
+    result = app_api_client.get_open_operations(collaboratore_id)
+    if not result.success:
+        return JSONResponse(status_code=502, content={"status": "error", "error": result.error})
+    return result.data
+
+
 @app.post("/complete_op/{item_id}")
 async def complete_operation(item_id: str, request: Request):
     try:
@@ -153,10 +164,21 @@ async def complete_operation(item_id: str, request: Request):
         bookmaker_id = int(payload["bookmaker_id"])
         back_stake = float(payload["back_stake"])
         back_odds = float(payload["back_odds"])
+        op_type = payload.get("op_type", "singola")
+        total_events = int(payload.get("total_events", 1))
+        current_event = int(payload.get("current_event", 1))
+        existing_op_id = payload.get("existing_op_id")
+        existing_op_id = int(existing_op_id) if existing_op_id not in (None, "") else None
     except (ValueError, KeyError, TypeError):
         return JSONResponse(status_code=400, content={
             "status": "error", "id": item_id,
             "error": "body JSON invalido: bookmaker_id/back_stake/back_odds richiesti",
+        })
+
+    if op_type == "cascata" and not (total_events >= 2 and 1 <= current_event <= total_events):
+        return JSONResponse(status_code=400, content={
+            "status": "error", "id": item_id,
+            "error": "cascata non valida: total_events >= 2 e 1 <= current_event <= total_events richiesti",
         })
 
     found = _find_unregistered_alert_in_files(item_id)
@@ -170,41 +192,64 @@ async def complete_operation(item_id: str, request: Request):
 
     app_api_client = AppApiClient()
 
-    op_result = app_api_client.write_operazione({
-        "nome": f"Bancata Betfair - {bet.get('event', 'evento')}",
-        "tipologia": tipologia,
-        "categoria": "Sport",
-        "bookmaker_id": bookmaker_id,
-        "collaboratori_ids": collaboratore_id,
-        "stato": "APERTO",
-        "data_apertura": date.today().isoformat(),
-        "note": f"Bancata Betfair non registrata - ID scommessa {bet.get('bet_id', 'n/d')}",
-    })
-    if not op_result.success or not op_result.data.success:
-        error = op_result.error if not op_result.success else op_result.data.message
-        return JSONResponse(status_code=502, content={"status": "error", "id": item_id, "error": error})
+    note = f"Cascata evento {current_event}/{total_events}" if op_type == "cascata" else None
 
-    operazione_id = op_result.data.netcap_id
-    if operazione_id is None:
-        return JSONResponse(status_code=502, content={"status": "error", "id": item_id, "error": "operazione creata senza id"})
+    if existing_op_id is not None:
+        open_ops_result = app_api_client.get_open_operations(collaboratore_id)
+        if not open_ops_result.success:
+            return JSONResponse(status_code=502, content={"status": "error", "id": item_id, "error": open_ops_result.error})
+        matching_op = next((op for op in open_ops_result.data if op.get("id") == existing_op_id), None)
+        if matching_op is None:
+            return JSONResponse(status_code=400, content={
+                "status": "error", "id": item_id,
+                "error": f"existing_op_id {existing_op_id} non trovato tra le operazioni APERTO del collaboratore",
+            })
+        operazione_id = existing_op_id
+        bet_gruppo_id = matching_op.get("bet_gruppo_id")
+    else:
+        op_result = app_api_client.write_operazione({
+            "nome": f"Bancata Betfair - {bet.get('event', 'evento')}",
+            "tipologia": tipologia,
+            "categoria": "Sport",
+            "bookmaker_id": bookmaker_id,
+            "collaboratori_ids": collaboratore_id,
+            "stato": "APERTO",
+            "data_apertura": date.today().isoformat(),
+            "note": f"Bancata Betfair non registrata - ID scommessa {bet.get('bet_id', 'n/d')}",
+        })
+        if not op_result.success or not op_result.data.success:
+            error = op_result.error if not op_result.success else op_result.data.message
+            return JSONResponse(status_code=502, content={"status": "error", "id": item_id, "error": error})
 
-    riga_result = app_api_client.add_riga_giocata_sport(
+        operazione_id = op_result.data.netcap_id
+        if operazione_id is None:
+            return JSONResponse(status_code=502, content={"status": "error", "id": item_id, "error": "operazione creata senza id"})
+
+        bet_gruppo_id = f"cascade_{operazione_id}_{int(datetime.now().timestamp())}" if op_type == "cascata" else None
+
+    riga_result = app_api_client.add_riga_cascata(
         operazione_id=operazione_id,
         collaboratore_id=collaboratore_id,
         bookmaker_id=bookmaker_id,
-        exchange_id=AppApiClient.BETFAIR_EXCHANGE_ID,
-        punta=back_stake,
-        contropuntata=bet.get("lay_stake"),
-        quota_punta=back_odds,
-        quota_contropuntata=bet.get("lay_odds"),
-        profitto_book=0.0,
-        profitto_banco=0.0,
+        back_stake=back_stake,
+        back_odds=back_odds,
+        lay_stake=bet.get("lay_stake"),
+        lay_odds=bet.get("lay_odds"),
+        bet_gruppo_id=bet_gruppo_id,
+        note=note,
     )
-    if not riga_result.success:
+    if not riga_result.success or not riga_result.data.success:
+        error = riga_result.error if not riga_result.success else riga_result.data.message
         return JSONResponse(status_code=502, content={
             "status": "error", "id": item_id,
-            "error": f"Operazione creata (id={operazione_id}) ma riga fallita: {riga_result.error}",
+            "error": f"Operazione (id={operazione_id}) ma riga fallita: {error}",
         })
 
     _update_unregistered_alert(file_path, index, "completed")
-    return {"status": "completed", "id": item_id, "operazione_id": operazione_id, "riga_id": riga_result.data}
+    return {
+        "status": "completed",
+        "id": item_id,
+        "operazione_id": operazione_id,
+        "riga_id": riga_result.data.netcap_id,
+        "linked_existing": existing_op_id is not None,
+    }

@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from orchestrator.core.result import Result
 from orchestrator.dashboard.app import app
 from orchestrator.dashboard.data_loader import DEFAULT_REPORT_DIR
+from orchestrator.modules.app_api_client.client import AppApiClient
 from orchestrator.modules.app_api_client.interface import WriteResult
 from orchestrator.modules.rules_engine.engine import RulesEngine
 from orchestrator.modules.rules_engine.interface import UnregisteredOperationAlert
@@ -219,7 +220,9 @@ class TestCompleteOperation:
                 mock_instance.write_operazione.return_value = Result.ok(
                     WriteResult(success=True, netcap_id=999, message=None)
                 )
-                mock_instance.add_riga_giocata_sport.return_value = Result.ok(111)
+                mock_instance.add_riga_cascata.return_value = Result.ok(
+                    WriteResult(success=True, netcap_id=111, message=None)
+                )
                 mock_client_cls.return_value = mock_instance
                 mock_client_cls.BETFAIR_EXCHANGE_ID = 6
 
@@ -235,18 +238,17 @@ class TestCompleteOperation:
             assert body["status"] == "completed"
             assert body["operazione_id"] == 999
             assert body["riga_id"] == 111
+            assert body["linked_existing"] is False
 
             mock_instance.write_operazione.assert_called_once()
-            mock_instance.add_riga_giocata_sport.assert_called_once()
-            riga_kwargs = mock_instance.add_riga_giocata_sport.call_args.kwargs
+            mock_instance.add_riga_cascata.assert_called_once()
+            riga_kwargs = mock_instance.add_riga_cascata.call_args.kwargs
             assert riga_kwargs["operazione_id"] == 999
-            assert riga_kwargs["exchange_id"] == 6
-            assert riga_kwargs["punta"] == pytest.approx(400.0)
-            assert riga_kwargs["quota_punta"] == pytest.approx(3.60)
-            assert riga_kwargs["contropuntata"] == pytest.approx(461.66)
-            assert riga_kwargs["quota_contropuntata"] == pytest.approx(3.50)
-            assert riga_kwargs["profitto_book"] == 0.0
-            assert riga_kwargs["profitto_banco"] == 0.0
+            assert riga_kwargs["back_stake"] == pytest.approx(400.0)
+            assert riga_kwargs["back_odds"] == pytest.approx(3.60)
+            assert riga_kwargs["lay_stake"] == pytest.approx(461.66)
+            assert riga_kwargs["lay_odds"] == pytest.approx(3.50)
+            assert riga_kwargs["bet_gruppo_id"] is None  # "singola" di default
 
             updated = json.loads(path.read_text(encoding="utf-8"))
             assert updated["alerts"][0]["status"] == "completed"
@@ -261,3 +263,174 @@ class TestCompleteOperation:
             })
         assert response.status_code == 404
         mock_client_cls.assert_not_called()
+
+    def test_complete_op_new_cascade(self):
+        """op_type='cascata' su nuova operazione -> bet_gruppo_id generato dall'operazione_id."""
+        filename = "unregistered_ops_test_cascade.json"
+        alert = {
+            "item_id": "unreg_test_cascade_0_123",
+            "collaboratore_id": "test",
+            "betfair_open_bet": {
+                "bet_id": "1:443519021791",
+                "event": "Gil Vicente - Maritimo",
+                "lay_stake": 461.66,
+                "lay_odds": 3.50,
+            },
+            "detected_at": "2026-09-19T16:00:00",
+            "status": "pending",
+            "bookmaker_id": None,
+            "back_stake": None,
+            "back_odds": None,
+            "tipologia": "Ricorrenti",
+        }
+        path = _write_alert_report(filename, [alert], collaboratore_id="test")
+        try:
+            with patch("orchestrator.dashboard.app.AppApiClient") as mock_client_cls:
+                mock_instance = MagicMock()
+                mock_instance.write_operazione.return_value = Result.ok(
+                    WriteResult(success=True, netcap_id=999, message=None)
+                )
+                mock_instance.add_riga_cascata.return_value = Result.ok(
+                    WriteResult(success=True, netcap_id=222, message=None)
+                )
+                mock_client_cls.return_value = mock_instance
+
+                client = TestClient(app)
+                response = client.post("/complete_op/unreg_test_cascade_0_123", json={
+                    "bookmaker_id": 5, "back_stake": 400.0, "back_odds": 3.60,
+                    "op_type": "cascata", "total_events": 3, "current_event": 1,
+                })
+
+            assert response.status_code == 200
+            body = response.json()
+            assert body["status"] == "completed"
+            assert body["linked_existing"] is False
+
+            mock_instance.write_operazione.assert_called_once()
+            riga_kwargs = mock_instance.add_riga_cascata.call_args.kwargs
+            assert riga_kwargs["bet_gruppo_id"].startswith("cascade_999_")
+            assert riga_kwargs["note"] == "Cascata evento 1/3"
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_complete_op_link_existing(self):
+        """existing_op_id fornito -> nessuna nuova operazione, bet_gruppo_id riusato da quella esistente."""
+        filename = "unregistered_ops_test_link.json"
+        alert = {
+            "item_id": "unreg_test_link_0_123",
+            "collaboratore_id": "test",
+            "betfair_open_bet": {
+                "bet_id": "1:443519021792",
+                "event": "Gil Vicente - Maritimo",
+                "lay_stake": 200.0,
+                "lay_odds": 2.10,
+            },
+            "detected_at": "2026-09-19T16:00:00",
+            "status": "pending",
+            "bookmaker_id": None,
+            "back_stake": None,
+            "back_odds": None,
+            "tipologia": "Ricorrenti",
+        }
+        path = _write_alert_report(filename, [alert], collaboratore_id="test")
+        try:
+            with patch("orchestrator.dashboard.app.AppApiClient") as mock_client_cls:
+                mock_instance = MagicMock()
+                mock_instance.get_open_operations.return_value = Result.ok([
+                    {"id": 777, "nome": "Gil Vicente - Maritimo", "stato": "APERTO", "bet_gruppo_id": "cascade_777_111"},
+                ])
+                mock_instance.add_riga_cascata.return_value = Result.ok(
+                    WriteResult(success=True, netcap_id=333, message=None)
+                )
+                mock_client_cls.return_value = mock_instance
+
+                client = TestClient(app)
+                response = client.post("/complete_op/unreg_test_link_0_123", json={
+                    "bookmaker_id": 5, "back_stake": 150.0, "back_odds": 2.05,
+                    "existing_op_id": 777,
+                })
+
+            assert response.status_code == 200
+            body = response.json()
+            assert body["operazione_id"] == 777
+            assert body["linked_existing"] is True
+
+            mock_instance.write_operazione.assert_not_called()
+            riga_kwargs = mock_instance.add_riga_cascata.call_args.kwargs
+            assert riga_kwargs["operazione_id"] == 777
+            assert riga_kwargs["bet_gruppo_id"] == "cascade_777_111"
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_dashboard_open_operations_route(self):
+        with patch("orchestrator.dashboard.app.AppApiClient") as mock_client_cls:
+            mock_instance = MagicMock()
+            mock_instance.get_open_operations.return_value = Result.ok([
+                {"id": 119, "nome": "Gil Vicente - Maritimo", "stato": "APERTO", "bet_gruppo_id": None},
+            ])
+            mock_client_cls.return_value = mock_instance
+
+            client = TestClient(app)
+            response = client.get("/open_operations/08")
+
+        assert response.status_code == 200
+        assert response.json() == [
+            {"id": 119, "nome": "Gil Vicente - Maritimo", "stato": "APERTO", "bet_gruppo_id": None},
+        ]
+        mock_instance.get_open_operations.assert_called_once_with("08")
+
+
+# ------------------------------------------------------------------
+# 8-9: AppApiClient — cascata / operazioni aperte
+# ------------------------------------------------------------------
+
+class TestAddRigaCascata:
+    def test_add_riga_cascata_payload(self):
+        """Verifica lo schema reale (puntata_e_bancata, niente quota_*) e il bet_gruppo_id."""
+        client = AppApiClient(session_token="x")
+        client._post_json = MagicMock(return_value=Result.ok({"id": 555}))
+
+        result = client.add_riga_cascata(
+            operazione_id=42,
+            collaboratore_id="08",
+            bookmaker_id=5,
+            back_stake=400.0,
+            back_odds=3.60,
+            lay_stake=461.66,
+            lay_odds=3.50,
+            bet_gruppo_id="cascade_42_123",
+        )
+
+        assert result.success
+        assert result.data.success
+        assert result.data.netcap_id == 555
+
+        client._post_json.assert_called_once()
+        path, body = client._post_json.call_args.args
+        assert path == "/operazioni/42/righe"
+        assert body["tipo_riga"] == "puntata_e_bancata"
+        assert body["parent_id"] is None
+        assert body["banco_collaboratore_id"] is None
+        assert body["punta"] == pytest.approx(400.0)
+        assert body["contropuntata"] == pytest.approx(461.66)
+        assert body["bet_gruppo_id"] == "cascade_42_123"
+        assert "quota_punta" not in body
+        assert "quota_contropuntata" not in body
+
+
+class TestGetOpenOperations:
+    def test_get_open_operations_maps_shape(self):
+        """Wrapper su get_operazioni_aperte: estrae bet_gruppo_id dalle righe annidate."""
+        client = AppApiClient(session_token="x")
+        client.get_operazioni_aperte = MagicMock(return_value=Result.ok([
+            {"id": 119, "nome": "Gil Vicente - Maritimo", "stato": "APERTO",
+             "righe": [{"bet_gruppo_id": "cascade_119_xxx"}]},
+        ]))
+
+        result = client.get_open_operations("08")
+
+        assert result.success
+        assert result.data == [{
+            "id": 119, "nome": "Gil Vicente - Maritimo", "stato": "APERTO",
+            "bet_gruppo_id": "cascade_119_xxx",
+        }]

@@ -105,7 +105,7 @@
         <p style="color: #666; font-size: 13px;">Bancate su Betfair non registrate su Netcap. Completa i campi mancanti.</p>
         {% if operazioni_non_registrate %}
         <table>
-            <tr><th>Collaboratore</th><th>Evento</th><th>Esito</th><th>Quota Lay</th><th>Lay Stake</th><th>Responsabilità</th><th>Book</th><th>Back Stake</th><th>Back Odds</th><th></th></tr>
+            <tr><th>Collaboratore</th><th>Evento</th><th>Esito</th><th>Quota Lay</th><th>Lay Stake</th><th>Responsabilità</th><th>Book</th><th>Back Stake</th><th>Back Odds</th><th>Cascata</th><th></th></tr>
             {% for o in operazioni_non_registrate %}
             <tr class="item {{ o.severity }}">
                 <td>{{ o.collaboratore_id }}</td>
@@ -123,6 +123,29 @@
                 </td>
                 <td><input type="number" step="0.01" id="back_stake-{{ o.item_id }}" style="width: 80px;"></td>
                 <td><input type="number" step="0.01" id="back_odds-{{ o.item_id }}" style="width: 70px;"></td>
+                <td>
+                    <div class="cascade-fields">
+                        <label>Tipo:</label>
+                        <select id="op_type_{{ o.item_id }}" onchange="toggleCascadeFields('{{ o.item_id }}')">
+                            <option value="singola">Singola</option>
+                            <option value="cascata">Cascata (multipla)</option>
+                        </select>
+
+                        <div id="cascade_detail_{{ o.item_id }}" style="display:none;">
+                            <label>Tot.:</label>
+                            <input type="number" id="total_events_{{ o.item_id }}" min="2" max="10" value="3" style="width: 50px;">
+                            <label>Attuale:</label>
+                            <input type="number" id="current_event_{{ o.item_id }}" min="1" max="10" value="1" style="width: 50px;">
+                        </div>
+
+                        <div id="link_existing_{{ o.item_id }}" style="display:none;">
+                            <label>Collega a operazione esistente:</label>
+                            <select id="existing_op_{{ o.item_id }}" onchange="toggleExistingOpSelected('{{ o.item_id }}')">
+                                <option value="">— Nuova operazione —</option>
+                            </select>
+                        </div>
+                    </div>
+                </td>
                 <td><button class="btn btn-approve" onclick="completeOperation('{{ o.item_id }}')">Registra</button></td>
             </tr>
             {% endfor %}
@@ -137,10 +160,56 @@
             fetch(`/${action}/${itemId}`, { method: 'POST' });
         }
 
+        const pendingCollaboratori = {
+            {% for o in operazioni_non_registrate %}
+            "{{ o.item_id }}": "{{ o.collaboratore_id }}",
+            {% endfor %}
+        };
+
+        function toggleCascadeFields(itemId) {
+            const opType = document.getElementById(`op_type_${itemId}`).value;
+            document.getElementById(`cascade_detail_${itemId}`).style.display = opType === 'cascata' ? '' : 'none';
+        }
+
+        function toggleExistingOpSelected(itemId) {
+            const existingOpId = document.getElementById(`existing_op_${itemId}`).value;
+            const opTypeSelect = document.getElementById(`op_type_${itemId}`);
+            opTypeSelect.disabled = !!existingOpId;
+            document.getElementById(`cascade_detail_${itemId}`).style.display =
+                (!existingOpId && opTypeSelect.value === 'cascata') ? '' : 'none';
+        }
+
+        function loadOpenOperations(itemId, collaboratoreId) {
+            fetch(`/open_operations/${collaboratoreId}`)
+                .then(r => r.json())
+                .then(operations => {
+                    if (!Array.isArray(operations) || operations.length === 0) return;
+                    const select = document.getElementById(`existing_op_${itemId}`);
+                    operations.forEach(op => {
+                        const option = document.createElement('option');
+                        option.value = op.id;
+                        option.textContent = `${op.nome} (#${op.id})`;
+                        select.appendChild(option);
+                    });
+                    document.getElementById(`link_existing_${itemId}`).style.display = '';
+                })
+                .catch(() => {});
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            Object.entries(pendingCollaboratori).forEach(([itemId, collaboratoreId]) => {
+                loadOpenOperations(itemId, collaboratoreId);
+            });
+        });
+
         function completeOperation(itemId) {
             const bookmakerId = document.getElementById(`bookmaker-${itemId}`).value;
             const backStake = document.getElementById(`back_stake-${itemId}`).value;
             const backOdds = document.getElementById(`back_odds-${itemId}`).value;
+            const opType = document.getElementById(`op_type_${itemId}`).value;
+            const totalEvents = document.getElementById(`total_events_${itemId}`).value;
+            const currentEvent = document.getElementById(`current_event_${itemId}`).value;
+            const existingOpId = document.getElementById(`existing_op_${itemId}`).value;
             fetch(`/complete_op/${itemId}`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -148,6 +217,10 @@
                     bookmaker_id: parseInt(bookmakerId, 10),
                     back_stake: parseFloat(backStake),
                     back_odds: parseFloat(backOdds),
+                    op_type: opType,
+                    total_events: parseInt(totalEvents, 10),
+                    current_event: parseInt(currentEvent, 10),
+                    existing_op_id: existingOpId ? parseInt(existingOpId, 10) : null,
                 }),
             });
         }
