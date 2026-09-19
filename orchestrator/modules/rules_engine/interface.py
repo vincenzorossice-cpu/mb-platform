@@ -37,6 +37,19 @@ class ReconciliationResult:
     rules_applied: list[str]
 
 
+@dataclass
+class UnregisteredOperationAlert:
+    """Bancata Betfair aperta senza operazione corrispondente su Netcap."""
+    collaboratore_id: str
+    betfair_open_bet: dict
+    detected_at: str
+    status: str = "pending"     # "pending" | "completed" | "ignored"
+    bookmaker_id: Optional[int] = None
+    back_stake: Optional[float] = None
+    back_odds: Optional[float] = None
+    tipologia: str = "Ricorrenti"
+
+
 class RulesEngineInterface(ABC):
     """Contratto per il motore regole di riconciliazione P6."""
 

@@ -184,6 +184,12 @@ def process_book(
         record["action"] = rec.action
         record["rules_applied"] = rec.rules_applied
         record["status"] = "ok"
+        # una bancata Betfair non registrata su Netcap fa scattare open_bets_netcap_mismatch
+        # qui sopra come hitl_required generico: va gestita dal flusso dedicato
+        # (test_betfair_unregistered_ops.py), non mostrata come rettifica ambigua
+        record["betfair_open_bets_candidate"] = (
+            account.is_betfair and "open_bets_netcap_mismatch" in rec.rules_applied
+        )
 
         if rec.action == "adjust" and rec.rectification is not None:
             record["rectification"] = asdict(rec.rectification)

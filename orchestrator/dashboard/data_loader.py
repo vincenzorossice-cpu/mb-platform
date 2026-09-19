@@ -32,6 +32,10 @@ def load_rettifiche(report_dir: str = DEFAULT_REPORT_DIR) -> list[dict]:
         for i, result in enumerate(report.get("results", [])):
             if result.get("action") != "hitl_required":
                 continue
+            if result.get("betfair_open_bets_candidate"):
+                # gestita dalla sezione dedicata "Operazioni non registrate", non
+                # come rettifica generica ambigua
+                continue
             confidence = result.get("real_balance", {}).get("confidence")
             differenza = result.get("difference", 0.0)
             severity = "critical"
@@ -76,6 +80,46 @@ def load_movimenti(report_dir: str = DEFAULT_REPORT_DIR) -> list[dict]:
                 "severity": severity,
             })
     return movimenti
+
+
+def load_unregistered_operations(report_dir: str = DEFAULT_REPORT_DIR) -> list[dict]:
+    """Legge gli alert 'operazione non registrata' pending salvati da
+    RulesEngine.save_unregistered_alerts."""
+    operazioni = []
+    for report in _load_json_files(report_dir, "unregistered_ops_*.json"):
+        collaboratore_id = report.get("collaboratore_id")
+        for alert in report.get("alerts", []):
+            if alert.get("status") != "pending":
+                continue
+            bet = alert.get("betfair_open_bet", {})
+            operazioni.append({
+                "item_id": alert.get("item_id"),
+                "collaboratore_id": alert.get("collaboratore_id", collaboratore_id),
+                "event": bet.get("event"),
+                "selection": bet.get("selection"),
+                "bet_id": bet.get("bet_id"),
+                "lay_stake": bet.get("lay_stake"),
+                "lay_odds": bet.get("lay_odds"),
+                "liability": bet.get("liability"),
+                "placed_at": bet.get("placed_at"),
+                "detected_at": alert.get("detected_at"),
+                "severity": "critical",  # bancata reale non registrata = movimento di denaro reale non tracciato
+            })
+    return operazioni
+
+
+def load_bookmaker_options(config_path: str = None) -> dict:
+    """Merge deduplicato bookmaker_id -> nome da tutte le identity in
+    config.json, per la dropdown book della sezione 'Operazioni non registrate'."""
+    from orchestrator.core.config import load_config
+    config = load_config(config_path)
+    options: dict[int, str] = {}
+    for identity in config.get("identities", []):
+        for book in identity.get("books", []):
+            bk_id, name = book.get("bookmaker_id"), book.get("name")
+            if bk_id is not None and name:
+                options[int(bk_id)] = name
+    return dict(sorted(options.items(), key=lambda kv: kv[1]))
 
 
 def load_errors(report_dir: str = DEFAULT_REPORT_DIR) -> list[dict]:

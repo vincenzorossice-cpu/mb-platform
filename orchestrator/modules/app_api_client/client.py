@@ -359,6 +359,81 @@ class AppApiClient(AppApiClientInterface):
             return Result.fail(f"Risposta riga senza id: {res.data}", self.NETCAP_PARSE_ERROR)
         return Result.ok(riga_id)
 
+    # Betfair e' il solo exchange gestito; il suo bookmaker_id (6) coincide oggi
+    # con RICONCILIAZIONE_PLACEHOLDER_BOOKMAKER_ID ma le due costanti restano
+    # separate di proposito: significano cose diverse (contenitore multi-book
+    # generico vs. identita' reale dell'exchange in una riga giocata_sport).
+    BETFAIR_EXCHANGE_ID = 6
+
+    def get_operazioni_aperte(self, collaboratore_id: str) -> Result[list[dict]]:
+        """GET /operazioni?collaboratori_ids=...&stato=APERTO: stesso pattern
+        raw-session-con-params di _find_existing_operazione_rettifica (bypassa
+        _get_json, che non supporta query params). Forma esatta della risposta
+        (presenza/nomi di eventuali 'righe' annidate) non confermata — il
+        consumo lato RulesEngine._matches_netcap e' defensivo."""
+        url = f"{self.base_url}/operazioni"
+        params = {"collaboratori_ids": collaboratore_id, "stato": "APERTO"}
+        try:
+            resp = self.session.get(url, params=params, timeout=self.timeout)
+        except requests.ConnectionError as exc:
+            return Result.fail(f"Connessione fallita: {exc}", self.NETCAP_UNREACHABLE)
+        except requests.Timeout:
+            return Result.fail(f"Timeout su {url}", self.NETCAP_TIMEOUT)
+
+        if not resp.ok:
+            return Result.fail(f"HTTP {resp.status_code} da {url}", self.NETCAP_HTTP_ERROR)
+
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            return Result.fail(f"JSON non valido: {exc}", self.NETCAP_PARSE_ERROR)
+
+        if not isinstance(data, list):
+            return Result.fail(f"Risposta /operazioni non e' una lista: {type(data)}", self.NETCAP_PARSE_ERROR)
+        return Result.ok(data)
+
+    def add_riga_giocata_sport(
+        self,
+        operazione_id: int,
+        collaboratore_id: str,
+        bookmaker_id: int,
+        exchange_id: int,
+        punta: float,
+        contropuntata: float,
+        quota_punta: float,
+        quota_contropuntata: float,
+        profitto_book: float,
+        profitto_banco: float,
+        fee_percentuale: float = 4.5,
+    ) -> Result[int]:
+        """POST /operazioni/{id}/righe: riga 'giocata_sport' (bancata reale su
+        un book x exchange, es. Betfair). A differenza di add_riga_rettifica,
+        qui e' corretto che la fee si applichi a profitto_banco: non e' una
+        rettifica, e' un'operazione sportiva reale su exchange."""
+        body = {
+            "operazione_id": operazione_id,
+            "collaboratore_id": collaboratore_id,
+            "tipo_riga": "giocata_sport",
+            "bookmaker_id": bookmaker_id,
+            "exchange_id": exchange_id,
+            "punta": round(punta, 2),
+            "contropuntata": round(contropuntata, 2),
+            "quota_punta": quota_punta,
+            "quota_contropuntata": quota_contropuntata,
+            "profitto_book": round(profitto_book, 2),
+            "profitto_banco": round(profitto_banco, 2),
+            "fee_percentuale": fee_percentuale,
+            "stato": "in_corso",
+        }
+        res = self._post_json(f"/operazioni/{operazione_id}/righe", body)
+        if not res.success:
+            return res  # type: ignore[return-value]
+
+        riga_id = res.data.get("id") if isinstance(res.data, dict) else None
+        if riga_id is None:
+            return Result.fail(f"Risposta riga senza id: {res.data}", self.NETCAP_PARSE_ERROR)
+        return Result.ok(riga_id)
+
     def close_riga(self, riga_id: int) -> Result[bool]:
         """POST /operazioni/righe/{id}/chiudi: chiude la riga appena scritta."""
         res = self._post_no_body(f"/operazioni/righe/{riga_id}/chiudi")

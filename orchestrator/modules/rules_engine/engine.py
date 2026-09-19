@@ -1,12 +1,18 @@
+import json
+from datetime import datetime, timezone
+from dataclasses import asdict
+from pathlib import Path
 from typing import Optional
 
 from orchestrator.core.result import Result
 from orchestrator.modules.screen_reader.interface import BalanceReading
+from orchestrator.modules.screen_reader.betfair_open_bets import BetfairOpenBet
 from orchestrator.modules.rules_engine.interface import (
     Account,
     Rectification,
     ReconciliationResult,
     RulesEngineInterface,
+    UnregisteredOperationAlert,
 )
 
 
@@ -107,9 +113,99 @@ class RulesEngine(RulesEngineInterface):
             rules_applied=rules_applied,
         ))
 
+    def detect_unregistered_operations(
+        self,
+        open_bets: list[BetfairOpenBet],
+        collaboratore_id: str,
+        netcap_operations: list[dict],
+    ) -> Result[list[UnregisteredOperationAlert]]:
+        """Confronta le bancate aperte su Betfair con le operazioni registrate
+        su Netcap. Le bancate senza operazione corrispondente (tolleranza ±1
+        EUR su lay_stake/liability contro qualunque campo stake-like trovato
+        sull'operazione) diventano alert 'operazione non registrata'."""
+        now = datetime.now(timezone.utc).isoformat()
+        alerts: list[UnregisteredOperationAlert] = []
+        for bet in open_bets:
+            if any(self._matches_netcap(bet, op) for op in netcap_operations):
+                continue
+            alerts.append(UnregisteredOperationAlert(
+                collaboratore_id=collaboratore_id,
+                betfair_open_bet=asdict(bet),
+                detected_at=now,
+            ))
+        return Result.ok(alerts)
+
+    def save_unregistered_alerts(
+        self,
+        alerts: list[UnregisteredOperationAlert],
+        collaboratore_id: str,
+        report_dir: str = "orchestrator/tests/validation/reports",
+    ) -> Result[str]:
+        """Salva gli alert 'operazione non registrata' in un file JSON per la
+        HITL Dashboard (stesso pattern di MovementImporter.save_pending_movements)."""
+        now = datetime.now(timezone.utc)
+        directory = Path(report_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        file_path = directory / f"unregistered_ops_{collaboratore_id}_{now:%Y%m%d_%H%M%S}.json"
+
+        epoch = int(now.timestamp())
+        alerts_data = [{
+            "item_id": f"unreg_{collaboratore_id}_{index}_{epoch}",
+            "collaboratore_id": alert.collaboratore_id,
+            "betfair_open_bet": alert.betfair_open_bet,
+            "detected_at": alert.detected_at,
+            "status": alert.status,
+            "bookmaker_id": alert.bookmaker_id,
+            "back_stake": alert.back_stake,
+            "back_odds": alert.back_odds,
+            "tipologia": alert.tipologia,
+        } for index, alert in enumerate(alerts)]
+
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "collaboratore_id": collaboratore_id,
+                "detected_at": now.isoformat(),
+                "alerts": alerts_data,
+            }, f, ensure_ascii=False, indent=2)
+
+        return Result.ok(str(file_path))
+
     # ------------------------------------------------------------------
     # private
     # ------------------------------------------------------------------
+
+    # campi Netcap potenzialmente stake-like; forma reale della risposta
+    # GET /operazioni non confermata — estrazione defensiva, mai eccezione
+    _NETCAP_STAKE_LIKE_KEYS = ("contropuntata", "punta", "importo", "importo_impegnato", "stake", "liability")
+
+    def _matches_netcap(self, bet: BetfairOpenBet, operazione: dict) -> bool:
+        """±1 EUR di tolleranza tra lay_stake/liability della bancata e
+        qualunque campo stake-like trovato sull'operazione Netcap."""
+        for value in self._extract_netcap_stake_fields(operazione):
+            if abs(round(bet.lay_stake - value, 2)) <= 1.0 or abs(round(bet.liability - value, 2)) <= 1.0:
+                return True
+        return False
+
+    def _extract_netcap_stake_fields(self, operazione: dict) -> list[float]:
+        """Estrazione defensiva: top-level + righe annidate (se presenti),
+        ignora tutto cio' che non e' un numero. Un'operazione senza campi
+        comparabili conta come 'non corrispondente', mai eccezione."""
+        values: list[float] = []
+        if not isinstance(operazione, dict):
+            return values
+        for key in self._NETCAP_STAKE_LIKE_KEYS:
+            v = operazione.get(key)
+            if isinstance(v, (int, float)):
+                values.append(float(v))
+        righe = operazione.get("righe")
+        if isinstance(righe, list):
+            for riga in righe:
+                if isinstance(riga, dict):
+                    for key in self._NETCAP_STAKE_LIKE_KEYS:
+                        v = riga.get(key)
+                        if isinstance(v, (int, float)):
+                            values.append(float(v))
+        return values
 
     def _calc_adjusted_balance(self, br: BalanceReading) -> float:
         """raw_balance + real_bonus (wagering escluso; open_bets escluso: usato solo

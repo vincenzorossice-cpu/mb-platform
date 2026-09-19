@@ -232,11 +232,19 @@ class Orchestrator:
                 )
             summary["adjusted"] += 1
         elif reconciliation.action == "hitl_required":
-            self.add_hitl_item(
-                "reconciliation",
-                {"identity_id": identity_id, "book": book["name"], "reconciliation": reconciliation},
-                severity="warning",
+            # una bancata Betfair non registrata su Netcap fa scattare
+            # open_bets_netcap_mismatch qui sopra: va gestita dal flusso
+            # dedicato (test_betfair_unregistered_ops.py + dashboard), non
+            # accodata come hitl_required generico
+            is_betfair_open_bets_case = (
+                book.get("is_exchange") and "open_bets_netcap_mismatch" in reconciliation.rules_applied
             )
+            if not is_betfair_open_bets_case:
+                self.add_hitl_item(
+                    "reconciliation",
+                    {"identity_id": identity_id, "book": book["name"], "reconciliation": reconciliation},
+                    severity="warning",
+                )
             summary["hitl"] += 1
 
     def _write_rettifica_live(self, identity_id: str, book: dict, reconciliation,
