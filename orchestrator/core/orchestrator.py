@@ -201,25 +201,31 @@ class Orchestrator:
                 })
                 return
 
-            reconcile_result = self.rules_engine.reconcile(balance_result.data, expected.saldo_atteso, account)
+            reconcile_result = self.rules_engine.reconcile(
+                balance_result.data, expected.saldo_atteso, account,
+                impegnato_netcap=expected.importo_impegnato,
+            )
             if not reconcile_result.success:
                 summary["errors"].append({
                     "identity_id": identity_id, "book": book["name"], "error": reconcile_result.error,
                 })
                 return
 
-            self._apply_reconciliation(identity_id, book, reconcile_result.data, live, summary, ctx)
+            self._apply_reconciliation(
+                identity_id, book, reconcile_result.data, live, summary, ctx,
+                impegnato_netcap=expected.importo_impegnato,
+            )
         finally:
             if device_id is not None:
                 self.device_manager.release_lock(device_id)
 
     def _apply_reconciliation(self, identity_id: str, book: dict, reconciliation, live: bool,
-                               summary: dict, ctx: dict) -> None:
+                               summary: dict, ctx: dict, impegnato_netcap: float = 0.0) -> None:
         if reconciliation.action == "no_adjustment":
             summary["no_adjustment"] += 1
         elif reconciliation.action == "adjust":
             if live:
-                self._write_rettifica_live(identity_id, book, reconciliation, ctx, summary)
+                self._write_rettifica_live(identity_id, book, reconciliation, ctx, summary, impegnato_netcap)
             else:
                 print(
                     f"[DRY-RUN] {identity_id}/{book['name']}: rettifica {reconciliation.rectification}"
@@ -234,7 +240,7 @@ class Orchestrator:
             summary["hitl"] += 1
 
     def _write_rettifica_live(self, identity_id: str, book: dict, reconciliation,
-                               ctx: dict, summary: dict) -> None:
+                               ctx: dict, summary: dict, impegnato_netcap: float = 0.0) -> None:
         """Scrive la rettifica sull'operazione di riconciliazione condivisa del
         ciclo, creandola lazy alla prima rettifica necessaria."""
         if ctx["operazione_id"] is None:
@@ -274,7 +280,11 @@ class Orchestrator:
             })
             # non interrompere: la verifica finale resta comunque significativa
 
-        ctx["written"].append((identity_id, book["bookmaker_id"], book["name"], reconciliation.adjusted_balance))
+        # verify_balance_after_rettifica confronta il matrix (totale) grezzo di Netcap:
+        # reconciliation.adjusted_balance e' il disponibile telefono (raw+real_bonus),
+        # va ricomposto in totale riaggiungendo l'impegnato (non toccato dalla rettifica)
+        matrix_atteso_post_rettifica = round(reconciliation.adjusted_balance + impegnato_netcap, 2)
+        ctx["written"].append((identity_id, book["bookmaker_id"], book["name"], matrix_atteso_post_rettifica))
 
     # ------------------------------------------------------------------
     # P7 — import movimenti

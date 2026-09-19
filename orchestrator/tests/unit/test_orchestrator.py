@@ -487,6 +487,51 @@ class TestRunDailyRiconciliazione:
         assert result.data["errors"] == []
         assert orch.rules_engine.reconcile.call_count == 4
 
+    def test_run_daily_riconciliazione_passes_impegnato_netcap_to_rules_engine(self, orch):
+        """importo_impegnato di ExpectedBalance viene passato a RulesEngine.reconcile."""
+        orch.config = _one_identity_config()
+        orch.app_api_client.read_expected_balance.return_value = Result.ok([
+            ExpectedBalance(collaboratore_id="01", bookmaker_id=6, bookmaker_nome="BETFAIR",
+                             saldo_atteso=212.92, importo_impegnato=200.0, is_exchange=True),
+        ])
+        orch.screen_reader.read_balance.return_value = Result.ok(_balance_reading(raw_balance=12.92))
+        orch.rules_engine.reconcile.return_value = Result.ok(_reconciliation_result("no_adjustment"))
+
+        result = orch.run_daily_riconciliazione()
+
+        assert result.success
+        orch.rules_engine.reconcile.assert_called_once()
+        _, kwargs = orch.rules_engine.reconcile.call_args
+        assert kwargs["impegnato_netcap"] == 200.0
+
+    def test_run_daily_riconciliazione_verify_uses_matrix_reconstructed_with_impegnato(self, orch):
+        """live=True: la verifica post-rettifica confronta contro il matrix totale
+        (disponibile telefono + impegnato Netcap), non contro il solo disponibile."""
+        orch.config = _one_identity_config()
+        orch.app_api_client.read_expected_balance.return_value = Result.ok([
+            ExpectedBalance(collaboratore_id="01", bookmaker_id=6, bookmaker_nome="BETFAIR",
+                             saldo_atteso=212.92, importo_impegnato=200.0, is_exchange=True),
+        ])
+        orch.screen_reader.read_balance.return_value = Result.ok(_balance_reading(raw_balance=5.92))
+        rectification = Rectification(amount=-7.0, column="BOOK", reason="differenza saldo")
+        reconciliation = ReconciliationResult(
+            adjusted_balance=5.92, expected_balance=12.92, difference=-7.0,
+            column="BOOK", bonus_note=None, action="adjust",
+            rectification=rectification, rules_applied=[],
+        )
+        orch.rules_engine.reconcile.return_value = Result.ok(reconciliation)
+        orch.app_api_client.create_riconciliazione_operazione.return_value = Result.ok(145)
+        orch.app_api_client.add_riga_rettifica.return_value = Result.ok(991)
+        orch.app_api_client.close_riga.return_value = Result.ok(True)
+        orch.app_api_client.close_operazione.return_value = Result.ok(True)
+        orch.app_api_client.verify_balance_after_rettifica.return_value = Result.ok(True)
+
+        result = orch.run_daily_riconciliazione(live=True)
+
+        assert result.success
+        # adjusted_balance (5.92, disponibile telefono) + impegnato_netcap (200.0) = 205.92
+        orch.app_api_client.verify_balance_after_rettifica.assert_called_once_with("01", 6, 205.92)
+
     def test_run_daily_riconciliazione_opsec_blocked(self, orch):
         """OpSec segnala rischio alto -> skip, HITL, nessuna lettura saldo."""
         orch.config = _one_identity_config()

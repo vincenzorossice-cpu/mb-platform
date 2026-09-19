@@ -46,5 +46,6 @@ class RulesEngineInterface(ABC):
         balance_reading: BalanceReading,
         expected_balance: float,
         account: Account,
+        impegnato_netcap: float = 0.0,
     ) -> Result[ReconciliationResult]:
         """Applica le regole di riconciliazione P6."""
