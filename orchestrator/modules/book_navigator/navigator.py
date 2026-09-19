@@ -67,7 +67,7 @@ class BookNavigator(BookNavigatorInterface):
     # Configurazione per-book: solo URL. Le keyword di navigazione sono
     # generiche e valgono per qualunque sito (vedi costanti di modulo sopra).
     BOOK_CONFIG = {
-        "BETFAIR": {"url": "https://mobile.betfair.com"},
+        "BETFAIR": {"url": "https://www.betfair.it/exchange/plus/"},
         "SISAL": {"url": "https://m.sisal.it"},
         "STANLEYBET": {"url": "https://m.stanleybet.it"},
         "BET365": {"url": "https://www.bet365.it"},
