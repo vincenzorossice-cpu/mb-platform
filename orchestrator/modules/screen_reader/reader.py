@@ -34,6 +34,19 @@ _AMOUNT_RE = re.compile(
     r"\s*€?\)?"
 )
 
+# FIX-BETFAIR-STANDALONE: elemento che contiene SOLO un importo con simbolo euro
+# (nessun'altra parola), usato come saldo quando non esiste un'etichetta associata
+# (es. Betfair mostra il saldo come "â‚¬1,194.57" standalone). "â‚¬" e' la sequenza
+# mojibake reale di "€" nei dump con encoding errato.
+_STANDALONE_EURO_RE = re.compile(
+    r"^\s*[-+]?\(?\s*(?:€|â‚¬|EUR|eur)\s*"
+    r"(?:\d{1,3}(?:\.\d{3})+,\d{2}"   # italiano con migliaia: 1.234,56
+    r"|\d{1,3}(?:,\d{3})+\.\d{2}"     # inglese con migliaia: 1,194.57
+    r"|\d+,\d{2}"                      # solo virgola decimale: 150,75
+    r"|\d+\.\d{2})"                    # solo punto decimale: 123.45
+    r"\s*\)?\s*$"
+)
+
 # FIX-4: etichette per scommesse aperte, bonus reale (prelevabile) e wagering bonus
 _OPEN_BETS_LABELS = ("scommesse aperte", "open bets", "scommesse in corso", "puntate aperte", "giocate aperte")
 _REAL_BONUS_LABELS = ("bonus reale", "real bonus", "bonus saldo", "bonus disponibile")
@@ -455,6 +468,17 @@ class ScreenReader(ScreenReaderInterface):
                         break
 
         if raw_balance is None:
+            # FIX-BETFAIR-STANDALONE: nessuna etichetta trovata (ne' generica ne' per-book) ->
+            # cerca un elemento che sia SOLO un importo con simbolo euro (es. Betfair "â‚¬1,194.57")
+            for t in texts:
+                match = _STANDALONE_EURO_RE.match(t)
+                if match:
+                    val = self._clean_italian_amount(match.group(0))
+                    if val is not None:
+                        raw_balance = val
+                        break
+
+        if raw_balance is None:
             # FIX-1: nessuna etichetta trovata -> non indovinare, ritorna None
             return None
 
@@ -502,7 +526,7 @@ class ScreenReader(ScreenReaderInterface):
         # FIX-2: normalizza un importo in formato italiano o inglese, con simbolo euro,
         # segno negativo o parentesi, in un float
         s = amount_str.strip()
-        s = s.replace("€", "").replace("EUR", "").replace("eur", "").strip()
+        s = s.replace("€", "").replace("â‚¬", "").replace("EUR", "").replace("eur", "").strip()
 
         negative = False
         if s.startswith("(") and s.endswith(")"):
@@ -518,8 +542,12 @@ class ScreenReader(ScreenReaderInterface):
         has_comma = "," in s
 
         if has_dot and has_comma:
-            # punto = separatore di migliaia, virgola = decimale
-            s = s.replace(".", "").replace(",", ".")
+            # FIX-BETFAIR-STANDALONE: il separatore che compare per ultimo e' il decimale
+            # (euristica standard) - gestisce sia "1.234,56" (IT) che "1,194.57" (EN)
+            if s.rfind(",") > s.rfind("."):
+                s = s.replace(".", "").replace(",", ".")
+            else:
+                s = s.replace(",", "")
         elif has_comma:
             # solo virgola: e' il decimale
             s = s.replace(",", ".")
