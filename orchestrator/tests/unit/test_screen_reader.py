@@ -256,3 +256,46 @@ class TestClassifyScreen:
     def test_classify_unknown(self, reader):
         elements = [UIElement(text="Qualcos'altro", bounds=[0,0,100,100])]
         assert reader._classify_screen(elements) == "unknown"
+
+    def test_classify_betfair_standalone_euro(self, reader):
+        """FIX-CLASSIFY-STANDALONE: saldo senza etichetta, solo importo standalone."""
+        elements = [UIElement(text="â‚¬1,194.57", bounds=[0, 0, 100, 100])]
+        assert reader._classify_screen(elements) == "balance_page"
+
+    def test_classify_standalone_euro_with_other_elements(self, reader):
+        """L'importo standalone deve vincere su 'unknown' anche con altri elementi
+        della UI Betfair che non fanno match con nessuna keyword esistente."""
+        elements = [
+            UIElement(text="â‚¬1,194.57", bounds=[0, 0, 100, 100]),
+            UIElement(text="Vincenzo Carfora - C.F. CRFVCN00H15E791G", bounds=[0, 0, 100, 100]),
+            UIElement(text="Scommesse", bounds=[0, 0, 100, 100]),
+            UIElement(text="Home", bounds=[0, 0, 100, 100]),
+            UIElement(text="Menu", bounds=[0, 0, 100, 100]),
+        ]
+        assert reader._classify_screen(elements) == "balance_page"
+
+
+class TestValidateScreenConfidence:
+
+    def test_validate_confidence_standalone_euro(self, reader):
+        """FIX-CONFIDENCE-STANDALONE: saldo Betfair senza etichetta ma con importo
+        standalone -> confidence sufficiente a superare il gate MIN_CONFIDENCE (0.85)."""
+        elements = [
+            UIElement(text="â‚¬1,194.57", bounds=[0, 0, 100, 100]),
+            UIElement(text="Vincenzo Carfora - C.F. CRFVCN00H15E791G", bounds=[0, 0, 100, 100]),
+            UIElement(text="Scommesse", bounds=[0, 0, 100, 100]),
+            UIElement(text="Home", bounds=[0, 0, 100, 100]),
+            UIElement(text="Menu", bounds=[0, 0, 100, 100]),
+        ]
+        assert reader._validate_screen_confidence(elements, "balance_page") == 0.85
+
+    def test_validate_confidence_with_label(self, reader):
+        """Regressione: etichetta 'Saldo' presente con importo -> confidence invariata a 1.0."""
+        elements = [UIElement(text="Saldo: € 500,00", bounds=[0, 0, 100, 100])]
+        assert reader._validate_screen_confidence(elements, "balance_page") == 1.0
+
+    def test_validate_confidence_no_label_no_amount(self, reader):
+        """Né etichetta né importo standalone -> confidence bassa (0.3, non più 0.5).
+        Regression guard per il cambio di fallback richiesto dal fix."""
+        elements = [UIElement(text="Qualcos'altro", bounds=[0, 0, 100, 100])]
+        assert reader._validate_screen_confidence(elements, "balance_page") == 0.3

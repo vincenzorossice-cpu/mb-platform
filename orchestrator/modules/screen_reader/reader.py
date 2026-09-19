@@ -395,6 +395,13 @@ class ScreenReader(ScreenReaderInterface):
             return "market_page"
         if any(kw in texts for kw in ["movimenti", "transactions", "storico", "history", "bonifico", "deposito"]):
             return "movements"
+        # FIX-CLASSIFY-STANDALONE: nessuna etichetta trovata, ma un elemento contiene
+        # SOLO un importo con simbolo euro (es. Betfair "â‚¬1,194.57" senza label "Saldo") ->
+        # trattalo comunque come balance_page invece di "unknown". Check per-elemento sul
+        # testo originale (non sul blob lowercased) perché la regex è ancorata ^...$.
+        for e in elements:
+            if e.text and _STANDALONE_EURO_RE.match(e.text):
+                return "balance_page"
         return "unknown"
 
     def _validate_screen_confidence(self, elements: list[UIElement], screen_type: str) -> float:
@@ -404,11 +411,18 @@ class ScreenReader(ScreenReaderInterface):
         texts = " ".join(e.text.lower() for e in elements if e.text)
 
         if screen_type == "balance_page":
-            if not any(kw in texts for kw in ("saldo", "balance", "disponibile", "wallet", "conto")):
-                return 0.5
-            if not _AMOUNT_RE.search(texts):
-                return 0.3
-            return 1.0
+            if any(kw in texts for kw in ("saldo", "balance", "disponibile", "wallet", "conto")):
+                if not _AMOUNT_RE.search(texts):
+                    return 0.3
+                return 1.0
+            # FIX-CONFIDENCE-STANDALONE: nessuna etichetta di saldo trovata. Se un elemento
+            # è un importo standalone con simbolo euro (es. Betfair "â‚¬1,194.57" senza label
+            # "Saldo"), il balance è comunque stato estratto in modo affidabile da
+            # _extract_balance -> confidence sufficiente a superare il gate
+            # RulesEngine.MIN_CONFIDENCE (0.85), evitando un HITL inutile.
+            if any(e.text and _STANDALONE_EURO_RE.match(e.text) for e in elements):
+                return 0.85
+            return 0.3
 
         if screen_type == "my_bets":
             if not any(kw in texts for kw in ("scommesse", "bets", "matched", "unsettled")):
