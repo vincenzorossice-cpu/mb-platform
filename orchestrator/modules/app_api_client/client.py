@@ -429,7 +429,7 @@ class AppApiClient(AppApiClientInterface):
         bookmaker_id: int,
         back_stake: float,
         back_odds: float,
-        lay_stake: float,
+        liability: float,
         lay_odds: float,
         bet_gruppo_id: Optional[str] = None,
         fee_percentuale: float = 4.5,
@@ -437,9 +437,12 @@ class AppApiClient(AppApiClientInterface):
     ) -> Result[WriteResult]:
         """POST /operazioni/{id}/righe: riga 'puntata_e_bancata' (bancata reale
         su un book x exchange, es. Betfair), schema confermato dal codice
-        sorgente Netcap. back_odds/lay_odds non vengono inviati: l'API non ha
-        campi quota_*, traccia solo gli stake. bet_gruppo_id collega le righe
-        della stessa cascata multipla (stesso valore su tutte)."""
+        sorgente Netcap. contropuntata e' la responsabilita' (liability) della
+        bancata lay su Betfair, NON il lay_stake: e' la somma effettivamente
+        esposta/bloccata sull'exchange. back_odds/lay_odds non vengono
+        inviati: l'API non ha campi quota_*, traccia solo gli stake.
+        bet_gruppo_id collega le righe della stessa cascata multipla (stesso
+        valore su tutte)."""
         body = {
             "tipo_riga": "puntata_e_bancata",
             "parent_id": None,
@@ -449,7 +452,7 @@ class AppApiClient(AppApiClientInterface):
             "banco_collaboratore_id": None,
             "punta": round(back_stake, 2),
             "punta_bonus": 0,
-            "contropuntata": round(lay_stake, 2),
+            "contropuntata": round(liability, 2),
             "profitto_book": 0,
             "profitto_banco": 0,
             "fee_percentuale": fee_percentuale,

@@ -233,7 +233,7 @@ async def complete_operation(item_id: str, request: Request):
         bookmaker_id=bookmaker_id,
         back_stake=back_stake,
         back_odds=back_odds,
-        lay_stake=bet.get("lay_stake"),
+        liability=bet.get("liability"),
         lay_odds=bet.get("lay_odds"),
         bet_gruppo_id=bet_gruppo_id,
         note=note,

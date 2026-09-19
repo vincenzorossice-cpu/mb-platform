@@ -205,6 +205,7 @@ class TestCompleteOperation:
                 "event": "Gil Vicente - Maritimo",
                 "lay_stake": 461.66,
                 "lay_odds": 3.50,
+                "liability": 1154.15,
             },
             "detected_at": "2026-09-19T16:00:00",
             "status": "pending",
@@ -246,7 +247,7 @@ class TestCompleteOperation:
             assert riga_kwargs["operazione_id"] == 999
             assert riga_kwargs["back_stake"] == pytest.approx(400.0)
             assert riga_kwargs["back_odds"] == pytest.approx(3.60)
-            assert riga_kwargs["lay_stake"] == pytest.approx(461.66)
+            assert riga_kwargs["liability"] == pytest.approx(1154.15)
             assert riga_kwargs["lay_odds"] == pytest.approx(3.50)
             assert riga_kwargs["bet_gruppo_id"] is None  # "singola" di default
 
@@ -275,6 +276,7 @@ class TestCompleteOperation:
                 "event": "Gil Vicente - Maritimo",
                 "lay_stake": 461.66,
                 "lay_odds": 3.50,
+                "liability": 1154.15,
             },
             "detected_at": "2026-09-19T16:00:00",
             "status": "pending",
@@ -324,6 +326,7 @@ class TestCompleteOperation:
                 "event": "Gil Vicente - Maritimo",
                 "lay_stake": 200.0,
                 "lay_odds": 2.10,
+                "liability": 500.0,
             },
             "detected_at": "2026-09-19T16:00:00",
             "status": "pending",
@@ -396,7 +399,7 @@ class TestAddRigaCascata:
             bookmaker_id=5,
             back_stake=400.0,
             back_odds=3.60,
-            lay_stake=461.66,
+            liability=1154.15,
             lay_odds=3.50,
             bet_gruppo_id="cascade_42_123",
         )
@@ -412,7 +415,7 @@ class TestAddRigaCascata:
         assert body["parent_id"] is None
         assert body["banco_collaboratore_id"] is None
         assert body["punta"] == pytest.approx(400.0)
-        assert body["contropuntata"] == pytest.approx(461.66)
+        assert body["contropuntata"] == pytest.approx(1154.15)  # liability, non lay_stake
         assert body["bet_gruppo_id"] == "cascade_42_123"
         assert "quota_punta" not in body
         assert "quota_contropuntata" not in body
