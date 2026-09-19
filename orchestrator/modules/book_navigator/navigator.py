@@ -26,6 +26,10 @@ GUEST_KEYWORDS = [
 
 LOGIN_KEYWORDS = ["login", "accedi", "log in", "registrati", "sign in"]
 
+LOGIN_SUBMIT_KEYWORDS = ["accedi", "login", "log in", "sign in"]
+
+TWO_FA_KEYWORDS = ["codice", "verifica", "sms", "autenticazione", "two factor", "2fa"]
+
 MY_BETS_KEYWORDS = ["scommesse", "my bets", "le mie scommesse"]
 
 _AMOUNT_CHARS = ("€", "$", "£")
@@ -121,6 +125,125 @@ class BookNavigator(BookNavigatorInterface):
             return Result.fail(f"Cannot open Chrome: {e}", "CHROME_OPEN_FAILED")
 
     # --------------------------------------------------------
+    # PUBLIC: auto_login
+    # --------------------------------------------------------
+
+    def auto_login(self, device_id: str, book: str) -> Result[NavigationResult]:
+        """Tenta UN SOLO login automatico se Chrome ha già le credenziali salvate.
+
+        MAX 1 TENTATIVO: nessun retry a livello di business logic. Qualsiasi
+        fallimento (form vuoto, 2FA, pulsante non trovato, saldo non
+        confermato dopo il submit) termina con needs_login=True: da qui in
+        poi serve HITL, l'operatore fa login manualmente. Questo previene
+        il lockout dell'account.
+        """
+        book_upper = book.upper()
+        url = self._resolve_url(book_upper)
+
+        if self.screen_reader is None or self.touch_injector is None:
+            return Result.fail(
+                "ScreenReader o TouchInjector non disponibile per auto-login",
+                "AUTOLOGIN_DEPS_MISSING",
+            )
+
+        screen = self.screen_reader.read_screen(device_id)
+        if not screen.success:
+            return Result.fail(f"Cannot read screen: {screen.error}", screen.error_code)
+
+        login_element = _find_nav_candidate(screen.data.elements, LOGIN_KEYWORDS)
+        if login_element is None:
+            return Result.ok(NavigationResult(
+                success=False, current_screen_type=screen.data.screen_type,
+                url=url, needs_login=True,
+                message="Login fallito, login manuale richiesto"
+            ))
+
+        tap_result = self.touch_injector.tap_element(device_id, login_element.text)
+        if not tap_result.success:
+            return Result.ok(NavigationResult(
+                success=False, current_screen_type=screen.data.screen_type,
+                url=url, needs_login=True,
+                message="Login fallito, login manuale richiesto"
+            ))
+
+        time.sleep(3)  # Attendi caricamento form di login
+
+        form_screen = self.screen_reader.read_screen(device_id)
+        if not form_screen.success:
+            return Result.fail(f"Cannot read screen: {form_screen.error}", form_screen.error_code)
+
+        form_elements = form_screen.data.elements
+        form_screen_type = form_screen.data.screen_type
+
+        # AUTO-LOGIN: il controllo 2FA va fatto prima del conteggio EditText,
+        # perché una schermata 2FA può avere 0/1 campi input e verrebbe
+        # altrimenti scambiata per un form vuoto.
+        form_text = " ".join(e.text.lower().strip() for e in form_elements if e.text)
+        if any(kw in form_text for kw in TWO_FA_KEYWORDS):
+            return Result.ok(NavigationResult(
+                success=False, current_screen_type=form_screen_type,
+                url=url, needs_login=True,
+                message="2FA richiesto, login manuale richiesto"
+            ))
+
+        edit_texts = [e for e in form_elements if e.class_name == "android.widget.EditText"]
+        if len(edit_texts) < 2:
+            return Result.ok(NavigationResult(
+                success=False, current_screen_type=form_screen_type,
+                url=url, needs_login=True,
+                message="Login fallito, login manuale richiesto"
+            ))
+
+        filled_fields = [e for e in edit_texts if e.text and e.text.strip()]
+        if len(filled_fields) < 2:
+            return Result.ok(NavigationResult(
+                success=False, current_screen_type=form_screen_type,
+                url=url, needs_login=True,
+                message="Credenziali non salvate, login manuale richiesto"
+            ))
+
+        submit_element = _find_nav_candidate(form_elements, LOGIN_SUBMIT_KEYWORDS)
+        if submit_element is None:
+            return Result.ok(NavigationResult(
+                success=False, current_screen_type=form_screen_type,
+                url=url, needs_login=True,
+                message="Login fallito, login manuale richiesto"
+            ))
+
+        submit_tap = self.touch_injector.tap_element(device_id, submit_element.text)
+        if not submit_tap.success:
+            return Result.ok(NavigationResult(
+                success=False, current_screen_type=form_screen_type,
+                url=url, needs_login=True,
+                message="Login fallito, login manuale richiesto"
+            ))
+
+        time.sleep(5)  # Attendi elaborazione login
+
+        result_screen = self.screen_reader.read_screen(device_id)
+        if not result_screen.success:
+            return Result.fail(f"Cannot read screen: {result_screen.error}", result_screen.error_code)
+
+        result_screen_type = result_screen.data.screen_type
+        login_succeeded = (
+            result_screen_type == "balance_page"
+            or _find_direct_balance_element(result_screen.data.elements) is not None
+        )
+
+        if login_succeeded:
+            return Result.ok(NavigationResult(
+                success=True, current_screen_type=result_screen_type,
+                url=url, needs_login=False,
+                message=f"Auto-login riuscito per {book}"
+            ))
+
+        return Result.ok(NavigationResult(
+            success=False, current_screen_type=result_screen_type,
+            url=url, needs_login=True,
+            message="Login fallito, login manuale richiesto"
+        ))
+
+    # --------------------------------------------------------
     # PUBLIC: navigate_to_balance
     # --------------------------------------------------------
 
@@ -182,10 +305,40 @@ class BookNavigator(BookNavigatorInterface):
 
         all_text = " ".join(e.text.lower().strip() for e in elements if e.text)
         if any(kw in all_text for kw in LOGIN_KEYWORDS):
+            # AUTO-LOGIN: un solo tentativo automatico prima di richiedere HITL.
+            login_result = self.auto_login(device_id, book)
+
+            if not login_result.success:
+                return Result.ok(NavigationResult(
+                    success=False, current_screen_type="login_page",
+                    url=url, needs_login=True,
+                    message=f"Auto-login non disponibile per {book}"
+                ))
+
+            if not login_result.data.success:
+                return Result.ok(NavigationResult(
+                    success=False,
+                    current_screen_type=login_result.data.current_screen_type,
+                    url=url, needs_login=True,
+                    message=login_result.data.message
+                ))
+
+            verify = self.screen_reader.read_screen(device_id)
+            if not verify.success:
+                return Result.fail(f"Cannot read screen: {verify.error}", verify.error_code)
+
+            verify_screen_type = verify.data.screen_type
+            if verify_screen_type == "balance_page" or _find_direct_balance_element(verify.data.elements) is not None:
+                return Result.ok(NavigationResult(
+                    success=True, current_screen_type=verify_screen_type,
+                    url=url, needs_login=False,
+                    message=f"Pagina del saldo raggiunta per {book} dopo auto-login"
+                ))
+
             return Result.ok(NavigationResult(
-                success=False, current_screen_type="login_page",
-                url=url, needs_login=True,
-                message=f"Login richiesto per {book}. L'operatore deve fare login manualmente."
+                success=False, current_screen_type=verify_screen_type or "unknown",
+                url=url, needs_login=False,
+                message=f"Auto-login riuscito ma saldo non trovato per {book}. Screen type: {verify_screen_type}"
             ))
 
         return Result.ok(NavigationResult(

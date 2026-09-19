@@ -28,3 +28,7 @@ class BookNavigatorInterface(ABC):
     @abstractmethod
     def check_login_status(self, device_id: str) -> Result[bool]:
         """Verifica se l'utente è loggato sul book corrente."""
+
+    @abstractmethod
+    def auto_login(self, device_id: str, book: str) -> Result[NavigationResult]:
+        """Tenta un login automatico (MAX 1 tentativo) se Chrome ha credenziali salvate."""

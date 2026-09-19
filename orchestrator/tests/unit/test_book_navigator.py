@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import patch, MagicMock
 from orchestrator.core.result import Result
 from orchestrator.modules.screen_reader.interface import UIElement, ScreenContent
+from orchestrator.modules.book_navigator.interface import NavigationResult
 from orchestrator.modules.book_navigator.navigator import BookNavigator
 
 
@@ -9,12 +10,12 @@ DEVICE = "emulator-5554"
 BETFAIR_URL = "https://mobile.betfair.com"
 
 
-def _make_element(text="OK", bounds=None, resource_id=None):
+def _make_element(text="OK", bounds=None, resource_id=None, class_name=None):
     return UIElement(
         text=text,
         bounds=bounds or [100, 200, 300, 400],
         resource_id=resource_id,
-        class_name=None,
+        class_name=class_name,
         confidence=1.0,
     )
 
@@ -215,6 +216,179 @@ class TestNavigateToBalance(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertTrue(result.data.success)
         self.assertIn("non disponibile", result.data.message)
+
+    @patch("orchestrator.modules.book_navigator.navigator.time.sleep")
+    @patch("orchestrator.modules.book_navigator.navigator.subprocess.run")
+    def test_navigate_to_balance_auto_login_success(self, mock_run, mock_sleep):
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+        screen_reader = MagicMock()
+        screen_reader.read_screen.side_effect = [
+            Result.ok(_make_screen(
+                elements=[_make_element(text="Accedi")],
+                screen_type="unknown",
+            )),
+            Result.ok(_make_screen(
+                elements=[_make_element(text="€ 0.68")],
+                screen_type="balance_page",
+            )),
+        ]
+        navigator = BookNavigator(screen_reader=screen_reader)
+        navigator.auto_login = MagicMock(return_value=Result.ok(NavigationResult(
+            success=True, current_screen_type="balance_page",
+            url="https://www.betfair.it/exchange/plus/", needs_login=False,
+            message="Auto-login riuscito per BETFAIR",
+        )))
+
+        result = navigator.navigate_to_balance(DEVICE, "BETFAIR")
+
+        self.assertTrue(result.success)
+        self.assertTrue(result.data.success)
+        self.assertEqual(result.data.current_screen_type, "balance_page")
+        self.assertFalse(result.data.needs_login)
+        navigator.auto_login.assert_called_once_with(DEVICE, "BETFAIR")
+
+    @patch("orchestrator.modules.book_navigator.navigator.time.sleep")
+    @patch("orchestrator.modules.book_navigator.navigator.subprocess.run")
+    def test_navigate_to_balance_auto_login_fails(self, mock_run, mock_sleep):
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+        screen_reader = MagicMock()
+        screen_reader.read_screen.return_value = Result.ok(_make_screen(
+            elements=[_make_element(text="Accedi")],
+            screen_type="unknown",
+        ))
+        navigator = BookNavigator(screen_reader=screen_reader)
+        navigator.auto_login = MagicMock(return_value=Result.ok(NavigationResult(
+            success=False, current_screen_type="unknown",
+            url="https://www.betfair.it/exchange/plus/", needs_login=True,
+            message="Credenziali non salvate, login manuale richiesto",
+        )))
+
+        result = navigator.navigate_to_balance(DEVICE, "BETFAIR")
+
+        self.assertTrue(result.success)
+        self.assertFalse(result.data.success)
+        self.assertTrue(result.data.needs_login)
+        self.assertEqual(result.data.message, "Credenziali non salvate, login manuale richiesto")
+        navigator.auto_login.assert_called_once_with(DEVICE, "BETFAIR")
+
+
+class TestAutoLogin(unittest.TestCase):
+
+    @patch("orchestrator.modules.book_navigator.navigator.time.sleep")
+    def test_auto_login_success(self, mock_sleep):
+        screen_reader = MagicMock()
+        screen_reader.read_screen.side_effect = [
+            Result.ok(_make_screen(
+                elements=[_make_element(text="Accedi")],
+                screen_type="unknown",
+            )),
+            Result.ok(_make_screen(
+                elements=[
+                    _make_element(text="user@test.com", class_name="android.widget.EditText"),
+                    _make_element(text="pass123", class_name="android.widget.EditText"),
+                    _make_element(text="Accedi"),
+                ],
+                screen_type="unknown",
+            )),
+            Result.ok(_make_screen(
+                elements=[_make_element(text="€ 12.34")],
+                screen_type="balance_page",
+            )),
+        ]
+        touch_injector = MagicMock()
+        touch_injector.tap_element.return_value = Result.ok(True)
+        navigator = BookNavigator(screen_reader=screen_reader, touch_injector=touch_injector)
+
+        result = navigator.auto_login(DEVICE, "BETFAIR")
+
+        self.assertTrue(result.success)
+        self.assertTrue(result.data.success)
+        self.assertFalse(result.data.needs_login)
+        self.assertEqual(result.data.current_screen_type, "balance_page")
+        self.assertEqual(touch_injector.tap_element.call_count, 2)
+        mock_sleep.assert_any_call(3)
+        mock_sleep.assert_any_call(5)
+
+    @patch("orchestrator.modules.book_navigator.navigator.time.sleep")
+    def test_auto_login_empty_form(self, mock_sleep):
+        screen_reader = MagicMock()
+        screen_reader.read_screen.side_effect = [
+            Result.ok(_make_screen(
+                elements=[_make_element(text="Accedi")],
+                screen_type="unknown",
+            )),
+            Result.ok(_make_screen(
+                elements=[
+                    _make_element(text="", class_name="android.widget.EditText"),
+                    _make_element(text="", class_name="android.widget.EditText"),
+                ],
+                screen_type="unknown",
+            )),
+        ]
+        touch_injector = MagicMock()
+        touch_injector.tap_element.return_value = Result.ok(True)
+        navigator = BookNavigator(screen_reader=screen_reader, touch_injector=touch_injector)
+
+        result = navigator.auto_login(DEVICE, "BETFAIR")
+
+        self.assertTrue(result.success)
+        self.assertFalse(result.data.success)
+        self.assertTrue(result.data.needs_login)
+        self.assertEqual(result.data.message, "Credenziali non salvate, login manuale richiesto")
+        self.assertEqual(touch_injector.tap_element.call_count, 1)
+
+    @patch("orchestrator.modules.book_navigator.navigator.time.sleep")
+    def test_auto_login_2fa(self, mock_sleep):
+        screen_reader = MagicMock()
+        screen_reader.read_screen.side_effect = [
+            Result.ok(_make_screen(
+                elements=[_make_element(text="Accedi")],
+                screen_type="unknown",
+            )),
+            Result.ok(_make_screen(
+                elements=[_make_element(text="Inserisci il codice ricevuto via SMS")],
+                screen_type="unknown",
+            )),
+        ]
+        touch_injector = MagicMock()
+        touch_injector.tap_element.return_value = Result.ok(True)
+        navigator = BookNavigator(screen_reader=screen_reader, touch_injector=touch_injector)
+
+        result = navigator.auto_login(DEVICE, "BETFAIR")
+
+        self.assertTrue(result.success)
+        self.assertFalse(result.data.success)
+        self.assertTrue(result.data.needs_login)
+        self.assertEqual(result.data.message, "2FA richiesto, login manuale richiesto")
+        self.assertEqual(touch_injector.tap_element.call_count, 1)
+
+    @patch("orchestrator.modules.book_navigator.navigator.time.sleep")
+    def test_auto_login_no_login_button(self, mock_sleep):
+        screen_reader = MagicMock()
+        screen_reader.read_screen.side_effect = [
+            Result.ok(_make_screen(
+                elements=[_make_element(text="Accedi")],
+                screen_type="unknown",
+            )),
+            Result.ok(_make_screen(
+                elements=[
+                    _make_element(text="user@test.com", class_name="android.widget.EditText"),
+                    _make_element(text="pass123", class_name="android.widget.EditText"),
+                ],
+                screen_type="unknown",
+            )),
+        ]
+        touch_injector = MagicMock()
+        touch_injector.tap_element.return_value = Result.ok(True)
+        navigator = BookNavigator(screen_reader=screen_reader, touch_injector=touch_injector)
+
+        result = navigator.auto_login(DEVICE, "BETFAIR")
+
+        self.assertTrue(result.success)
+        self.assertFalse(result.data.success)
+        self.assertTrue(result.data.needs_login)
+        self.assertEqual(result.data.message, "Login fallito, login manuale richiesto")
+        self.assertEqual(touch_injector.tap_element.call_count, 1)
 
 
 class TestCheckLoginStatus(unittest.TestCase):
