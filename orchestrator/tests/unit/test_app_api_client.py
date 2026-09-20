@@ -524,3 +524,167 @@ class TestNetcapHttpError:
 
         assert not result.success
         assert result.error_code == "NETCAP_HTTP_ERROR"
+
+
+class TestNetcapRequestException:
+    """FIX-18: eccezioni requests diverse da ConnectionError/Timeout non devono
+    uscire dal client come eccezione grezza."""
+
+    def test_get_json_generic_request_exception(self, client: AppApiClient):
+        with patch.object(
+            client.session, "get",
+            side_effect=requests.exceptions.ChunkedEncodingError("broken stream"),
+        ):
+            result = client.read_expected_balance("01")
+
+        assert not result.success
+        assert result.error_code == "NETCAP_UNREACHABLE"
+
+    def test_post_json_generic_request_exception(self, client: AppApiClient):
+        with patch.object(
+            client.session, "post",
+            side_effect=requests.exceptions.TooManyRedirects("too many redirects"),
+        ):
+            result = client.create_riconciliazione_operazione("2026-09-17")
+
+        assert not result.success
+        assert result.error_code == "NETCAP_UNREACHABLE"
+
+    def test_post_no_body_generic_request_exception(self, client: AppApiClient):
+        with patch.object(
+            client.session, "post",
+            side_effect=requests.exceptions.TooManyRedirects("too many redirects"),
+        ):
+            result = client.close_riga(991)
+
+        assert not result.success
+        assert result.error_code == "NETCAP_UNREACHABLE"
+
+    def test_find_existing_operazione_generic_request_exception(self, client: AppApiClient):
+        rect = Rectification(amount=10.0, column="BOOK", reason="r")
+        with patch.object(
+            client.session, "get",
+            side_effect=requests.exceptions.ChunkedEncodingError("broken stream"),
+        ):
+            result = client.write_rettifica(rect, collaboratore_id="01", bookmaker_id=1)
+
+        assert not result.success
+        assert result.error_code == "NETCAP_UNREACHABLE"
+
+    def test_get_operazioni_aperte_generic_request_exception(self, client: AppApiClient):
+        with patch.object(
+            client.session, "get",
+            side_effect=requests.exceptions.InvalidURL("bad url"),
+        ):
+            result = client.get_operazioni_aperte("01")
+
+        assert not result.success
+        assert result.error_code == "NETCAP_UNREACHABLE"
+
+
+class TestNetcapParseErrorOnMalformedItems:
+    """FIX-18: dati per-item malformati nella risposta devono abortire con
+    NETCAP_PARSE_ERROR invece di sollevare KeyError/ValueError/TypeError grezzi."""
+
+    def test_read_expected_balance_bad_bookmaker_id(self, client: AppApiClient):
+        bad = {
+            **SALDI_BOOKMAKER_RESPONSE,
+            "matrix": {"01": {"not-an-int": 50.0}},
+        }
+        with patch.object(client.session, "get", return_value=_mock_get_ok(bad)):
+            result = client.read_expected_balance("01")
+
+        assert not result.success
+        assert result.error_code == "NETCAP_PARSE_ERROR"
+
+    def test_read_wallet_balance_bad_amount(self, client: AppApiClient):
+        bad = {
+            **SALDI_BOOKMAKER_RESPONSE,
+            "contiMatrix": {"01": {"hype": "not-a-number", "paypal": 50.0}},
+        }
+        with patch.object(client.session, "get", return_value=_mock_get_ok(bad)):
+            result = client.read_wallet_balance("01")
+
+        assert not result.success
+        assert result.error_code == "NETCAP_PARSE_ERROR"
+
+    def test_read_book_status_bad_bookmaker_id(self, client: AppApiClient):
+        bad = [{"collaboratore_id": "01", "bookmaker_id": "not-an-int", "stato": "aperto"}]
+        with patch.object(client.session, "get", return_value=_mock_get_ok(bad)):
+            result = client.read_book_status("01")
+
+        assert not result.success
+        assert result.error_code == "NETCAP_PARSE_ERROR"
+
+    def test_read_movements_missing_id(self, client: AppApiClient):
+        bad = [{"tipo": "deposito", "importo": 30, "bookmaker_id": 1,
+                 "collaboratore_id": "01", "data": "2026-09-13"}]  # niente "id"
+        with patch.object(client.session, "get", return_value=_mock_get_ok(bad)):
+            result = client.read_movements("01")
+
+        assert not result.success
+        assert result.error_code == "NETCAP_PARSE_ERROR"
+
+    def test_verify_balance_bad_saldo_value(self, client: AppApiClient):
+        bad = {
+            "collaboratori": [{"id": "01", "nome": "Test"}],
+            "bookmakers": [{"id": 6, "nome": "BETFAIR", "tipo": "exchange"}],
+            "matrix": {"01": {"6": "not-a-number"}},
+        }
+        with patch.object(client.session, "get", return_value=_mock_get_ok(bad)):
+            result = client.verify_balance_after_rettifica("01", 6, 100.0)
+
+        assert not result.success
+        assert result.error_code == "NETCAP_PARSE_ERROR"
+
+
+class TestSaldiBookmakerCaching:
+    """FIX-25: /saldi-bookmaker e' condiviso da read_expected_balance,
+    read_wallet_balance e verify_balance_after_rettifica; deve essere
+    riusato entro 60s invece di rifare una GET per ciascuno."""
+
+    def test_second_saldi_call_uses_cache(self, client: AppApiClient):
+        with patch.object(client.session, "get", return_value=_mock_get_ok(SALDI_BOOKMAKER_RESPONSE)) as mock_get:
+            client.read_expected_balance("01")
+            client.read_wallet_balance("01")
+
+        assert mock_get.call_count == 1
+
+    def test_clear_cache_forces_fresh_get(self, client: AppApiClient):
+        with patch.object(client.session, "get", return_value=_mock_get_ok(SALDI_BOOKMAKER_RESPONSE)) as mock_get:
+            client.read_expected_balance("01")
+            client.clear_cache()
+            client.read_wallet_balance("01")
+
+        assert mock_get.call_count == 2
+
+    def test_cache_expires_after_ttl(self, client: AppApiClient):
+        with patch.object(client.session, "get", return_value=_mock_get_ok(SALDI_BOOKMAKER_RESPONSE)) as mock_get, \
+                patch("orchestrator.modules.app_api_client.client.time.time") as mock_time:
+            mock_time.return_value = 1000.0
+            client.read_expected_balance("01")
+            mock_time.return_value = 1000.0 + 61  # oltre il TTL di 60s
+            client.read_wallet_balance("01")
+
+        assert mock_get.call_count == 2
+
+    def test_failed_get_does_not_poison_cache(self, client: AppApiClient):
+        """Una GET fallita non deve cancellare una cache ancora valida."""
+        with patch.object(client.session, "get", return_value=_mock_get_ok(SALDI_BOOKMAKER_RESPONSE)):
+            client.read_expected_balance("01")  # popola la cache
+
+        with patch.object(client.session, "get", side_effect=requests.ConnectionError("boom")):
+            result = client.read_wallet_balance("01")  # servito dalla cache, get() non richiamata
+
+        assert result.success
+
+    def test_write_invalidates_saldi_cache(self, client: AppApiClient):
+        """FIX-25: una scrittura (es. close_riga) deve invalidare la cache di
+        /saldi-bookmaker, cosi' una lettura successiva ottiene dati freschi."""
+        with patch.object(client.session, "get", return_value=_mock_get_ok(SALDI_BOOKMAKER_RESPONSE)) as mock_get, \
+                patch.object(client.session, "post", return_value=_mock_post_ok({})):
+            client.read_expected_balance("01")  # popola la cache
+            client.close_riga(991)              # deve invalidare la cache
+            client.read_expected_balance("01")  # deve rifare la GET
+
+        assert mock_get.call_count == 2

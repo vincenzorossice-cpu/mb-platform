@@ -340,7 +340,7 @@ class TouchInjector(TouchInjectorInterface):
         start = time.monotonic()
         while time.monotonic() - start < self.bet_confirm_timeout:
             time.sleep(1.0)
-            status = self.screen_reader.read_bet_status(device_id, betfair=True)
+            status = self.screen_reader.read_bet_status(device_id, betfair=True, force_refresh=True)  # FIX-22
             if not status.success:
                 continue
             if status.data.status in ("matched", "unsettled"):
@@ -366,7 +366,7 @@ class TouchInjector(TouchInjectorInterface):
         """Verify-then-act dopo ADB timeout durante place_lay_bet.
         MAI ritentare ciecamente — verifica lo stato reale."""
         time.sleep(2.0)  # attendi che l'eventuale tap sia processato
-        status = self.screen_reader.read_bet_status(device_id, betfair=True)
+        status = self.screen_reader.read_bet_status(device_id, betfair=True, force_refresh=True)  # FIX-22
 
         if not status.success:
             return Result.fail(

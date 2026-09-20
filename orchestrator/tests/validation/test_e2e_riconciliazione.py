@@ -72,12 +72,23 @@ def fetch_netcap_data(app_api_client: AppApiClient, collaboratore_id: str):
     dati non si puo' riconciliare nulla, ma la funzione resta riutilizzabile
     e non termina il processo dall'interno.
     """
-    expected_result = app_api_client.read_expected_balance(collaboratore_id)
+    try:  # FIX-18: difesa in profondita' - la pipeline e2e non deve morire
+        # su un imprevisto, anche se AppApiClient non dovrebbe piu' sollevare
+        expected_result = app_api_client.read_expected_balance(collaboratore_id)
+    except Exception as exc:  # FIX-18
+        print(f"ERRORE FATALE: read_expected_balance ha sollevato un'eccezione: {exc}")
+        return None, None
+
     if not expected_result.success:
         print(f"ERRORE FATALE: read_expected_balance fallita: {expected_result.error} ({expected_result.error_code})")
         return None, None  # FIX-26.1
 
-    book_status_result = app_api_client.read_book_status(collaboratore_id)
+    try:  # FIX-18
+        book_status_result = app_api_client.read_book_status(collaboratore_id)
+    except Exception as exc:  # FIX-18
+        print(f"ERRORE FATALE: read_book_status ha sollevato un'eccezione: {exc}")
+        return None, None
+
     if not book_status_result.success:
         print(f"ERRORE FATALE: read_book_status fallita: {book_status_result.error} ({book_status_result.error_code})")
         return None, None  # FIX-26.1

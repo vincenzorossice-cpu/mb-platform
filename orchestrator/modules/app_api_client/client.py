@@ -1,4 +1,5 @@
 import os
+import time
 from datetime import date, datetime
 from typing import Optional
 
@@ -34,6 +35,11 @@ class AppApiClient(AppApiClientInterface):
         token = session_token or os.getenv("NETCAP_SESSION_TOKEN")
         if token:
             self.session.cookies.set("session_token", token)
+        # FIX-25: cache di breve durata per GET /saldi-bookmaker, chiamato
+        # indipendentemente da read_expected_balance/read_wallet_balance/
+        # verify_balance_after_rettifica
+        self._saldi_cache: Optional[dict] = None
+        self._saldi_cache_timestamp: Optional[float] = None
 
     # ------------------------------------------------------------------
     # public
@@ -42,7 +48,7 @@ class AppApiClient(AppApiClientInterface):
     def read_expected_balance(self, collaboratore_id: str) -> Result[list[ExpectedBalance]]:
         """GET /saldi-bookmaker → lista ExpectedBalance per il collaboratore."""
 
-        res = self._get_json("/saldi-bookmaker")
+        res = self._get_saldi_bookmaker()  # FIX-25
         if not res.success:
             return res  # type: ignore[return-value]
 
@@ -60,29 +66,33 @@ class AppApiClient(AppApiClientInterface):
                 self.NETCAP_EMPTY_RESULT,
             )
 
-        book_map = self._build_book_map(bookmakers_list)
-        coll_matrix = matrix[collaboratore_id]
-        coll_impegnato = impegnato.get(collaboratore_id, {})
+        try:  # FIX-18: dati malformati (id non intero, campi mancanti) devono
+            # abortire con NETCAP_PARSE_ERROR invece di sollevare un'eccezione grezza
+            book_map = self._build_book_map(bookmakers_list)
+            coll_matrix = matrix[collaboratore_id]
+            coll_impegnato = impegnato.get(collaboratore_id, {})
 
-        balances: list[ExpectedBalance] = []
-        for bk_id_str, saldo in coll_matrix.items():
-            bk_id = int(bk_id_str)
-            info = book_map.get(bk_id)
-            balances.append(ExpectedBalance(
-                collaboratore_id=collaboratore_id,
-                bookmaker_id=bk_id,
-                bookmaker_nome=info["nome"] if info else f"BK-{bk_id}",
-                saldo_atteso=round(saldo, 2),
-                importo_impegnato=round(float(coll_impegnato.get(bk_id_str, 0)), 2),
-                is_exchange=info["tipo"] == "exchange" if info else False,
-            ))
+            balances: list[ExpectedBalance] = []
+            for bk_id_str, saldo in coll_matrix.items():
+                bk_id = int(bk_id_str)
+                info = book_map.get(bk_id)
+                balances.append(ExpectedBalance(
+                    collaboratore_id=collaboratore_id,
+                    bookmaker_id=bk_id,
+                    bookmaker_nome=info["nome"] if info else f"BK-{bk_id}",
+                    saldo_atteso=round(saldo, 2),
+                    importo_impegnato=round(float(coll_impegnato.get(bk_id_str, 0)), 2),
+                    is_exchange=info["tipo"] == "exchange" if info else False,
+                ))
+        except (KeyError, ValueError, TypeError, AttributeError) as exc:  # FIX-18
+            return Result.fail(f"Errore di parsing: {exc}", self.NETCAP_PARSE_ERROR)
 
         return Result.ok(balances)
 
     def read_wallet_balance(self, collaboratore_id: str) -> Result[WalletBalance]:
         """GET /saldi-bookmaker → WalletBalance dal contiMatrix."""
 
-        res = self._get_json("/saldi-bookmaker")
+        res = self._get_saldi_bookmaker()  # FIX-25
         if not res.success:
             return res  # type: ignore[return-value]
 
@@ -99,11 +109,14 @@ class AppApiClient(AppApiClientInterface):
             )
 
         entry = conti[collaboratore_id]
-        return Result.ok(WalletBalance(
-            collaboratore_id=collaboratore_id,
-            saldo_hype=round(float(entry.get("hype", 0)), 2),
-            saldo_paypal=round(float(entry.get("paypal", 0)), 2),
-        ))
+        try:  # FIX-18
+            return Result.ok(WalletBalance(
+                collaboratore_id=collaboratore_id,
+                saldo_hype=round(float(entry.get("hype", 0)), 2),
+                saldo_paypal=round(float(entry.get("paypal", 0)), 2),
+            ))
+        except (KeyError, ValueError, TypeError, AttributeError) as exc:  # FIX-18
+            return Result.fail(f"Errore di parsing: {exc}", self.NETCAP_PARSE_ERROR)
 
     def read_book_status(self, collaboratore_id: str) -> Result[list[BookStatus]]:
         """GET /stati-book → lista BookStatus per il collaboratore."""
@@ -117,14 +130,17 @@ class AppApiClient(AppApiClientInterface):
             return Result.fail("Risposta /stati-book non è una lista", self.NETCAP_PARSE_ERROR)
 
         statuses: list[BookStatus] = []
-        for item in data:
-            if item.get("collaboratore_id") == collaboratore_id:
-                statuses.append(BookStatus(
-                    collaboratore_id=collaboratore_id,
-                    bookmaker_id=int(item["bookmaker_id"]),
-                    stato=item.get("stato", "sconosciuto"),
-                    limitazioni=item.get("limitazioni"),
-                ))
+        try:  # FIX-18
+            for item in data:
+                if item.get("collaboratore_id") == collaboratore_id:
+                    statuses.append(BookStatus(
+                        collaboratore_id=collaboratore_id,
+                        bookmaker_id=int(item["bookmaker_id"]),
+                        stato=item.get("stato", "sconosciuto"),
+                        limitazioni=item.get("limitazioni"),
+                    ))
+        except (KeyError, ValueError, TypeError, AttributeError) as exc:  # FIX-18
+            return Result.fail(f"Errore di parsing: {exc}", self.NETCAP_PARSE_ERROR)
 
         return Result.ok(statuses)
 
@@ -144,29 +160,32 @@ class AppApiClient(AppApiClientInterface):
             return Result.fail("Risposta /movimentazioni non è una lista", self.NETCAP_PARSE_ERROR)
 
         records: list[MovementRecord] = []
-        for item in data:
-            if item.get("collaboratore_id") != collaboratore_id:
-                continue
-            if date_from:
-                # FIX-19: normalizza sia la data della riga sia date_from (ISO o italiano
-                # DD/MM/YYYY) prima di confrontarle; se una delle due non si riconosce,
-                # ripiega sul confronto stringa originale
-                item_date = self._parse_date(item.get("data", ""))
-                from_date = self._parse_date(date_from)
-                if item_date is not None and from_date is not None:
-                    if item_date < from_date:
-                        continue
-                elif item.get("data", "") < date_from:
+        try:  # FIX-18
+            for item in data:
+                if item.get("collaboratore_id") != collaboratore_id:
                     continue
-            records.append(MovementRecord(
-                id=int(item["id"]),
-                tipo=item["tipo"],
-                importo=round(float(item["importo"]), 2),
-                bookmaker_id=int(item["bookmaker_id"]) if item.get("bookmaker_id") is not None else None,
-                bookmaker_nome=item.get("bookmaker_nome"),
-                collaboratore_id=collaboratore_id,
-                data=item.get("data", ""),
-            ))
+                if date_from:
+                    # FIX-19: normalizza sia la data della riga sia date_from (ISO o italiano
+                    # DD/MM/YYYY) prima di confrontarle; se una delle due non si riconosce,
+                    # ripiega sul confronto stringa originale
+                    item_date = self._parse_date(item.get("data", ""))
+                    from_date = self._parse_date(date_from)
+                    if item_date is not None and from_date is not None:
+                        if item_date < from_date:
+                            continue
+                    elif item.get("data", "") < date_from:
+                        continue
+                records.append(MovementRecord(
+                    id=int(item["id"]),
+                    tipo=item["tipo"],
+                    importo=round(float(item["importo"]), 2),
+                    bookmaker_id=int(item["bookmaker_id"]) if item.get("bookmaker_id") is not None else None,
+                    bookmaker_nome=item.get("bookmaker_nome"),
+                    collaboratore_id=collaboratore_id,
+                    data=item.get("data", ""),
+                ))
+        except (KeyError, ValueError, TypeError, AttributeError) as exc:  # FIX-18
+            return Result.fail(f"Errore di parsing: {exc}", self.NETCAP_PARSE_ERROR)
 
         return Result.ok(records)
 
@@ -191,16 +210,19 @@ class AppApiClient(AppApiClientInterface):
         else:
             create_res = self._create_operazione_rettifica(bookmaker_id, collaboratore_id)
             if not create_res.success:
+                self.clear_cache()  # FIX-25
                 return Result.fail(create_res.error, create_res.error_code)
             operazione_id = create_res.data
 
         riga_res = self._add_riga_rettifica(operazione_id, collaboratore_id, bookmaker_id, rectification)
         if not riga_res.success:
+            self.clear_cache()  # FIX-25
             return Result.fail(
                 f"Operazione creata (id={operazione_id}) ma riga fallita: {riga_res.error}",
                 riga_res.error_code,
             )
 
+        self.clear_cache()  # FIX-25
         return Result.ok(WriteResult(success=True, netcap_id=riga_res.data, message="Rettifica scritta"))
 
     def _find_existing_operazione_rettifica(self, bookmaker_id: int) -> Result[Optional[int]]:
@@ -218,6 +240,8 @@ class AppApiClient(AppApiClientInterface):
             return Result.fail(f"Connessione fallita: {exc}", self.NETCAP_UNREACHABLE)
         except requests.Timeout:
             return Result.fail(f"Timeout su {url}", self.NETCAP_TIMEOUT)
+        except requests.RequestException as exc:  # FIX-18
+            return Result.fail(f"Errore di rete: {exc}", self.NETCAP_UNREACHABLE)
 
         if not resp.ok:
             return Result.fail(f"HTTP {resp.status_code} da {url}", self.NETCAP_HTTP_ERROR)
@@ -313,11 +337,14 @@ class AppApiClient(AppApiClientInterface):
         }
         res = self._post_json("/operazioni", body)
         if not res.success:
+            self.clear_cache()  # FIX-25
             return res  # type: ignore[return-value]
 
         operazione_id = res.data.get("id") if isinstance(res.data, dict) else None
         if operazione_id is None:
+            self.clear_cache()  # FIX-25
             return Result.fail(f"Risposta creazione operazione senza id: {res.data}", self.NETCAP_PARSE_ERROR)
+        self.clear_cache()  # FIX-25
         return Result.ok(operazione_id)
 
     def add_riga_rettifica(
@@ -352,11 +379,14 @@ class AppApiClient(AppApiClientInterface):
         }
         res = self._post_json(f"/operazioni/{operazione_id}/righe", body)
         if not res.success:
+            self.clear_cache()  # FIX-25
             return res  # type: ignore[return-value]
 
         riga_id = res.data.get("id") if isinstance(res.data, dict) else None
         if riga_id is None:
+            self.clear_cache()  # FIX-25
             return Result.fail(f"Risposta riga senza id: {res.data}", self.NETCAP_PARSE_ERROR)
+        self.clear_cache()  # FIX-25
         return Result.ok(riga_id)
 
     # Betfair e' il solo exchange gestito; il suo bookmaker_id (6) coincide oggi
@@ -379,6 +409,8 @@ class AppApiClient(AppApiClientInterface):
             return Result.fail(f"Connessione fallita: {exc}", self.NETCAP_UNREACHABLE)
         except requests.Timeout:
             return Result.fail(f"Timeout su {url}", self.NETCAP_TIMEOUT)
+        except requests.RequestException as exc:  # FIX-18
+            return Result.fail(f"Errore di rete: {exc}", self.NETCAP_UNREACHABLE)
 
         if not resp.ok:
             return Result.fail(f"HTTP {resp.status_code} da {url}", self.NETCAP_HTTP_ERROR)
@@ -461,18 +493,23 @@ class AppApiClient(AppApiClientInterface):
         }
         res = self._post_json(f"/operazioni/{operazione_id}/righe", body)
         if not res.success:
+            self.clear_cache()  # FIX-25
             return Result.ok(WriteResult(success=False, netcap_id=None, message=res.error))
 
         riga_id = res.data.get("id") if isinstance(res.data, dict) else None
         if riga_id is None:
+            self.clear_cache()  # FIX-25
             return Result.ok(WriteResult(success=False, netcap_id=None, message=f"Risposta riga senza id: {res.data}"))
+        self.clear_cache()  # FIX-25
         return Result.ok(WriteResult(success=True, netcap_id=riga_id, message=None))
 
     def close_riga(self, riga_id: int) -> Result[bool]:
         """POST /operazioni/righe/{id}/chiudi: chiude la riga appena scritta."""
         res = self._post_no_body(f"/operazioni/righe/{riga_id}/chiudi")
         if not res.success:
+            self.clear_cache()  # FIX-25
             return res  # type: ignore[return-value]
+        self.clear_cache()  # FIX-25
         return Result.ok(True)
 
     def close_operazione(self, operazione_id: int) -> Result[bool]:
@@ -480,7 +517,9 @@ class AppApiClient(AppApiClientInterface):
         da chiamare una sola volta a fine ciclo."""
         res = self._post_no_body(f"/operazioni/{operazione_id}/chiudi")
         if not res.success:
+            self.clear_cache()  # FIX-25
             return res  # type: ignore[return-value]
+        self.clear_cache()  # FIX-25
         return Result.ok(True)
 
     def verify_balance_after_rettifica(
@@ -497,7 +536,7 @@ class AppApiClient(AppApiClientInterface):
         compaiono in matrix, fallisce con NETCAP_EMPTY_RESULT ("non verificabile")
         anziche' restituire Result.ok(False) ("verificato ma sbagliato"), per una
         diagnostica piu' chiara lato orchestrator."""
-        res = self._get_json("/saldi-bookmaker")
+        res = self._get_saldi_bookmaker()  # FIX-25
         if not res.success:
             return res  # type: ignore[return-value]
 
@@ -521,13 +560,39 @@ class AppApiClient(AppApiClientInterface):
                 self.NETCAP_EMPTY_RESULT,
             )
 
-        saldo_attuale = round(float(coll_matrix[saldo_key]), 2)
+        try:  # FIX-18
+            saldo_attuale = round(float(coll_matrix[saldo_key]), 2)
+        except (KeyError, ValueError, TypeError, AttributeError) as exc:  # FIX-18
+            return Result.fail(f"Errore di parsing: {exc}", self.NETCAP_PARSE_ERROR)
         match = abs(saldo_attuale - round(expected_balance, 2)) < 0.01
         return Result.ok(match)
 
     # ------------------------------------------------------------------
     # private
     # ------------------------------------------------------------------
+
+    def _get_saldi_bookmaker(self) -> Result[dict]:
+        """FIX-25: GET /saldi-bookmaker e' chiamato indipendentemente da
+        read_expected_balance/read_wallet_balance/verify_balance_after_rettifica;
+        senza cache un singolo ciclo di riconciliazione lo richiede 3x. Cache
+        in-memory con TTL 60s, invalidata esplicitamente da clear_cache() dopo
+        ogni scrittura. Un fallimento della GET non tocca la cache esistente,
+        cosi' un errore di rete transitorio non butta via un dato ancora valido."""
+        if self._saldi_cache is not None and time.time() - self._saldi_cache_timestamp < 60:
+            return Result.ok(self._saldi_cache)
+
+        res = self._get_json("/saldi-bookmaker")
+        if res.success:
+            self._saldi_cache = res.data
+            self._saldi_cache_timestamp = time.time()
+        return res
+
+    def clear_cache(self) -> None:
+        """FIX-25: invalida la cache di /saldi-bookmaker. Va chiamata dopo ogni
+        scrittura che puo' alterare i saldi (rettifiche/operazioni), per non
+        servire dati stantii nei prossimi 60s."""
+        self._saldi_cache = None
+        self._saldi_cache_timestamp = None
 
     def _get_json(self, path: str) -> Result[dict | list]:
         """GET + parse JSON. Gestisce tutti gli errori infrastrutturali."""
@@ -538,6 +603,8 @@ class AppApiClient(AppApiClientInterface):
             return Result.fail(f"Connessione fallita: {exc}", self.NETCAP_UNREACHABLE)
         except requests.Timeout:
             return Result.fail(f"Timeout su {url}", self.NETCAP_TIMEOUT)
+        except requests.RequestException as exc:  # FIX-18
+            return Result.fail(f"Errore di rete: {exc}", self.NETCAP_UNREACHABLE)
 
         if not resp.ok:
             return Result.fail(
@@ -559,6 +626,8 @@ class AppApiClient(AppApiClientInterface):
             return Result.fail(f"Connessione fallita: {exc}", self.NETCAP_UNREACHABLE)
         except requests.Timeout:
             return Result.fail(f"Timeout su {url}", self.NETCAP_TIMEOUT)
+        except requests.RequestException as exc:  # FIX-18
+            return Result.fail(f"Errore di rete: {exc}", self.NETCAP_UNREACHABLE)
 
         print(f"[Netcap] POST {url} -> status={resp.status_code} body={resp.text}")  # FIX-NETCAP-2STEP
 
@@ -584,6 +653,8 @@ class AppApiClient(AppApiClientInterface):
             return Result.fail(f"Connessione fallita: {exc}", self.NETCAP_UNREACHABLE)
         except requests.Timeout:
             return Result.fail(f"Timeout su {url}", self.NETCAP_TIMEOUT)
+        except requests.RequestException as exc:  # FIX-18
+            return Result.fail(f"Errore di rete: {exc}", self.NETCAP_UNREACHABLE)
 
         print(f"[Netcap] POST {url} -> status={resp.status_code}")
 
@@ -596,10 +667,12 @@ class AppApiClient(AppApiClientInterface):
         """POST /operazioni e wrappa il risultato in WriteResult."""
         res = self._post_json("/operazioni", body)
         if not res.success:
+            self.clear_cache()  # FIX-25
             return Result.ok(WriteResult(success=False, netcap_id=None, message=res.error))
 
         data = res.data
         netcap_id = data.get("id") if isinstance(data, dict) else None
+        self.clear_cache()  # FIX-25
         return Result.ok(WriteResult(success=True, netcap_id=netcap_id, message=None))
 
     def _build_book_map(self, bookmakers_list: list[dict]) -> dict[int, dict]:

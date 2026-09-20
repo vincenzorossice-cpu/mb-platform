@@ -152,6 +152,21 @@ class TestReadScreen:
         reader.read_screen("device_001", screen_type="balance_page", use_cache=True, cache_ttl=0)
         assert mock_run.call_count > calls_after_first
 
+    @patch("orchestrator.modules.screen_reader.reader.subprocess.run")
+    def test_read_screen_force_refresh_bypasses_cache(self, mock_run, reader):
+        """FIX-22: force_refresh=True salta la cache anche entro la TTL, ma
+        ricache il risultato fresco per le letture successive non forzate."""
+        mock_run.return_value = MagicMock(returncode=0, stdout=SAMPLE_XML, stderr="")
+        reader.read_screen("device_001", screen_type="balance_page", use_cache=True)
+        calls_after_first = mock_run.call_count
+
+        reader.read_screen("device_001", screen_type="balance_page", use_cache=True, force_refresh=True)
+        assert mock_run.call_count > calls_after_first
+
+        calls_after_forced = mock_run.call_count
+        reader.read_screen("device_001", screen_type="balance_page", use_cache=True)
+        assert mock_run.call_count == calls_after_forced  # cache ripopolata dal forced read
+
 
 class TestFindElement:
 
@@ -215,6 +230,16 @@ class TestReadBetStatus:
         assert result.data.status == "not_found"
         assert result.data.lay_odds is None
         assert result.data.confidence == 1.0
+
+    @patch("orchestrator.modules.screen_reader.reader.subprocess.run")
+    def test_read_bet_status_force_refresh_passed_through(self, mock_run, reader):
+        """FIX-22: force_refresh su read_bet_status deve propagarsi a read_screen,
+        cosi' ogni chiamata forzata rilegge invece di servire la cache 5s."""
+        mock_run.return_value = MagicMock(returncode=0, stdout=SAMPLE_XML_MYBETS, stderr="")
+        reader.read_bet_status("device_001", betfair=True, force_refresh=True)
+        calls_after_first = mock_run.call_count
+        reader.read_bet_status("device_001", betfair=True, force_refresh=True)
+        assert mock_run.call_count > calls_after_first
 
 
 class TestExtractBalance:

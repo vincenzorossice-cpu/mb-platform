@@ -72,10 +72,10 @@ class ScreenReader(ScreenReaderInterface):
 
     def read_screen(
         self, device_id: str, screen_type: Optional[str] = None,
-        use_cache: bool = False, cache_ttl: int = 5,
+        use_cache: bool = False, cache_ttl: int = 5, force_refresh: bool = False,
     ) -> Result[ScreenContent]:
         cache_key = (device_id, screen_type)  # FIX-B: chiave per device+tipo, mai uno slot globale
-        if use_cache:
+        if use_cache and not force_refresh:  # FIX-22: force_refresh salta la lettura dalla cache
             cached = self._screen_cache.get(cache_key)
             if cached is not None:
                 cached_result, cached_at = cached
@@ -154,8 +154,8 @@ class ScreenReader(ScreenReaderInterface):
             confidence=screen.data.confidence,
         ))
 
-    def read_bet_status(self, device_id: str, betfair: bool = False) -> Result[BetStatus]:
-        screen = self.read_screen(device_id, screen_type="my_bets", use_cache=True)  # FIX-B
+    def read_bet_status(self, device_id: str, betfair: bool = False, force_refresh: bool = False) -> Result[BetStatus]:
+        screen = self.read_screen(device_id, screen_type="my_bets", use_cache=True, force_refresh=force_refresh)  # FIX-B / FIX-22
         if not screen.success:
             return Result.fail(f"Cannot read bet status: {screen.error}", screen.error_code)
 

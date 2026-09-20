@@ -344,6 +344,22 @@ class TestPlaceLayBetVerifyThenAct(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertEqual(result.error_code, "AMBIGUOUS_STATE")
 
+    @patch("orchestrator.modules.touch_injector.injector.time.sleep")
+    @patch("orchestrator.modules.touch_injector.injector.subprocess.run")
+    def test_verify_lay_state_passes_force_refresh(self, mock_run, mock_sleep):
+        """FIX-22: _verify_lay_state deve bypassare la cache schermo dopo un
+        timeout ADB, altrimenti rischia di leggere uno stato stantio."""
+        injector, reader = self._make_injector_with_timeout()
+        mock_run.side_effect = self._lay_side_effect_factory()
+
+        reader.read_bet_status.return_value = Result.ok(
+            BetStatus(status="matched", lay_odds=2.10, confidence=1.0)
+        )
+
+        injector.place_lay_bet(DEVICE, "match_odds", 2.10, 50.0)
+
+        reader.read_bet_status.assert_called_with(DEVICE, betfair=True, force_refresh=True)
+
 
 class TestWaitLayConfirmation(unittest.TestCase):
     """Test diretti su _wait_lay_confirmation (percorso normale, tap di conferma riuscito)."""
@@ -383,6 +399,20 @@ class TestWaitLayConfirmation(unittest.TestCase):
         # Una sola iterazione eseguita, nonostante bet_confirm_timeout=15 permetterebbe
         # normalmente ~15 cicli da 1s se il tempo non fosse stato consumato dalla read lenta
         self.assertEqual(reader.read_bet_status.call_count, 1)
+
+    @patch("orchestrator.modules.touch_injector.injector.time.sleep")
+    def test_wait_lay_confirmation_passes_force_refresh(self, mock_sleep):
+        """FIX-22: il polling deve bypassare la cache a 5s dello ScreenReader,
+        altrimenti in un loop da 1s vedrebbe sempre lo stesso screenshot stantio."""
+        reader = MagicMock()
+        reader.read_bet_status.return_value = Result.ok(
+            BetStatus(status="matched", lay_odds=2.10, confidence=1.0)
+        )
+        injector = TouchInjector(screen_reader=reader, bet_confirm_timeout=15)
+
+        injector._wait_lay_confirmation(DEVICE, 2.10, 50.0)
+
+        reader.read_bet_status.assert_called_with(DEVICE, betfair=True, force_refresh=True)
 
 
 class TestNavigateTo(unittest.TestCase):
