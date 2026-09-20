@@ -122,6 +122,22 @@ def load_bookmaker_options(config_path: str = None) -> dict:
     return dict(sorted(options.items(), key=lambda kv: kv[1]))
 
 
+def load_pending_sport_flows(report_dir: str = DEFAULT_REPORT_DIR) -> list[dict]:
+    """Legge i flow P5 Sport pending salvati da SportFlowHandler.save_pending_flow,
+    aggiungendo severity per il badge della dashboard."""
+    from orchestrator.flows.sport_flow_handler import SportFlowHandler
+
+    flows = SportFlowHandler().load_pending_flows(report_dir)
+    for flow in flows:
+        if flow.get("status") == "calc_error":
+            flow["severity"] = "critical"
+        elif flow.get("status") == "tc_discrepancy":
+            flow["severity"] = "warning"
+        else:
+            flow["severity"] = "ok"
+    return flows
+
+
 def load_errors(report_dir: str = DEFAULT_REPORT_DIR) -> list[dict]:
     """Legge gli errori di sistema (device offline, OCR fallito, Netcap irraggiungibile)."""
     errori = []

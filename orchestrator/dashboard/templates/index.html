@@ -155,9 +155,44 @@
         {% endif %}
     </div>
 
+    <div class="section">
+        <h2>⚽ Operazioni Sport Pending <span class="badge badge-warning">{{ sport_flows|length }}</span></h2>
+        {% if sport_flows %}
+        <table>
+            <tr><th>Book</th><th>Tipo</th><th>T&C</th><th>Profitto</th><th>Identità</th><th>Conferma</th></tr>
+            {% for f in sport_flows %}
+            <tr class="item {{ f.severity }}">
+                <td>{{ f.book }}</td>
+                <td>{{ f.category }}</td>
+                <td><span class="badge badge-{{ f.severity }}">{{ f.tc_status }}</span></td>
+                <td>{{ f.expected_profit }}</td>
+                <td>
+                    {% for iid in f.identity_ids_available %}
+                    <label><input type="checkbox" class="sport-identity-{{ f.item_id }}" value="{{ iid }}"> {{ iid }}</label>
+                    {% endfor %}
+                </td>
+                <td><button class="btn btn-approve" onclick="confirmSportFlow('{{ f.item_id }}')">Conferma</button></td>
+            </tr>
+            {% endfor %}
+        </table>
+        {% else %}
+        <p class="empty">Nessuna operazione sport pending</p>
+        {% endif %}
+    </div>
+
     <script>
         function hitlAction(action, itemId) {
             fetch(`/${action}/${itemId}`, { method: 'POST' });
+        }
+
+        function confirmSportFlow(itemId) {
+            const checked = document.querySelectorAll(`.sport-identity-${itemId}:checked`);
+            const identityIds = Array.from(checked).map(el => el.value);
+            fetch(`/confirm_sport_flow/${itemId}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ identity_ids: identityIds }),
+            });
         }
 
         const pendingCollaboratori = {

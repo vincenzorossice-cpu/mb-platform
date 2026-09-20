@@ -397,6 +397,33 @@ class TestCloseOperazione:
         assert result.error_code == "NETCAP_HTTP_ERROR"
 
 
+class TestCloseBetGruppoOutcome:
+
+    def test_close_bet_gruppo_outcome_win(self, client: AppApiClient):
+        with patch.object(client.session, "put", return_value=_mock_post_ok({"profitto_totale": 30})) as mock_put:
+            result = client.close_bet_gruppo_outcome("cascade_119_xxx", True, False)
+
+        assert result.success
+        assert result.data is True
+        url = mock_put.call_args.args[0]
+        assert url.endswith("/operazioni/righe-gruppo/cascade_119_xxx/outcome")
+        assert mock_put.call_args.kwargs["json"] == {"win": True, "lose": False}
+
+    def test_close_bet_gruppo_outcome_lose(self, client: AppApiClient):
+        with patch.object(client.session, "put", return_value=_mock_post_ok({})) as mock_put:
+            result = client.close_bet_gruppo_outcome("cascade_119_xxx", False, True)
+
+        assert result.success
+        assert mock_put.call_args.kwargs["json"] == {"win": False, "lose": True}
+
+    def test_close_bet_gruppo_outcome_http_error(self, client: AppApiClient):
+        with patch.object(client.session, "put", return_value=_mock_http_error(500)):
+            result = client.close_bet_gruppo_outcome("cascade_119_xxx", True, False)
+
+        assert not result.success
+        assert result.error_code == "NETCAP_HTTP_ERROR"
+
+
 class TestVerifyBalanceAfterRettifica:
 
     def _saldi_response(self, saldo: float):

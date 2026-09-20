@@ -522,6 +522,17 @@ class AppApiClient(AppApiClientInterface):
         self.clear_cache()  # FIX-25
         return Result.ok(True)
 
+    def close_bet_gruppo_outcome(self, bet_gruppo_id: str, win: bool, lose: bool) -> Result[bool]:
+        """PUT /operazioni/righe-gruppo/{bet_gruppo_id}/outcome: chiude un intero
+        gruppo cascade con l'esito finale (win/lose), da chiamare quando tutti gli
+        eventi della cascata sono risolti."""
+        res = self._put_json(f"/operazioni/righe-gruppo/{bet_gruppo_id}/outcome", {"win": win, "lose": lose})
+        if not res.success:
+            self.clear_cache()  # FIX-25
+            return res  # type: ignore[return-value]
+        self.clear_cache()  # FIX-25
+        return Result.ok(True)
+
     def verify_balance_after_rettifica(
         self,
         collaboratore_id: str,
@@ -630,6 +641,31 @@ class AppApiClient(AppApiClientInterface):
             return Result.fail(f"Errore di rete: {exc}", self.NETCAP_UNREACHABLE)
 
         print(f"[Netcap] POST {url} -> status={resp.status_code} body={resp.text}")  # FIX-NETCAP-2STEP
+
+        if not resp.ok:
+            return Result.fail(
+                f"HTTP {resp.status_code} da {url}",
+                self.NETCAP_HTTP_ERROR,
+            )
+
+        try:
+            return Result.ok(resp.json())
+        except ValueError as exc:
+            return Result.fail(f"JSON non valido: {exc}", self.NETCAP_PARSE_ERROR)
+
+    def _put_json(self, path: str, body: dict) -> Result[dict]:
+        """PUT JSON + parse response."""
+        url = f"{self.base_url}{path}"
+        try:
+            resp = self.session.put(url, json=body, timeout=self.timeout)
+        except requests.ConnectionError as exc:
+            return Result.fail(f"Connessione fallita: {exc}", self.NETCAP_UNREACHABLE)
+        except requests.Timeout:
+            return Result.fail(f"Timeout su {url}", self.NETCAP_TIMEOUT)
+        except requests.RequestException as exc:  # FIX-18
+            return Result.fail(f"Errore di rete: {exc}", self.NETCAP_UNREACHABLE)
+
+        print(f"[Netcap] PUT {url} -> status={resp.status_code} body={resp.text}")
 
         if not resp.ok:
             return Result.fail(

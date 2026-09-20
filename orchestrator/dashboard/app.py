@@ -8,17 +8,26 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 
+from orchestrator.core.device_manager import DeviceManager
 from orchestrator.dashboard.data_loader import (
     DEFAULT_REPORT_DIR,
     load_bookmaker_options,
     load_errors,
     load_movimenti,
+    load_pending_sport_flows,
     load_rettifiche,
     load_unregistered_operations,
 )
+from orchestrator.flows.sport_flow import SportFlow
+from orchestrator.flows.sport_flow_handler import SportFlowHandler
 from orchestrator.modules.app_api_client.client import AppApiClient
+from orchestrator.modules.cascade_engine.engine import CascadeEngine
 from orchestrator.modules.movement_importer.importer import MovementImporter
 from orchestrator.modules.movement_importer.interface import Movement
+from orchestrator.modules.multiplier_engine.calculator import MultiplierEngine
+from orchestrator.modules.screen_reader.reader import ScreenReader
+from orchestrator.modules.signal_parser.parser import SignalParser
+from orchestrator.modules.touch_injector.injector import TouchInjector
 
 app = FastAPI(title="MB Platform HITL Dashboard")
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
@@ -31,13 +40,37 @@ async def dashboard(request: Request):
     errori = load_errors()
     operazioni_non_registrate = load_unregistered_operations()
     bookmaker_options = load_bookmaker_options()
+    sport_flows = load_pending_sport_flows()
     return templates.TemplateResponse(request, "index.html", {
         "rettifiche": rettifiche,
         "movimenti": movimenti,
         "errori": errori,
         "operazioni_non_registrate": operazioni_non_registrate,
         "bookmaker_options": bookmaker_options,
+        "sport_flows": sport_flows,
     })
+
+
+def _build_sport_flow() -> SportFlow:
+    """Istanzia SportFlow con i 7 moduli P5 Sport, stesso stile inline di
+    AppApiClient()/MovementImporter(...) gia' usato dalle altre route. rag_system
+    resta None: qui viene usato solo execute_operation, non process_signal."""
+    screen_reader = ScreenReader()
+    touch_injector = TouchInjector(screen_reader=screen_reader)
+    multiplier_engine = MultiplierEngine()
+    cascade_engine = CascadeEngine(
+        screen_reader=screen_reader, touch_injector=touch_injector, multiplier_engine=multiplier_engine,
+    )
+    return SportFlow(
+        signal_parser=SignalParser(),
+        rag_system=None,
+        multiplier_engine=multiplier_engine,
+        touch_injector=touch_injector,
+        cascade_engine=cascade_engine,
+        app_api_client=AppApiClient(),
+        screen_reader=screen_reader,
+        device_manager=DeviceManager(),
+    )
 
 
 def _find_movement_in_files(
@@ -253,3 +286,30 @@ async def complete_operation(item_id: str, request: Request):
         "riga_id": riga_result.data.netcap_id,
         "linked_existing": existing_op_id is not None,
     }
+
+
+@app.get("/pending_sport_flows")
+async def get_pending_sport_flows():
+    """Restituisce i flow P5 Sport pending per la dashboard."""
+    return SportFlowHandler().load_pending_flows()
+
+
+@app.post("/confirm_sport_flow/{hitl_item_id}")
+async def confirm_sport_flow(hitl_item_id: str, request: Request):
+    """Raffaele conferma -> execute_operation su tutte le identita' selezionate."""
+    try:
+        payload = await request.json()
+        identity_ids = list(payload["identity_ids"])
+    except (ValueError, KeyError, TypeError):
+        return JSONResponse(status_code=400, content={
+            "status": "error", "id": hitl_item_id,
+            "error": "body JSON invalido: identity_ids richiesto",
+        })
+
+    sport_flow = _build_sport_flow()
+    result = sport_flow.execute_operation(hitl_item_id, identity_ids)
+    if not result.success:
+        return JSONResponse(status_code=502, content={"status": "error", "id": hitl_item_id, "error": result.error})
+
+    SportFlowHandler().update_flow_status(hitl_item_id, "executed")
+    return {"status": "executed", "id": hitl_item_id, "result": asdict(result.data)}
