@@ -366,8 +366,9 @@ class TestWaitLayConfirmation(unittest.TestCase):
 
     @patch("orchestrator.modules.touch_injector.injector.time.sleep")
     def test_wait_lay_confirmation_unknown_status(self, mock_sleep):
-        """FIX-5: status='unknown' durante il polling -> AMBIGUOUS_STATE, non BET_NOT_CONFIRMED
-        e mai confirmed=True."""
+        """FIX-5: status='unknown' per 3 letture consecutive durante il polling -> AMBIGUOUS_STATE,
+        non BET_NOT_CONFIRMED e mai confirmed=True. Una singola lettura 'unknown' isolata non
+        deve invece far fallire subito (si tollera fino a 2 letture ambigue consecutive)."""
         reader = MagicMock()
         reader.read_bet_status.return_value = Result.ok(
             BetStatus(status="unknown", lay_odds=None, confidence=1.0)
@@ -378,15 +379,36 @@ class TestWaitLayConfirmation(unittest.TestCase):
 
         self.assertFalse(result.success)
         self.assertEqual(result.error_code, "AMBIGUOUS_STATE")
+        # Deve aver atteso 3 letture "unknown" consecutive prima di escalare
+        self.assertEqual(reader.read_bet_status.call_count, 3)
+
+    @patch("orchestrator.modules.touch_injector.injector.time.sleep")
+    def test_wait_lay_confirmation_unknown_streak_resets(self, mock_sleep):
+        """FIX-5: 2 letture 'unknown' seguite da una lettura riconosciuta non devono
+        far scattare l'escalation — lo streak di ambiguita' si resetta."""
+        reader = MagicMock()
+        reader.read_bet_status.side_effect = [
+            Result.ok(BetStatus(status="unknown", lay_odds=None, confidence=1.0)),
+            Result.ok(BetStatus(status="unknown", lay_odds=None, confidence=1.0)),
+            Result.ok(BetStatus(status="matched", lay_odds=2.10, confidence=1.0)),
+        ]
+        injector = TouchInjector(screen_reader=reader, bet_confirm_timeout=15)
+
+        result = injector._wait_lay_confirmation(DEVICE, 2.10, 50.0)
+
+        self.assertTrue(result.success)
+        self.assertTrue(result.data.confirmed)
+        self.assertEqual(reader.read_bet_status.call_count, 3)
 
     @patch("orchestrator.modules.touch_injector.injector.time.monotonic")
     @patch("orchestrator.modules.touch_injector.injector.time.sleep")
     def test_wait_lay_confirmation_respects_timeout_despite_slow_read(self, mock_sleep, mock_monotonic):
         """FIX-21: anche se read_bet_status è lenta, il deadline (wall-clock via monotonic)
         viene rispettato — non si continua a fare polling oltre bet_confirm_timeout."""
-        # start=0, primo check while (0-0=0 < 15) entra nel loop, dopo l'iterazione "lenta"
-        # il secondo check while vede 16-0=16 >= 15 -> esce
-        mock_monotonic.side_effect = [0, 0, 16]
+        # start=0; check inizio 1a iterazione: remaining=15-0=15>0, prima iterazione -> parte
+        # sempre; dopo la read "lenta" elapsed=16-0=16 (> timeout, logga warning); check
+        # inizio 2a iterazione: remaining=15-16=-1<=0 -> esce
+        mock_monotonic.side_effect = [0, 0, 16, 16]
 
         reader = MagicMock()
         reader.read_bet_status.return_value = Result.fail("slow/ambiguous read", "OCR_LOW_CONFIDENCE")
@@ -398,6 +420,42 @@ class TestWaitLayConfirmation(unittest.TestCase):
         self.assertEqual(result.error_code, "BET_NOT_CONFIRMED")
         # Una sola iterazione eseguita, nonostante bet_confirm_timeout=15 permetterebbe
         # normalmente ~15 cicli da 1s se il tempo non fosse stato consumato dalla read lenta
+        self.assertEqual(reader.read_bet_status.call_count, 1)
+
+    @patch("orchestrator.modules.touch_injector.injector.time.monotonic")
+    @patch("orchestrator.modules.touch_injector.injector.time.sleep")
+    def test_bet_confirm_wall_clock(self, mock_sleep, mock_monotonic):
+        """FIX-21: se una singola lettura supera il bet_confirm_timeout dichiarato, viene
+        loggato un warning e non parte un'ulteriore iterazione di polling."""
+        mock_monotonic.side_effect = [0, 0, 16, 16]
+
+        reader = MagicMock()
+        reader.read_bet_status.return_value = Result.fail("slow read", "OCR_LOW_CONFIDENCE")
+        injector = TouchInjector(screen_reader=reader, bet_confirm_timeout=15)
+
+        with self.assertLogs("orchestrator.modules.touch_injector.injector", level="WARNING") as cm:
+            result = injector._wait_lay_confirmation(DEVICE, 2.10, 50.0)
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, "BET_NOT_CONFIRMED")
+        self.assertTrue(any("bet_confirm_timeout" in msg for msg in cm.output))
+        self.assertEqual(reader.read_bet_status.call_count, 1)
+
+    @patch("orchestrator.modules.touch_injector.injector.time.sleep")
+    def test_wait_lay_confirmation_margin_guard_stops_before_deadline(self, mock_sleep):
+        """FIX-21: non si avvia una nuova iterazione (oltre la prima) se il tempo rimanente
+        e' inferiore ad adb_timeout — evita di iniziare una lettura che rischia di sforare."""
+        reader = MagicMock()
+        reader.read_bet_status.return_value = Result.fail("still loading", "OCR_LOW_CONFIDENCE")
+        # bet_confirm_timeout appena sopra 1s: dopo la prima iterazione (~1s) il tempo
+        # rimanente e' gia' sotto adb_timeout (10s di default) -> niente seconda iterazione
+        injector = TouchInjector(screen_reader=reader, bet_confirm_timeout=1.5)
+
+        result = injector._wait_lay_confirmation(DEVICE, 2.10, 50.0)
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, "BET_NOT_CONFIRMED")
+        # Garantito almeno un tentativo, ma non un secondo dato il margine insufficiente
         self.assertEqual(reader.read_bet_status.call_count, 1)
 
     @patch("orchestrator.modules.touch_injector.injector.time.sleep")
@@ -428,8 +486,8 @@ class TestNavigateTo(unittest.TestCase):
         self.assertTrue(result.success)
 
     def test_navigate_to_tap_failure(self):
-        """_human_tap fallisce sempre -> nessun tap va mai a buon fine -> NAVIGATION_FAILED
-        con messaggio dedicato, non si scambia il fallimento per progresso."""
+        """_human_tap fallisce sempre sullo stesso elemento -> FIX-23 interrompe dopo 2
+        fallimenti consecutivi con NAVIGATION_FAILED, senza attendere max_steps."""
         reader = MagicMock()
         reader.read_screen.return_value = Result.ok(_make_screen(screen_type="unknown"))
         elem = _make_element("saldo", bounds=[100, 200, 300, 400])
@@ -442,7 +500,48 @@ class TestNavigateTo(unittest.TestCase):
 
         self.assertFalse(result.success)
         self.assertEqual(result.error_code, "NAVIGATION_FAILED")
-        self.assertEqual(result.error, "Navigation failed: no successful taps")
+        self.assertEqual(result.error, "Navigation tap failed")
+        # Si ferma dopo il 2° fallimento consecutivo, non prosegue fino a max_steps
+        self.assertEqual(injector._human_tap.call_count, 2)
+
+    def test_navigate_tap_failed(self):
+        """FIX-23: 2 tap falliti di seguito sullo stesso elemento -> NAVIGATION_FAILED
+        immediato ('Navigation tap failed'), il tap non va mai considerato riuscito."""
+        reader = MagicMock()
+        reader.read_screen.return_value = Result.ok(_make_screen(screen_type="unknown"))
+        elem = _make_element("saldo", bounds=[100, 200, 300, 400])
+        reader.find_element.return_value = Result.ok(elem)
+
+        injector = TouchInjector(screen_reader=reader)
+        injector._human_tap = MagicMock(return_value=Result.fail("tap missed", "TAP_MISSED"))
+
+        result = injector.navigate_to(DEVICE, "balance_page", "Stanleybet")
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, "NAVIGATION_FAILED")
+        self.assertEqual(result.error, "Navigation tap failed")
+
+    def test_navigate_to_recovers_after_single_tap_failure(self):
+        """FIX-23: un singolo fallimento seguito da un successo sullo stesso elemento
+        non deve far scattare l'interruzione anticipata (serve la ripetizione consecutiva)."""
+        reader = MagicMock()
+        elem = _make_element("saldo", bounds=[100, 200, 300, 400])
+        reader.find_element.return_value = Result.ok(elem)
+        reader.read_screen.side_effect = [
+            Result.ok(_make_screen(screen_type="unknown")),
+            Result.ok(_make_screen(screen_type="unknown")),
+            Result.ok(_make_screen(screen_type="balance_page")),
+        ]
+
+        injector = TouchInjector(screen_reader=reader)
+        injector._human_tap = MagicMock(side_effect=[
+            Result.fail("tap missed", "TAP_MISSED"),
+            Result.ok(True),
+        ])
+
+        result = injector.navigate_to(DEVICE, "balance_page", "Stanleybet")
+
+        self.assertTrue(result.success)
 
     def test_navigate_to_no_navigation_path(self):
         """Nessun hint trovato sullo schermo -> fallimento immediato al primo step."""

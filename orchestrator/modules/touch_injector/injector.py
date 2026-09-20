@@ -1,3 +1,4 @@
+import logging
 import subprocess
 import time
 import random
@@ -11,9 +12,15 @@ from orchestrator.modules.touch_injector.interface import (
 )
 from orchestrator.modules.screen_reader.interface import ScreenReaderInterface
 
+logger = logging.getLogger(__name__)
+
 # FIX-24: caratteri interpretati dalla shell del device (adb shell input text)
 # che vanno rimossi dal testo prima di inviarlo, per evitare injection
 _DANGEROUS_CHARS_RE = re.compile(r"[;&$`|<>(){}\[\]]")
+
+# FIX-5: numero di letture "unknown" consecutive durante il polling prima di
+# escalare ad AMBIGUOUS_STATE, invece di fallire alla primissima lettura ambigua
+_UNKNOWN_STATUS_STREAK_LIMIT = 3
 
 
 class TouchInjector(TouchInjectorInterface):
@@ -114,6 +121,8 @@ class TouchInjector(TouchInjectorInterface):
         Max 5 tentativi di navigazione prima di fallire."""
         max_steps = 5
         had_successful_tap = False  # FIX-23: tracciato su tutti gli step, per il messaggio finale
+        last_failed_hint = None  # FIX-23: rileva 2 fallimenti consecutivi sullo stesso elemento
+        consecutive_failures = 0
 
         for step in range(max_steps):
             screen = self.screen_reader.read_screen(device_id)
@@ -136,6 +145,18 @@ class TouchInjector(TouchInjectorInterface):
                     tap_result = self._human_tap(device_id, cx, cy)
                     if tap_result.success:
                         had_successful_tap = True
+                        last_failed_hint = None
+                        consecutive_failures = 0
+                    else:
+                        # FIX-23: 2 fallimenti di seguito sullo stesso elemento -> non
+                        # insistere fino a max_steps, l'elemento e' probabilmente irraggiungibile
+                        if hint == last_failed_hint:
+                            consecutive_failures += 1
+                        else:
+                            last_failed_hint = hint
+                            consecutive_failures = 1
+                        if consecutive_failures >= 2:
+                            return Result.fail("Navigation tap failed", "NAVIGATION_FAILED")
                     break
 
             if not found_hint:
@@ -336,11 +357,35 @@ class TouchInjector(TouchInjectorInterface):
         """Polling post-conferma per lay bet."""
         # FIX-21: time.monotonic() invece di time.time() — un read_bet_status lento
         # (fino a piu' iterazioni di adb_timeout) non deve far sforare bet_confirm_timeout
-        # in modo silenzioso; il deadline viene ricontrollato prima di ogni iterazione.
+        # in modo silenzioso. Il deadline viene ricontrollato sia prima che dopo ogni
+        # read_bet_status, e non si avvia una nuova iterazione (oltre la prima, per
+        # garantire almeno un tentativo) se il tempo rimanente non basta per un'altra
+        # lettura (margine = adb_timeout).
         start = time.monotonic()
-        while time.monotonic() - start < self.bet_confirm_timeout:
+        unknown_streak = 0  # FIX-5: escalare solo dopo letture "unknown" consecutive
+        iterations = 0
+
+        while True:
+            remaining = self.bet_confirm_timeout - (time.monotonic() - start)
+            if remaining <= 0:
+                break
+            if iterations > 0 and remaining < self.adb_timeout:
+                break
+
+            iterations += 1
             time.sleep(1.0)
             status = self.screen_reader.read_bet_status(device_id, betfair=True, force_refresh=True)  # FIX-22
+
+            elapsed = time.monotonic() - start
+            if elapsed > self.bet_confirm_timeout:
+                # FIX-21: il timeout dichiarato e' gia' stato superato da questa singola
+                # lettura — non e' un errore silenzioso, va segnalato
+                logger.warning(
+                    "_wait_lay_confirmation: bet_confirm_timeout dichiarato di %ss superato "
+                    "(tempo effettivo trascorso: %.1fs)",
+                    self.bet_confirm_timeout, elapsed,
+                )
+
             if not status.success:
                 continue
             if status.data.status in ("matched", "unsettled"):
@@ -350,11 +395,17 @@ class TouchInjector(TouchInjectorInterface):
                 ))
             if status.data.status == "unknown":
                 # FIX-5: schermata non riconosciuta durante il polling -> stato ambiguo,
-                # mai trattarlo come confirmed
-                return Result.fail(
-                    "Ambiguous lay state while waiting confirmation: unknown",
-                    "AMBIGUOUS_STATE",
-                )
+                # mai trattarlo come confirmed. Si tollerano letture ambigue isolate,
+                # ma non una sequenza di 3 consecutive.
+                unknown_streak += 1
+                if unknown_streak >= _UNKNOWN_STATUS_STREAK_LIMIT:
+                    return Result.fail(
+                        f"Ambiguous lay state while waiting confirmation: unknown "
+                        f"x{unknown_streak} consecutive reads",
+                        "AMBIGUOUS_STATE",
+                    )
+                continue
+            unknown_streak = 0
             if status.data.status == "not_found":
                 return Result.fail("Lay bet not placed (verified)", "LAY_NOT_PLACED_RETRY_SAFE")
 
