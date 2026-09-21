@@ -471,7 +471,7 @@ async def submit_signal(request: Request):
 
     return {
         "success": True,
-        "message": "Segnale inviato al flusso P5 Sport",
+        "message": f"Segnale inviato al flusso P5 {parsed.data.category.capitalize()}",
         "filter_action": promo.action,
         "filter_reason": promo.reason,
         "signal_book": flow_result.data.signal.book,
