@@ -7,9 +7,12 @@ from orchestrator.modules.telegram_acquirer.acquirer import TelegramAcquirer, _l
 from orchestrator.modules.telegram_acquirer.notification_monitor import NotificationMonitor
 
 MOCK_NOTIFICATION_OUTPUT = """
-NotificationRecord{0x123: u0d123 com.telegram.messenger}
-  android.app.Notification@456
-  extras: Bundle[{android.title=Canale Segnali, android.text=📚 STANLEYBET 💎RICORRENTE SPORT}]
+NotificationRecord(0x0ca54915: pkg=org.telegram.messenger user=UserHandle{0} id=1)
+  notification=
+            tickerText=📚 STANLEYBET 💎RICORRENTE SPORT
+            extras={
+                android.title=String (Canale Segnali)
+            }
 """
 
 MOCK_NO_TELEGRAM_OUTPUT = """
@@ -140,7 +143,7 @@ class TestOpenTelegram:
         args = mock_run.call_args[0][0]
         assert args[:3] == ["adb", "-s", "device_001"]
         assert "am" in args and "start" in args
-        assert "com.telegram.messenger/.TelegramLaunchActivity" in args
+        assert "org.telegram.messenger/.TelegramLaunchActivity" in args
 
 
 class TestScreenshot:

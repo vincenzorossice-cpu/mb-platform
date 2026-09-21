@@ -13,7 +13,7 @@ from orchestrator.modules.touch_injector.interface import TouchInjectorInterface
 
 logger = logging.getLogger(__name__)
 
-TELEGRAM_PACKAGE = "com.telegram.messenger"
+TELEGRAM_PACKAGE = "org.telegram.messenger"
 
 # Emoji delimitatore usate dai canali segnali: la loro presenza in una notifica
 # è un'euristica per distinguere un segnale promo da una notifica generica.
@@ -28,8 +28,9 @@ PLACEHOLDER_MAP = {
     "😳😃€": "importo_bonus",
 }
 
-_EXTRAS_RE = re.compile(r"android\.title=(.*?),\s*android\.text=(.*?)\}\]")
-_TEXT_ONLY_RE = re.compile(r"android\.text=(.*?)\}\]")
+_EXTRAS_RE = re.compile(r"android\.title=String \((.*?)\)")
+_TITLE_RE = re.compile(r"tickerText=(.*?)(?:\n|\r)")
+_TEXT_ONLY_RE = re.compile(r"tickerText=(.*?)(?:\n|\r)")
 
 
 def _looks_like_signal(text: str) -> bool:
@@ -82,16 +83,16 @@ class TelegramAcquirer(TelegramAcquirerInterface):
             return Result.fail(f"dumpsys notification failed: {result.stderr}", "ADB_ERROR")
 
         notifications = []
-        for block in result.stdout.split("NotificationRecord{")[1:]:
+        for block in result.stdout.split("NotificationRecord(")[1:]:
             if TELEGRAM_PACKAGE not in block:
                 continue
 
-            match = _EXTRAS_RE.search(block)
-            if match:
-                title, text = match.group(1).strip(), match.group(2).strip()
-            else:
+            title_match = _EXTRAS_RE.search(block)
+            text_match = _TITLE_RE.search(block)
+            if not text_match:
                 text_match = _TEXT_ONLY_RE.search(block)
-                title, text = None, (text_match.group(1).strip() if text_match else "")
+            title = title_match.group(1).strip() if title_match else None
+            text = text_match.group(1).strip() if text_match else ""
 
             notifications.append({"title": title, "text": text, "is_signal": _looks_like_signal(text)})
 
@@ -203,7 +204,7 @@ class TelegramAcquirer(TelegramAcquirerInterface):
         try:
             result = subprocess.run(
                 ["adb", "-s", device_id, "shell", "am", "start", "-n",
-                 "com.telegram.messenger/.TelegramLaunchActivity"],
+                 "org.telegram.messenger/.TelegramLaunchActivity"],
                 capture_output=True, text=True, timeout=self.adb_timeout, encoding="utf-8",
             )
         except subprocess.TimeoutExpired:
