@@ -1,4 +1,6 @@
 import re
+import asyncio
+import threading
 from datetime import datetime, timezone
 
 from telethon import TelegramClient
@@ -56,12 +58,25 @@ class TelegramAcquirer(TelegramAcquirerInterface):
         self.session_name = session_name
         self.channel_id = channel_id
         self._client = None  # lazy init
+        self._loop = None
+        self._thread = None
 
     def _get_client(self) -> TelegramClient:
         if self._client is None:
-            self._client = TelegramClient(self.session_name, self.api_id, self.api_hash)
-            self._client.start()
+            self._loop = asyncio.new_event_loop()
+            self._thread = threading.Thread(target=self._loop.run_forever, daemon=True)
+            self._thread.start()
+            self._client = TelegramClient(self.session_name, self.api_id, self.api_hash, loop=self._loop)
+            future = asyncio.run_coroutine_threadsafe(self._client.connect(), self._loop)
+            future.result(timeout=30)
         return self._client
+
+    def _run_async(self, coro):
+        """Run a coroutine in the dedicated thread loop. Handles mocks that return non-coroutines."""
+        if asyncio.iscoroutine(coro):
+            future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+            return future.result(timeout=30)
+        return coro  # Mock returns non-coroutine directly
 
     # --------------------------------------------------------
     # NOTIFICATION DETECTION
@@ -72,7 +87,7 @@ class TelegramAcquirer(TelegramAcquirerInterface):
         try:
             client = self._get_client()
             notifications = []
-            for msg in client.iter_messages(self.channel_id, limit=20):
+            for msg in client.get_messages(self.channel_id, limit=20):
                 if not msg.text:
                     continue
                 text = msg.text
@@ -97,7 +112,8 @@ class TelegramAcquirer(TelegramAcquirerInterface):
         """Acquisisce l'ultimo segnale (testo che inizia con 📚) dal canale."""
         try:
             client = self._get_client()
-            for msg in client.iter_messages(self.channel_id, limit=50):
+            messages = self._run_async(client.get_messages(self.channel_id, limit=50))
+            for msg in messages:
                 if msg.text and _looks_like_signal(msg.text):
                     raw_text = msg.text
                     return Result.ok(AcquiredSignal(
@@ -110,6 +126,7 @@ class TelegramAcquirer(TelegramAcquirerInterface):
                         channel_name="MB Evo Pro",
                         message_id=str(msg.id),
                     ))
+            return Result.fail("Nessun segnale trovato negli ultimi 50 messaggi", "NO_SIGNAL_FOUND")
         except Exception as e:
             return Result.fail(f"Errore Telegram: {e}", "TELEGRAM_ERROR")
 

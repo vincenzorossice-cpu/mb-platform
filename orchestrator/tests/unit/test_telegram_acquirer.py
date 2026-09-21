@@ -32,7 +32,7 @@ def _patch_client(acquirer, messages):
     """Patcha _get_client() dell'acquirer per restituire un client fake il cui
     iter_messages ritorna la lista di messaggi data."""
     mock_client = MagicMock()
-    mock_client.iter_messages.return_value = list(messages)
+    mock_client.get_messages.return_value = list(messages)
     acquirer._client = mock_client
     return mock_client
 
