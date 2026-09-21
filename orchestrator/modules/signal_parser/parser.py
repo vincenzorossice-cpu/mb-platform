@@ -269,18 +269,21 @@ class SignalPostprocessor:
         # 2 — determina category
         category = extracted.get("category")
         strategy_lower = (preprocessed.get("strategy_raw") or "").lower()
+        bonus_type_lower = (preprocessed.get("bonus_type_raw") or "").lower()
+        deadline_raw = preprocessed.get("deadline_raw", "")
+        
         if not category:
-            if any(kw in strategy_lower for kw in self.SPORT_KEYWORDS):
-                category = "sport"
-            elif any(kw in (preprocessed.get("bonus_type_raw") or "").lower() for kw in ["sport", "multipla", "tripla"]):
-                category = "sport"
-            elif any(kw in (strategy_lower + " " + (preprocessed.get("bonus_type_raw") or "").lower()) for kw in self.CASINO_KEYWORDS):
+            combined = strategy_lower + " " + bonus_type_lower
+            # Prima controlla casino (bingo, slot, ecc.)
+            if any(kw in combined for kw in self.CASINO_KEYWORDS):
                 category = "casino"
+            elif any(kw in combined for kw in ["sport", "multipla", "tripla", "quota", "evento", "scommessa"]):
+                category = "sport"
             else:
                 return Result.fail("Cannot determine category", "MISSING_CRITICAL_FIELD")
-
-        # 3 — parse deadline (formato italiano: "23 Luglio 23:59")
-        deadline_raw = preprocessed.get("deadline_raw") or ""
+        
+        if not deadline_raw:
+            return Result.fail("Missing deadline", "MISSING_CRITICAL_FIELD")
         deadline = self._parse_deadline(deadline_raw)
         if not deadline:
             return Result.fail(f"Cannot parse deadline: {deadline_raw}", "MISSING_CRITICAL_FIELD")
