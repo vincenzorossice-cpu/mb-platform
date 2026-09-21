@@ -25,6 +25,14 @@
                cursor: pointer; margin: 4px 0; min-height: 44px; font-size: 16px; box-sizing: border-box; }
         .btn-approve { background: #28a745; color: white; }
         .btn-reject { background: #dc3545; color: white; }
+        .btn-acquire { background: #6f42c1; color: white; }
+
+        .acquire-form input[type="text"] { width: 100%; box-sizing: border-box; margin-bottom: 8px; }
+        .manual-values-form .field { margin: 10px 0; }
+        .manual-values-form input[type="number"] { width: 100%; box-sizing: border-box; }
+        .filter-params { display: flex; flex-wrap: wrap; gap: 10px; margin: 10px 0; }
+        .filter-params .field { flex: 1 1 140px; }
+        .filter-params input[type="number"] { width: 100%; box-sizing: border-box; }
 
         .badge { padding: 3px 6px; border-radius: 12px; font-size: 11px; font-weight: bold; }
         .badge-critical { background: #dc3545; color: white; }
@@ -56,6 +64,48 @@
     <div class="header">
         <h1>MB Platform - Mission Control</h1>
         <p>Human-in-the-Loop Dashboard</p>
+    </div>
+
+    <div class="section">
+        <h2>📲 Acquisizione Segnale Telegram</h2>
+        <p style="color: #666; font-size: 13px;">Acquisisci un segnale da Telegram. I valori nascosti dietro emoji animate vanno inseriti a mano prima dell'invio al flusso P5 Sport.</p>
+
+        <div class="acquire-form">
+            <label for="device_id_input">Device ID</label>
+            <input type="text" id="device_id_input" placeholder="es. ZE223GVFJ2">
+            <button class="btn btn-acquire" onclick="acquireSignal()">Acquisisci segnale</button>
+        </div>
+
+        <div id="acquire_error" class="item critical" style="display:none;"></div>
+
+        <div id="acquire_result" style="display:none;">
+            <h3>Testo OCR</h3>
+            <pre id="ocr_text_display" style="white-space: pre-wrap; background:#f8f9fa; padding:10px; border-radius:4px;"></pre>
+            <p><small>Screenshot: <span id="screenshot_path_display"></span></small></p>
+
+            <h3>Valori mancanti (emoji animate)</h3>
+            <div id="manual_values_container" class="manual-values-form"></div>
+
+            <h3>Parametri filtro promo</h3>
+            <div class="filter-params">
+                <div class="field">
+                    <label for="expected_value_eur_input">Valore atteso (€)</label>
+                    <input type="number" step="0.01" id="expected_value_eur_input">
+                </div>
+                <div class="field">
+                    <label for="capital_required_input">Capitale richiesto per la punta (€)</label>
+                    <input type="number" step="0.01" id="capital_required_input">
+                </div>
+                <div class="field">
+                    <label for="available_capital_input">Capitale disponibile in banca (€)</label>
+                    <input type="number" step="0.01" id="available_capital_input">
+                </div>
+            </div>
+
+            <button class="btn btn-approve" onclick="submitSignal()">Invia segnale</button>
+        </div>
+
+        <div id="submit_result" style="display:none; margin-top: 10px;"></div>
     </div>
 
     <div class="dashboard-grid">
@@ -292,6 +342,105 @@
                     current_event: parseInt(currentEvent, 10),
                     existing_op_id: existingOpId ? parseInt(existingOpId, 10) : null,
                 }),
+            });
+        }
+
+        let acquiredData = null;
+
+        function acquireSignal() {
+            const deviceId = document.getElementById('device_id_input').value;
+            document.getElementById('acquire_error').style.display = 'none';
+            fetch('/acquire_signal', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ device_id: deviceId }),
+            })
+            .then(r => r.json().then(data => ({ ok: r.ok, data })))
+            .then(({ ok, data }) => {
+                if (!ok || !data.success) {
+                    const err = document.getElementById('acquire_error');
+                    err.textContent = data.error || 'Errore acquisizione segnale';
+                    err.style.display = '';
+                    return;
+                }
+                acquiredData = {
+                    ocr_text: data.ocr_text,
+                    screenshot_path: data.screenshot_path,
+                    telegram_message_id: data.telegram_message_id,
+                };
+                document.getElementById('ocr_text_display').textContent = data.ocr_text;
+                document.getElementById('screenshot_path_display').textContent = data.screenshot_path || '';
+
+                const container = document.getElementById('manual_values_container');
+                container.innerHTML = '';
+                if (data.placeholders.length === 0) {
+                    container.innerHTML = '<p class="empty">Nessun valore nascosto — tutti i valori sono stati letti dall\'OCR.</p>';
+                } else {
+                    data.placeholders.forEach(p => {
+                        const div = document.createElement('div');
+                        div.className = 'field';
+                        const label = document.createElement('label');
+                        label.setAttribute('for', `manual_value_${p.key}`);
+                        label.textContent = `${p.label} — contesto: "${p.context}"`;
+                        const input = document.createElement('input');
+                        input.type = 'number';
+                        input.step = '0.01';
+                        input.id = `manual_value_${p.key}`;
+                        input.placeholder = `es. ${p.example}`;
+                        div.appendChild(label);
+                        div.appendChild(input);
+                        container.appendChild(div);
+                    });
+                }
+
+                document.getElementById('submit_result').style.display = 'none';
+                document.getElementById('acquire_result').style.display = '';
+            })
+            .catch(() => {
+                const err = document.getElementById('acquire_error');
+                err.textContent = 'Errore di rete durante acquisizione';
+                err.style.display = '';
+            });
+        }
+
+        function submitSignal() {
+            if (!acquiredData) return;
+
+            const manualValues = {};
+            document.querySelectorAll('#manual_values_container input[id^="manual_value_"]').forEach(input => {
+                const key = input.id.replace('manual_value_', '');
+                if (input.value !== '') manualValues[key] = parseFloat(input.value);
+            });
+
+            fetch('/submit_signal', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    ocr_text: acquiredData.ocr_text,
+                    manual_values: manualValues,
+                    telegram_message_id: acquiredData.telegram_message_id,
+                    screenshot_path: acquiredData.screenshot_path,
+                    expected_value_eur: parseFloat(document.getElementById('expected_value_eur_input').value) || 0,
+                    capital_required: parseFloat(document.getElementById('capital_required_input').value) || 0,
+                    available_capital: parseFloat(document.getElementById('available_capital_input').value) || 0,
+                }),
+            })
+            .then(r => r.json())
+            .then(data => {
+                const resultDiv = document.getElementById('submit_result');
+                resultDiv.style.display = '';
+                let text = data.message || data.error || JSON.stringify(data);
+                if (data.filter_action) text += ` | Filtro: ${data.filter_action} (${data.filter_reason || ''})`;
+                resultDiv.textContent = text;
+                if (data.success && data.filter_action !== 'skip') {
+                    acquiredData = null;
+                    document.getElementById('acquire_result').style.display = 'none';
+                }
+            })
+            .catch(() => {
+                const resultDiv = document.getElementById('submit_result');
+                resultDiv.style.display = '';
+                resultDiv.textContent = 'Errore di rete durante invio segnale';
             });
         }
     </script>

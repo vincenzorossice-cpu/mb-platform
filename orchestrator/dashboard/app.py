@@ -1,4 +1,5 @@
 import json
+import time
 from dataclasses import asdict
 from datetime import date, datetime
 from pathlib import Path
@@ -25,12 +26,27 @@ from orchestrator.modules.cascade_engine.engine import CascadeEngine
 from orchestrator.modules.movement_importer.importer import MovementImporter
 from orchestrator.modules.movement_importer.interface import Movement
 from orchestrator.modules.multiplier_engine.calculator import MultiplierEngine
+from orchestrator.modules.rag_system.rag import RAGSystem
 from orchestrator.modules.screen_reader.reader import ScreenReader
 from orchestrator.modules.signal_parser.parser import SignalParser
+from orchestrator.modules.signal_parser.promo_filter import PromoFilter
+from orchestrator.modules.telegram_acquirer.acquirer import PLACEHOLDER_MAP, TelegramAcquirer
 from orchestrator.modules.touch_injector.injector import TouchInjector
 
 app = FastAPI(title="MB Platform HITL Dashboard")
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
+
+_rag_system: Optional[RAGSystem] = None
+
+
+def _get_rag_system() -> RAGSystem:
+    """Costruisce RAGSystem una sola volta (carica ChromaDB + embedding model,
+    operazione lenta) e la cachea a livello di modulo — a differenza degli altri
+    oggetti di questo file, non va ricostruita ad ogni richiesta."""
+    global _rag_system
+    if _rag_system is None:
+        _rag_system = RAGSystem()
+    return _rag_system
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -71,6 +87,56 @@ def _build_sport_flow() -> SportFlow:
         screen_reader=screen_reader,
         device_manager=DeviceManager(),
     )
+
+
+def _build_sport_flow_for_acquisition() -> SportFlow:
+    """Come _build_sport_flow(), ma con RAGSystem reale (lazy-cached): a
+    differenza di execute_operation, process_signal chiama sempre
+    rag_system.verify_tc(), quindi qui rag_system=None non è utilizzabile."""
+    screen_reader = ScreenReader()
+    touch_injector = TouchInjector(screen_reader=screen_reader)
+    multiplier_engine = MultiplierEngine()
+    cascade_engine = CascadeEngine(
+        screen_reader=screen_reader, touch_injector=touch_injector, multiplier_engine=multiplier_engine,
+    )
+    return SportFlow(
+        signal_parser=SignalParser(),
+        rag_system=_get_rag_system(),
+        multiplier_engine=multiplier_engine,
+        touch_injector=touch_injector,
+        cascade_engine=cascade_engine,
+        app_api_client=AppApiClient(),
+        screen_reader=screen_reader,
+        device_manager=DeviceManager(),
+    )
+
+
+def _build_telegram_acquirer() -> TelegramAcquirer:
+    screen_reader = ScreenReader()
+    touch_injector = TouchInjector(screen_reader=screen_reader)
+    return TelegramAcquirer(screen_reader=screen_reader, touch_injector=touch_injector)
+
+
+_PLACEHOLDER_LABELS = {
+    "importo_ricarica": ("Importo ricarica (€)", "100"),
+    "profitto_atteso": ("Profitto atteso (€)", "12.50"),
+    "importo_bonus": ("Importo bonus (€)", "25"),
+}
+
+
+def _find_placeholders(ocr_text: str) -> list[dict]:
+    """Scansiona il testo OCR per i placeholder noti (PLACEHOLDER_MAP, da
+    telegram_acquirer.acquirer — non reimplementato qui) e produce la lista
+    che la dashboard usa per generare gli input dei valori manuali."""
+    found = []
+    for placeholder, key in PLACEHOLDER_MAP.items():
+        if placeholder not in ocr_text:
+            continue
+        label, example = _PLACEHOLDER_LABELS[key]
+        idx = ocr_text.index(placeholder)
+        context = ocr_text[max(0, idx - 20): idx + len(placeholder) + 20].replace("\n", " ").strip()
+        found.append({"key": key, "placeholder": placeholder, "label": label, "example": example, "context": context})
+    return found
 
 
 def _find_movement_in_files(
@@ -313,3 +379,111 @@ async def confirm_sport_flow(hitl_item_id: str, request: Request):
 
     SportFlowHandler().update_flow_status(hitl_item_id, "executed")
     return {"status": "executed", "id": hitl_item_id, "result": asdict(result.data)}
+
+
+@app.post("/acquire_signal")
+async def acquire_signal(request: Request):
+    """Acquisisce un segnale da Telegram via TelegramAcquirer e identifica i
+    placeholder (emoji animate) da far risolvere manualmente a Raffaele."""
+    try:
+        payload = await request.json()
+        device_id = payload["device_id"]
+        if not device_id:
+            raise KeyError("device_id")
+        channel_name = payload.get("channel_name")
+    except (ValueError, KeyError, TypeError):
+        return JSONResponse(status_code=400, content={
+            "success": False, "error": "body JSON invalido: device_id richiesto",
+        })
+
+    acquirer = _build_telegram_acquirer()
+    result = acquirer.capture_signal(device_id, channel_name=channel_name)
+    if not result.success:
+        return JSONResponse(status_code=502, content={
+            "success": False, "error": result.error, "error_code": result.error_code,
+        })
+
+    signal = result.data
+    telegram_message_id = f"acq_{device_id}_{int(time.time() * 1000)}"
+
+    return {
+        "success": True,
+        "ocr_text": signal.ocr_text,
+        "screenshot_path": signal.screenshot_path,
+        "confidence": signal.confidence,
+        "telegram_message_id": telegram_message_id,
+        "placeholders": _find_placeholders(signal.ocr_text),
+    }
+
+
+@app.post("/submit_signal")
+async def submit_signal(request: Request):
+    """Riceve testo OCR + valori manuali, li fonde e invia il segnale risolto
+    a SignalParser -> PromoFilter -> SportFlow -> SportFlowHandler (HITL)."""
+    try:
+        payload = await request.json()
+        ocr_text = payload["ocr_text"]
+        manual_values = dict(payload.get("manual_values") or {})
+        telegram_message_id = payload["telegram_message_id"]
+        expected_value_eur = float(payload["expected_value_eur"])
+        capital_required = float(payload["capital_required"])
+        available_capital = float(payload["available_capital"])
+    except (ValueError, KeyError, TypeError):
+        return JSONResponse(status_code=400, content={
+            "success": False,
+            "error": "body JSON invalido: ocr_text/telegram_message_id/expected_value_eur/"
+                     "capital_required/available_capital richiesti",
+        })
+
+    acquirer = _build_telegram_acquirer()
+    resolved_text = acquirer.merge_text_and_values(ocr_text, manual_values)
+
+    parse_result = SignalParser().parse(resolved_text, telegram_message_id)
+    if not parse_result.success:
+        if parse_result.error_code == "OBSCURED_VALUES":
+            return JSONResponse(status_code=400, content={
+                "success": False,
+                "error": "Alcuni valori non sono stati risolti",
+                "error_code": "OBSCURED_VALUES",
+            })
+        return JSONResponse(status_code=400, content={
+            "success": False, "error": parse_result.error, "error_code": parse_result.error_code,
+        })
+    signal = parse_result.data
+
+    filter_result = PromoFilter().filter_promo(
+        signal, expected_value_eur, capital_required, available_capital,
+    )
+    promo = filter_result.data
+
+    if promo.action == "skip":
+        return {
+            "success": True,
+            "message": "Segnale scartato dal filtro promo",
+            "filter_action": promo.action,
+            "filter_reason": promo.reason,
+        }
+
+    sport_flow = _build_sport_flow_for_acquisition()
+    flow_result = sport_flow.process_signal(resolved_text, telegram_message_id)
+    if not flow_result.success:
+        return JSONResponse(status_code=502, content={
+            "success": False, "error": flow_result.error, "error_code": flow_result.error_code,
+        })
+
+    save_result = SportFlowHandler().save_pending_flow(flow_result.data)
+    if not save_result.success:
+        return JSONResponse(status_code=502, content={
+            "success": False, "error": save_result.error, "error_code": save_result.error_code,
+        })
+
+    return {
+        "success": True,
+        "message": "Segnale inviato al flusso P5 Sport",
+        "filter_action": promo.action,
+        "filter_reason": promo.reason,
+        "signal_book": flow_result.data.signal.book,
+        "signal_type": flow_result.data.signal.bonus_type,
+        "hitl_item_id": save_result.data,
+        "flow_status": flow_result.data.status,
+    }
