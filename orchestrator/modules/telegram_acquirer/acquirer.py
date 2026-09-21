@@ -17,10 +17,10 @@ SIGNAL_EMOJI = "📚"
 # stesse regex per decidere quali campi manuali mostrare (vedi
 # orchestrator/dashboard/app.py::_find_placeholders).
 PLACEHOLDER_PATTERNS: dict[str, re.Pattern] = {
-    "importo_ricarica": re.compile(r'(ricarica|deposita|gioca)\s+🔡+\s*€?', re.IGNORECASE),
-    "importo_bonus": re.compile(r'(bonus|rcevi)\s+🔡+\s*€?', re.IGNORECASE),
-    "profitto_atteso": re.compile(r'(PROFITTO|profitto)\s*(MEDIO|atteso)?\s*:?\s*🔡+\s*€?', re.IGNORECASE),
-    "valore_atteso": re.compile(r'(VALORE\s+ATTESO|VA)\s*:?\s*🔡+\s*€?', re.IGNORECASE),
+    "importo_ricarica": re.compile(r'(ricarica|deposita|gioca)\s+[:+]?\s*🔡+\s*[€💶🚀]*', re.IGNORECASE),
+    "importo_bonus": re.compile(r'(bonus|rcevi)\s+[:+]?\s*🔡+\s*[€💶🚀]*', re.IGNORECASE),
+    "profitto_atteso": re.compile(r'(PROFITTO|profitto)\s*(MEDIO|atteso)?\s*:?\s*[:+]?\s*🔡+\s*[€💶🚀]*', re.IGNORECASE),
+    "valore_atteso": re.compile(r'(VALORE\s+ATTESO|valore\s+atteso|VA)\s*:?\s*[:+]?\s*🔡+\s*[€💶🚀]*', re.IGNORECASE),
 }
 
 
