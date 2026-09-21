@@ -2,3 +2,4 @@ chromadb
 sentence-transformers
 pyyaml
 requests
+paddleocr
