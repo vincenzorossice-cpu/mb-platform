@@ -225,7 +225,7 @@ class ScreenReader(ScreenReaderInterface):
             result = subprocess.run(
                 ["adb", "-s", device_id, "shell", "uiautomator", "dump", "/sdcard/ui_dump.xml"],
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8",
                 timeout=self.adb_timeout,
             )
 
@@ -244,13 +244,13 @@ class ScreenReader(ScreenReaderInterface):
             # Leggi il file con cat
             cat_result = subprocess.run(
                 ["adb", "-s", device_id, "shell", "cat", "/sdcard/ui_dump.xml"],
-                capture_output=True, text=True, timeout=self.adb_timeout,
+                capture_output=True, text=True, timeout=self.adb_timeout, encoding="utf-8",
             )
             if cat_result.returncode != 0:
                 # FIX-15: dump ok ma cat fallito, ritenta una volta prima di arrendersi
                 cat_result = subprocess.run(
                     ["adb", "-s", device_id, "shell", "cat", "/sdcard/ui_dump.xml"],
-                    capture_output=True, text=True, timeout=self.adb_timeout,
+                    capture_output=True, text=True, timeout=self.adb_timeout, encoding="utf-8",
                 )
                 if cat_result.returncode != 0:
                     return Result.fail(f"cat fallito dopo retry: {cat_result.stderr}", "ADB_TIMEOUT")
