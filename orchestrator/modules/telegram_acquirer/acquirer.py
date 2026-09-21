@@ -204,7 +204,7 @@ class TelegramAcquirer(TelegramAcquirerInterface):
         try:
             result = subprocess.run(
                 ["adb", "-s", device_id, "shell", "am", "start", "-n",
-                 "org.telegram.messenger/.TelegramLaunchActivity"],
+                 "org.telegram.messenger/org.telegram.ui.LaunchActivity"],
                 capture_output=True, text=True, timeout=self.adb_timeout, encoding="utf-8",
             )
         except subprocess.TimeoutExpired:

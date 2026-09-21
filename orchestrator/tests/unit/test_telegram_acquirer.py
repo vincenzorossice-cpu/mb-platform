@@ -143,7 +143,7 @@ class TestOpenTelegram:
         args = mock_run.call_args[0][0]
         assert args[:3] == ["adb", "-s", "device_001"]
         assert "am" in args and "start" in args
-        assert "org.telegram.messenger/.TelegramLaunchActivity" in args
+        assert "org.telegram.messenger/org.telegram.ui.LaunchActivity" in args
 
 
 class TestScreenshot:
