@@ -87,7 +87,7 @@ class LlamaSignalExtractor:
         if any(kw in strategy_lower for kw in self.SPORT_KEYWORDS):
             extracted["category"] = "sport"
             extracted["strategy"], extracted["bonus"] = self._extract_sport(strategy_raw)
-        elif any(kw in strategy_lower for kw in self.CASINO_KEYWORDS):
+        elif any(kw in (strategy_lower + " " + (preprocessed.get("bonus_type_raw") or "").lower()) for kw in self.CASINO_KEYWORDS):
             extracted["category"] = "casino"
             extracted["strategy"], extracted["bonus"] = self._extract_casino(
                 strategy_raw, preprocessed
@@ -272,7 +272,9 @@ class SignalPostprocessor:
         if not category:
             if any(kw in strategy_lower for kw in self.SPORT_KEYWORDS):
                 category = "sport"
-            elif any(kw in strategy_lower for kw in self.CASINO_KEYWORDS):
+            elif any(kw in (preprocessed.get("bonus_type_raw") or "").lower() for kw in ["sport", "multipla", "tripla"]):
+                category = "sport"
+            elif any(kw in (strategy_lower + " " + (preprocessed.get("bonus_type_raw") or "").lower()) for kw in self.CASINO_KEYWORDS):
                 category = "casino"
             else:
                 return Result.fail("Cannot determine category", "MISSING_CRITICAL_FIELD")
