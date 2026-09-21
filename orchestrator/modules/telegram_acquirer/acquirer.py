@@ -114,7 +114,15 @@ class TelegramAcquirer(TelegramAcquirerInterface):
             client = self._get_client()
             messages = self._run_async(client.get_messages(self.channel_id, limit=50))
             for msg in messages:
-                if msg.text and _looks_like_signal(msg.text):
+                if not msg.text:
+                    continue
+                # Filtro topic: solo topic 2 (Ricorrenti) e 1 (Benvenuto)
+                reply_to = None
+                if msg.reply_to:
+                    reply_to = msg.reply_to.reply_to_msg_id if hasattr(msg.reply_to, 'reply_to_msg_id') else None
+                if reply_to not in (1, 2):
+                    continue
+                if _looks_like_signal(msg.text):
                     raw_text = msg.text
                     return Result.ok(AcquiredSignal(
                         raw_text=raw_text,

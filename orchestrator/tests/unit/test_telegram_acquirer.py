@@ -7,11 +7,13 @@ from orchestrator.modules.telegram_acquirer.acquirer import TelegramAcquirer, _l
 from orchestrator.modules.telegram_acquirer.notification_monitor import NotificationMonitor
 
 
-def make_mock_message(id, text, date=None):
+def make_mock_message(id, text, date=None, reply_to_id=2):
     msg = MagicMock()
     msg.id = id
     msg.text = text
     msg.date = date or datetime(2026, 9, 21, 10, 0, 0)
+    msg.reply_to = MagicMock()
+    msg.reply_to.reply_to_msg_id = reply_to_id
     return msg
 
 
