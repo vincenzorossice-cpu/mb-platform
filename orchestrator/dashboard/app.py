@@ -1,5 +1,4 @@
 import json
-import time
 from dataclasses import asdict
 from datetime import date, datetime
 from pathlib import Path
@@ -30,7 +29,7 @@ from orchestrator.modules.rag_system.rag import RAGSystem
 from orchestrator.modules.screen_reader.reader import ScreenReader
 from orchestrator.modules.signal_parser.parser import SignalParser
 from orchestrator.modules.signal_parser.promo_filter import PromoFilter
-from orchestrator.modules.telegram_acquirer.acquirer import PLACEHOLDER_MAP, TelegramAcquirer
+from orchestrator.modules.telegram_acquirer.acquirer import PLACEHOLDER_PATTERNS, TelegramAcquirer
 from orchestrator.modules.touch_injector.injector import TouchInjector
 
 app = FastAPI(title="MB Platform HITL Dashboard")
@@ -112,30 +111,30 @@ def _build_sport_flow_for_acquisition() -> SportFlow:
 
 
 def _build_telegram_acquirer() -> TelegramAcquirer:
-    screen_reader = ScreenReader()
-    touch_injector = TouchInjector(screen_reader=screen_reader)
-    return TelegramAcquirer(screen_reader=screen_reader, touch_injector=touch_injector)
+    return TelegramAcquirer()
 
 
 _PLACEHOLDER_LABELS = {
     "importo_ricarica": ("Importo ricarica (€)", "100"),
-    "profitto_atteso": ("Profitto atteso (€)", "12.50"),
     "importo_bonus": ("Importo bonus (€)", "25"),
+    "profitto_atteso": ("Profitto atteso (€)", "12.50"),
+    "valore_atteso": ("Valore atteso (€)", "15.00"),
 }
 
 
 def _find_placeholders(ocr_text: str) -> list[dict]:
-    """Scansiona il testo OCR per i placeholder noti (PLACEHOLDER_MAP, da
-    telegram_acquirer.acquirer — non reimplementato qui) e produce la lista
-    che la dashboard usa per generare gli input dei valori manuali."""
+    """Scansiona il testo del messaggio per i placeholder noti (le stesse
+    regex usate da telegram_acquirer.acquirer.merge_text_and_values, così
+    rilevamento e sostituzione condividono un'unica fonte di verità) e
+    produce la lista che la dashboard usa per generare gli input manuali."""
     found = []
-    for placeholder, key in PLACEHOLDER_MAP.items():
-        if placeholder not in ocr_text:
+    for key, pattern in PLACEHOLDER_PATTERNS.items():
+        match = pattern.search(ocr_text)
+        if not match:
             continue
         label, example = _PLACEHOLDER_LABELS[key]
-        idx = ocr_text.index(placeholder)
-        context = ocr_text[max(0, idx - 20): idx + len(placeholder) + 20].replace("\n", " ").strip()
-        found.append({"key": key, "placeholder": placeholder, "label": label, "example": example, "context": context})
+        context = ocr_text[max(0, match.start() - 20): match.end() + 20].replace("\n", " ").strip()
+        found.append({"key": key, "placeholder": match.group(0), "label": label, "example": example, "context": context})
     return found
 
 
@@ -382,36 +381,22 @@ async def confirm_sport_flow(hitl_item_id: str, request: Request):
 
 
 @app.post("/acquire_signal")
-async def acquire_signal(request: Request):
-    """Acquisisce un segnale da Telegram via TelegramAcquirer e identifica i
-    placeholder (emoji animate) da far risolvere manualmente a Raffaele."""
-    try:
-        payload = await request.json()
-        device_id = payload["device_id"]
-        if not device_id:
-            raise KeyError("device_id")
-        channel_name = payload.get("channel_name")
-    except (ValueError, KeyError, TypeError):
-        return JSONResponse(status_code=400, content={
-            "success": False, "error": "body JSON invalido: device_id richiesto",
-        })
-
+async def acquire_signal():
+    """Acquisisce l'ultimo segnale dal canale Telegram "MB Evo Pro" via Telethon
+    e identifica i placeholder (emoji animate) da far risolvere manualmente a Raffaele."""
     acquirer = _build_telegram_acquirer()
-    result = acquirer.capture_signal(device_id, channel_name=channel_name)
+    result = acquirer.capture_signal()
     if not result.success:
         return JSONResponse(status_code=502, content={
             "success": False, "error": result.error, "error_code": result.error_code,
         })
 
     signal = result.data
-    telegram_message_id = f"acq_{device_id}_{int(time.time() * 1000)}"
 
     return {
         "success": True,
         "ocr_text": signal.ocr_text,
-        "screenshot_path": signal.screenshot_path,
-        "confidence": signal.confidence,
-        "telegram_message_id": telegram_message_id,
+        "telegram_message_id": signal.message_id,
         "placeholders": _find_placeholders(signal.ocr_text),
     }
 

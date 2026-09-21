@@ -6,6 +6,8 @@ venv/
 chroma_db/
 *.egg-info/
 .DS_Store
+*.session
+*.session-journal
 
 # Temporary test scripts (use orchestrator/tests/ for tests)
 health_check.py

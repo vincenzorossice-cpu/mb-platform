@@ -1,52 +1,50 @@
+from datetime import datetime, timezone
+
 from orchestrator.modules.telegram_acquirer.acquirer import TelegramAcquirer, _looks_like_signal
 from orchestrator.modules.telegram_acquirer.interface import AcquiredSignal
 
 
 class NotificationMonitor:
-    """Monitora le notifiche Telegram su tutti i telefoni.
+    """Monitora il canale Telegram "MB Evo Pro" per nuovi segnali usando Telethon.
 
     Progettata per essere richiamata a intervalli regolari (es. 30 secondi)
-    dall'orchestratore: non implementa un loop proprio. Quando rileva un nuovo
-    segnale lo acquisisce via TelegramAcquirer.capture_signal."""
+    dall'orchestratore: non implementa un loop proprio. Deduplica confrontando
+    l'id dell'ultimo messaggio processato."""
 
-    def __init__(self, acquirer: TelegramAcquirer, device_ids: list[str], poll_interval: int = 30):
+    def __init__(self, acquirer: TelegramAcquirer, poll_interval: int = 30):
         self.acquirer = acquirer
-        self.device_ids = device_ids
         self.poll_interval = poll_interval
-        self._last_notification_text: dict[str, str] = {}
+        self._last_message_id: int = 0
 
-    def check_all_devices(self) -> list[AcquiredSignal]:
-        """Controlla tutti i telefoni per nuovi segnali, deduplicando sia per
-        device (stesso testo di prima non riacquisito) sia tra device diversi
-        (lo stesso segnale arrivato su più telefoni viene acquisito una sola volta)."""
-        acquired = []
-        seen_this_round = set()
+    def check_new_signals(self) -> list[AcquiredSignal]:
+        """Controlla il canale per nuovi segnali dall'ultimo check.
 
-        for device_id in self.device_ids:
-            result = self.acquirer.check_notifications(device_id)
-            if not result.success:
-                continue
+        Legge i messaggi più recenti e si ferma appena trova un id già
+        processato (i messaggi arrivano in ordine decrescente)."""
+        client = self.acquirer._get_client()
 
-            for notification in result.data:
-                text = notification.get("text", "")
-                if not notification.get("is_signal") or not text:
-                    continue
-                if not self._is_new_signal(device_id, text):
-                    continue
-                self._last_notification_text[device_id] = text
-                if text in seen_this_round:
-                    continue
-                seen_this_round.add(text)
+        new_signals = []
+        highest_seen = self._last_message_id
+        for msg in client.iter_messages(self.acquirer.channel_id, limit=20):
+            if msg.id <= self._last_message_id:
+                break
 
-                capture_result = self.acquirer.capture_signal(device_id)
-                if capture_result.success:
-                    acquired.append(capture_result.data)
+            highest_seen = max(highest_seen, msg.id)
 
-        return acquired
+            if msg.text and self._looks_like_signal(msg.text):
+                new_signals.append(AcquiredSignal(
+                    raw_text=msg.text,
+                    ocr_text=msg.text,
+                    emoji_values={},
+                    source="telegram_telethon",
+                    device_id="pc",
+                    detected_at=datetime.now(timezone.utc).isoformat(),
+                    channel_name="MB Evo Pro",
+                    message_id=str(msg.id),
+                ))
 
-    def _is_new_signal(self, device_id: str, notification_text: str) -> bool:
-        """Verifica se la notifica è nuova (non uguale all'ultima vista su questo device)."""
-        return self._last_notification_text.get(device_id) != notification_text
+        self._last_message_id = highest_seen
+        return new_signals
 
     def _looks_like_signal(self, text: str) -> bool:
         return _looks_like_signal(text)

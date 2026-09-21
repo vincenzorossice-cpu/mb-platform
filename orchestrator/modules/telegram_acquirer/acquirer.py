@@ -1,232 +1,139 @@
-import logging
-import os
 import re
-import subprocess
-import tempfile
-import time
 from datetime import datetime, timezone
 
+from telethon import TelegramClient
+
 from orchestrator.core.result import Result
-from orchestrator.modules.screen_reader.interface import ScreenReaderInterface
 from orchestrator.modules.telegram_acquirer.interface import AcquiredSignal, TelegramAcquirerInterface
-from orchestrator.modules.touch_injector.interface import TouchInjectorInterface
 
-logger = logging.getLogger(__name__)
+# Un segnale di interesse inizia sempre con l'emoji 📚 (book).
+SIGNAL_EMOJI = "📚"
 
-TELEGRAM_PACKAGE = "org.telegram.messenger"
-
-# Emoji delimitatore usate dai canali segnali: la loro presenza in una notifica
-# è un'euristica per distinguere un segnale promo da una notifica generica.
-SIGNAL_EMOJI = ("📚", "💎", "⏳", "🚨", "✅")
-
-# Placeholder noti per i valori nascosti dietro emoji animate (vedi
-# SignalParser.OBSCURED_MARKERS): mappa placeholder -> chiave in emoji_values,
-# compilata manualmente da chi legge lo screenshot quando l'OCR non risolve il valore.
-PLACEHOLDER_MAP = {
-    "🔡🔡€": "importo_ricarica",
-    "🔡💶": "profitto_atteso",
-    "😳😃€": "importo_bonus",
+# Regex condivise per i valori nascosti dietro emoji animate: con Telethon
+# arrivano sempre come sequenze di 🔡 (a differenza dell'OCR, che leggeva
+# glifi diversi e imprevedibili per ogni sticker). La dashboard riusa queste
+# stesse regex per decidere quali campi manuali mostrare (vedi
+# orchestrator/dashboard/app.py::_find_placeholders).
+PLACEHOLDER_PATTERNS: dict[str, re.Pattern] = {
+    "importo_ricarica": re.compile(r'(ricarica|deposita|gioca)\s+🔡+\s*€?', re.IGNORECASE),
+    "importo_bonus": re.compile(r'(bonus|rcevi)\s+🔡+\s*€?', re.IGNORECASE),
+    "profitto_atteso": re.compile(r'(PROFITTO|profitto)\s*(MEDIO|atteso)?\s*:?\s*🔡+\s*€?', re.IGNORECASE),
+    "valore_atteso": re.compile(r'(VALORE\s+ATTESO|VA)\s*:?\s*🔡+\s*€?', re.IGNORECASE),
 }
-
-_EXTRAS_RE = re.compile(r"android\.title=String \((.*?)\)")
-_TITLE_RE = re.compile(r"tickerText=(.*?)(?:\n|\r)")
-_TEXT_ONLY_RE = re.compile(r"tickerText=(.*?)(?:\n|\r)")
 
 
 def _looks_like_signal(text: str) -> bool:
-    """Euristica: il testo contiene emoji delimitatori tipiche dei segnali promo?"""
+    """Un segnale inizia sempre con l'emoji 📚 (book)."""
     if not text:
         return False
-    return any(emoji in text for emoji in SIGNAL_EMOJI)
+    return text.strip().startswith(SIGNAL_EMOJI)
+
+
+def _replacement_for(key: str, match: "re.Match", value_str: str) -> str:
+    if key == "profitto_atteso":
+        label = " ".join(g for g in (match.group(1), match.group(2)) if g)
+        return f"{label}: {value_str}€"
+    if key == "valore_atteso":
+        return f"{match.group(1)}: {value_str}€"
+    return f"{match.group(1)} {value_str}€"
 
 
 class TelegramAcquirer(TelegramAcquirerInterface):
-    """Acquisisce segnali di matched betting dalle notifiche Telegram via ADB:
-    rileva la notifica, apre Telegram, fa uno screenshot della chat e ne estrae
-    il testo via OCR. I valori nascosti dietro emoji animate che l'OCR non
-    risolve restano come placeholder, da completare a mano (vedi merge_text_and_values)."""
+    """Acquisisce segnali di matched betting leggendo direttamente il canale
+    Telegram "MB Evo Pro" via Telethon: niente telefoni, screenshot o OCR.
+    I valori nascosti dietro emoji animate arrivano come placeholder 🔡, da
+    completare a mano (vedi merge_text_and_values)."""
 
     def __init__(
         self,
-        screen_reader: ScreenReaderInterface,
-        touch_injector: TouchInjectorInterface,
-        ocr_engine=None,
-        screenshot_dir: str = None,
-        adb_timeout: int = 15,
+        api_id: int = 30241084,
+        api_hash: str = "691c8b667128597541ca1785bbb7007d",
+        session_name: str = "telegram_session",
+        channel_id: int = -1003833700547,
     ):
-        self.screen_reader = screen_reader
-        self.touch_injector = touch_injector
-        self._ocr_engine = ocr_engine
-        self.screenshot_dir = screenshot_dir or tempfile.gettempdir()
-        self.adb_timeout = adb_timeout
+        self.api_id = api_id
+        self.api_hash = api_hash
+        self.session_name = session_name
+        self.channel_id = channel_id
+        self._client = None  # lazy init
+
+    def _get_client(self) -> TelegramClient:
+        if self._client is None:
+            self._client = TelegramClient(self.session_name, self.api_id, self.api_hash)
+            self._client.start()
+        return self._client
 
     # --------------------------------------------------------
     # NOTIFICATION DETECTION
     # --------------------------------------------------------
 
-    def check_notifications(self, device_id: str) -> Result[list[dict]]:
-        """Legge le notifiche Android via ADB e filtra quelle di Telegram."""
+    def check_notifications(self, device_id: str = None) -> Result[list[dict]]:
+        """Legge gli ultimi messaggi del canale e identifica quelli che sono segnali."""
         try:
-            result = subprocess.run(
-                ["adb", "-s", device_id, "shell", "dumpsys", "notification", "--noredact"],
-                capture_output=True, text=True, timeout=self.adb_timeout, encoding="utf-8",
-            )
-        except subprocess.TimeoutExpired:
-            return Result.fail(f"ADB timeout on {device_id}", "ADB_TIMEOUT")
-        except FileNotFoundError:
-            return Result.fail("ADB not found in PATH", "DEVICE_OFFLINE")
-
-        if result.returncode != 0:
-            stderr = result.stderr.lower()
-            if "device not found" in stderr or "device offline" in stderr or "no devices" in stderr:
-                return Result.fail(f"Device offline: {device_id}", "DEVICE_OFFLINE")
-            return Result.fail(f"dumpsys notification failed: {result.stderr}", "ADB_ERROR")
-
-        notifications = []
-        for block in result.stdout.split("NotificationRecord(")[1:]:
-            if TELEGRAM_PACKAGE not in block:
-                continue
-
-            title_match = _EXTRAS_RE.search(block)
-            text_match = _TITLE_RE.search(block)
-            if not text_match:
-                text_match = _TEXT_ONLY_RE.search(block)
-            title = title_match.group(1).strip() if title_match else None
-            text = text_match.group(1).strip() if text_match else ""
-
-            notifications.append({"title": title, "text": text, "is_signal": _looks_like_signal(text)})
-
-        return Result.ok(notifications)
+            client = self._get_client()
+            notifications = []
+            for msg in client.iter_messages(self.channel_id, limit=20):
+                if not msg.text:
+                    continue
+                text = msg.text
+                if not _looks_like_signal(text):
+                    continue
+                notifications.append({
+                    "title": "MB Evo Pro",
+                    "text": text,
+                    "is_signal": True,
+                    "message_id": str(msg.id),
+                    "date": msg.date.isoformat() if msg.date else None,
+                })
+            return Result.ok(notifications)
+        except Exception as e:
+            return Result.fail(f"Errore Telegram: {e}", "TELEGRAM_ERROR")
 
     # --------------------------------------------------------
-    # SCREENSHOT + OCR
+    # CAPTURE
     # --------------------------------------------------------
 
-    def capture_signal(self, device_id: str, channel_name: str = None) -> Result[AcquiredSignal]:
-        """Pipeline: apri Telegram -> (naviga al canale) -> screenshot -> OCR."""
-        open_result = self._open_telegram(device_id)
-        if not open_result.success:
-            return Result.fail(open_result.error, open_result.error_code)
-
-        if channel_name:
-            tap_result = self.touch_injector.tap_element(device_id, channel_name)
-            if not tap_result.success:
-                logger.warning(
-                    "Impossibile aprire il canale '%s' su %s: %s", channel_name, device_id, tap_result.error,
-                )
-
-        time.sleep(3)
-
-        screenshot_result = self._take_screenshot(device_id)
-        if not screenshot_result.success:
-            return Result.fail(screenshot_result.error, screenshot_result.error_code)
-        screenshot_path = screenshot_result.data
-
+    def capture_signal(self, device_id: str = None, channel_name: str = None) -> Result[AcquiredSignal]:
+        """Acquisisce l'ultimo segnale (testo che inizia con 📚) dal canale."""
         try:
-            ocr_text, confidence = self._run_ocr(screenshot_path)
+            client = self._get_client()
+            for msg in client.iter_messages(self.channel_id, limit=50):
+                if msg.text and _looks_like_signal(msg.text):
+                    raw_text = msg.text
+                    return Result.ok(AcquiredSignal(
+                        raw_text=raw_text,
+                        ocr_text=raw_text,
+                        emoji_values={},
+                        source="telegram_telethon",
+                        device_id="pc",
+                        detected_at=datetime.now(timezone.utc).isoformat(),
+                        channel_name="MB Evo Pro",
+                        message_id=str(msg.id),
+                    ))
         except Exception as e:
-            return Result.fail(f"OCR failed: {e}", "OCR_LOW_CONFIDENCE")
+            return Result.fail(f"Errore Telegram: {e}", "TELEGRAM_ERROR")
 
-        return Result.ok(AcquiredSignal(
-            raw_text=ocr_text,
-            screenshot_path=screenshot_path,
-            ocr_text=ocr_text,
-            emoji_values={},
-            confidence=confidence,
-            source="telegram_notification",
-            device_id=device_id,
-            detected_at=datetime.now(timezone.utc).isoformat(),
-            channel_name=channel_name,
-        ))
+        return Result.fail("Nessun segnale trovato negli ultimi 50 messaggi", "NO_SIGNAL_FOUND")
 
-    def _take_screenshot(self, device_id: str) -> Result[str]:
-        try:
-            local_path = os.path.join(self.screenshot_dir, f"telegram_{device_id}_{int(time.time() * 1000)}.png")
-            subprocess.run(
-                ["adb", "-s", device_id, "shell", "screencap", "-p", "/sdcard/screen.png"],
-                capture_output=True, timeout=self.adb_timeout,
-            )
-            subprocess.run(
-                ["adb", "-s", device_id, "pull", "/sdcard/screen.png", local_path],
-                capture_output=True, timeout=self.adb_timeout,
-            )
-            if not os.path.exists(local_path):
-                return Result.fail("Screenshot file not created", "ADB_TIMEOUT")
-            return Result.ok(local_path)
-        except subprocess.TimeoutExpired:
-            return Result.fail("Screenshot timeout", "ADB_TIMEOUT")
-        except Exception as e:
-            return Result.fail(f"Screenshot error: {e}", "ADB_ERROR")
-
-    def _run_ocr(self, image_path: str) -> tuple[str, float]:
-        if self._ocr_engine is None:
-            from paddleocr import PaddleOCR
-            self._ocr_engine = PaddleOCR(use_angle_cls=True, lang="it")
-
-        raw_result = self._ocr_engine.ocr(image_path, cls=True)
-        raw_result = raw_result if raw_result else []
-
-        lines, confidences = [], []
-        for item in raw_result:
-            if len(item) >= 2:
-                text = item[1][0] if isinstance(item[1], tuple) else str(item[1])
-                conf = item[1][1] if isinstance(item[1], tuple) else 0.5
-                lines.append(text)
-                confidences.append(conf)
-
-        ocr_text = "\n".join(lines)
-        avg_conf = round(sum(confidences) / len(confidences), 3) if confidences else 0.0
-        return ocr_text, avg_conf
+    def extract_emoji_values(self, screenshot_path: str) -> Result[dict]:
+        """Non più necessario con Telethon — i valori vengono inseriti manualmente."""
+        return Result.ok({})
 
     # --------------------------------------------------------
     # MERGE
     # --------------------------------------------------------
 
     def merge_text_and_values(self, ocr_text: str, emoji_values: dict) -> str:
-        """Sostituisce i placeholder noti con i valori inseriti manualmente.
-        Un placeholder senza valore corrispondente (assente o None) resta intatto:
-        SignalParser.parse fa comunque da rete di sicurezza (OBSCURED_VALUES)."""
-        merged = ocr_text
-        for placeholder, key in PLACEHOLDER_MAP.items():
-            if placeholder not in merged:
+        """Sostituisce i placeholder 🔡 con i valori inseriti manualmente.
+        Un placeholder senza valore corrispondente (assente, None o 0) resta
+        intatto: SignalParser.parse fa comunque da rete di sicurezza (OBSCURED_VALUES)."""
+        result = ocr_text
+        for key, value in emoji_values.items():
+            if not value:
                 continue
-            value = emoji_values.get(key)
-            if value is None:
+            pattern = PLACEHOLDER_PATTERNS.get(key)
+            if pattern is None:
                 continue
-            merged = merged.replace(placeholder, f"{value}€")
-        return merged
-
-    # --------------------------------------------------------
-    # NAVIGATION
-    # --------------------------------------------------------
-
-    def _open_telegram(self, device_id: str) -> Result[bool]:
-        try:
-            result = subprocess.run(
-                ["adb", "-s", device_id, "shell", "am", "start", "-n",
-                 "org.telegram.messenger/org.telegram.ui.LaunchActivity"],
-                capture_output=True, text=True, timeout=self.adb_timeout, encoding="utf-8",
-            )
-        except subprocess.TimeoutExpired:
-            return Result.fail(f"ADB timeout on {device_id}", "ADB_TIMEOUT")
-        except FileNotFoundError:
-            return Result.fail("ADB not found in PATH", "DEVICE_OFFLINE")
-
-        if result.returncode != 0:
-            return Result.fail(f"Impossibile aprire Telegram: {result.stderr}", "ADB_ERROR")
-        return Result.ok(True)
-
-    def _scroll_to_latest(self, device_id: str) -> Result[bool]:
-        try:
-            result = subprocess.run(
-                ["adb", "-s", device_id, "shell", "input", "swipe", "540", "1800", "540", "600"],
-                capture_output=True, text=True, timeout=self.adb_timeout, encoding="utf-8",
-            )
-        except subprocess.TimeoutExpired:
-            return Result.fail(f"ADB timeout on {device_id}", "ADB_TIMEOUT")
-        except FileNotFoundError:
-            return Result.fail("ADB not found in PATH", "DEVICE_OFFLINE")
-
-        if result.returncode != 0:
-            return Result.fail(f"Swipe fallito: {result.stderr}", "ADB_ERROR")
-        return Result.ok(True)
+            value_str = str(value).replace('.', ',')
+            result = pattern.sub(lambda m: _replacement_for(key, m, value_str), result)
+        return result

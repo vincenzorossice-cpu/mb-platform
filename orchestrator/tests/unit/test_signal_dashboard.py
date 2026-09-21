@@ -40,14 +40,13 @@ def _signal(**overrides):
 def _acquired_signal(**overrides):
     defaults = dict(
         raw_text="ricarica 🔡🔡€",
-        screenshot_path="/tmp/shot.png",
         ocr_text="ricarica 🔡🔡€",
         emoji_values={},
-        confidence=0.9,
-        source="telegram_notification",
-        device_id="dev1",
+        source="telegram_telethon",
+        device_id="pc",
         detected_at="2026-09-21T10:00:00+00:00",
-        channel_name=None,
+        channel_name="MB Evo Pro",
+        message_id="100",
     )
     defaults.update(overrides)
     return AcquiredSignal(**defaults)
@@ -76,7 +75,7 @@ def test_find_placeholders_detects_importo_ricarica():
 
 
 def test_find_placeholders_detects_profitto_atteso():
-    placeholders = _find_placeholders("PROFITTO MEDIO:🔡💶 garantito")
+    placeholders = _find_placeholders("PROFITTO MEDIO:🔡🔡€ garantito")
     keys = [p["key"] for p in placeholders]
     assert "profitto_atteso" in keys
 
@@ -86,7 +85,7 @@ def test_find_placeholders_none_when_clean():
 
 
 def test_find_placeholders_detects_all_three():
-    text = "ricarica 🔡🔡€ bonus 😳😃€ PROFITTO:🔡💶"
+    text = "ricarica 🔡🔡€ bonus 🔡🔡€ PROFITTO:🔡🔡€"
     placeholders = _find_placeholders(text)
     keys = {p["key"] for p in placeholders}
     assert keys == {"importo_ricarica", "importo_bonus", "profitto_atteso"}
@@ -103,36 +102,31 @@ def test_acquire_signal_success():
         mock_cls.return_value = mock_instance
 
         client = TestClient(app)
-        response = client.post("/acquire_signal", json={"device_id": "dev1"})
+        response = client.post("/acquire_signal")
 
     assert response.status_code == 200
     body = response.json()
     assert body["success"] is True
-    assert body["telegram_message_id"].startswith("acq_dev1_")
+    assert body["telegram_message_id"] == "100"
     keys = [p["key"] for p in body["placeholders"]]
     assert "importo_ricarica" in keys
 
 
-def test_acquire_signal_device_offline():
+def test_acquire_signal_no_signal_found():
     with patch("orchestrator.dashboard.app.TelegramAcquirer") as mock_cls:
         mock_instance = MagicMock()
-        mock_instance.capture_signal.return_value = Result.fail("Device offline: dev1", "DEVICE_OFFLINE")
+        mock_instance.capture_signal.return_value = Result.fail(
+            "Nessun segnale trovato negli ultimi 50 messaggi", "NO_SIGNAL_FOUND",
+        )
         mock_cls.return_value = mock_instance
 
         client = TestClient(app)
-        response = client.post("/acquire_signal", json={"device_id": "dev1"})
+        response = client.post("/acquire_signal")
 
     assert response.status_code == 502
     body = response.json()
     assert body["success"] is False
-    assert body["error_code"] == "DEVICE_OFFLINE"
-
-
-def test_acquire_signal_missing_device_id():
-    client = TestClient(app)
-    response = client.post("/acquire_signal", json={})
-    assert response.status_code == 400
-    assert response.json()["success"] is False
+    assert body["error_code"] == "NO_SIGNAL_FOUND"
 
 
 # --------------------------------------------------------------------------
