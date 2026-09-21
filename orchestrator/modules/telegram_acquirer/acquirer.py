@@ -68,7 +68,7 @@ class TelegramAcquirer(TelegramAcquirerInterface):
         try:
             result = subprocess.run(
                 ["adb", "-s", device_id, "shell", "dumpsys", "notification", "--noredact"],
-                capture_output=True, text=True, timeout=self.adb_timeout,
+                capture_output=True, text=True, timeout=self.adb_timeout, encoding="utf-8",
             )
         except subprocess.TimeoutExpired:
             return Result.fail(f"ADB timeout on {device_id}", "ADB_TIMEOUT")
@@ -204,7 +204,7 @@ class TelegramAcquirer(TelegramAcquirerInterface):
             result = subprocess.run(
                 ["adb", "-s", device_id, "shell", "am", "start", "-n",
                  "com.telegram.messenger/.TelegramLaunchActivity"],
-                capture_output=True, text=True, timeout=self.adb_timeout,
+                capture_output=True, text=True, timeout=self.adb_timeout, encoding="utf-8",
             )
         except subprocess.TimeoutExpired:
             return Result.fail(f"ADB timeout on {device_id}", "ADB_TIMEOUT")
@@ -219,7 +219,7 @@ class TelegramAcquirer(TelegramAcquirerInterface):
         try:
             result = subprocess.run(
                 ["adb", "-s", device_id, "shell", "input", "swipe", "540", "1800", "540", "600"],
-                capture_output=True, text=True, timeout=self.adb_timeout,
+                capture_output=True, text=True, timeout=self.adb_timeout, encoding="utf-8",
             )
         except subprocess.TimeoutExpired:
             return Result.fail(f"ADB timeout on {device_id}", "ADB_TIMEOUT")
