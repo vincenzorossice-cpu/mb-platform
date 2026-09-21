@@ -171,6 +171,49 @@ def test_dashboard_route():
     assert "HITL Dashboard" in response.text
 
 
+def test_dashboard_mobile_render():
+    client = TestClient(app)
+    response = client.get("/")
+    assert response.status_code == 200
+    assert 'name="viewport"' in response.text
+    assert "width=device-width" in response.text
+
+
+def test_dashboard_terminology():
+    filename = "unregistered_ops_test_terminology.json"
+    path = _write_report(REAL_REPORT_DIR, filename, {
+        "collaboratore_id": "01",
+        "detected_at": "2026-09-16T15:30:00",
+        "alerts": [
+            {
+                "item_id": "unreg_test_terminology",
+                "collaboratore_id": "01",
+                "detected_at": "2026-09-16T15:30:00",
+                "status": "pending",
+                "betfair_open_bet": {
+                    "event": "Gil Vicente - Maritimo",
+                    "selection": "Maritimo",
+                    "bet_id": "B1",
+                    "lay_stake": 48.0,
+                    "lay_odds": 2.1,
+                    "liability": 52.0,
+                    "placed_at": "2026-09-16T15:00:00",
+                },
+            },
+        ],
+    })
+    try:
+        client = TestClient(app)
+        response = client.get("/")
+        assert response.status_code == 200
+        assert "Punta" in response.text
+        assert "Banca" in response.text
+        assert "Back" not in response.text
+        assert "Lay" not in response.text
+    finally:
+        path.unlink(missing_ok=True)
+
+
 def test_reject_updates_status():
     filename = "movimenti_pending_test_reject.json"
     path = _write_report(REAL_REPORT_DIR, filename, _pending_report(

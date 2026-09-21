@@ -1,4 +1,6 @@
 import json
+import logging
+import os
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,8 +11,12 @@ from orchestrator.flows.sport_flow import SignalFlowResult
 from orchestrator.modules.multiplier_engine.interface import CascadeCalculation, CascadeEventCalc
 from orchestrator.modules.rag_system.interface import TCVerification
 from orchestrator.modules.signal_parser.interface import Signal
+from orchestrator.modules.telegram_notifier.notifier import TelegramNotifier
 
 DEFAULT_REPORT_DIR = "orchestrator/tests/validation/reports"
+DEFAULT_DASHBOARD_BASE_URL = "http://localhost:8000"
+
+logger = logging.getLogger(__name__)
 
 
 class SportFlowHandler:
@@ -48,7 +54,26 @@ class SportFlowHandler:
                 "flows": [flow_data],
             }, f, ensure_ascii=False, indent=2)
 
+        self._notify_sport_flow(flow_result.signal, item_id, len(flow_result.identity_ids_available))
+
         return Result.ok(item_id)
+
+    def _notify_sport_flow(self, signal: Signal, item_id: str, identities_ready: int) -> None:
+        """Notifica Raffaele via Telegram che un flow sport e' pronto per conferma.
+        Un fallimento della notifica non deve far fallire il salvataggio del flow."""
+        dashboard_base_url = os.environ.get("DASHBOARD_BASE_URL", DEFAULT_DASHBOARD_BASE_URL)
+        dashboard_url = f"{dashboard_base_url}/confirm_sport_flow/{item_id}"
+
+        result = TelegramNotifier().notify_sport_flow(
+            book=signal.book,
+            bonus_type=f"{signal.bonus_type.capitalize()} {signal.category.capitalize()}",
+            va=signal.expected_profit,
+            identities_ready=identities_ready,
+            deadline=signal.deadline,
+            dashboard_url=dashboard_url,
+        )
+        if not result.success:
+            logger.warning("Notifica Telegram fallita per flow %s: %s", item_id, result.error)
 
     TERMINAL_STATUSES = ("executed", "rejected")
 

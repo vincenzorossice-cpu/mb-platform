@@ -13,6 +13,7 @@ from orchestrator.modules.multiplier_engine.interface import CascadeCalculation,
 from orchestrator.modules.rag_system.interface import TCVerification
 from orchestrator.modules.screen_reader.interface import BetStatus
 from orchestrator.modules.signal_parser.interface import Signal
+from orchestrator.modules.telegram_notifier.notifier import TelegramNotifier
 from orchestrator.modules.touch_injector.interface import BackBetResult
 
 
@@ -294,7 +295,8 @@ class TestSportFlowHandler:
         handler = SportFlowHandler()
         report_dir = str(tmp_path)
 
-        save_result = handler.save_pending_flow(flow_result, report_dir=report_dir)
+        with patch.object(TelegramNotifier, "notify_sport_flow", return_value=Result.ok(True)):
+            save_result = handler.save_pending_flow(flow_result, report_dir=report_dir)
         assert save_result.success
         item_id = save_result.data
 
@@ -306,6 +308,43 @@ class TestSportFlowHandler:
         assert reloaded is not None
         assert reloaded.signal.telegram_message_id == signal.telegram_message_id
         assert reloaded.cascade_calc.events[0].lay_stake == calc.events[0].lay_stake
+
+    def test_save_pending_flow_sends_telegram_notification(self, tmp_path):
+        """save_pending_flow notifica Raffaele via Telegram dopo il salvataggio."""
+        signal = _signal(category="sport", book="STANLEYBET")
+        flow_result = SignalFlowResult(
+            signal=signal, tc_verification=_tc_verification(), cascade_calc=None,
+            identity_ids_available=["01", "02"], status="pending_hitl",
+        )
+        handler = SportFlowHandler()
+
+        with patch.object(TelegramNotifier, "notify_sport_flow", return_value=Result.ok(True)) as mock_notify:
+            save_result = handler.save_pending_flow(flow_result, report_dir=str(tmp_path))
+
+        assert save_result.success
+        mock_notify.assert_called_once()
+        _args, kwargs = mock_notify.call_args
+        assert kwargs["book"] == "STANLEYBET"
+        assert kwargs["identities_ready"] == 2
+        assert save_result.data in kwargs["dashboard_url"]
+
+    def test_save_pending_flow_survives_telegram_failure(self, tmp_path):
+        """Un fallimento della notifica Telegram non deve far fallire il salvataggio."""
+        signal = _signal(category="sport")
+        flow_result = SignalFlowResult(
+            signal=signal, tc_verification=_tc_verification(), cascade_calc=None,
+            identity_ids_available=["01"], status="pending_hitl",
+        )
+        handler = SportFlowHandler()
+
+        with patch.object(
+            TelegramNotifier, "notify_sport_flow",
+            return_value=Result.fail("errore rete", "TELEGRAM_SEND_ERROR"),
+        ):
+            save_result = handler.save_pending_flow(flow_result, report_dir=str(tmp_path))
+
+        assert save_result.success
+        assert handler.load_pending_flows(report_dir=str(tmp_path))
 
 
 # ----------------------------------------------------------------------
