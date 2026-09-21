@@ -6,7 +6,12 @@ from fastapi.testclient import TestClient
 
 from orchestrator.core.result import Result
 from orchestrator.dashboard.app import _find_movement_in_files, app
-from orchestrator.dashboard.data_loader import DEFAULT_REPORT_DIR, load_movimenti, load_rettifiche
+from orchestrator.dashboard.data_loader import (
+    DEFAULT_REPORT_DIR,
+    load_movimenti,
+    load_pending_sport_flows,
+    load_rettifiche,
+)
 
 REAL_REPORT_DIR = Path(DEFAULT_REPORT_DIR)
 
@@ -212,6 +217,63 @@ def test_dashboard_terminology():
         assert "Lay" not in response.text
     finally:
         path.unlink(missing_ok=True)
+
+
+def test_dashboard_splits_sport_and_casino_flows():
+    filename = "sport_flow_pending_test_split.json"
+    path = _write_report(REAL_REPORT_DIR, filename, {
+        "flows": [
+            {
+                "item_id": "flow_sport_split",
+                "status": "pending_hitl",
+                "signal": {"book": "SISAL", "category": "sport", "expected_profit": 10.0},
+                "tc_verification": {"verified": True},
+                "identity_ids_available": ["id1"],
+            },
+            {
+                "item_id": "flow_casino_split",
+                "status": "pending_hitl",
+                "signal": {"book": "STARCASINO", "category": "casino", "expected_profit": 5.0},
+                "tc_verification": {"verified": True},
+                "identity_ids_available": ["id2"],
+            },
+        ],
+    })
+    try:
+        client = TestClient(app)
+        response = client.get("/")
+        assert response.status_code == 200
+        assert "Operazioni Sport Pending" in response.text
+        assert "Operazioni Casino Pending" in response.text
+        assert "flow_sport_split" in response.text
+        assert "flow_casino_split" in response.text
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_load_pending_sport_flows_preserves_category(tmp_path):
+    report_dir = tmp_path / "reports"
+    _write_report(report_dir, "sport_flow_pending_test.json", {
+        "flows": [
+            {
+                "item_id": "f1",
+                "status": "pending_hitl",
+                "signal": {"book": "SISAL", "category": "sport", "expected_profit": 1.0},
+                "tc_verification": {"verified": True},
+                "identity_ids_available": [],
+            },
+            {
+                "item_id": "f2",
+                "status": "pending_hitl",
+                "signal": {"book": "STARCASINO", "category": "casino", "expected_profit": 1.0},
+                "tc_verification": {"verified": True},
+                "identity_ids_available": [],
+            },
+        ],
+    })
+    flows = load_pending_sport_flows(report_dir=str(report_dir))
+    categories = {f["item_id"]: f["category"] for f in flows}
+    assert categories == {"f1": "sport", "f2": "casino"}
 
 
 def test_reject_updates_status():

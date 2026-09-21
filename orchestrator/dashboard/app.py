@@ -1,3 +1,7 @@
+import os
+
+os.environ["HF_HUB_OFFLINE"] = "1"
+
 import json
 from dataclasses import asdict
 from datetime import date, datetime
@@ -55,7 +59,9 @@ async def dashboard(request: Request):
     errori = load_errors()
     operazioni_non_registrate = load_unregistered_operations()
     bookmaker_options = load_bookmaker_options()
-    sport_flows = load_pending_sport_flows()
+    pending_flows = load_pending_sport_flows()
+    sport_flows = [f for f in pending_flows if f.get("category") == "sport"]
+    casino_flows = [f for f in pending_flows if f.get("category") == "casino"]
     return templates.TemplateResponse(request, "index.html", {
         "rettifiche": rettifiche,
         "movimenti": movimenti,
@@ -63,6 +69,7 @@ async def dashboard(request: Request):
         "operazioni_non_registrate": operazioni_non_registrate,
         "bookmaker_options": bookmaker_options,
         "sport_flows": sport_flows,
+        "casino_flows": casino_flows,
     })
 
 
