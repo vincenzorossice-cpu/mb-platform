@@ -84,14 +84,27 @@ class LlamaSignalExtractor:
             "expected_profit": self._extract_expected_profit(preprocessed.get("profit_raw")),
         }
 
-        if any(kw in strategy_lower for kw in self.SPORT_KEYWORDS):
+        bonus_type_lower = (preprocessed.get("bonus_type_raw") or "").lower()
+        combined = strategy_lower + " " + bonus_type_lower
+        
+        # 1. Check esplicito nel bonus_type
+        if "sport" in bonus_type_lower or "multipla" in bonus_type_lower:
             extracted["category"] = "sport"
             extracted["strategy"], extracted["bonus"] = self._extract_sport(strategy_raw)
-        elif any(kw in (strategy_lower + " " + (preprocessed.get("bonus_type_raw") or "").lower()) for kw in self.CASINO_KEYWORDS):
+        elif any(kw in bonus_type_lower for kw in ["slot", "bingo", "casino"]):
             extracted["category"] = "casino"
             extracted["strategy"], extracted["bonus"] = self._extract_casino(
                 strategy_raw, preprocessed
             )
+        # 2. Fallback sulla strategia (casino ha priorità per evitare falsi sport)
+        elif any(kw in combined for kw in self.CASINO_KEYWORDS):
+            extracted["category"] = "casino"
+            extracted["strategy"], extracted["bonus"] = self._extract_casino(
+                strategy_raw, preprocessed
+            )
+        elif any(kw in combined for kw in self.SPORT_KEYWORDS):
+            extracted["category"] = "sport"
+            extracted["strategy"], extracted["bonus"] = self._extract_sport(strategy_raw)
         else:
             extracted["category"] = None
             extracted["strategy"] = {}
