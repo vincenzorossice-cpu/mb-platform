@@ -18,6 +18,7 @@ class SignalPreprocessor:
         "💎": "bonus_type_1",
         "⏳": "bonus_type_2",
         "✅": "strategy",
+        "🔩": "strategy",
         "✋": "slot_advised",
         "📛": "slot_rigioco",
         "⏰": "deadline",
@@ -51,7 +52,7 @@ class SignalPreprocessor:
         variance_match = re.search(r'⚡️+\s*(.+?)(?:\n|$)', raw_text)
         fields["variance_raw"] = variance_match.group(1).strip() if variance_match else None
 
-        strategy_match = re.search(r'✅\s*(.+?)(?=\n[✋📛⏰🤩💰⚡️]|\Z)', raw_text, re.DOTALL)
+        strategy_match = re.search(r'[✅🔩]\s*(.+?)(?=\n[✋📛⏰🤩💰⚡️]|\Z)', raw_text, re.DOTALL)
         fields["strategy_raw"] = strategy_match.group(1).strip() if strategy_match else None
 
         slot_match = re.search(r'✋\s*(.+?)(?:\n|$)', raw_text)
