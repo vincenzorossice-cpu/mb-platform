@@ -39,12 +39,15 @@ _AMOUNT_RE = re.compile(
 # (es. Betfair mostra il saldo come "â‚¬1,194.57" standalone). "â‚¬" e' la sequenza
 # mojibake reale di "€" nei dump con encoding errato.
 _STANDALONE_EURO_RE = re.compile(
-    r"^\s*[-+]?\(?\s*(?:€|â‚¬|EUR|eur)\s*"
+    r"^\s*[-+]?\(?\s*"
+    r"(?:(?:€|â‚¬|EUR|eur)\s*)?"        # simbolo euro PRIMA (opzionale)
     r"(?:\d{1,3}(?:\.\d{3})+,\d{2}"   # italiano con migliaia: 1.234,56
     r"|\d{1,3}(?:,\d{3})+\.\d{2}"     # inglese con migliaia: 1,194.57
     r"|\d+,\d{2}"                      # solo virgola decimale: 150,75
     r"|\d+\.\d{2})"                    # solo punto decimale: 123.45
-    r"\s*\)?\s*$"
+    r"\s*\)?\s*"
+    r"(?:(?:€|â‚¬|EUR|eur)\s*)?"        # simbolo euro DOPO (opzionale)
+    r"\s*$"
 )
 
 # FIX-4: etichette per scommesse aperte, bonus reale (prelevabile) e wagering bonus
@@ -486,6 +489,8 @@ class ScreenReader(ScreenReaderInterface):
             # FIX-BETFAIR-STANDALONE: nessuna etichetta trovata (ne' generica ne' per-book) ->
             # cerca un elemento che sia SOLO un importo con simbolo euro (es. Betfair "â‚¬1,194.57")
             for t in texts:
+                if not any(sym in t for sym in ['€', 'â‚¬', 'EUR', 'eur']):
+                    continue
                 match = _STANDALONE_EURO_RE.match(t)
                 if match:
                     val = self._clean_italian_amount(match.group(0))
