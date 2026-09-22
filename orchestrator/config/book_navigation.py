@@ -22,7 +22,7 @@ I campi lasciati a None/"" con commento TODO vanno validati sui telefoni.
 BOOK_NAVIGATION = {
     # --- Book mappati dalla guida P6 (open_bets_path noto) ---
     "BETFAIR": {
-        "balance_url": "https://www.betfair.it/exchange/plus/",
+        "balance_url": "https://betfair.it/exchange",
         "balance_label": "Totale saldo reale",
         "open_bets_path": "Conto Personale → Conto Personale → Attività Scommesse → Scommesse Sportsbook / Scommesse Exchange",
         "open_bets_url": None,  # TODO: verificare URL
@@ -37,7 +37,7 @@ BOOK_NAVIGATION = {
         ),
     },
     "SISAL": {
-        "balance_url": "https://m.sisal.it",
+        "balance_url": "https://www.sisal.it",
         "balance_label": "Saldo",
         "open_bets_path": "Icona in alto a destra → scorrere fino a Ultimi Movimenti",
         "open_bets_url": None,  # TODO: verificare URL
@@ -47,7 +47,7 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
     "WILLIAMHILL": {
-        "balance_url": "https://m.williamhill.it",
+        "balance_url": "https://www.williamhill.it",
         "balance_label": "Saldo",
         "open_bets_path": "Il Mio Conto → Estratto Conto → filtri di ricerca",
         "open_bets_url": None,  # TODO: verificare URL
@@ -57,7 +57,7 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
     "LEOVEGAS": {
-        "balance_url": "https://m.leovegas.it",
+        "balance_url": "https://www.leovegas.it",
         "balance_label": "Saldo",
         "open_bets_path": "Scommesse → Storico Scommesse",
         "open_bets_url": None,  # TODO: verificare URL
@@ -67,7 +67,7 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
     "EUROBET": {
-        "balance_url": "https://m.eurobet.it",
+        "balance_url": "https://www.eurobet.it",
         "balance_label": "Saldo",
         "open_bets_path": "Le Mie Scommesse",
         "open_bets_url": None,  # TODO: verificare URL
@@ -77,7 +77,7 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
     "UNIBET": {
-        "balance_url": "https://m.unibet.it",
+        "balance_url": "https://www.unibet.it",
         "balance_label": "Saldo",
         "open_bets_path": "Scommesse → Storico Scommesse",
         "open_bets_url": None,  # TODO: verificare URL
@@ -87,7 +87,7 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
     "BET365": {
-        "balance_url": "https://www.bet365.it",
+        "balance_url": "https://www.bet365.it/#/HO/",
         "balance_label": "Balance",
         "open_bets_path": "Icona in alto a destra → Archivio → Scommesse in corso / concluse",
         "open_bets_url": None,  # TODO: verificare URL
@@ -97,7 +97,7 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
     "GIOCO DIGITALE": {
-        "balance_url": None,  # TODO: verificare URL
+        "balance_url": "https://www.giocodigitale.it",  # TODO: verificare URL
         "balance_label": "Saldo",
         "open_bets_path": "Il Mio Conto → Le Mie Scommesse",
         "open_bets_url": None,  # TODO: verificare URL
@@ -107,7 +107,7 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
     "STANLEYBET": {
-        "balance_url": "https://m.stanleybet.it",
+        "balance_url": "https://www.stanleybet.it",
         "balance_label": "Saldo",
         "open_bets_path": "Profilo → Le Mie Giocate → filtri",
         "open_bets_url": None,  # TODO: verificare URL
@@ -117,7 +117,7 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
     "POKERSTARS": {
-        "balance_url": "https://m.pokerstars.it",
+        "balance_url": "https://www.pokerstars.it",
         "balance_label": "Saldo",
         "open_bets_path": "Account → Scommesse → Cronologia Scommesse → filtri",
         "open_bets_url": None,  # TODO: verificare URL
@@ -127,7 +127,7 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
     "BETFLAG": {
-        "balance_url": "https://m.betflag.it",
+        "balance_url": "https://www.betflag.it",
         "balance_label": "Saldo",
         "open_bets_path": "I Miei Movimenti → Scommesse Sportive / Exchange",
         "open_bets_url": None,  # TODO: verificare URL
@@ -141,7 +141,7 @@ BOOK_NAVIGATION = {
         ),
     },
     "TOTOSI": {
-        "balance_url": None,  # TODO: verificare URL
+        "balance_url": "https://www.totosi.it",  # TODO: verificare URL
         "balance_label": "Saldo",
         "open_bets_path": "Movimenti e Giocate → filtri",
         "open_bets_url": None,  # TODO: verificare URL
@@ -151,7 +151,7 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
     "NETBET": {
-        "balance_url": "https://m.netbet.it",
+        "balance_url": "https://www.netbet.it",
         "balance_label": "Saldo",
         "open_bets_path": "Nome utente → Le Tue Scommesse → filtri",
         "open_bets_url": None,  # TODO: verificare URL
@@ -161,7 +161,7 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
     "ADMIRALBET": {
-        "balance_url": None,  # TODO: verificare URL
+        "balance_url": "https://www.admiralbet.it",  # TODO: verificare URL
         "balance_label": "Saldo",
         "open_bets_path": "Nickname in alto → Giocate → Scommesse → filtri",
         "open_bets_url": None,  # TODO: verificare URL
@@ -171,7 +171,7 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
     "GOLDBET": {
-        "balance_url": "https://m.goldbet.it",
+        "balance_url": "https://www.goldbet.it",
         "balance_label": "Saldo",
         "open_bets_path": "Il Mio Conto → Le Mie Scommesse → filtri",
         "open_bets_url": None,  # TODO: verificare URL
@@ -181,7 +181,7 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
     "DOMUSBET": {
-        "balance_url": None,  # TODO: verificare URL
+        "balance_url": "https://www.domusbet.it",  # TODO: verificare URL
         "balance_label": "Saldo",
         "open_bets_path": "Icona in alto a destra → Scommesse Sportive → Le Mie Giocate",
         "open_bets_url": None,  # TODO: verificare URL
@@ -191,7 +191,7 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
     "SNAI": {
-        "balance_url": "https://m.snai.it",
+        "balance_url": "https://www.snai.it",
         "balance_label": "Saldo",
         "open_bets_path": "Il Tuo Conto → Movimenti e Saldo → filtri",
         "open_bets_url": None,  # TODO: verificare URL
@@ -201,7 +201,7 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
     "PLANET WIN": {
-        "balance_url": "https://m.planetwin365.it",
+        "balance_url": "https://www.planetwin365.it",
         "balance_label": "Saldo",
         "open_bets_path": "Il Mio Conto → Lista Scommesse → filtri",
         "open_bets_url": None,  # TODO: verificare URL
@@ -212,7 +212,7 @@ BOOK_NAVIGATION = {
     },
     # --- Book non mappati nella guida P6 (percorso da verificare) ---
     "BETPASSION": {
-        "balance_url": None,  # TODO: verificare URL
+        "balance_url": "https://betpassion.it",  # TODO: verificare URL
         "balance_label": "Saldo",
         "open_bets_path": "",  # TODO: verificare percorso
         "open_bets_url": None,  # TODO: verificare URL
@@ -222,7 +222,7 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
     "BETPOINT": {
-        "balance_url": None,  # TODO: verificare URL
+        "balance_url": "https://www.betpoint.it",  # TODO: verificare URL
         "balance_label": "Saldo",
         "open_bets_path": "",  # TODO: verificare percorso
         "open_bets_url": None,  # TODO: verificare URL
@@ -232,7 +232,7 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
     "BETSSON": {
-        "balance_url": "https://m.betsson.it",
+        "balance_url": "https://betsson.it",
         "balance_label": "Saldo",
         "open_bets_path": "",  # TODO: verificare percorso
         "open_bets_url": None,  # TODO: verificare URL
@@ -242,7 +242,7 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
     "BETWIN360": {
-        "balance_url": None,  # TODO: verificare URL
+        "balance_url": "https://www.betwin360.it",  # TODO: verificare URL
         "balance_label": "Saldo",
         "open_bets_path": "",  # TODO: verificare percorso
         "open_bets_url": None,  # TODO: verificare URL
@@ -252,7 +252,7 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
     "BGAME": {
-        "balance_url": None,  # TODO: verificare URL
+        "balance_url": "https://www.bgame.it",  # TODO: verificare URL
         "balance_label": "Saldo",
         "open_bets_path": "",  # TODO: verificare percorso
         "open_bets_url": None,  # TODO: verificare URL
@@ -262,7 +262,7 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
     "BWIN": {
-        "balance_url": "https://m.bwin.it",
+        "balance_url": "https://www.bwin.it",
         "balance_label": "Saldo",
         "open_bets_path": "",  # TODO: verificare percorso
         "open_bets_url": None,  # TODO: verificare URL
@@ -272,7 +272,7 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
     "CODERE": {
-        "balance_url": "https://m.codere.it",
+        "balance_url": "https://www.codere.it",
         "balance_label": "Saldo",
         "open_bets_path": "",  # TODO: verificare percorso
         "open_bets_url": None,  # TODO: verificare URL
@@ -282,7 +282,7 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
     "DAZNBET": {
-        "balance_url": "https://m.daznbet.it",
+        "balance_url": "https://daznbet.it",
         "balance_label": "Saldo",
         "open_bets_path": "",  # TODO: verificare percorso
         "open_bets_url": None,  # TODO: verificare URL
@@ -292,7 +292,7 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
     "E-PLAY24": {
-        "balance_url": None,  # TODO: verificare URL
+        "balance_url": "https://www.eplay24.it",  # TODO: verificare URL
         "balance_label": "Saldo",
         "open_bets_path": "",  # TODO: verificare percorso
         "open_bets_url": None,  # TODO: verificare URL
@@ -302,7 +302,7 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
     "FASTBET": {
-        "balance_url": None,  # TODO: verificare URL
+        "balance_url": "https://www.fastbet.it",  # TODO: verificare URL
         "balance_label": "Saldo",
         "open_bets_path": "",  # TODO: verificare percorso
         "open_bets_url": None,  # TODO: verificare URL
@@ -312,7 +312,7 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
     "GIOCA7": {
-        "balance_url": None,  # TODO: verificare URL
+        "balance_url": "https://www.gioca7.it",  # TODO: verificare URL
         "balance_label": "Saldo",
         "open_bets_path": "",  # TODO: verificare percorso
         "open_bets_url": None,  # TODO: verificare URL
@@ -322,7 +322,7 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
     "GIOCHI24": {
-        "balance_url": None,  # TODO: verificare URL
+        "balance_url": "https://www.giochi24.it",  # TODO: verificare URL
         "balance_label": "Saldo",
         "open_bets_path": "",  # TODO: verificare percorso
         "open_bets_url": None,  # TODO: verificare URL
@@ -332,7 +332,7 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
     "LOTTOMATICA": {
-        "balance_url": "https://m.lottomatica.it",
+        "balance_url": "https://www.lottomatica.it",
         "balance_label": "Saldo",
         "open_bets_path": "",  # TODO: verificare percorso
         "open_bets_url": None,  # TODO: verificare URL
@@ -342,7 +342,7 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
     "MARATHONBET": {
-        "balance_url": None,  # TODO: verificare URL
+        "balance_url": "https://www.marathonbet.it",  # TODO: verificare URL
         "balance_label": "Saldo",
         "open_bets_path": "",  # TODO: verificare percorso
         "open_bets_url": None,  # TODO: verificare URL
@@ -352,7 +352,7 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
     "MYLOTTERIES": {
-        "balance_url": None,  # TODO: verificare URL
+        "balance_url": "https://www.mylotteriesplay.it",  # TODO: verificare URL
         "balance_label": "Saldo",
         "open_bets_path": "",  # TODO: verificare percorso
         "open_bets_url": None,  # TODO: verificare URL
@@ -362,7 +362,7 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
     "NETWIN": {
-        "balance_url": None,  # TODO: verificare URL
+        "balance_url": "https://www.netwin.it",  # TODO: verificare URL
         "balance_label": "Saldo",
         "open_bets_path": "",  # TODO: verificare percorso
         "open_bets_url": None,  # TODO: verificare URL
@@ -372,7 +372,7 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
     "QUIGIOCO": {
-        "balance_url": None,  # TODO: verificare URL
+        "balance_url": "https://www.quigioco.it",  # TODO: verificare URL
         "balance_label": "Saldo",
         "open_bets_path": "",  # TODO: verificare percorso
         "open_bets_url": None,  # TODO: verificare URL
@@ -382,7 +382,7 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
     "SPORTBET": {
-        "balance_url": None,  # TODO: verificare URL
+        "balance_url": "https://www.sportbet.it",  # TODO: verificare URL
         "balance_label": "Saldo",
         "open_bets_path": "",  # TODO: verificare percorso
         "open_bets_url": None,  # TODO: verificare URL
@@ -392,7 +392,7 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
     "SPORTIUM": {
-        "balance_url": None,  # TODO: verificare URL
+        "balance_url": "https://www.sportium.it",  # TODO: verificare URL
         "balance_label": "Saldo",
         "open_bets_path": "",  # TODO: verificare percorso
         "open_bets_url": None,  # TODO: verificare URL
@@ -402,7 +402,7 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
     "STAKE": {
-        "balance_url": "https://m.stake.it",
+        "balance_url": "https://www.stake.it",
         "balance_label": "Saldo",
         "open_bets_path": "",  # TODO: verificare percorso
         "open_bets_url": None,  # TODO: verificare URL
@@ -412,7 +412,7 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
     "STARCASINO": {
-        "balance_url": None,  # TODO: verificare URL
+        "balance_url": "https://www.starcasino.it",  # TODO: verificare URL
         "balance_label": "Saldo",
         "open_bets_path": "",  # TODO: verificare percorso
         "open_bets_url": None,  # TODO: verificare URL
@@ -422,7 +422,7 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
     "STARYES": {
-        "balance_url": None,  # TODO: verificare URL
+        "balance_url": "https://www.staryes.it",  # TODO: verificare URL
         "balance_label": "Saldo",
         "open_bets_path": "",  # TODO: verificare percorso
         "open_bets_url": None,  # TODO: verificare URL
@@ -432,7 +432,7 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
     "SUNBET": {
-        "balance_url": None,  # TODO: verificare URL
+        "balance_url": "https://www.sunbet.it",  # TODO: verificare URL
         "balance_label": "Saldo",
         "open_bets_path": "",  # TODO: verificare percorso
         "open_bets_url": None,  # TODO: verificare URL
@@ -442,7 +442,7 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
     "VINCITU": {
-        "balance_url": None,  # TODO: verificare URL
+        "balance_url": "https://www.vincitu.it",  # TODO: verificare URL
         "balance_label": "Saldo",
         "open_bets_path": "",  # TODO: verificare percorso
         "open_bets_url": None,  # TODO: verificare URL
@@ -452,7 +452,7 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
     "ZONAGIOCO": {
-        "balance_url": None,  # TODO: verificare URL
+        "balance_url": "https://www.zonagioco.it",  # TODO: verificare URL
         "balance_label": "Saldo",
         "open_bets_path": "",  # TODO: verificare percorso
         "open_bets_url": None,  # TODO: verificare URL
