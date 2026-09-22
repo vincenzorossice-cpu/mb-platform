@@ -3,4 +3,5 @@ sentence-transformers
 pyyaml
 requests
 paddleocr
+easyocr
 telethon
