@@ -74,16 +74,16 @@ class TestReconcileAdjustBook:
 
 
 class TestReconcileAdjustBanco:
-    def test_difference_betfair_uses_banco(self, engine: RulesEngine):
-        """Differenza >= 0.50, Betfair → adjust, column BANCO."""
+    def test_difference_betfair_uses_book(self, engine: RulesEngine):
+        """Differenza >= 0.50, Betfair → adjust, column BOOK (non BANCO per evitare fee Netcap)."""
         br = _make_balance(raw=110.0)
         account = _make_account(book="Betfair", is_betfair=True)
         result = engine.reconcile(br, expected_balance=100.0, account=account)
         assert result.success
         data = result.data
         assert data.action == "adjust"
-        assert data.column == "BANCO"
-        assert data.rectification.column == "BANCO"
+        assert data.column == "BOOK"
+        assert data.rectification.column == "BOOK"
 
 
 class TestReconcileAnomalousDifference:
@@ -149,13 +149,13 @@ class TestReconcileOpenBets:
 
 
 class TestReconcileBetfairColumnBanco:
-    def test_betfair_always_banco(self, engine: RulesEngine):
-        """Betfair → colonna BANCO in ogni caso."""
+    def test_betfair_always_book(self, engine: RulesEngine):
+        """Betfair → colonna BOOK in riconciliazione (non BANCO per evitare fee Netcap)."""
         br = _make_balance(raw=100.0)
         account = _make_account(book="Betfair", is_betfair=True)
         result = engine.reconcile(br, expected_balance=100.0, account=account)
         assert result.success
-        assert result.data.column == "BANCO"
+        assert result.data.column == "BOOK"
         assert "betfair_banco_column" in result.data.rules_applied
 
 

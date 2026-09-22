@@ -213,8 +213,9 @@ class RulesEngine(RulesEngineInterface):
         return round(br.raw_balance + br.real_bonus, 2)
 
     def _determine_column(self, account: Account) -> str:
-        """Betfair → BANCO, tutti gli altri → BOOK."""
-        return "BANCO" if account.is_betfair else "BOOK"
+        """In riconciliazione (P6) tutto va in colonna BOOK (anche Betfair).
+        Il differenziale in BANCO farebbe applicare la fee Netcap corrompendo il saldo."""
+        return "BOOK"
 
     def _format_bonus_note(self, wagering_bonus: Optional[float]) -> Optional[str]:
         """Genera nota bonus se wagering_bonus presente e > 0."""
