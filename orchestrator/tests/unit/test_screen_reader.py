@@ -246,21 +246,21 @@ class TestExtractBalance:
 
     def test_extract_balance_betfair_standalone(self, reader):
         """FIX-BETFAIR-STANDALONE: saldo senza etichetta, solo importo con simbolo euro."""
-        texts = ["â‚¬1,194.57", "Vincenzo Carfora - C.F. CRFVCN00H15E791G"]
-        result = reader._extract_balance(texts, "betfair")
+        elements = [UIElement(text="â‚¬1,194.57", bounds=[0, 0, 100, 50]), UIElement(text="Vincenzo Carfora", bounds=[0, 100, 100, 150])]
+        result = reader._extract_balance(elements, "betfair")
         assert result is not None
         assert result["raw"] == 1194.57
 
     def test_extract_balance_standalone_with_migliaia(self, reader):
-        texts = ["â‚¬2,500.00"]
-        result = reader._extract_balance(texts, "betfair")
+        elements = [UIElement(text="â‚¬2,500.00", bounds=[0, 0, 100, 50])]
+        result = reader._extract_balance(elements, "betfair")
         assert result is not None
         assert result["raw"] == 2500.00
 
     def test_extract_balance_standalone_not_quota(self, reader):
         """Un numero decimale senza simbolo euro e' una quota, non un saldo."""
-        texts = ["1.80"]
-        result = reader._extract_balance(texts, "betfair")
+        elements = [UIElement(text="1.80", bounds=[0, 0, 100, 50])]
+        result = reader._extract_balance(elements, "betfair")
         assert result is None
 
 

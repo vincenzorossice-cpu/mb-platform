@@ -131,9 +131,8 @@ class ScreenReader(ScreenReaderInterface):
             return Result.fail(f"Cannot read balance: {screen.error}", screen.error_code)
 
         elements = screen.data.elements
-        texts = [e.text for e in elements]
 
-        balance = self._extract_balance(texts, book)
+        balance = self._extract_balance(elements, book)
 
         if balance is None:
             if screen.data.method == "uiautomator":
@@ -435,7 +434,7 @@ class ScreenReader(ScreenReaderInterface):
     # INTERNAL: Balance extraction
     # --------------------------------------------------------
 
-    def _extract_balance(self, texts: list[str], book: str) -> Optional[dict]:
+    def _extract_balance(self, elements: list, book: str) -> Optional[dict]:
         # FIX-4: estrae raw_balance, open_bets, real_bonus e wagering_bonus in un solo
         # passaggio sugli elementi, invece di restituire open_bets/real_bonus hardcoded a 0
         raw_balance = None
@@ -443,7 +442,9 @@ class ScreenReader(ScreenReaderInterface):
         real_bonus = 0.0
         wagering_bonus = None
 
-        for i, t in enumerate(texts):
+        for i, elem in enumerate(elements):
+            t = elem.text
+            texts = [e.text for e in elements] # for _extract_amount_near
             t_lower = t.lower()
 
             # Saldo reale (FIX-1/FIX-2: ancorato a etichetta, mai il primo decimale della pagina)
