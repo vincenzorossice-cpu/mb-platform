@@ -69,7 +69,7 @@ class LlamaSignalExtractor:
     """Step 2 — estrazione strutturata. STUB euristico: sostituirà Llama 3 8B."""
 
     SPORT_KEYWORDS = ("tripla", "doppia", "singola", "quota", "evento", "scommess")
-    CASINO_KEYWORDS = ("slot", "spin", "rollover", "wagering", "bingo")
+    CASINO_KEYWORDS = ("slot", "spin", "rollover", "wagering", "bingo", "baccarat", "roulette", "blackjack", "live", "casino", "baccarà")
 
     def extract(self, preprocessed: dict, raw_text: str) -> Result[dict]:
         strategy_raw = preprocessed.get("strategy_raw") or ""
@@ -270,7 +270,7 @@ class SignalPostprocessor:
     }
 
     SPORT_KEYWORDS = ("tripla", "doppia", "singola", "quota", "evento", "scommess")
-    CASINO_KEYWORDS = ("slot", "spin", "rollover", "wagering", "bingo")
+    CASINO_KEYWORDS = ("slot", "spin", "rollover", "wagering", "bingo", "baccarat", "roulette", "blackjack", "live", "casino", "baccarà")
 
     def postprocess(self, extracted: dict, preprocessed: dict) -> Result[Signal]:
         # 1 — normalizza book
