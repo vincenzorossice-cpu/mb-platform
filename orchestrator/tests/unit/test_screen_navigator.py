@@ -137,7 +137,7 @@ class TestLowConfidence(unittest.TestCase):
         screen_reader = MagicMock()
         screen_reader.read_screen.return_value = Result.ok(_make_screen(elements=[_make_element(text="Boh")]))
         decision_engine_client = MagicMock()
-        decision_engine_client.ask.return_value = Result.ok(_answers("tap", target="Boh", confidence=0.2))
+        decision_engine_client.ask.return_value = Result.ok(_answers("tap", target="Boh", confidence=0.1))
         navigator = _make_navigator(screen_reader, decision_engine_client=decision_engine_client)
 
         result = navigator.navigate(DEVICE, goal="Obiettivo ambiguo")

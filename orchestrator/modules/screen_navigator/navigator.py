@@ -22,7 +22,7 @@ class ScreenNavigator(ScreenNavigatorInterface):
     l'interfaccia di qualunque bookmaker verso un obiettivo in linguaggio
     naturale, senza coordinate o keyword hardcoded per-book."""
 
-    LOW_CONFIDENCE_THRESHOLD = 0.5
+    LOW_CONFIDENCE_THRESHOLD = 0.15
     MAX_HISTORY = 5
     MAX_ELEMENTS_SUMMARY = 20
 
