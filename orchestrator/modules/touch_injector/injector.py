@@ -22,6 +22,10 @@ _DANGEROUS_CHARS_RE = re.compile(r"[;&$`|<>(){}\[\]]")
 # escalare ad AMBIGUOUS_STATE, invece di fallire alla primissima lettura ambigua
 _UNKNOWN_STATUS_STREAK_LIMIT = 3
 
+# Risoluzione di fallback se `adb shell wm size` fallisce o non e' parsabile
+_DEFAULT_SCREEN_SIZE = (1080, 1920)
+_WM_SIZE_RE = re.compile(r"(\d+)x(\d+)")
+
 
 class TouchInjector(TouchInjectorInterface):
     def __init__(
@@ -33,6 +37,7 @@ class TouchInjector(TouchInjectorInterface):
         self.screen_reader = screen_reader
         self.adb_timeout = adb_timeout
         self.bet_confirm_timeout = bet_confirm_timeout
+        self._screen_size_cache: dict[str, tuple[int, int]] = {}
 
     # --------------------------------------------------------
     # PUBLIC: tap_element
@@ -111,6 +116,43 @@ class TouchInjector(TouchInjectorInterface):
             return Result.fail("ADB timeout during input text", "ADB_TIMEOUT")
         except Exception as e:
             return Result.fail(f"input text error: {e}", "TEXT_INPUT_FAILED")
+
+    # --------------------------------------------------------
+    # PUBLIC: scroll
+    # --------------------------------------------------------
+
+    def scroll(self, device_id: str, direction: str = "down", duration_ms: int = 300) -> Result[bool]:
+        """Swipe di scroll. direction='down' fa scorrere il CONTENUTO verso l'alto
+        (swipe dal basso verso l'alto dello schermo), coerente con il gesto naturale."""
+        w, h = self._get_screen_size(device_id)
+        cx, cy = w // 2, h // 2
+        top, bottom = int(h * 0.25), int(h * 0.75)
+        left, right = int(w * 0.25), int(w * 0.75)
+        coords = {
+            "down": (cx, bottom, cx, top),
+            "up": (cx, top, cx, bottom),
+            "left": (right, cy, left, cy),
+            "right": (left, cy, right, cy),
+        }
+        if direction not in coords:
+            return Result.fail(f"Unknown scroll direction: {direction}", "INVALID_SCROLL_DIRECTION")
+
+        x1, y1, x2, y2 = coords[direction]
+        try:
+            result = subprocess.run(
+                ["adb", "-s", device_id, "shell", "input", "swipe",
+                 str(x1), str(y1), str(x2), str(y2), str(duration_ms)],
+                capture_output=True,
+                text=True,
+                timeout=self.adb_timeout,
+            )
+            if result.returncode != 0:
+                return Result.fail(f"ADB swipe failed: {result.stderr}", "SCROLL_FAILED")
+            return Result.ok(True)
+        except subprocess.TimeoutExpired:
+            return Result.fail("ADB timeout during scroll", "ADB_TIMEOUT")
+        except Exception as e:
+            return Result.fail(f"Scroll error: {e}", "SCROLL_FAILED")
 
     # --------------------------------------------------------
     # PUBLIC: navigate_to
@@ -453,6 +495,32 @@ class TouchInjector(TouchInjectorInterface):
     def _bounds_center(self, bounds: list[int]) -> tuple[int, int]:
         """Calcola il centro di un rettangolo [x1, y1, x2, y2]."""
         return (bounds[0] + bounds[2]) // 2, (bounds[1] + bounds[3]) // 2
+
+    def _get_screen_size(self, device_id: str) -> tuple[int, int]:
+        """Risoluzione dello schermo via `adb shell wm size`, cachata per device_id.
+        Non solleva mai eccezioni: su fallimento o output non parsabile ripiega su
+        _DEFAULT_SCREEN_SIZE, loggando un warning."""
+        if device_id in self._screen_size_cache:
+            return self._screen_size_cache[device_id]
+
+        size = _DEFAULT_SCREEN_SIZE
+        try:
+            result = subprocess.run(
+                ["adb", "-s", device_id, "shell", "wm", "size"],
+                capture_output=True,
+                text=True,
+                timeout=self.adb_timeout,
+            )
+            match = _WM_SIZE_RE.search(result.stdout)
+            if result.returncode == 0 and match:
+                size = (int(match.group(1)), int(match.group(2)))
+            else:
+                logger.warning(f"wm size non parsabile per {device_id}, uso default {_DEFAULT_SCREEN_SIZE}")
+        except Exception as e:
+            logger.warning(f"wm size fallito per {device_id}: {e}, uso default {_DEFAULT_SCREEN_SIZE}")
+
+        self._screen_size_cache[device_id] = size
+        return size
 
     def _navigation_hints(self, destination: str, book: str) -> list[str]:
         """Restituisce hint di testo per navigare verso la destinazione."""

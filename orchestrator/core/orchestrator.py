@@ -8,11 +8,13 @@ from orchestrator.core.result import Result
 from orchestrator.modules.app_api_client.client import AppApiClient
 from orchestrator.modules.book_navigator.navigator import BookNavigator
 from orchestrator.modules.cascade_engine.engine import CascadeEngine
+from orchestrator.modules.decision_engine.client import DecisionEngineClient
 from orchestrator.modules.movement_importer.importer import MovementImporter
 from orchestrator.modules.multiplier_engine.calculator import MultiplierEngine
 from orchestrator.modules.opsec.monitor import OpSec
 from orchestrator.modules.rules_engine.engine import RulesEngine
 from orchestrator.modules.rules_engine.interface import Account
+from orchestrator.modules.screen_navigator.navigator import ScreenNavigator
 from orchestrator.modules.screen_reader.reader import ScreenReader
 from orchestrator.modules.signal_parser.parser import SignalParser
 from orchestrator.modules.touch_injector.injector import TouchInjector
@@ -31,6 +33,12 @@ class Orchestrator:
         self.touch_injector = TouchInjector(screen_reader=self.screen_reader)
         self.book_navigator = BookNavigator(
             screen_reader=self.screen_reader, touch_injector=self.touch_injector
+        )
+        self.decision_engine_client = DecisionEngineClient()
+        self.screen_navigator = ScreenNavigator(
+            screen_reader=self.screen_reader,
+            touch_injector=self.touch_injector,
+            decision_engine_client=self.decision_engine_client,
         )
         self.multiplier_engine = MultiplierEngine()
         self.rules_engine = RulesEngine()

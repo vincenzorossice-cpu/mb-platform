@@ -90,6 +90,100 @@ class TestTapCoordinates(unittest.TestCase):
             self.assertLessEqual(tap_y, y_orig + 5)
 
 
+class TestScroll(unittest.TestCase):
+
+    @patch("orchestrator.modules.touch_injector.injector.time.sleep")
+    @patch("orchestrator.modules.touch_injector.injector.subprocess.run")
+    def test_scroll_down_uses_wm_size_and_swipes_bottom_to_top(self, mock_run, mock_sleep):
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="Physical size: 1080x1920", stderr=""),
+            MagicMock(returncode=0, stderr=""),
+        ]
+        reader = MagicMock()
+        injector = TouchInjector(screen_reader=reader)
+
+        result = injector.scroll(DEVICE, "down")
+
+        self.assertTrue(result.success)
+        swipe_cmd = mock_run.call_args_list[1][0][0]
+        self.assertEqual(swipe_cmd[:6], ["adb", "-s", DEVICE, "shell", "input", "swipe"])
+        x1, y1, x2, y2 = swipe_cmd[6], swipe_cmd[7], swipe_cmd[8], swipe_cmd[9]
+        self.assertEqual(x1, x2)
+        self.assertGreater(int(y1), int(y2))  # down = swipe dal basso verso l'alto
+
+    @patch("orchestrator.modules.touch_injector.injector.time.sleep")
+    @patch("orchestrator.modules.touch_injector.injector.subprocess.run")
+    def test_scroll_up_swipes_top_to_bottom(self, mock_run, mock_sleep):
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="Physical size: 1080x1920", stderr=""),
+            MagicMock(returncode=0, stderr=""),
+        ]
+        injector = TouchInjector(screen_reader=MagicMock())
+
+        result = injector.scroll(DEVICE, "up")
+
+        self.assertTrue(result.success)
+        swipe_cmd = mock_run.call_args_list[1][0][0]
+        y1, y2 = int(swipe_cmd[7]), int(swipe_cmd[9])
+        self.assertLess(y1, y2)
+
+    @patch("orchestrator.modules.touch_injector.injector.time.sleep")
+    @patch("orchestrator.modules.touch_injector.injector.subprocess.run")
+    def test_scroll_unparseable_wm_size_falls_back_to_default(self, mock_run, mock_sleep):
+        mock_run.side_effect = [
+            MagicMock(returncode=1, stdout="", stderr="error"),
+            MagicMock(returncode=0, stderr=""),
+        ]
+        injector = TouchInjector(screen_reader=MagicMock())
+
+        result = injector.scroll(DEVICE, "down")
+
+        self.assertTrue(result.success)
+        swipe_cmd = mock_run.call_args_list[1][0][0]
+        # default 1080x1920 -> centro x = 540
+        self.assertEqual(swipe_cmd[6], "540")
+
+    @patch("orchestrator.modules.touch_injector.injector.time.sleep")
+    @patch("orchestrator.modules.touch_injector.injector.subprocess.run")
+    def test_scroll_caches_screen_size_across_calls(self, mock_run, mock_sleep):
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="Physical size: 1080x1920", stderr=""),
+            MagicMock(returncode=0, stderr=""),
+            MagicMock(returncode=0, stderr=""),
+        ]
+        injector = TouchInjector(screen_reader=MagicMock())
+
+        injector.scroll(DEVICE, "down")
+        injector.scroll(DEVICE, "up")
+
+        wm_size_calls = [c for c in mock_run.call_args_list if c[0][0][4:6] == ["wm", "size"]]
+        self.assertEqual(len(wm_size_calls), 1)
+
+    @patch("orchestrator.modules.touch_injector.injector.time.sleep")
+    @patch("orchestrator.modules.touch_injector.injector.subprocess.run")
+    def test_scroll_invalid_direction(self, mock_run, mock_sleep):
+        injector = TouchInjector(screen_reader=MagicMock())
+
+        result = injector.scroll(DEVICE, "diagonal")
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, "INVALID_SCROLL_DIRECTION")
+
+    @patch("orchestrator.modules.touch_injector.injector.time.sleep")
+    @patch("orchestrator.modules.touch_injector.injector.subprocess.run")
+    def test_scroll_swipe_failure(self, mock_run, mock_sleep):
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="Physical size: 1080x1920", stderr=""),
+            MagicMock(returncode=1, stderr="swipe failed"),
+        ]
+        injector = TouchInjector(screen_reader=MagicMock())
+
+        result = injector.scroll(DEVICE, "down")
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, "SCROLL_FAILED")
+
+
 class TestTapElement(unittest.TestCase):
 
     @patch("orchestrator.modules.touch_injector.injector.time.sleep")
