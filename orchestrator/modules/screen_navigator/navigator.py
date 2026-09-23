@@ -150,7 +150,7 @@ class ScreenNavigator(ScreenNavigatorInterface):
             text = answers.get("text_to_type", {}).get("choice", "")
             res = self.touch_injector.input_text(device_id, text, field_hint=target)
         elif action == "scroll":
-            res = self.touch_injector.scroll(device_id, target or "down")
+            res = self.touch_injector.scroll(device_id, "down")
         elif action == "wait":
             time.sleep(3)
             return
