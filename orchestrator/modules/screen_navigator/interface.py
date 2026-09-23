@@ -14,5 +14,6 @@ class NavigationStep:
 
 class ScreenNavigatorInterface(ABC):
     @abstractmethod
-    def navigate(self, device_id: str, goal: str, book: str = "") -> Result[bool]:
-        """Loop read -> decide (Decision Engine) -> act, fino a 'done' o max_steps."""
+    def navigate(self, device_id: str, goal: str, book: str = "", demo_mode: bool = False) -> Result[bool]:
+        """Loop read -> decide (Decision Engine) -> act, fino a 'done' o max_steps.
+        Se demo_mode=True, cerca 'Prova'/'For fun' invece di 'Gioca' con soldi veri."""

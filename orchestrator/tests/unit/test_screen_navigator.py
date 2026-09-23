@@ -233,5 +233,118 @@ class TestActionFailureDoesNotAbortLoop(unittest.TestCase):
         self.assertEqual(decision_engine_client.ask.call_count, 2)
 
 
+class TestInvisibleElementsFiltered(unittest.TestCase):
+
+    def test_zero_bounds_element_excluded_from_target_candidates(self):
+        screen_reader = MagicMock()
+        screen_reader.read_screen.return_value = Result.ok(_make_screen(elements=[
+            _make_element(text="Menu nascosto", bounds=[0, 0, 0, 0]),
+            _make_element(text="Promozioni", bounds=[10, 20, 100, 60]),
+        ]))
+        decision_engine_client = MagicMock()
+        decision_engine_client.ask.return_value = Result.ok(_answers("done"))
+        navigator = _make_navigator(screen_reader, decision_engine_client=decision_engine_client)
+
+        navigator.navigate(DEVICE, goal="Vai alle promozioni")
+
+        _, questions = decision_engine_client.ask.call_args.args
+        target_criteria = questions["target"]["criteria"]
+        self.assertIn("Promozioni", target_criteria)
+        self.assertNotIn("Menu nascosto", target_criteria)
+
+
+class TestAntiLoopRecovery(unittest.TestCase):
+
+    def test_third_consecutive_same_action_triggers_recovery_scroll(self):
+        screen_reader = MagicMock()
+        screen_reader.read_screen.return_value = Result.ok(_make_screen(elements=[_make_element(text="Promo")]))
+        touch_injector = MagicMock()
+        touch_injector.tap_element.return_value = Result.ok(True)
+        touch_injector.scroll.return_value = Result.ok(True)
+        decision_engine_client = MagicMock()
+        decision_engine_client.ask.side_effect = [
+            Result.ok(_answers("tap", target="Promo")),
+            Result.ok(_answers("tap", target="Promo")),
+            Result.ok(_answers("tap", target="Promo")),
+            Result.ok(_answers("done")),
+        ]
+        navigator = _make_navigator(screen_reader, touch_injector, decision_engine_client, max_steps=10)
+
+        result = navigator.navigate(DEVICE, goal="Attiva la promo")
+
+        self.assertTrue(result.success)
+        # Il 3° tentativo consecutivo di "tap 'Promo'" scatena lo scroll di recovery
+        # invece di un altro tap.
+        touch_injector.scroll.assert_called_once_with(DEVICE, "down")
+        self.assertEqual(touch_injector.tap_element.call_count, 2)
+
+    def test_stuck_loop_after_recovery_returns_navigation_stuck(self):
+        screen_reader = MagicMock()
+        screen_reader.read_screen.return_value = Result.ok(_make_screen(elements=[_make_element(text="Promo")]))
+        touch_injector = MagicMock()
+        touch_injector.tap_element.return_value = Result.ok(True)
+        touch_injector.scroll.return_value = Result.ok(True)
+        decision_engine_client = MagicMock()
+        # 3 tap identici -> recovery scroll -> altri 3 tap identici -> stuck
+        decision_engine_client.ask.return_value = Result.ok(_answers("tap", target="Promo"))
+        navigator = _make_navigator(screen_reader, touch_injector, decision_engine_client, max_steps=20)
+
+        result = navigator.navigate(DEVICE, goal="Attiva la promo")
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, "NAVIGATION_STUCK")
+        touch_injector.scroll.assert_called_once_with(DEVICE, "down")
+
+    def test_different_action_resets_loop_counter(self):
+        screen_reader = MagicMock()
+        screen_reader.read_screen.return_value = Result.ok(_make_screen(elements=[
+            _make_element(text="Promo"), _make_element(text="Altro"),
+        ]))
+        touch_injector = MagicMock()
+        touch_injector.tap_element.return_value = Result.ok(True)
+        touch_injector.scroll.return_value = Result.ok(True)
+        decision_engine_client = MagicMock()
+        decision_engine_client.ask.side_effect = [
+            Result.ok(_answers("tap", target="Promo")),
+            Result.ok(_answers("tap", target="Altro")),
+            Result.ok(_answers("tap", target="Promo")),
+            Result.ok(_answers("done")),
+        ]
+        navigator = _make_navigator(screen_reader, touch_injector, decision_engine_client, max_steps=10)
+
+        result = navigator.navigate(DEVICE, goal="Attiva la promo")
+
+        self.assertTrue(result.success)
+        touch_injector.scroll.assert_not_called()
+
+
+class TestDemoMode(unittest.TestCase):
+
+    def test_demo_mode_rewrites_goal_sent_to_decision_engine(self):
+        screen_reader = MagicMock()
+        screen_reader.read_screen.return_value = Result.ok(_make_screen(elements=[_make_element(text="Prova")]))
+        decision_engine_client = MagicMock()
+        decision_engine_client.ask.return_value = Result.ok(_answers("done"))
+        navigator = _make_navigator(screen_reader, decision_engine_client=decision_engine_client)
+
+        navigator.navigate(DEVICE, goal="Gioca alla slot X", demo_mode=True)
+
+        state, _ = decision_engine_client.ask.call_args.args
+        self.assertIn("demo", state.lower())
+        self.assertIn("Prova", state)
+
+    def test_demo_mode_off_leaves_goal_untouched(self):
+        screen_reader = MagicMock()
+        screen_reader.read_screen.return_value = Result.ok(_make_screen(elements=[_make_element(text="Gioca")]))
+        decision_engine_client = MagicMock()
+        decision_engine_client.ask.return_value = Result.ok(_answers("done"))
+        navigator = _make_navigator(screen_reader, decision_engine_client=decision_engine_client)
+
+        navigator.navigate(DEVICE, goal="Gioca alla slot X", demo_mode=False)
+
+        state, _ = decision_engine_client.ask.call_args.args
+        self.assertIn("Goal: Gioca alla slot X\n", state)
+
+
 if __name__ == "__main__":
     unittest.main()
