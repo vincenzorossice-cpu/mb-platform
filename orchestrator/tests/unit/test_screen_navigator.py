@@ -346,5 +346,42 @@ class TestDemoMode(unittest.TestCase):
         self.assertIn("Goal: Gioca alla slot X\n", state)
 
 
+class TestDecisionEngineProviderSelection(unittest.TestCase):
+    """Quando decision_engine_client non e' iniettato esplicitamente, ScreenNavigator
+    sceglie l'implementazione in base a DECISION_ENGINE_PROVIDER."""
+
+    def test_default_provider_uses_openjev_client(self):
+        with patch.dict("os.environ", {}, clear=False):
+            import os
+
+            os.environ.pop("DECISION_ENGINE_PROVIDER", None)
+            with patch("orchestrator.modules.decision_engine.client.DecisionEngineClient") as mock_cls:
+                navigator = ScreenNavigator(screen_reader=MagicMock(), touch_injector=MagicMock())
+        mock_cls.assert_called_once()
+        self.assertIs(navigator.decision_engine_client, mock_cls.return_value)
+
+    def test_openjev_provider_uses_openjev_client(self):
+        with patch.dict("os.environ", {"DECISION_ENGINE_PROVIDER": "openjev"}):
+            with patch("orchestrator.modules.decision_engine.client.DecisionEngineClient") as mock_cls:
+                navigator = ScreenNavigator(screen_reader=MagicMock(), touch_injector=MagicMock())
+        mock_cls.assert_called_once()
+        self.assertIs(navigator.decision_engine_client, mock_cls.return_value)
+
+    def test_gpt4o_provider_uses_gpt_client(self):
+        with patch.dict("os.environ", {"DECISION_ENGINE_PROVIDER": "gpt4o"}):
+            with patch("orchestrator.modules.decision_engine.gpt_client.GPTDecisionClient") as mock_cls:
+                navigator = ScreenNavigator(screen_reader=MagicMock(), touch_injector=MagicMock())
+        mock_cls.assert_called_once()
+        self.assertIs(navigator.decision_engine_client, mock_cls.return_value)
+
+    def test_explicit_client_bypasses_provider_selection(self):
+        explicit_client = MagicMock()
+        with patch.dict("os.environ", {"DECISION_ENGINE_PROVIDER": "gpt4o"}):
+            navigator = ScreenNavigator(
+                screen_reader=MagicMock(), touch_injector=MagicMock(), decision_engine_client=explicit_client
+            )
+        self.assertIs(navigator.decision_engine_client, explicit_client)
+
+
 if __name__ == "__main__":
     unittest.main()

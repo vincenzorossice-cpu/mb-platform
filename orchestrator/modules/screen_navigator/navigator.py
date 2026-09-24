@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 
 from orchestrator.core.result import Result
@@ -17,6 +18,19 @@ logger = logging.getLogger(__name__)
 _STUCK_LOOP_THRESHOLD = 3
 
 
+def _create_default_decision_engine_client() -> DecisionEngineClientInterface:
+    """Sceglie il Decision Engine in base a DECISION_ENGINE_PROVIDER (default: openjev)."""
+    provider = os.environ.get("DECISION_ENGINE_PROVIDER", "openjev").lower()
+    if provider == "gpt4o":
+        from orchestrator.modules.decision_engine.gpt_client import GPTDecisionClient
+
+        return GPTDecisionClient()
+
+    from orchestrator.modules.decision_engine.client import DecisionEngineClient
+
+    return DecisionEngineClient()
+
+
 class ScreenNavigator(ScreenNavigatorInterface):
     """Navigatore autonomo generico: usa un Decision Engine AI per guidare
     l'interfaccia di qualunque bookmaker verso un obiettivo in linguaggio
@@ -30,7 +44,7 @@ class ScreenNavigator(ScreenNavigatorInterface):
         self,
         screen_reader,
         touch_injector,
-        decision_engine_client: DecisionEngineClientInterface,
+        decision_engine_client: DecisionEngineClientInterface = None,
         max_steps: int = 20,
     ):
         # screen_reader e' tipizzato come la classe concreta ScreenReader (non
@@ -39,7 +53,7 @@ class ScreenNavigator(ScreenNavigatorInterface):
         # tra interfaccia e implementazione, non introdotto qui.
         self.screen_reader = screen_reader
         self.touch_injector = touch_injector
-        self.decision_engine_client = decision_engine_client
+        self.decision_engine_client = decision_engine_client or _create_default_decision_engine_client()
         self.max_steps = max_steps
 
     def navigate(self, device_id: str, goal: str, book: str = "", demo_mode: bool = False) -> Result[bool]:
