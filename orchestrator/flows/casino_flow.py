@@ -125,15 +125,27 @@ class SlotOCRReader:
         return state
 
     def _extract_amount(self, text: str) -> Optional[float]:
-        """Estrae un importo numerico da un testo OCR (es. '114,36 €', '0,10€', '1.234,56')."""
-        clean = text.replace(' ', '').replace('€', '').strip()
-        match = re.match(r'^(\d+[.,]\d{1,2})$', clean)
-        if match:
-            return float(match.group(1).replace(',', '.'))
-        match = re.match(r'^(\d{1,3}\.\d{3},\d{2})$', clean)
-        if match:
-            return float(match.group(1).replace('.', '').replace(',', '.'))
-        return None
+        """Estrae un importo numerico da un testo OCR (es. '114,36 €', '5,000.00')."""
+        match = re.search(r'(\d[\d.,]*\d)', text)
+        if not match: return None
+        clean = match.group(1)
+        
+        # Determina formato in base all'ultimo separatore
+        last_comma = clean.rfind(',')
+        last_dot = clean.rfind('.')
+        
+        if last_comma > last_dot:
+            # Formato europeo: 1.234,56 o 114,36
+            return float(clean.replace('.', '').replace(',', '.'))
+        elif last_dot > last_comma:
+            # Formato americano: 5,000.00 o 1.50
+            return float(clean.replace(',', ''))
+        elif ',' in clean:
+            # Solo virgola: europeo 114,36
+            return float(clean.replace(',', '.'))
+        
+        # Solo punto o nessuno: intero o americano 1.50
+        return float(clean)
 
 
 class CasinoFlow:
