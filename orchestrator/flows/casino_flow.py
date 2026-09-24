@@ -98,13 +98,13 @@ class SlotOCRReader:
 
             text_upper = text.upper()
 
-            if "SALDO" in text_upper:
+            if "SALDO" in text_upper or "DEMO" in text_upper or "MODALIT" in text_upper:
                 saldo_coords = (x, y)
 
-            if "POSTA" in text_upper:
+            if "POSTA" in text_upper or "PUNTATA" in text_upper or "BET" in text_upper:
                 posta_coords = (x, y)
 
-            if "VINCITA" in text_upper:
+            if "VINCITA" in text_upper or "WIN" in text_upper:
                 vincita_coords = (x, y)
 
             if "SPIN" in text_upper and "ATTIVO" not in text_upper:
