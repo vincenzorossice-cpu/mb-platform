@@ -46,6 +46,13 @@ class SlotOCRReader:
     illeggibile da uiautomator). Lazy init: il primo readtext e' lento perche'
     carica i pesi del modello, poi il Reader resta cache in self._ocr."""
 
+    _SALDO_LABELS = ("SALDO", "DEMO", "MODALIT", "BALANCE")
+    _POSTA_LABELS = ("POSTA", "PUNTATA", "BET", "STAKE")
+    _VINCITA_LABELS = ("VINCITA", "WIN")
+    _SPIN_LABELS = ("SPIN", "XITER", "GIRA")
+    _ALL_AMOUNT_LABELS = _SALDO_LABELS + _POSTA_LABELS + _VINCITA_LABELS
+    _LABEL_Y_TOLERANCE = 50
+
     def __init__(self):
         self._ocr = None
 
@@ -80,9 +87,9 @@ class SlotOCRReader:
             "raw_texts": [],
         }
 
-        saldo_coords = None
-        posta_coords = None
-        vincita_coords = None
+        label_coords = {"saldo": None, "posta": None, "vincita": None}
+        resolved = {"saldo": False, "posta": False, "vincita": False}
+        detections = []  # (text_upper, x, y) per la passata di fallback
 
         for detection in results:
             bbox = detection[0]
@@ -97,30 +104,56 @@ class SlotOCRReader:
             state["raw_texts"].append((text, (x, y), conf))
 
             text_upper = text.upper()
+            detections.append((text_upper, x, y))
 
-            if "SALDO" in text_upper or "DEMO" in text_upper or "MODALIT" in text_upper:
-                saldo_coords = (x, y)
+            if any(kw in text_upper for kw in self._SALDO_LABELS):
+                label_coords["saldo"] = (x, y)
+            if any(kw in text_upper for kw in self._POSTA_LABELS):
+                label_coords["posta"] = (x, y)
+            if any(kw in text_upper for kw in self._VINCITA_LABELS):
+                label_coords["vincita"] = (x, y)
 
-            if "POSTA" in text_upper or "PUNTATA" in text_upper or "BET" in text_upper:
-                posta_coords = (x, y)
-
-            if "VINCITA" in text_upper or "WIN" in text_upper:
-                vincita_coords = (x, y)
-
-            if "SPIN" in text_upper and "ATTIVO" not in text_upper:
+            if any(kw in text_upper for kw in self._SPIN_LABELS) and "ATTIVO" not in text_upper:
                 state["spin_button_coords"] = (x + 50, y + 20)  # centro approssimativo
 
             if "ATTIVO" in text_upper and "SCOMMETTI" in text_upper:
                 state["is_active"] = "NON" not in text_upper
 
+            # Importo nella STESSA stringa della label: risolvi subito, cosi'
+            # un'altra label sulla stessa riga (y simile) non puo' piu' rubarlo.
             amount = self._extract_amount(text)
             if amount is not None:
-                if saldo_coords is not None and abs(y - saldo_coords[1]) < 50:
+                if any(kw in text_upper for kw in self._SALDO_LABELS):
                     state["saldo"] = amount
-                elif posta_coords is not None and abs(y - posta_coords[1]) < 50:
+                    resolved["saldo"] = True
+                elif any(kw in text_upper for kw in self._POSTA_LABELS):
                     state["posta"] = amount
-                elif vincita_coords is not None and abs(y - vincita_coords[1]) < 50:
+                    resolved["posta"] = True
+                elif any(kw in text_upper for kw in self._VINCITA_LABELS):
                     state["vincita"] = amount
+                    resolved["vincita"] = True
+
+        # Fallback: label senza importo nella propria stringa -> cerca
+        # l'elemento numerico piu' vicino (stessa riga, y +-50px; a parita'
+        # di riga vince quello piu' vicino in x).
+        for key in ("saldo", "posta", "vincita"):
+            if resolved[key] or label_coords[key] is None:
+                continue
+            label_x, label_y = label_coords[key]
+            best_amount, best_dist = None, None
+            for text_upper, x, y in detections:
+                if abs(y - label_y) >= self._LABEL_Y_TOLERANCE:
+                    continue
+                if any(kw in text_upper for kw in self._ALL_AMOUNT_LABELS):
+                    continue  # non riusare il testo di un'altra label come importo
+                amount = self._extract_amount(text_upper)
+                if amount is None:
+                    continue
+                dist = abs(x - label_x)
+                if best_dist is None or dist < best_dist:
+                    best_amount, best_dist = amount, dist
+            if best_amount is not None:
+                state[key] = best_amount
 
         return state
 

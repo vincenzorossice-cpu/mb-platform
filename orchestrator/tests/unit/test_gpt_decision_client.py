@@ -14,6 +14,25 @@ QUESTIONS = {
     "text_to_type": {"type": "noul", "instructions": "..."},
 }
 
+NAVIGATION_QUESTIONS = {
+    "action": {
+        "type": "choice",
+        "instructions": "...",
+        "criteria": {"tap": "...", "input_text": "...", "scroll": "...", "wait": "...", "done": "..."},
+    },
+    "target": {"type": "choice", "instructions": "...", "criteria": {"Accedi": "Accedi", "up": "up"}},
+    "text_to_type": {"type": "noul", "instructions": "..."},
+}
+
+SLOT_QUESTIONS = {
+    "action": {
+        "type": "choice",
+        "instructions": "...",
+        "criteria": {"spin": "Spin again", "stop": "Stop playing"},
+    },
+    "balance_ok": {"type": "noul", "instructions": "..."},
+}
+
 
 def _mock_completion(content: str):
     message = MagicMock()
@@ -87,13 +106,49 @@ class TestAsk:
         assert mock_create.call_args.kwargs["model"] == "gpt-4o-mini"
         assert mock_create.call_args.kwargs["response_format"] == {"type": "json_object"}
 
-    def test_invalid_action(self, client: GPTDecisionClient):
+    def test_invalid_action_falls_back_instead_of_failing(self, client: GPTDecisionClient):
+        """QUESTIONS non ha 'wait'/'stop' tra le criteria: il fallback ricade
+        sulla prima opzione valida in ordine alfabetico ('done')."""
         payload = {"action": "fly", "target": "Accedi", "confidence": 0.5}
         with patch.object(client.client.chat.completions, "create", return_value=_mock_completion(json.dumps(payload))):
             result = client.ask("state", QUESTIONS)
 
-        assert not result.success
-        assert result.error_code == "GPT_DECISION_INVALID_ACTION"
+        assert result.success
+        assert result.data["answers"]["action"]["choice"] == "done"
+
+    def test_invalid_action_falls_back_to_wait_when_available(self, client: GPTDecisionClient):
+        payload = {"action": "click_random_thing", "target": "Accedi", "confidence": 0.5}
+        with patch.object(client.client.chat.completions, "create", return_value=_mock_completion(json.dumps(payload))):
+            result = client.ask("state", NAVIGATION_QUESTIONS)
+
+        assert result.success
+        assert result.data["answers"]["action"]["choice"] == "wait"
+
+    def test_slot_choices_accepted(self, client: GPTDecisionClient):
+        payload = {"action": "spin", "confidence": 0.9}
+        with patch.object(client.client.chat.completions, "create", return_value=_mock_completion(json.dumps(payload))):
+            result = client.ask("state", SLOT_QUESTIONS)
+
+        assert result.success
+        assert result.data["answers"]["action"]["choice"] == "spin"
+
+    def test_slot_invalid_action_falls_back_to_stop_not_wait(self, client: GPTDecisionClient):
+        """GPT risponde con un'azione da bookmaker (input_text) mentre le uniche
+        scelte valide sono spin/stop: niente 'wait' disponibile -> fallback 'stop'."""
+        payload = {"action": "input_text", "confidence": 0.4}
+        with patch.object(client.client.chat.completions, "create", return_value=_mock_completion(json.dumps(payload))):
+            result = client.ask("state", SLOT_QUESTIONS)
+
+        assert result.success
+        assert result.data["answers"]["action"]["choice"] == "stop"
+
+    def test_navigation_choices_accepted(self, client: GPTDecisionClient):
+        payload = {"action": "scroll", "target": "down", "confidence": 0.7}
+        with patch.object(client.client.chat.completions, "create", return_value=_mock_completion(json.dumps(payload))):
+            result = client.ask("state", NAVIGATION_QUESTIONS)
+
+        assert result.success
+        assert result.data["answers"]["action"]["choice"] == "scroll"
 
     def test_malformed_json(self, client: GPTDecisionClient):
         with patch.object(client.client.chat.completions, "create", return_value=_mock_completion("not json")):
@@ -122,3 +177,24 @@ class TestAsk:
 
         assert not result.success
         assert result.error_code == "GPT_DECISION_HTTP_ERROR"
+
+
+class TestSystemPrompt:
+
+    def test_slot_questions_mention_spin_stop(self, client: GPTDecisionClient):
+        payload = {"action": "spin", "confidence": 0.9}
+        with patch.object(client.client.chat.completions, "create", return_value=_mock_completion(json.dumps(payload))) as mock_create:
+            client.ask("state", SLOT_QUESTIONS)
+
+        system_message = mock_create.call_args.kwargs["messages"][0]["content"]
+        assert "slot machine" in system_message.lower()
+        assert "bookmaker" not in system_message.lower()
+
+    def test_navigation_questions_mention_bookmaker(self, client: GPTDecisionClient):
+        payload = {"action": "tap", "target": "Accedi", "confidence": 0.9}
+        with patch.object(client.client.chat.completions, "create", return_value=_mock_completion(json.dumps(payload))) as mock_create:
+            client.ask("state", NAVIGATION_QUESTIONS)
+
+        system_message = mock_create.call_args.kwargs["messages"][0]["content"]
+        assert "bookmaker" in system_message.lower()
+        assert "slot machine" not in system_message.lower()

@@ -19,6 +19,19 @@ def _balance_reading(raw_balance: float = 100.0, open_bets: float = 0.0,
     )
 
 
+def _detection(text: str, x: int, y: int, conf: float = 0.9):
+    """Riproduce il formato nativo di easyocr.Reader.readtext(): (bbox, text, conf)."""
+    bbox = [[x, y], [x + 150, y], [x + 150, y + 30], [x, y + 30]]
+    return (bbox, text, conf)
+
+
+def _ocr_reader_with(detections: list) -> SlotOCRReader:
+    reader = SlotOCRReader()
+    reader._ocr = MagicMock()
+    reader._ocr.readtext.return_value = detections
+    return reader
+
+
 @pytest.fixture
 def mock_deps():
     reader = MagicMock()
@@ -47,6 +60,79 @@ class TestSlotOCRReader:
         assert r._extract_amount("0,10") == 0.10
         assert r._extract_amount("1.234,56") == 1234.56
         assert r._extract_amount("non un numero") is None
+
+    def test_extract_amount_us_format(self):
+        """Formato americano: virgola delle migliaia, punto decimale."""
+        r = SlotOCRReader()
+        assert r._extract_amount("5,000.00") == 5000.00
+        assert r._extract_amount("MODALITÀ DEMO € 5,000.00") == 5000.00
+
+    def test_extract_amount_label_and_amount_combined(self):
+        """L'importo va estratto anche quando e' nella stessa stringa della label."""
+        r = SlotOCRReader()
+        assert r._extract_amount("PUNTATA € 1.00") == 1.00
+        assert r._extract_amount("SALDO 114,36 €") == 114.36
+        assert r._extract_amount("POSTA 0,10€") == 0.10
+
+    def test_real_bug_scenario_saldo_and_posta_on_same_row(self):
+        """Riproduce il bug reale: SALDO e PUNTATA su detection separate ma con
+        y quasi identica (stessa riga della UI). Prima del fix, l'importo della
+        posta finiva assegnato al saldo (if/elif esclusivo su sola y)."""
+        ocr_reader = _ocr_reader_with([
+            _detection("MODALITÀ DEMO € 5,000.00", x=13, y=2219, conf=0.94),
+            _detection("PUNTATA € 1.00", x=729, y=2225, conf=0.65),
+        ])
+
+        state = ocr_reader.read_slot_state("fake.png")
+
+        assert state["saldo"] == 5000.00
+        assert state["posta"] == 1.00
+
+    def test_fallback_when_amount_in_separate_element(self):
+        """Label e importo in due detection distinte, entro y+-50px: usa il
+        fallback per associare l'importo piu' vicino (in x) alla label."""
+        ocr_reader = _ocr_reader_with([
+            _detection("SALDO", x=10, y=100, conf=0.9),
+            _detection("€ 114,36", x=200, y=105, conf=0.9),
+        ])
+
+        state = ocr_reader.read_slot_state("fake.png")
+
+        assert state["saldo"] == 114.36
+
+    def test_fallback_does_not_steal_other_labels_value(self):
+        """Con SALDO/POSTA sulla stessa riga e importi in detection separate,
+        ognuna deve prendere il proprio importo piu' vicino, non quello altrui."""
+        ocr_reader = _ocr_reader_with([
+            _detection("SALDO", x=10, y=100, conf=0.9),
+            _detection("100,00", x=120, y=102, conf=0.9),
+            _detection("POSTA", x=400, y=100, conf=0.9),
+            _detection("0,10", x=500, y=102, conf=0.9),
+        ])
+
+        state = ocr_reader.read_slot_state("fake.png")
+
+        assert state["saldo"] == 100.00
+        assert state["posta"] == 0.10
+
+    def test_spin_button_recognizes_xiter_and_gira(self):
+        ocr_reader = _ocr_reader_with([_detection("XITER", x=500, y=1900, conf=0.9)])
+        state = ocr_reader.read_slot_state("fake.png")
+        assert state["spin_button_coords"] == (550, 1920)
+
+        ocr_reader = _ocr_reader_with([_detection("GIRA", x=500, y=1900, conf=0.9)])
+        state = ocr_reader.read_slot_state("fake.png")
+        assert state["spin_button_coords"] == (550, 1920)
+
+    def test_balance_label_recognizes_balance_keyword(self):
+        ocr_reader = _ocr_reader_with([_detection("BALANCE € 25.50", x=10, y=100, conf=0.9)])
+        state = ocr_reader.read_slot_state("fake.png")
+        assert state["saldo"] == 25.50
+
+    def test_bet_label_recognizes_stake_keyword(self):
+        ocr_reader = _ocr_reader_with([_detection("STAKE 0.20", x=10, y=100, conf=0.9)])
+        state = ocr_reader.read_slot_state("fake.png")
+        assert state["posta"] == 0.20
 
 
 class TestCasinoFlow:

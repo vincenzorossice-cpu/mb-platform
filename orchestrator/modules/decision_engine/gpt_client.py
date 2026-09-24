@@ -1,4 +1,6 @@
+import difflib
 import json
+import logging
 import os
 
 import openai
@@ -6,28 +8,12 @@ import openai
 from orchestrator.core.result import Result
 from orchestrator.modules.decision_engine.interface import DecisionEngineClientInterface
 
-_VALID_ACTIONS = {"tap", "scroll", "input_text", "wait", "done"}
+logger = logging.getLogger(__name__)
 
-_SYSTEM_PROMPT = """Sei un agente che naviga interfacce di app di bookmaker su Android tramite ADB.
-Ad ogni turno ricevi lo stato corrente dello schermo (testi degli elementi visibili, obiettivo,
-storico delle azioni) e la lista degli elementi su cui puoi agire. Devi decidere una singola
-azione per avvicinarti all'obiettivo.
+_DEFAULT_VALID_ACTIONS = {"tap", "scroll", "input_text", "wait", "done"}
 
-Rispondi SOLO con un oggetto JSON con questo schema esatto, senza testo aggiuntivo:
-{
-  "action": "tap|scroll|input_text|wait|done",
-  "target": "testo_esatto_dell_elemento",
-  "text_to_type": "testo_da_inserire_opzionale",
-  "confidence": 0.0-1.0,
-  "reasoning": "breve_spiegazione"
-}
-
-Regole:
-- "action" deve essere una tra: tap, scroll, input_text, wait, done.
-- "target" deve essere il testo esatto di uno degli elementi candidati elencati, oppure una
-  direzione (up/down/left/right) se action è scroll.
-- Usa "done" solo quando l'obiettivo e' stato raggiunto.
-- "confidence" riflette quanto sei sicuro della scelta (0.0 = nessuna sicurezza, 1.0 = massima)."""
+_SLOT_ACTIONS = {"spin", "stop"}
+_NAVIGATION_ACTIONS = {"tap", "scroll", "done"}
 
 
 class GPTDecisionClient(DecisionEngineClientInterface):
@@ -37,7 +23,6 @@ class GPTDecisionClient(DecisionEngineClientInterface):
     GPT_DECISION_TIMEOUT = "GPT_DECISION_TIMEOUT"
     GPT_DECISION_HTTP_ERROR = "GPT_DECISION_HTTP_ERROR"
     GPT_DECISION_PARSE_ERROR = "GPT_DECISION_PARSE_ERROR"
-    GPT_DECISION_INVALID_ACTION = "GPT_DECISION_INVALID_ACTION"
 
     def __init__(self, api_key: str = None, model: str = "gpt-4o-mini", timeout: int = 30):
         api_key = api_key or os.environ.get("OPENAI_API_KEY")
@@ -50,12 +35,14 @@ class GPTDecisionClient(DecisionEngineClientInterface):
 
     def ask(self, state: str, questions: dict) -> Result[dict]:
         """Chiama Chat Completions in JSON mode e mappa la risposta nel formato answers atteso."""
+        valid_actions = set(questions.get("action", {}).get("criteria") or {}) or _DEFAULT_VALID_ACTIONS
+        system_prompt = self._build_system_prompt(valid_actions)
         user_prompt = self._build_user_prompt(state, questions)
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
                 response_format={"type": "json_object"},
@@ -76,13 +63,7 @@ class GPTDecisionClient(DecisionEngineClientInterface):
         except (json.JSONDecodeError, IndexError, AttributeError, TypeError) as exc:
             return Result.fail(f"JSON non valido da GPT-4o-mini: {exc}", self.GPT_DECISION_PARSE_ERROR)
 
-        action = data.get("action")
-        if action not in _VALID_ACTIONS:
-            return Result.fail(
-                f"Azione non valida restituita da GPT-4o-mini: {action!r}",
-                self.GPT_DECISION_INVALID_ACTION,
-            )
-
+        action = self._resolve_action(data.get("action"), valid_actions)
         confidence = data.get("confidence", 0.0)
         answers = {
             "action": {"choice": action, "confidence": confidence},
@@ -90,6 +71,63 @@ class GPTDecisionClient(DecisionEngineClientInterface):
             "text_to_type": {"choice": data.get("text_to_type", ""), "confidence": confidence},
         }
         return Result.ok({"answers": answers})
+
+    def _build_system_prompt(self, valid_actions: set) -> str:
+        lines = [
+            "You are an AI agent controlling an Android phone via ADB. "
+            "You MUST choose an action from the provided options only. Do not invent actions. "
+            "Respond ONLY with the JSON object described below, with no extra text.",
+        ]
+        if valid_actions & _SLOT_ACTIONS:
+            lines.append(
+                "You are inside a slot machine game. Choose 'spin' to play another round or 'stop' to finish."
+            )
+        if valid_actions & _NAVIGATION_ACTIONS:
+            lines.append(
+                "You are navigating a bookmaker website. Choose 'tap' to click an element, "
+                "'scroll' to see more, or 'done' when the goal is reached."
+            )
+
+        actions_list = "|".join(sorted(valid_actions))
+        lines.append(
+            "Respond SOLELY with a JSON object matching this exact schema:\n"
+            "{\n"
+            f'  "action": "{actions_list}",\n'
+            '  "target": "exact_text_of_the_element",\n'
+            '  "text_to_type": "optional_text_to_enter",\n'
+            '  "confidence": 0.0-1.0,\n'
+            '  "reasoning": "brief_explanation"\n'
+            "}\n\n"
+            f"Rules:\n"
+            f'- "action" must be one of: {", ".join(sorted(valid_actions))}.\n'
+            '- "target" must be the exact text of one of the listed candidate elements, or a '
+            "direction (up/down/left/right) if action is scroll.\n"
+            '- "confidence" reflects how sure you are of the choice (0.0 = no confidence, 1.0 = fully confident).'
+        )
+        return "\n\n".join(lines)
+
+    def _resolve_action(self, raw_action, valid_actions: set) -> str:
+        """Se l'azione di GPT non e' tra quelle valide, prova un fuzzy match e poi
+        ricade su un fallback sicuro (mai un'azione inventata al chiamante)."""
+        if raw_action in valid_actions:
+            return raw_action
+
+        candidates = sorted(valid_actions)
+        match = difflib.get_close_matches(str(raw_action).lower(), [a.lower() for a in candidates], n=1, cutoff=0.6)
+        if match:
+            resolved = next(a for a in candidates if a.lower() == match[0])
+        elif "wait" in valid_actions:
+            resolved = "wait"
+        elif "stop" in valid_actions:
+            resolved = "stop"
+        else:
+            resolved = candidates[0]
+
+        logger.warning(
+            "GPT-4o-mini ha restituito un'azione non valida (%r): rimappata a %r (opzioni valide: %s)",
+            raw_action, resolved, candidates,
+        )
+        return resolved
 
     def _build_user_prompt(self, state: str, questions: dict) -> str:
         target_question = questions.get("target", {})
