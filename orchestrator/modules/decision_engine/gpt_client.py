@@ -183,6 +183,11 @@ class GPTDecisionClient(DecisionEngineClientInterface):
             "Your goal is to: 1) set the bet to the minimum amount possible, 2) play spins until "
             "the total played reaches the target, 3) stop when done.",
 
+            "CRITICAL: Before spinning, you MUST set the bet to the minimum amount. Look for a bet "
+            "selector, menu, +/- buttons, or a bet amount display. Tap on it to open the bet "
+            "selection. Then tap the lowest amount available (e.g., €0.10 or €0.20). Only "
+            "after the bet is at minimum, find and tap the SPIN button.",
+
             "Look at the screenshot and decide: if a bet settings menu or modal is open, navigate "
             "it to set the minimum bet and close it; if the bet is already at minimum, find the "
             "SPIN button and tap it; if the total played has reached the target, choose stop.",

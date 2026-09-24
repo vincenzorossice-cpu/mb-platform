@@ -31,6 +31,7 @@ Uso:
 import argparse
 import logging
 import os
+import shutil
 import sys
 import time
 from typing import Optional
@@ -44,11 +45,12 @@ from orchestrator.modules.touch_injector.injector import TouchInjector
 logger = logging.getLogger(__name__)
 
 OCR_REFRESH_INTERVAL = 3  # step tra una lettura OCR (saldo/posta) e l'altra
-MIN_BET = 0.10
+MIN_BET = 0.10  # posta minima assunta; usata per la fase setup/playing e per lo stop su saldo basso
 DEFAULT_MAX_STEPS = 50
 DEFAULT_TARGET_AMOUNT = 30.0
 VISION_RESIZE_SCALE = 1.0  # dimezza lo screenshot prima di inviarlo alla Vision API
 SPIN_PROXIMITY_PX = 100  # tap entro questa distanza dal tasto spin noto -> non serve rileggere l'OCR
+SCREENSHOTS_DIR = "screenshots"
 
 
 def resize_screenshot_for_vision(screenshot_path: str, scale: float = VISION_RESIZE_SCALE) -> tuple:
@@ -74,14 +76,47 @@ def descale_coords(x: float, y: float, scale_x: float, scale_y: float) -> tuple:
     return (int(round(x * scale_x)), int(round(y * scale_y)))
 
 
+def determine_phase(current_bet: Optional[float], min_bet: float = MIN_BET) -> str:
+    """'setup' finche' la posta letta via OCR e' sopra il minimo, 'playing' quando
+    e' al minimo (o sconosciuta: non possiamo chiedere di abbassarla se non
+    sappiamo qual e')."""
+    if current_bet is not None and current_bet > min_bet:
+        return "setup"
+    return "playing"
+
+
 def build_vision_state_text(
+    initial_balance: Optional[float],
     current_balance: Optional[float],
     current_bet: Optional[float],
     total_played: float,
     target_amount: float,
     step: int,
     action_history: list,
+    min_bet: float = MIN_BET,
 ) -> str:
+    phase = determine_phase(current_bet, min_bet)
+
+    phase_banner = ""
+    if phase == "setup":
+        phase_banner = (
+            f"\nPHASE: BET SETUP - Lower the bet before spinning! Current bet {current_bet:.2f} EUR "
+            f"is above the minimum ({min_bet:.2f} EUR)."
+        )
+
+    net_profit_loss = "unknown"
+    if initial_balance is not None and current_balance is not None:
+        net_profit_loss = f"{current_balance - initial_balance:.2f}"
+
+    exceed_warning = ""
+    if current_bet is not None and (total_played + current_bet) > target_amount:
+        projected = total_played + current_bet
+        exceed_warning = (
+            f"\nWARNING: Playing another spin will exceed the target ({total_played:.2f} EUR played + "
+            f"{current_bet:.2f} EUR bet = {projected:.2f} EUR, target is {target_amount:.2f} EUR). "
+            "Consider stopping."
+        )
+
     goal_note = ""
     if total_played >= target_amount:
         goal_note = (
@@ -94,10 +129,13 @@ def build_vision_state_text(
 GOAL: Set the bet to minimum (0.10 EUR if possible), play until total played reaches {target_amount} EUR, then stop.
 
 Step: {step}
+Step phase: {phase}{phase_banner}
 Current balance (read via OCR): {current_balance if current_balance is not None else "unknown"} EUR
-Current bet (read via OCR): {current_bet if current_bet is not None else "unknown"} EUR
-Total played so far: {total_played:.2f} EUR
-Target: {target_amount} EUR{goal_note}
+Current bet: {current_bet if current_bet is not None else "unknown"} EUR (MINIMUM BET: {min_bet:.2f} EUR or lowest available)
+WARNING: If current bet is above minimum, you MUST lower it first. Do not spin with a high bet.
+Total played so far: {total_played:.2f} EUR (this is the SUM of all bets, NOT the balance difference)
+Net profit/loss: {net_profit_loss} EUR
+Target: {target_amount} EUR{goal_note}{exceed_warning}
 
 Previous actions: {action_history[-5:]}
 
@@ -125,17 +163,30 @@ def read_ocr_state(screen_reader: ScreenReader, ocr_reader: SlotOCRReader, devic
     return ocr_reader.read_slot_state(ss.data)
 
 
-def run_autonomous_session(device_id: str, target_amount: float, max_steps: int) -> bool:
+def run_autonomous_session(
+    device_id: str, target_amount: float, max_steps: int, save_screenshots: bool = False,
+) -> bool:
     """Gioca la slot gia' aperta sul device lasciando che GPT-4o-mini Vision
     scelga autonomamente dove tappare guardando lo screenshot ad ogni passo.
     L'OCR resta in uso solo per saldo/posta (letti su una cadenza piu' rada,
-    riusata finche' l'ultimo tap e' stato vicino al tasto spin noto). Ritorna
-    True se la sessione si e' conclusa in modo pulito (stop deciso dal
-    Decision Engine o saldo insufficiente), False in caso di errore."""
+    riusata finche' l'ultimo tap e' stato vicino al tasto spin noto).
+
+    total_played e' la SOMMA delle poste piazzate (non saldo_iniziale -
+    saldo_attuale, che sarebbe il net loss e diminuirebbe con le vincite): si
+    incrementa di current_bet solo quando un tap va a buon fine durante la
+    fase "playing" (posta gia' al minimo), assumendo che l'unico tap sensato
+    in quella fase sia uno spin.
+
+    Ritorna True se la sessione si e' conclusa in modo pulito (stop deciso dal
+    Decision Engine, target raggiunto o saldo insufficiente), False in caso di
+    errore."""
     screen_reader = ScreenReader()
     touch_injector = TouchInjector(screen_reader=screen_reader)
     ocr_reader = SlotOCRReader()
     engine = GPTDecisionClient()
+
+    if save_screenshots:
+        os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
 
     print("=== TEST GIOCO SLOT AUTONOMO (GPT-4o-mini Vision) ===")
     print(f"Device: {device_id}")
@@ -167,8 +218,6 @@ def run_autonomous_session(device_id: str, target_amount: float, max_steps: int)
             force_ocr_refresh = False
             if ocr_state.get("saldo") is not None:
                 current_balance = ocr_state["saldo"]
-                if initial_balance is not None:
-                    total_played = initial_balance - current_balance
             if ocr_state.get("posta") is not None:
                 current_bet = ocr_state["posta"]
             if ocr_state.get("spin_button_coords") is not None:
@@ -176,11 +225,16 @@ def run_autonomous_session(device_id: str, target_amount: float, max_steps: int)
         else:
             steps_since_ocr += 1
 
-        print(f"\n=== Step {step}/{max_steps} ===")
+        phase = determine_phase(current_bet)
+        print(f"\n=== Step {step}/{max_steps} (fase: {phase}) ===")
         print(f"Saldo: {current_balance} | Posta: {current_bet} | Giocato finora: {total_played:.2f} EUR")
 
         if current_balance is not None and current_balance < MIN_BET:
             print(f"Saldo insufficiente (< {MIN_BET}). Stop automatico.")
+            break
+
+        if total_played >= target_amount:
+            print(f"Target di {target_amount} EUR giocati raggiunto. Stop automatico.")
             break
 
         ss = screen_reader._screenshot(device_id)
@@ -191,8 +245,11 @@ def run_autonomous_session(device_id: str, target_amount: float, max_steps: int)
 
         resized_path, resized_w, resized_h, scale_x, scale_y = resize_screenshot_for_vision(screenshot_path)
         try:
+            if save_screenshots:
+                shutil.copy(resized_path, os.path.join(SCREENSHOTS_DIR, f"step_{step:04d}.png"))
+
             state_text = build_vision_state_text(
-                current_balance, current_bet, total_played, target_amount, step, action_history,
+                initial_balance, current_balance, current_bet, total_played, target_amount, step, action_history,
             )
             questions = build_questions()
 
@@ -237,8 +294,12 @@ def run_autonomous_session(device_id: str, target_amount: float, max_steps: int)
         tap_result = touch_injector.tap_coordinates(device_id, real_x, real_y)
         if not tap_result.success:
             print(f"ERRORE: tap fallito: {tap_result.error} ({tap_result.error_code})")
+        elif phase == "playing" and current_bet is not None:
+            # Fase "playing" = posta gia' al minimo: l'unico tap sensato e' uno
+            # spin, quindi contiamo la posta come giocata.
+            total_played += current_bet
 
-        action_history.append({"step": step, "action": action, "target": (real_x, real_y)})
+        action_history.append({"step": step, "action": action, "target": (real_x, real_y), "phase": phase})
         action_history = action_history[-5:]
         time.sleep(1.5)
 
@@ -246,9 +307,11 @@ def run_autonomous_session(device_id: str, target_amount: float, max_steps: int)
     print(f"Saldo iniziale: {initial_balance}")
     print(f"Saldo finale: {current_balance}")
     print(f"Totale giocato: {total_played:.2f} EUR")
+    if initial_balance is not None and current_balance is not None:
+        print(f"Net profit/loss: {current_balance - initial_balance:+.2f} EUR")
     print("\nStorico:")
     for a in action_history:
-        print(f"  Step {a['step']}: {a['action']} -> {a['target']}")
+        print(f"  Step {a['step']}: {a['action']} -> {a['target']} ({a['phase']})")
 
     return True
 
@@ -260,12 +323,17 @@ def main() -> None:
     parser.add_argument("--device-id", required=True, help="ID del dispositivo ADB (es. emulator-5554 o seriale reale).")
     parser.add_argument("--target-amount", type=float, default=DEFAULT_TARGET_AMOUNT, help="Importo obiettivo giocato in EUR (default: 30.0).")
     parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS, help="Numero massimo di step di sicurezza (default: 50).")
+    parser.add_argument(
+        "--save-screenshots", action="store_true",
+        help=f"Salva ogni screenshot inviato a GPT-4o-mini nella cartella {SCREENSHOTS_DIR}/ per debug.",
+    )
     args = parser.parse_args()
 
     ok = run_autonomous_session(
         device_id=args.device_id,
         target_amount=args.target_amount,
         max_steps=args.max_steps,
+        save_screenshots=args.save_screenshots,
     )
     sys.exit(0 if ok else 1)
 

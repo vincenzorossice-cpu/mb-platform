@@ -225,6 +225,19 @@ class TestAskWithImage:
         assert user_content[1]["image_url"]["url"].startswith("data:image/png;base64,")
         assert "540x1200" in messages[0]["content"]
 
+    def test_system_prompt_insists_on_lowering_bet_before_spinning(self, client: GPTDecisionClient, screenshot_path: str):
+        """Regressione per il bug 'GPT non abbassa la puntata al minimo':
+        il system prompt deve dire esplicitamente di impostare la posta al
+        minimo PRIMA di cercare il tasto spin."""
+        payload = {"action": "tap", "x": 270, "y": 600, "confidence": 0.8}
+        with patch.object(client.client.chat.completions, "create", return_value=_mock_completion(json.dumps(payload))) as mock_create:
+            client.ask_with_image(screenshot_path, "state text", VISION_QUESTIONS, 540, 1200)
+
+        system_message = mock_create.call_args.kwargs["messages"][0]["content"]
+        assert "CRITICAL" in system_message
+        assert "minimum" in system_message.lower()
+        assert "before" in system_message.lower()
+
     def test_stop_has_no_coordinates(self, client: GPTDecisionClient, screenshot_path: str):
         payload = {"action": "stop", "confidence": 0.9}
         with patch.object(client.client.chat.completions, "create", return_value=_mock_completion(json.dumps(payload))):
