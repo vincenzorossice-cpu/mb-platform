@@ -1,3 +1,4 @@
+import base64
 import difflib
 import json
 import logging
@@ -26,6 +27,9 @@ class GPTDecisionClient(DecisionEngineClientInterface):
     GPT_DECISION_TIMEOUT = "GPT_DECISION_TIMEOUT"
     GPT_DECISION_HTTP_ERROR = "GPT_DECISION_HTTP_ERROR"
     GPT_DECISION_PARSE_ERROR = "GPT_DECISION_PARSE_ERROR"
+    GPT_DECISION_IMAGE_READ_ERROR = "GPT_DECISION_IMAGE_READ_ERROR"
+
+    _VISION_MAX_TOKENS = 300
 
     def __init__(self, api_key: str = None, model: str = "gpt-4o-mini", timeout: int = 30):
         api_key = api_key or os.environ.get("OPENAI_API_KEY")
@@ -41,15 +45,77 @@ class GPTDecisionClient(DecisionEngineClientInterface):
         valid_actions = set(questions.get("action", {}).get("criteria") or {}) or _DEFAULT_VALID_ACTIONS
         system_prompt = self._build_system_prompt(valid_actions)
         user_prompt = self._build_user_prompt(state, questions)
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        result = self._create_completion(messages)
+        if not result.success:
+            return result
+        data = result.data
+
+        action = self._resolve_action(data.get("action"), valid_actions)
+        confidence = data.get("confidence", 0.0)
+        answers = {
+            "action": {"choice": action, "confidence": confidence},
+            "target": {"choice": data.get("target"), "confidence": confidence},
+            "text_to_type": {"choice": data.get("text_to_type", ""), "confidence": confidence},
+        }
+        return Result.ok({"answers": answers})
+
+    def ask_with_image(
+        self, screenshot_path: str, state: str, questions: dict, image_width: int, image_height: int,
+    ) -> Result[dict]:
+        """Come ask(), ma invia anche lo screenshot (Vision API): GPT vede il layout
+        reale invece di un dump di testi OCR, e sceglie dove tappare restituendo
+        coordinate [x,y] nello spazio dell'immagine inviata (image_width x image_height)."""
+        valid_actions = set(questions.get("action", {}).get("criteria") or {}) or _SLOT_TAP_ACTIONS
+        system_prompt = self._build_vision_system_prompt(valid_actions, image_width, image_height)
+
+        try:
+            with open(screenshot_path, "rb") as img_file:
+                base64_image = base64.b64encode(img_file.read()).decode("utf-8")
+        except OSError as exc:
+            return Result.fail(
+                f"Impossibile leggere lo screenshot {screenshot_path}: {exc}", self.GPT_DECISION_IMAGE_READ_ERROR,
+            )
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": [
+                {"type": "text", "text": state},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}},
+            ]},
+        ]
+
+        result = self._create_completion(messages, max_tokens=self._VISION_MAX_TOKENS)
+        if not result.success:
+            return result
+        data = result.data
+
+        action = self._resolve_action(data.get("action"), valid_actions)
+        confidence = data.get("confidence", 0.0)
+        x, y = data.get("x"), data.get("y")
+        target = (x, y) if isinstance(x, (int, float)) and isinstance(y, (int, float)) else None
+
+        answers = {
+            "action": {"choice": action, "confidence": confidence},
+            "target": {"choice": target, "confidence": confidence},
+        }
+        return Result.ok({"answers": answers})
+
+    def _create_completion(self, messages: list, max_tokens: int = None) -> Result[dict]:
+        """Chiama Chat Completions in JSON mode e ritorna il JSON gia' parsato.
+        Fattorizza la gestione errori condivisa tra ask() e ask_with_image()."""
+        kwargs = {"max_tokens": max_tokens} if max_tokens is not None else {}
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
+                messages=messages,
                 response_format={"type": "json_object"},
                 temperature=0.1,
+                **kwargs,
             )
         except openai.APITimeoutError as exc:
             return Result.fail(f"Timeout GPT-4o-mini: {exc}", self.GPT_DECISION_TIMEOUT)
@@ -66,14 +132,7 @@ class GPTDecisionClient(DecisionEngineClientInterface):
         except (json.JSONDecodeError, IndexError, AttributeError, TypeError) as exc:
             return Result.fail(f"JSON non valido da GPT-4o-mini: {exc}", self.GPT_DECISION_PARSE_ERROR)
 
-        action = self._resolve_action(data.get("action"), valid_actions)
-        confidence = data.get("confidence", 0.0)
-        answers = {
-            "action": {"choice": action, "confidence": confidence},
-            "target": {"choice": data.get("target"), "confidence": confidence},
-            "text_to_type": {"choice": data.get("text_to_type", ""), "confidence": confidence},
-        }
-        return Result.ok({"answers": answers})
+        return Result.ok(data)
 
     def _build_system_prompt(self, valid_actions: set) -> str:
         lines = [
@@ -114,6 +173,36 @@ class GPTDecisionClient(DecisionEngineClientInterface):
             '- "confidence" reflects how sure you are of the choice (0.0 = no confidence, 1.0 = fully confident).'
         )
         return "\n\n".join(lines)
+
+    def _build_vision_system_prompt(self, valid_actions: set, image_width: int, image_height: int) -> str:
+        actions_list = "|".join(sorted(valid_actions))
+        return "\n\n".join([
+            "You are an AI agent controlling a slot machine on an Android phone via ADB. "
+            "You can SEE the screen through the attached screenshot image.",
+
+            "Your goal is to: 1) set the bet to the minimum amount possible, 2) play spins until "
+            "the total played reaches the target, 3) stop when done.",
+
+            "Look at the screenshot and decide: if a bet settings menu or modal is open, navigate "
+            "it to set the minimum bet and close it; if the bet is already at minimum, find the "
+            "SPIN button and tap it; if the total played has reached the target, choose stop.",
+
+            f"You can tap ANY pixel on the screen by returning coordinates. The image is "
+            f"{image_width}x{image_height} pixels; x must be in [0,{image_width}], y in [0,{image_height}]. "
+            "Buttons are usually colored rectangles; the SPIN button is usually large, at the "
+            "bottom of the screen.",
+
+            "Respond ONLY with a JSON object matching this exact schema, with no extra text:\n"
+            "{\n"
+            f'  "action": "{actions_list}",\n'
+            '  "x": integer,\n'
+            '  "y": integer,\n'
+            '  "confidence": 0.0-1.0,\n'
+            '  "reasoning": "brief_explanation"\n'
+            "}\n\n"
+            f'"action" must be one of: {", ".join(sorted(valid_actions))}. "x" and "y" are required '
+            'when action is "tap" and must point at the element you want to touch.',
+        ])
 
     def _resolve_action(self, raw_action, valid_actions: set) -> str:
         """Se l'azione di GPT non e' tra quelle valide, prova un fuzzy match e poi

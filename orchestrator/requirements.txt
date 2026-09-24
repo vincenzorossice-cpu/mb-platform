@@ -6,3 +6,4 @@ paddleocr
 easyocr
 telethon
 openai>=1.0
+Pillow

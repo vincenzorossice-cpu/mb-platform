@@ -7,6 +7,14 @@ from unittest.mock import MagicMock, patch
 
 from orchestrator.modules.decision_engine.gpt_client import GPTDecisionClient
 
+VISION_QUESTIONS = {
+    "action": {
+        "type": "choice",
+        "instructions": "...",
+        "criteria": {"tap": "Touch a point on the screen", "stop": "Stop playing"},
+    },
+}
+
 
 QUESTIONS = {
     "action": {"type": "choice", "instructions": "...", "criteria": {"tap": "...", "done": "..."}},
@@ -73,6 +81,15 @@ def _api_timeout_error() -> openai.APITimeoutError:
 def client() -> GPTDecisionClient:
     with patch("orchestrator.modules.decision_engine.gpt_client.openai.OpenAI"):
         return GPTDecisionClient(api_key="test-key")
+
+
+@pytest.fixture
+def screenshot_path(tmp_path) -> str:
+    from PIL import Image
+
+    path = tmp_path / "screenshot.png"
+    Image.new("RGB", (4, 4), color="white").save(path)
+    return str(path)
 
 
 class TestConstruction:
@@ -183,6 +200,78 @@ class TestAsk:
     def test_http_error(self, client: GPTDecisionClient):
         with patch.object(client.client.chat.completions, "create", side_effect=_api_status_error(500)):
             result = client.ask("state", QUESTIONS)
+
+        assert not result.success
+        assert result.error_code == "GPT_DECISION_HTTP_ERROR"
+
+
+class TestAskWithImage:
+
+    def test_success(self, client: GPTDecisionClient, screenshot_path: str):
+        payload = {"action": "tap", "x": 270, "y": 600, "confidence": 0.8, "reasoning": "Tap the spin button."}
+        with patch.object(client.client.chat.completions, "create", return_value=_mock_completion(json.dumps(payload))) as mock_create:
+            result = client.ask_with_image(screenshot_path, "state text", VISION_QUESTIONS, 540, 1200)
+
+        assert result.success
+        assert result.data["answers"]["action"] == {"choice": "tap", "confidence": 0.8}
+        assert result.data["answers"]["target"] == {"choice": (270, 600), "confidence": 0.8}
+
+        mock_create.assert_called_once()
+        messages = mock_create.call_args.kwargs["messages"]
+        assert mock_create.call_args.kwargs["max_tokens"] == 300
+        user_content = messages[1]["content"]
+        assert user_content[0] == {"type": "text", "text": "state text"}
+        assert user_content[1]["type"] == "image_url"
+        assert user_content[1]["image_url"]["url"].startswith("data:image/png;base64,")
+        assert "540x1200" in messages[0]["content"]
+
+    def test_stop_has_no_coordinates(self, client: GPTDecisionClient, screenshot_path: str):
+        payload = {"action": "stop", "confidence": 0.9}
+        with patch.object(client.client.chat.completions, "create", return_value=_mock_completion(json.dumps(payload))):
+            result = client.ask_with_image(screenshot_path, "state", VISION_QUESTIONS, 540, 1200)
+
+        assert result.success
+        assert result.data["answers"]["action"]["choice"] == "stop"
+        assert result.data["answers"]["target"]["choice"] is None
+
+    def test_invalid_action_falls_back_to_stop(self, client: GPTDecisionClient, screenshot_path: str):
+        payload = {"action": "input_text", "x": 1, "y": 1, "confidence": 0.5}
+        with patch.object(client.client.chat.completions, "create", return_value=_mock_completion(json.dumps(payload))):
+            result = client.ask_with_image(screenshot_path, "state", VISION_QUESTIONS, 540, 1200)
+
+        assert result.success
+        assert result.data["answers"]["action"]["choice"] == "stop"
+
+    def test_missing_screenshot_file(self, client: GPTDecisionClient):
+        result = client.ask_with_image("/nonexistent/path/screenshot.png", "state", VISION_QUESTIONS, 540, 1200)
+
+        assert not result.success
+        assert result.error_code == "GPT_DECISION_IMAGE_READ_ERROR"
+
+    def test_malformed_json(self, client: GPTDecisionClient, screenshot_path: str):
+        with patch.object(client.client.chat.completions, "create", return_value=_mock_completion("not json")):
+            result = client.ask_with_image(screenshot_path, "state", VISION_QUESTIONS, 540, 1200)
+
+        assert not result.success
+        assert result.error_code == "GPT_DECISION_PARSE_ERROR"
+
+    def test_connection_error(self, client: GPTDecisionClient, screenshot_path: str):
+        with patch.object(client.client.chat.completions, "create", side_effect=_api_connection_error()):
+            result = client.ask_with_image(screenshot_path, "state", VISION_QUESTIONS, 540, 1200)
+
+        assert not result.success
+        assert result.error_code == "GPT_DECISION_UNREACHABLE"
+
+    def test_timeout(self, client: GPTDecisionClient, screenshot_path: str):
+        with patch.object(client.client.chat.completions, "create", side_effect=_api_timeout_error()):
+            result = client.ask_with_image(screenshot_path, "state", VISION_QUESTIONS, 540, 1200)
+
+        assert not result.success
+        assert result.error_code == "GPT_DECISION_TIMEOUT"
+
+    def test_http_error(self, client: GPTDecisionClient, screenshot_path: str):
+        with patch.object(client.client.chat.completions, "create", side_effect=_api_status_error(500)):
+            result = client.ask_with_image(screenshot_path, "state", VISION_QUESTIONS, 540, 1200)
 
         assert not result.success
         assert result.error_code == "GPT_DECISION_HTTP_ERROR"
