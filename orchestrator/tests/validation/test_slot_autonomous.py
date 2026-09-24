@@ -47,7 +47,7 @@ OCR_REFRESH_INTERVAL = 3  # step tra una lettura OCR (saldo/posta) e l'altra
 MIN_BET = 0.10
 DEFAULT_MAX_STEPS = 50
 DEFAULT_TARGET_AMOUNT = 30.0
-VISION_RESIZE_SCALE = 0.5  # dimezza lo screenshot prima di inviarlo alla Vision API
+VISION_RESIZE_SCALE = 1.0  # dimezza lo screenshot prima di inviarlo alla Vision API
 SPIN_PROXIMITY_PX = 100  # tap entro questa distanza dal tasto spin noto -> non serve rileggere l'OCR
 
 
