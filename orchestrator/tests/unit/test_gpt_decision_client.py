@@ -33,6 +33,15 @@ SLOT_QUESTIONS = {
     "balance_ok": {"type": "noul", "instructions": "..."},
 }
 
+SLOT_TAP_QUESTIONS = {
+    "action": {
+        "type": "choice",
+        "instructions": "...",
+        "criteria": {"tap": "Touch an element", "stop": "Stop playing"},
+    },
+    "target": {"type": "choice", "instructions": "...", "criteria": {"PUNTATA € 1.00": "...", "Xiter": "..."}},
+}
+
 
 def _mock_completion(content: str):
     message = MagicMock()
@@ -198,3 +207,16 @@ class TestSystemPrompt:
         system_message = mock_create.call_args.kwargs["messages"][0]["content"]
         assert "bookmaker" in system_message.lower()
         assert "slot machine" not in system_message.lower()
+
+    def test_slot_tap_questions_mention_slot_not_bookmaker_or_spin(self, client: GPTDecisionClient):
+        """criteria={'tap','stop'}: dominio nuovo (tap libero in slot), non deve
+        confondersi con la navigazione bookmaker (che condivide 'tap') ne' menzionare
+        'spin' (non e' un'azione valida qui)."""
+        payload = {"action": "tap", "target": "Xiter", "confidence": 0.9}
+        with patch.object(client.client.chat.completions, "create", return_value=_mock_completion(json.dumps(payload))) as mock_create:
+            client.ask("state", SLOT_TAP_QUESTIONS)
+
+        system_message = mock_create.call_args.kwargs["messages"][0]["content"]
+        assert "slot machine" in system_message.lower()
+        assert "bookmaker" not in system_message.lower()
+        assert "'spin'" not in system_message.lower()

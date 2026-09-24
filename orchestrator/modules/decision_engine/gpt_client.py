@@ -12,8 +12,11 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_VALID_ACTIONS = {"tap", "scroll", "input_text", "wait", "done"}
 
-_SLOT_ACTIONS = {"spin", "stop"}
-_NAVIGATION_ACTIONS = {"tap", "scroll", "done"}
+_SLOT_SPIN_ACTIONS = {"spin", "stop"}
+# Vocabolario specifico della navigazione bookmaker: esclude "tap", che e' generico
+# e condiviso anche dal flusso slot a tap libero (vedi _SLOT_TAP_ACTIONS).
+_NAVIGATION_SIGNAL_ACTIONS = {"scroll", "done", "input_text", "wait"}
+_SLOT_TAP_ACTIONS = {"tap", "stop"}
 
 
 class GPTDecisionClient(DecisionEngineClientInterface):
@@ -78,14 +81,20 @@ class GPTDecisionClient(DecisionEngineClientInterface):
             "You MUST choose an action from the provided options only. Do not invent actions. "
             "Respond ONLY with the JSON object described below, with no extra text.",
         ]
-        if valid_actions & _SLOT_ACTIONS:
+        if "spin" in valid_actions:
             lines.append(
                 "You are inside a slot machine game. Choose 'spin' to play another round or 'stop' to finish."
             )
-        if valid_actions & _NAVIGATION_ACTIONS:
+        elif valid_actions & _NAVIGATION_SIGNAL_ACTIONS:
             lines.append(
                 "You are navigating a bookmaker website. Choose 'tap' to click an element, "
                 "'scroll' to see more, or 'done' when the goal is reached."
+            )
+        elif valid_actions == _SLOT_TAP_ACTIONS:
+            lines.append(
+                "You are inside a slot machine game and can tap any element visible on screen. "
+                "Choose 'tap' to touch the element named in 'target' (e.g. to adjust the bet or spin), "
+                "or 'stop' to finish playing."
             )
 
         actions_list = "|".join(sorted(valid_actions))
