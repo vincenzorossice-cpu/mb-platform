@@ -2,20 +2,32 @@
 Script di validazione manuale: GPT-4o-mini Vision gioca la slot in piena
 autonomia guardando lo screenshot.
 
-Rispetto alla versione precedente (basata su testi OCR), qui il Decision
-Engine VEDE lo screenshot del telefono (Vision API di GPT-4o-mini) invece di
-un dump di testi con coordinate: capisce il layout come un umano (bottoni,
-menu modali aperti, dove si trova il tasto SPIN) e sceglie autonomamente dove
-tappare restituendo coordinate [x,y]. L'OCR (EasyOCR, via SlotOCRReader) resta
-in uso per leggere saldo/posta (valori numerici: l'OCR e' piu' preciso e molto
-piu' economico della vision per questo) e per rilevare se un menu si e'
-aperto/chiuso confrontando i testi letti prima/dopo un tap.
+Il Decision Engine VEDE lo screenshot del telefono (Vision API di GPT-4o-mini)
+per capire il layout e lo stato dello schermo, ma NON restituisce mai
+coordinate [x,y] dirette: secondo slot_anatomy.md, gpt-4o-mini non e'
+affidabile nel "grounding spaziale" (indicare pixel precisi). Sceglie invece
+un elemento candidato individuato dall'OCR (target_text, risolto con
+precisione dalle coordinate misurate dall'OCR stesso) oppure, per icone senza
+etichetta, una regione grossolana su una griglia 3x3 (target_region). GPT
+classifica anche lo stato dello schermo (screen_state: idle/spinning/modal/
+ecc., vedi slot_anatomy.md sez. 7): e' il segnale principale per sapere se un
+menu e' aperto e se i numeri letti in quel momento sono attendibili — molto
+piu' robusto di confrontare due letture OCR, che in produzione sono leggermente
+diverse ad ogni lettura anche a schermo fermo (rumore OCR).
 
-Include un safety-net anti-spin-prematuro (blocca i tentativi di spin mentre
-la posta non e' al minimo), un anti-loop consapevole se si e' dentro un menu
-o no, e un'escalation HITL da terminale se il sistema non riesce ad abbassare
-la posta da solo dopo troppi tentativi (l'operatore non vede mai lo
-screenshot: quello lo vede solo GPT via Vision API).
+L'OCR (EasyOCR, via SlotOCRReader) resta in uso per leggere saldo/posta/testi
+grezzi (candidati per il targeting), riletto dopo ogni tap reale e comunque
+almeno ogni OCR_REFRESH_INTERVAL step.
+
+Include: un safety-net anti-spin-prematuro (blocca i tentativi di spin mentre
+la posta non e' al minimo, imparando le coordinate spin anche quando l'OCR non
+le etichetta), un anti-loop consapevole se si e' dentro un menu o no, una
+escalation HITL da terminale (l'operatore non vede mai lo screenshot: quello
+lo vede solo GPT via Vision API) con suggerimenti cumulativi (non piu'
+usa-e-getta), e una memoria persistente per slot tra un'esecuzione e l'altra
+(--slot-name): le coordinate spin imparate e i suggerimenti confermati utili
+si salvano su file e si ricaricano automaticamente la prossima volta che si
+gioca la STESSA slot.
 
 Questo script richiede GPT-4o-mini (Vision e' una capacita' specifica di
 GPTDecisionClient, non fa parte del contratto generico DecisionEngineClientInterface
@@ -32,10 +44,12 @@ Prerequisiti:
 
 Uso:
     python -m orchestrator.tests.validation.test_slot_autonomous \
-        --device-id ZE223HNBKJ --target-amount 30
+        --device-id ZE223HNBKJ --target-amount 30 --slot-name "Pirots 5"
 """
 
 import argparse
+import difflib
+import json
 import logging
 import os
 import shutil
@@ -58,6 +72,7 @@ DEFAULT_TARGET_AMOUNT = 30.0
 VISION_RESIZE_SCALE = 1.0  # dimezza lo screenshot prima di inviarlo alla Vision API
 SPIN_PROXIMITY_PX = 100  # tap entro questa distanza dal tasto spin noto -> considerato un tentativo di spin
 SCREENSHOTS_DIR = "screenshots"
+SLOT_MEMORY_DIR = "slot_memory"
 MAX_CONSECUTIVE_SETUP_STEPS = 5  # oltre questa soglia in fase "setup" senza progressi -> HITL
 REPEAT_TAP_TOLERANCE_PX = 50  # tap entro questa distanza sono considerati "lo stesso punto"
 STUCK_SCREEN_THRESHOLD = 3  # step consecutivi senza cambiamenti a schermo -> nudge esplorativo
@@ -66,7 +81,68 @@ MAX_REPEAT_ATTEMPTS_OUTSIDE_MENU = 2  # fuori da un menu, un tap fermo e' un seg
 MAX_REPEAT_ATTEMPTS_INSIDE_MENU = 4  # dentro un menu, selezionare una cella diversa non cambia l'OCR:
 # serve piu' pazienza prima di considerare un tap davvero "senza effetto" (vedi Causa B nel piano)
 NEARBY_OFFSETS_PX = (40, 80)  # offset (px) usati per suggerire coordinate vicine a un tap bloccato
-HINT_TTL_STEPS = 5  # per quanti step un suggerimento testuale dell'operatore resta attivo
+HINT_TTL_STEPS = 5  # per quanti step un suggerimento resta attivo nello state text
+
+# Frazioni (larghezza, altezza) del centro di ciascuna cella di una griglia 3x3,
+# usate per tradurre una regione grossolana (target_region) in un punto reale
+# da tappare quando l'elemento non ha un'etichetta testuale riconoscibile.
+_REGION_FRACTIONS = {
+    "top-left": (1 / 6, 1 / 6), "top-center": (1 / 2, 1 / 6), "top-right": (5 / 6, 1 / 6),
+    "middle-left": (1 / 6, 1 / 2), "center": (1 / 2, 1 / 2), "middle-right": (5 / 6, 1 / 2),
+    "bottom-left": (1 / 6, 5 / 6), "bottom-center": (1 / 2, 5 / 6), "bottom-right": (5 / 6, 5 / 6),
+}
+
+# Stati in cui i numeri letti via OCR (saldo/posta) sono considerati attendibili
+# per il calcolo di total_played (slot_anatomy.md sez. 7): durante il
+# caricamento, uno spin in corso o la presentazione di una vincita i valori
+# possono essere in transizione. None = nessuna classificazione ancora
+# disponibile (es. primissimo step): si sceglie di fidarsi per non bloccare
+# tutto al cold-start.
+_BALANCE_TRUSTED_STATES = {None, "idle", "modal"}
+
+
+def region_to_point(region: Optional[str], width: int, height: int) -> Optional[tuple]:
+    """Punto generico al centro di una delle 9 celle di una griglia 3x3.
+    Nessuna coordinata specifica di slot: solo geometria su frazioni fisse."""
+    fractions = _REGION_FRACTIONS.get(region)
+    if fractions is None:
+        return None
+    fx, fy = fractions
+    return (int(round(width * fx)), int(round(height * fy)))
+
+
+def resolve_target(
+    target: Optional[dict], raw_texts: list, real_width: int, real_height: int,
+) -> Optional[tuple]:
+    """Risolve la scelta di GPT (target_text o target_region) in coordinate
+    reali da tappare. Il testo si risolve con le coordinate ESATTE misurate
+    dall'OCR (match esatto, poi case-insensitive, poi fuzzy) — niente
+    grounding spaziale richiesto a GPT. La regione si traduce geometricamente
+    in un punto reale, senza alcuna coordinata hardcoded per slot."""
+    if not target:
+        return None
+
+    target_text = target.get("text")
+    if target_text:
+        for text, (x, y), _conf in raw_texts:
+            if text == target_text:
+                return (x, y)
+        target_lower = target_text.lower()
+        for text, (x, y), _conf in raw_texts:
+            if text.lower() == target_lower:
+                return (x, y)
+        texts = [text for text, _coords, _conf in raw_texts]
+        match = difflib.get_close_matches(target_lower, [t.lower() for t in texts], n=1, cutoff=0.6)
+        if match:
+            for text, (x, y), _conf in raw_texts:
+                if text.lower() == match[0]:
+                    return (x, y)
+
+    target_region = target.get("region")
+    if target_region:
+        return region_to_point(target_region, real_width, real_height)
+
+    return None
 
 
 def nearby_offsets(x: int, y: int, offsets: tuple = NEARBY_OFFSETS_PX) -> list:
@@ -113,9 +189,11 @@ def resize_screenshot_for_vision(screenshot_path: str, scale: float = VISION_RES
     """Ridimensiona lo screenshot per ridurre token/costo della Vision API.
 
     Ritorna (percorso_immagine_ridotta, larghezza_ridotta, altezza_ridotta,
-    fattore_scala_x, fattore_scala_y). I fattori di scala vanno moltiplicati
-    alle coordinate restituite da GPT (nello spazio dell'immagine ridotta) per
-    riportarle allo spazio dello screenshot originale (schermo reale)."""
+    larghezza_originale, altezza_originale). Le dimensioni originali servono a
+    risolvere target_region in coordinate reali da tappare: l'OCR lavora
+    sempre sullo screenshot originale (non ridimensionato), quindi anche il
+    targeting per testo e' gia' preciso in quello spazio senza bisogno di
+    riscalare nulla."""
     from PIL import Image
 
     with Image.open(screenshot_path) as img:
@@ -125,11 +203,7 @@ def resize_screenshot_for_vision(screenshot_path: str, scale: float = VISION_RES
         resized_path = screenshot_path.rsplit(".", 1)[0] + "_small.png"
         resized.save(resized_path)
 
-    return resized_path, resized_w, resized_h, orig_w / resized_w, orig_h / resized_h
-
-
-def descale_coords(x: float, y: float, scale_x: float, scale_y: float) -> tuple:
-    return (int(round(x * scale_x)), int(round(y * scale_y)))
+    return resized_path, resized_w, resized_h, orig_w, orig_h
 
 
 def determine_phase(current_bet: Optional[float], min_bet: float = MIN_BET) -> str:
@@ -175,8 +249,10 @@ def build_vision_state_text(
             phase_banner += (
                 "\nTO LOWER THE BET: look for the bet amount display (usually shows something like "
                 "'€10.00' or 'PUNTATA €10.00') and tap on it to open the bet selection menu. OR look "
-                "for +/- buttons near the bet amount. OR look for a coins/credits icon. DO NOT tap "
-                "the SPIN button. DO NOT tap random elements. Focus ONLY on finding the bet control."
+                "for +/- buttons near the bet amount. OR look for a coins/credits icon (but note: on "
+                "some slots a coin+'+' icon means 'add demo credits', not 'open bet menu' — if it "
+                "doesn't work, try the bet amount text itself). DO NOT tap the SPIN button. Focus "
+                "ONLY on finding the bet control."
             )
     else:
         phase_banner = "\nBET IS AT MINIMUM. Now find and tap the SPIN button."
@@ -233,14 +309,19 @@ Look at the attached screenshot and decide what to do next.
 """
 
 
-def build_questions() -> dict:
+def build_questions(candidate_texts: list) -> dict:
     return {
         "action": choice_question(
-            "What should I do next? Choose 'tap' to touch a point on the screen, or 'stop' to finish playing.",
+            "What should I do next? Choose 'tap' to touch an element on screen, or 'stop' to finish playing.",
             {
-                "tap": "Touch a point on the screen",
+                "tap": "Touch an element on the screen",
                 "stop": "Stop playing - goal reached or cannot continue",
             },
+        ),
+        "target": choice_question(
+            "If action is tap, which element should I tap? Answer with the exact text of the "
+            "element if it has a visible label, or leave it and use a region instead.",
+            {text: text for text in candidate_texts},
         ),
     }
 
@@ -340,46 +421,106 @@ def handle_hitl_escalation(
         return ("hint", outcome[1])
 
 
+def _slot_memory_path(slot_name: str) -> str:
+    safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in slot_name.strip().lower())
+    return os.path.join(SLOT_MEMORY_DIR, f"{safe_name or 'unknown'}.json")
+
+
+def load_slot_memory(slot_name: str) -> dict:
+    """Carica cio' che e' stato imparato su questa slot in esecuzioni
+    precedenti (coordinate spin, suggerimenti confermati utili). Ritorna una
+    memoria vuota se non esiste ancora nulla o il file e' illeggibile."""
+    empty = {"known_spin_coords": None, "learned_hints": []}
+    path = _slot_memory_path(slot_name)
+    if not os.path.exists(path):
+        return empty
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return empty
+    coords = data.get("known_spin_coords")
+    return {
+        "known_spin_coords": tuple(coords) if coords else None,
+        "learned_hints": list(data.get("learned_hints", [])),
+    }
+
+
+def save_slot_memory(slot_name: str, memory: dict) -> None:
+    os.makedirs(SLOT_MEMORY_DIR, exist_ok=True)
+    path = _slot_memory_path(slot_name)
+    serializable = {
+        "known_spin_coords": list(memory["known_spin_coords"]) if memory.get("known_spin_coords") else None,
+        "learned_hints": list(memory.get("learned_hints", [])),
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(serializable, f, indent=2)
+
+
+def _persist_slot_memory(slot_name: Optional[str], known_spin_coords: Optional[tuple], new_hints: list) -> None:
+    """Aggiorna la memoria su file per questa slot (se un nome e' stato dato):
+    unisce quanto gia' salvato con le nuove informazioni, senza perdere nulla."""
+    if not slot_name:
+        return
+    memory = load_slot_memory(slot_name)
+    if known_spin_coords is not None:
+        memory["known_spin_coords"] = known_spin_coords
+    hints = set(memory.get("learned_hints", []))
+    hints.update(new_hints)
+    memory["learned_hints"] = sorted(hints)
+    save_slot_memory(slot_name, memory)
+
+
 def run_autonomous_session(
-    device_id: str, target_amount: float, max_steps: int, save_screenshots: bool = False,
+    device_id: str,
+    target_amount: float,
+    max_steps: int,
+    save_screenshots: bool = False,
+    slot_name: Optional[str] = None,
 ) -> bool:
     """Gioca la slot gia' aperta sul device lasciando che GPT-4o-mini Vision
-    scelga autonomamente dove tappare guardando lo screenshot ad ogni passo.
-    L'OCR resta in uso solo per saldo/posta/testi grezzi, riletto dopo ogni tap
-    reale (per rilevare in modo affidabile se il saldo e' sceso o se sono
-    apparsi/spariti testi, es. un menu) e comunque almeno ogni
-    OCR_REFRESH_INTERVAL step.
+    scelga autonomamente cosa tappare guardando lo screenshot ad ogni passo.
+    GPT non restituisce mai coordinate pixel dirette (inaffidabile per
+    grounding spaziale, vedi slot_anatomy.md): sceglie un elemento OCR per
+    testo (risolto con precisione dalle coordinate misurate dall'OCR) o, in
+    mancanza di etichetta, una regione grossolana su griglia 3x3 (risolta
+    geometricamente, senza coordinate hardcoded per nessuna slot).
+
+    GPT classifica anche lo stato dello schermo (screen_state): e' il segnale
+    principale per "menu aperto" (screen_state == 'modal') e per decidere se i
+    numeri letti via OCR sono attendibili — molto piu' robusto di un confronto
+    tra due letture OCR, che in produzione sono leggermente diverse ad ogni
+    lettura anche a schermo fermo (rumore OCR che in passato impediva
+    all'anti-loop di accorgersi di tap ripetuti a vuoto).
 
     Safety-net anti-spin-prematuro: se la posta e' sopra il minimo (fase
     "setup"), un tap su/vicino al tasto spin noto viene BLOCCATO (mai
     eseguito). known_spin_coords viene sia letto dall'OCR (label "SPIN"/"GIRA")
     sia IMPARATO a runtime osservando un calo di saldo dopo un tap, cosi' il
     primo spin "accidentale" (inevitabile: non possiamo bloccare coordinate
-    mai osservate prima) non si ripete piu' nella stessa sessione. Nessuna
-    coordinata o label e' hardcoded per una slot specifica.
+    mai osservate prima) non si ripete piu' nella stessa sessione.
 
     Anti-loop consapevole del contesto: un tap ripetuto sullo stesso punto
     senza alcun cambiamento a schermo viene bloccato dopo
-    MAX_REPEAT_ATTEMPTS_OUTSIDE_MENU tentativi fuori da un menu (segnale
-    affidabile di errore), ma solo dopo MAX_REPEAT_ATTEMPTS_INSIDE_MENU dentro
-    un menu (dove selezionare un'opzione diversa spesso non produce alcun
-    segnale OCR finche' il menu non si chiude): li' si suggeriscono coordinate
-    VICINE (nearby_offsets) per affinare la stima invece di abbandonare
-    l'area.
+    MAX_REPEAT_ATTEMPTS_OUTSIDE_MENU tentativi fuori da un menu, ma solo dopo
+    MAX_REPEAT_ATTEMPTS_INSIDE_MENU dentro un menu: li' si suggeriscono
+    coordinate VICINE (nearby_offsets) per affinare la stima invece di
+    abbandonare l'area.
 
     HITL: se dopo MAX_CONSECUTIVE_SETUP_STEPS step consecutivi la fase resta
-    "setup", il sistema chiede aiuto all'operatore da terminale
-    (handle_hitl_escalation/ask_human_help — mai uno screenshot aperto: lo
-    vede solo GPT via Vision API). Un suggerimento testuale dell'operatore
-    resta attivo (sticky_hint) per HINT_TTL_STEPS turni invece di sparire dopo
-    uno solo, finche' la fase non torna "playing".
+    "setup", il sistema chiede aiuto all'operatore da terminale (mai uno
+    screenshot aperto). I suggerimenti si accumulano (active_hints, ciascuno
+    con il proprio TTL) invece di sovrascriversi.
+
+    Memoria persistente: se slot_name e' dato, le coordinate spin imparate e i
+    suggerimenti che hanno portato la fase da "setup" a "playing" vengono
+    salvati su file e ricaricati automaticamente in esecuzioni future sulla
+    stessa slot (vedi load_slot_memory/save_slot_memory).
 
     total_played e' la SOMMA delle poste piazzate, dedotta osservando il
-    saldo: ogni volta che una lettura OCR fresca mostra un saldo piu' basso di
-    quello precedente (segno che uno spin e' avvenuto, indipendentemente da
-    quale fase pensavamo di essere), si aggiunge la posta corrente (letta via
-    OCR) a total_played -- mai saldo_iniziale - saldo_attuale, che sarebbe il
-    net loss e diminuirebbe con le vincite.
+    saldo — mai saldo_iniziale - saldo_attuale — e contata solo quando l'ultimo
+    screen_state noto rende il numero attendibile (non durante spin/loading/
+    win_presentation in corso).
 
     Ritorna True se la sessione si e' conclusa in modo pulito (stop deciso dal
     Decision Engine, target raggiunto o saldo insufficiente), False in caso di
@@ -392,9 +533,14 @@ def run_autonomous_session(
     if save_screenshots:
         os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
 
+    slot_memory = load_slot_memory(slot_name) if slot_name else {"known_spin_coords": None, "learned_hints": []}
+
     print("=== TEST GIOCO SLOT AUTONOMO (GPT-4o-mini Vision) ===")
     print(f"Device: {device_id}")
     print(f"Target giocato: {target_amount} EUR, max {max_steps} step")
+    if slot_name:
+        print(f"Slot: {slot_name} (memoria: {len(slot_memory['learned_hints'])} hint, "
+              f"spin noto: {slot_memory['known_spin_coords']})")
     print("Assicurati che la slot sia aperta in modalita' DEMO sul telefono.")
     input("Premi INVIO per iniziare...")
 
@@ -405,22 +551,25 @@ def run_autonomous_session(
     initial_balance = ocr_state.get("saldo")
     current_balance = initial_balance
     current_bet = ocr_state.get("posta")
-    known_spin_coords = ocr_state.get("spin_button_coords")
+    known_spin_coords = ocr_state.get("spin_button_coords") or slot_memory.get("known_spin_coords")
     total_played = 0.0
     action_history: list[dict] = []
     steps_since_ocr = 0
     force_ocr_refresh = False
     corrective_note: Optional[str] = None
-    sticky_hint: Optional[str] = None
-    hint_ttl = 0
+    active_hints: list[dict] = [
+        {"raw": h, "ttl": HINT_TTL_STEPS} for h in slot_memory.get("learned_hints", [])
+    ]
     consecutive_setup_steps = 0
     tapped_targets: list[dict] = []
     last_tap_coords: Optional[tuple] = None
     menu_open = False
+    last_screen_state: Optional[str] = None
     steps_without_screen_change = 0
     previous_raw_texts: Optional[set] = normalize_texts(ocr_state.get("raw_texts", []))
     new_texts: set = set()
     disappeared_texts: set = set()
+    previous_phase = determine_phase(current_bet)
 
     print(f"Saldo iniziale: {initial_balance}")
 
@@ -432,37 +581,44 @@ def run_autonomous_session(
                 return False
             steps_since_ocr = 0
             force_ocr_refresh = False
+            balance_trusted = last_screen_state in _BALANCE_TRUSTED_STATES
             if ocr_state.get("saldo") is not None:
                 current_balance = ocr_state["saldo"]
                 if previous_balance is not None and current_balance < previous_balance:
-                    spin_bet = current_bet if current_bet is not None else (previous_balance - current_balance)
-                    total_played += spin_bet
-                    print(
-                        f"Spin rilevato! Saldo: {previous_balance} -> {current_balance}. "
-                        f"Posta: {spin_bet:.2f}. Total played: {total_played:.2f}"
-                    )
-                    if last_tap_coords is not None:
-                        # Anche se l'OCR non ha mai etichettato il tasto SPIN
-                        # (nessun testo "SPIN"/"XITER"/"GIRA" trovato), abbiamo
-                        # appena OSSERVATO che tappare qui causa uno spin:
-                        # impariamo queste coordinate cosi' il safety-net qui
-                        # sotto puo' bloccare i tentativi successivi durante il
-                        # setup, invece di rilevarli solo a posteriori.
-                        known_spin_coords = last_tap_coords
-                        print(f"Coordinate del tasto SPIN apprese da questo spin: {known_spin_coords}")
+                    if balance_trusted:
+                        spin_bet = current_bet if current_bet is not None else (previous_balance - current_balance)
+                        total_played += spin_bet
+                        print(
+                            f"Spin rilevato! Saldo: {previous_balance} -> {current_balance}. "
+                            f"Posta: {spin_bet:.2f}. Total played: {total_played:.2f}"
+                        )
+                        if last_tap_coords is not None:
+                            # Anche se l'OCR non ha mai etichettato il tasto SPIN,
+                            # abbiamo appena OSSERVATO che tappare qui causa uno
+                            # spin: impariamo queste coordinate cosi' il
+                            # safety-net qui sotto puo' bloccare i tentativi
+                            # successivi durante il setup, invece di rilevarli
+                            # solo a posteriori.
+                            known_spin_coords = last_tap_coords
+                            print(f"Coordinate del tasto SPIN apprese da questo spin: {known_spin_coords}")
+                            _persist_slot_memory(slot_name, known_spin_coords, [])
+                    else:
+                        print(
+                            f"Calo di saldo rilevato ({previous_balance} -> {current_balance}) ma l'ultimo "
+                            f"stato noto era '{last_screen_state}', non 'idle': non conteggiato per prudenza "
+                            "(potrebbe essere un valore in transizione)."
+                        )
             if ocr_state.get("posta") is not None:
                 current_bet = ocr_state["posta"]
             if ocr_state.get("spin_button_coords") is not None:
                 known_spin_coords = ocr_state["spin_button_coords"]
 
-            # Confronta i testi OCR con la lettura precedente per capire se lo
-            # schermo e' cambiato (menu aperto/chiuso) dopo l'ultimo tap reale.
-            # Un cambio di saldo conta anch'esso come "schermo cambiato" (uno
-            # spin normale spesso non altera altre etichette oltre al numero
-            # del saldo, che potrebbe comunque comparire identico all'OCR se
-            # il valore e' arrotondato uguale): senza questo, uno spin
-            # ripetuto legittimo sullo stesso tasto verrebbe scambiato per un
-            # loop e bloccato dall'anti-loop qui sotto.
+            # Il confronto testi OCR resta solo per il nudge generico "sei
+            # fermo da troppo" (screen_diff_note/steps_without_screen_change):
+            # NON decide piu' se un menu e' aperto (screen_state lo fa in modo
+            # molto piu' affidabile, vedi sopra), perche' in produzione l'OCR
+            # legge testi leggermente diversi ad ogni lettura anche a schermo
+            # fermo, mascherando i tap davvero senza effetto.
             current_raw_texts = normalize_texts(ocr_state.get("raw_texts", []))
             new_texts = current_raw_texts - previous_raw_texts if previous_raw_texts is not None else set()
             disappeared_texts = previous_raw_texts - current_raw_texts if previous_raw_texts is not None else set()
@@ -470,17 +626,6 @@ def run_autonomous_session(
                 previous_balance is not None and current_balance is not None and current_balance != previous_balance
             )
             screen_changed = bool(new_texts or disappeared_texts) or balance_changed
-            was_menu_open = menu_open
-            if new_texts:
-                menu_open = True
-            elif disappeared_texts:
-                menu_open = False
-            if was_menu_open and not menu_open:
-                # Il momento della verita' per un menu selezione-posta: la HUD
-                # sottostante (es. "PUNTATA €X") resta congelata finche' il
-                # menu e' aperto e si aggiorna solo qui, alla sua chiusura.
-                bet_str = f"{current_bet:.2f} EUR" if current_bet is not None else "sconosciuta"
-                print(f"Menu chiuso: posta ora {bet_str}.")
             steps_without_screen_change = 0 if screen_changed else steps_without_screen_change + 1
             previous_raw_texts = current_raw_texts
 
@@ -495,11 +640,19 @@ def run_autonomous_session(
         print(f"\n=== Step {step}/{max_steps} (fase: {phase}) ===")
         print(f"Saldo: {current_balance} | Posta: {current_bet} | Giocato finora: {total_played:.2f} EUR")
 
-        if sticky_hint:
-            hint_ttl -= 1
-            if phase == "playing" or hint_ttl <= 0:
-                sticky_hint = None
-                hint_ttl = 0
+        if phase == "playing" and previous_phase == "setup" and active_hints:
+            # I suggerimenti attivi nel momento in cui la posta e' scesa al
+            # minimo vengono considerati confermati utili e salvati per la
+            # prossima volta che si gioca questa slot.
+            print("Posta al minimo raggiunta: salvo i suggerimenti attivi come confermati utili.")
+            _persist_slot_memory(slot_name, None, [h["raw"] for h in active_hints])
+        previous_phase = phase
+
+        for h in active_hints:
+            h["ttl"] -= 1
+        active_hints = [h for h in active_hints if h["ttl"] > 0]
+        if phase == "playing":
+            active_hints = []
 
         if phase == "setup":
             consecutive_setup_steps += 1
@@ -528,13 +681,13 @@ def run_autonomous_session(
                     steps_since_ocr = 0
                     force_ocr_refresh = False
                 elif hitl_action == "hint":
-                    # Sticky, non usa-e-getta: l'operatore ha gia' dovuto
+                    # Cumulativo, non usa-e-getta: l'operatore ha gia' dovuto
                     # ripetersi troppe volte nei log reali perche' il
                     # suggerimento spariva dopo un solo turno (Causa C).
-                    sticky_hint = f"The human operator suggests: {hitl_data}"
-                    hint_ttl = HINT_TTL_STEPS
+                    active_hints.append({"raw": hitl_data, "ttl": HINT_TTL_STEPS})
                 # hitl_action == "skip": nessun'altra azione, si riprova con GPT
                 phase = determine_phase(current_bet)
+                previous_phase = phase
         else:
             consecutive_setup_steps = 0
 
@@ -552,12 +705,18 @@ def run_autonomous_session(
             return False
         screenshot_path = ss.data
 
-        resized_path, resized_w, resized_h, scale_x, scale_y = resize_screenshot_for_vision(screenshot_path)
+        resized_path, resized_w, resized_h, orig_w, orig_h = resize_screenshot_for_vision(screenshot_path)
         try:
             if save_screenshots:
                 shutil.copy(resized_path, os.path.join(SCREENSHOTS_DIR, f"step_{step:04d}.png"))
 
-            combined_note = " ".join(note for note in (corrective_note, sticky_hint) if note) or None
+            hint_texts = [f"The human operator suggests: {h['raw']}" for h in active_hints]
+            notes = ([corrective_note] if corrective_note else []) + hint_texts
+            combined_note = " ".join(notes) or None
+
+            raw_texts = ocr_state.get("raw_texts", [])
+            candidate_texts = [text for text, _coords, _conf in raw_texts]
+
             state_text = build_vision_state_text(
                 initial_balance, current_balance, current_bet, total_played, target_amount, step, action_history,
                 corrective_note=combined_note, menu_open=menu_open, new_texts=new_texts,
@@ -565,7 +724,7 @@ def run_autonomous_session(
             )
             corrective_note = None
             new_texts, disappeared_texts = set(), set()
-            questions = build_questions()
+            questions = build_questions(candidate_texts)
 
             print("Chiedo a GPT-4o-mini Vision...")
             result = engine.ask_with_image(resized_path, state_text, questions, resized_w, resized_h)
@@ -583,19 +742,31 @@ def run_autonomous_session(
         action = answers.get("action", {}).get("choice", "stop")
         target = answers.get("target", {}).get("choice")
         confidence = answers.get("action", {}).get("confidence", 0.0)
+        screen_state = answers.get("screen_state", {}).get("choice")
 
-        print(f"Decisione: {action} target(risoluzione immagine)={target} (confidence: {confidence:.2f})")
+        last_screen_state = screen_state
+        was_menu_open = menu_open
+        menu_open = (screen_state == "modal")
+        if was_menu_open and not menu_open:
+            # Il momento della verita' per un menu selezione-posta: la HUD
+            # sottostante (es. "PUNTATA €X") resta congelata finche' il menu
+            # e' aperto e si aggiorna solo quando GPT stesso segnala che non
+            # e' piu' in stato 'modal'.
+            bet_str = f"{current_bet:.2f} EUR" if current_bet is not None else "sconosciuta"
+            print(f"Menu chiuso: posta ora {bet_str}.")
+
+        print(f"Decisione: {action} target={target} screen_state={screen_state} (confidence: {confidence:.2f})")
 
         if action == "stop":
             print("Il Decision Engine dice STOP. Fine del test.")
             break
 
-        if not target:
-            print("GPT non ha restituito coordinate valide. Rileggo lo schermo al prossimo step.")
+        real_target = resolve_target(target, ocr_state.get("raw_texts", []), orig_w, orig_h)
+        if real_target is None:
+            print("GPT non ha indicato un target risolvibile (ne' testo ne' regione valida). Rileggo lo schermo al prossimo step.")
             force_ocr_refresh = True
             continue
-
-        real_x, real_y = descale_coords(target[0], target[1], scale_x, scale_y)
+        real_x, real_y = real_target
 
         is_spin_tap = (
             known_spin_coords is not None
@@ -696,6 +867,11 @@ def main() -> None:
         "--save-screenshots", action="store_true",
         help=f"Salva ogni screenshot inviato a GPT-4o-mini nella cartella {SCREENSHOTS_DIR}/ per debug.",
     )
+    parser.add_argument(
+        "--slot-name", default=None,
+        help="Nome della slot (es. 'Pirots 5'): abilita la memoria persistente tra esecuzioni "
+        f"(coordinate spin e suggerimenti confermati utili, salvati in {SLOT_MEMORY_DIR}/).",
+    )
     args = parser.parse_args()
 
     ok = run_autonomous_session(
@@ -703,6 +879,7 @@ def main() -> None:
         target_amount=args.target_amount,
         max_steps=args.max_steps,
         save_screenshots=args.save_screenshots,
+        slot_name=args.slot_name,
     )
     sys.exit(0 if ok else 1)
 

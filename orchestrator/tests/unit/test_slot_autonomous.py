@@ -7,16 +7,21 @@ from orchestrator.core.result import Result
 from orchestrator.tests.validation.test_slot_autonomous import (
     MAX_REPEAT_ATTEMPTS_INSIDE_MENU,
     MAX_REPEAT_ATTEMPTS_OUTSIDE_MENU,
-    VISION_RESIZE_SCALE,
+    SLOT_MEMORY_DIR,
+    _persist_slot_memory,
+    _slot_memory_path,
     ask_human_help,
     count_consecutive_same_spot_failures,
-    descale_coords,
     determine_phase,
     find_untried_elements,
+    load_slot_memory,
     nearby_offsets,
     normalize_texts,
+    region_to_point,
     resize_screenshot_for_vision,
+    resolve_target,
     run_autonomous_session,
+    save_slot_memory,
 )
 
 
@@ -35,16 +40,21 @@ def _text(text, x, y, conf=0.9):
     return (text, (x, y), conf)
 
 
-def _answers(action, target=None, confidence=0.9):
+def _target(text=None, region=None):
+    return {"text": text, "region": region} if (text or region) else None
+
+
+def _answers(action, target=None, screen_state="idle", confidence=0.9):
     return {"answers": {
         "action": {"choice": action, "confidence": confidence},
         "target": {"choice": target, "confidence": confidence},
+        "screen_state": {"choice": screen_state, "confidence": confidence},
     }}
 
 
 class TestResizeScreenshotForVision:
 
-    def test_halves_dimensions_and_computes_scale(self, tmp_path):
+    def test_halves_dimensions_and_returns_original_size(self, tmp_path):
         """Passa scale=0.5 esplicitamente: il test verifica la matematica della
         funzione, indipendentemente da quale sia il default VISION_RESIZE_SCALE
         attualmente configurato per la sessione reale."""
@@ -53,19 +63,59 @@ class TestResizeScreenshotForVision:
         path = tmp_path / "shot.png"
         Image.new("RGB", (1080, 2400), color="white").save(path)
 
-        resized_path, w, h, scale_x, scale_y = resize_screenshot_for_vision(str(path), scale=0.5)
+        resized_path, w, h, orig_w, orig_h = resize_screenshot_for_vision(str(path), scale=0.5)
 
         assert (w, h) == (540, 1200)
-        assert scale_x == pytest.approx(2.0)
-        assert scale_y == pytest.approx(2.0)
+        assert (orig_w, orig_h) == (1080, 2400)
         assert os.path.exists(resized_path)
         assert Image.open(resized_path).size == (540, 1200)
 
         os.remove(resized_path)
 
-    def test_descale_coords_rounds_to_int(self):
-        assert descale_coords(270, 600, 2.0, 2.0) == (540, 1200)
-        assert descale_coords(270.4, 600.6, 2.0, 2.0) == (541, 1201)
+
+class TestRegionToPoint:
+
+    def test_known_regions_are_generic_geometry_not_slot_specific(self):
+        assert region_to_point("top-left", 1080, 2400) == (180, 400)
+        assert region_to_point("center", 1080, 2400) == (540, 1200)
+        assert region_to_point("bottom-right", 1080, 2400) == (900, 2000)
+        # Stessa griglia, dimensioni diverse: dimostra che non c'e' nulla hardcoded.
+        assert region_to_point("bottom-right", 540, 1200) == (450, 1000)
+
+    def test_unknown_region_returns_none(self):
+        assert region_to_point("nowhere", 1080, 2400) is None
+
+    def test_none_region_returns_none(self):
+        assert region_to_point(None, 1080, 2400) is None
+
+
+class TestResolveTarget:
+
+    def test_exact_text_match_uses_ocr_measured_coordinates(self):
+        raw_texts = [_text("SPIN", 543, 2107)]
+        assert resolve_target(_target(text="SPIN"), raw_texts, 1080, 2400) == (543, 2107)
+
+    def test_case_insensitive_match(self):
+        raw_texts = [_text("SPIN", 543, 2107)]
+        assert resolve_target(_target(text="spin"), raw_texts, 1080, 2400) == (543, 2107)
+
+    def test_fuzzy_match(self):
+        raw_texts = [_text("PUNTATA €10.00", 100, 2000)]
+        assert resolve_target(_target(text="PUNTATA  10.00"), raw_texts, 1080, 2400) == (100, 2000)
+
+    def test_falls_back_to_region_when_text_not_found(self):
+        raw_texts = [_text("SPIN", 543, 2107)]
+        result = resolve_target({"text": "NOPE", "region": "bottom-right"}, raw_texts, 1080, 2400)
+        assert result == (900, 2000)
+
+    def test_region_only_when_no_text_given(self):
+        assert resolve_target(_target(region="center"), [], 1080, 2400) == (540, 1200)
+
+    def test_no_target_returns_none(self):
+        assert resolve_target(None, [], 1080, 2400) is None
+
+    def test_no_text_and_no_valid_region_returns_none(self):
+        assert resolve_target({"text": "NOPE", "region": "nowhere"}, [], 1080, 2400) is None
 
 
 class TestDeterminePhase:
@@ -176,6 +226,38 @@ class TestAskHumanHelp:
         mock_input.assert_called_once()
 
 
+class TestSlotMemory:
+
+    def test_load_returns_empty_when_missing(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        assert load_slot_memory("Nonexistent Slot") == {"known_spin_coords": None, "learned_hints": []}
+
+    def test_save_and_load_round_trip(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        save_slot_memory("Pirots 5", {"known_spin_coords": (540, 2100), "learned_hints": ["tap coin icon"]})
+        assert load_slot_memory("Pirots 5") == {"known_spin_coords": (540, 2100), "learned_hints": ["tap coin icon"]}
+
+    def test_persist_merges_without_losing_existing_data(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        save_slot_memory("Pirots 5", {"known_spin_coords": (540, 2100), "learned_hints": ["hint A"]})
+        _persist_slot_memory("Pirots 5", None, ["hint B"])
+        memory = load_slot_memory("Pirots 5")
+        assert memory["known_spin_coords"] == (540, 2100)
+        assert set(memory["learned_hints"]) == {"hint A", "hint B"}
+
+    def test_persist_does_nothing_without_slot_name(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        _persist_slot_memory(None, (1, 2), ["x"])
+        assert not os.path.exists(SLOT_MEMORY_DIR)
+
+    def test_corrupted_file_returns_empty(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        os.makedirs(SLOT_MEMORY_DIR, exist_ok=True)
+        with open(_slot_memory_path("Broken"), "w") as f:
+            f.write("not json")
+        assert load_slot_memory("Broken") == {"known_spin_coords": None, "learned_hints": []}
+
+
 @pytest.fixture
 def mocks(tmp_path):
     from PIL import Image
@@ -229,24 +311,35 @@ class TestRunAutonomousSession:
         mocks["engine"].ask_with_image.assert_not_called()
         mocks["touch_injector"].tap_coordinates.assert_not_called()
 
-    def test_tap_coordinates_are_scaled_back_to_real_screen(self, mocks):
-        """Lo screenshot mockato e' 1080x2400: le coordinate [270,600]
-        restituite da GPT (nello spazio dell'immagine ridimensionata) vanno
-        riscalate in base a VISION_RESIZE_SCALE per tornare allo schermo reale.
-        Il fattore atteso e' calcolato dalla costante corrente, cosi' il test
-        non dipende da quale valore specifico e' configurato in produzione."""
-        mocks["ocr_reader"].read_slot_state.return_value = _ocr_state(saldo=100.0, spin_button_coords=(540, 1200))
+    def test_tap_uses_ocr_measured_coordinates_for_text_target(self, mocks):
+        """GPT non restituisce mai pixel: sceglie un testo tra i candidati OCR
+        e il sistema tappa esattamente dove l'OCR ha misurato quell'elemento
+        (nessun 'grounding spaziale' richiesto a GPT, vedi slot_anatomy.md)."""
+        raw_texts = [_text("SPIN", 543, 2107)]
+        mocks["ocr_reader"].read_slot_state.return_value = _ocr_state(
+            saldo=100.0, posta=0.10, spin_button_coords=(543, 2107), raw_texts=raw_texts,
+        )
         mocks["engine"].ask_with_image.side_effect = [
-            Result.ok(_answers("tap", (270, 600))),
+            Result.ok(_answers("tap", _target(text="SPIN"))),
             Result.ok(_answers("stop")),
         ]
 
         ok = run_autonomous_session("dev", target_amount=30.0, max_steps=10)
 
         assert ok is True
-        expected_x = round(270 / VISION_RESIZE_SCALE)
-        expected_y = round(600 / VISION_RESIZE_SCALE)
-        mocks["touch_injector"].tap_coordinates.assert_called_once_with("dev", expected_x, expected_y)
+        mocks["touch_injector"].tap_coordinates.assert_called_once_with("dev", 543, 2107)
+
+    def test_tap_falls_back_to_region_when_no_text_candidate_matches(self, mocks):
+        mocks["ocr_reader"].read_slot_state.return_value = _ocr_state(saldo=100.0, posta=0.10, raw_texts=[])
+        mocks["engine"].ask_with_image.side_effect = [
+            Result.ok(_answers("tap", _target(region="bottom-right"))),
+            Result.ok(_answers("stop")),
+        ]
+
+        ok = run_autonomous_session("dev", target_amount=30.0, max_steps=10)
+
+        assert ok is True
+        mocks["touch_injector"].tap_coordinates.assert_called_once_with("dev", 900, 2000)
 
     def test_ask_with_image_receives_resized_dimensions(self, mocks):
         mocks["ocr_reader"].read_slot_state.return_value = _ocr_state(saldo=100.0)
@@ -256,8 +349,8 @@ class TestRunAutonomousSession:
 
         call_args = mocks["engine"].ask_with_image.call_args
         # (screenshot_path, state_text, questions, image_width, image_height)
-        assert call_args.args[3] == round(1080 * VISION_RESIZE_SCALE)
-        assert call_args.args[4] == round(2400 * VISION_RESIZE_SCALE)
+        assert call_args.args[3] == 1080
+        assert call_args.args[4] == 2400
         assert call_args.args[0].endswith("_small.png")
 
     def test_total_played_is_sum_of_bets_not_balance_diff(self, mocks, capsys):
@@ -275,9 +368,9 @@ class TestRunAutonomousSession:
             _ocr_state(saldo=105.85, posta=0.10, spin_button_coords=(540, 1200)),  # dopo step3: vincita netta (saldo sale)
         ]
         mocks["engine"].ask_with_image.side_effect = [
-            Result.ok(_answers("tap", (540, 1200))),
-            Result.ok(_answers("tap", (540, 1200))),
-            Result.ok(_answers("tap", (540, 1200))),
+            Result.ok(_answers("tap", _target(region="center"))),
+            Result.ok(_answers("tap", _target(region="center"))),
+            Result.ok(_answers("tap", _target(region="center"))),
             Result.ok(_answers("stop")),
         ]
 
@@ -288,6 +381,27 @@ class TestRunAutonomousSession:
         assert "Totale giocato: 0.20 EUR" in out
         assert "Net profit/loss: +5.85 EUR" in out
 
+    def test_balance_drop_not_counted_when_screen_state_not_trusted(self, mocks, capsys):
+        """slot_anatomy.md sez. 7: i numeri sono attendibili solo in idle (o
+        modal). Se l'ultimo screen_state noto era 'spinning', un calo di saldo
+        NON deve essere sommato a total_played (potrebbe essere un valore a
+        meta' animazione)."""
+        mocks["ocr_reader"].read_slot_state.side_effect = [
+            _ocr_state(saldo=100.0, posta=0.10, spin_button_coords=(540, 1200)),  # initial
+            _ocr_state(saldo=90.0, posta=0.10, spin_button_coords=(540, 1200)),  # calo enorme, ma stato non fidato
+        ]
+        mocks["engine"].ask_with_image.side_effect = [
+            Result.ok(_answers("tap", _target(region="center"), screen_state="spinning")),
+            Result.ok(_answers("stop")),
+        ]
+
+        ok = run_autonomous_session("dev", target_amount=30.0, max_steps=10)
+
+        assert ok is True
+        out = capsys.readouterr().out
+        assert "Totale giocato: 0.00 EUR" in out
+        assert "non conteggiato per prudenza" in out
+
     def test_setup_phase_taps_do_not_count_toward_total_played(self, mocks, capsys):
         """Con la posta sopra il minimo (fase 'setup'), un tap serve ad
         aggiustare il menu posta, non a giocare: non deve incrementare
@@ -296,7 +410,7 @@ class TestRunAutonomousSession:
             saldo=100.0, posta=10.0, spin_button_coords=(540, 1200),
         )
         mocks["engine"].ask_with_image.side_effect = [
-            Result.ok(_answers("tap", (300, 400))),  # tap sul menu posta, non sullo spin
+            Result.ok(_answers("tap", _target(region="top-left"))),  # tap sul menu posta, non sullo spin
             Result.ok(_answers("stop")),
         ]
 
@@ -307,19 +421,18 @@ class TestRunAutonomousSession:
         assert "Totale giocato: 0.00 EUR" in out
 
     def test_learns_spin_coords_from_observed_spin_and_blocks_next_attempt(self, mocks):
-        """Bug reale: quando l'OCR non etichetta mai il tasto SPIN (nessun
-        testo 'SPIN'/'XITER'/'GIRA' riconosciuto), il primo tap che causa uno
-        spin non e' bloccabile in anticipo (non sappiamo ancora dove sia lo
-        SPIN) - ma una volta osservato il calo di saldo, il sistema impara
-        quelle coordinate e blocca i tentativi successivi durante il setup,
-        invece di limitarsi a rilevarli 'Spin rilevato!' dopo il fatto."""
+        """Bug reale: quando l'OCR non etichetta mai il tasto SPIN, il primo
+        tap che causa uno spin non e' bloccabile in anticipo (non sappiamo
+        ancora dove sia lo SPIN) - ma una volta osservato il calo di saldo, il
+        sistema impara quelle coordinate e blocca i tentativi successivi
+        durante il setup, invece di limitarsi a rilevarli dopo il fatto."""
         mocks["ocr_reader"].read_slot_state.side_effect = [
             _ocr_state(saldo=5000.0, posta=10.0, spin_button_coords=None),  # OCR non trova mai lo SPIN
             _ocr_state(saldo=4990.0, posta=10.0, spin_button_coords=None),  # dopo il 1o tap: spin avvenuto
         ]
         mocks["engine"].ask_with_image.side_effect = [
-            Result.ok(_answers("tap", (540, 2100))),  # 1o tentativo: non bloccabile, spin ancora sconosciuto
-            Result.ok(_answers("tap", (540, 2100))),  # 2o tentativo identico: ORA deve essere bloccato
+            Result.ok(_answers("tap", _target(region="center"))),  # 1o tentativo: non bloccabile, spin ancora sconosciuto
+            Result.ok(_answers("tap", _target(region="center"))),  # 2o tentativo identico: ORA deve essere bloccato
             Result.ok(_answers("stop")),
         ]
 
@@ -331,14 +444,14 @@ class TestRunAutonomousSession:
         assert "BLOCKED: You tried to tap the SPIN button" in third_call_state_text
 
     def test_spin_tap_blocked_during_setup_phase(self, mocks):
-        """Bug reale: GPT tappa SPIN (540,1200) mentre la posta e' ancora a
-        10 EUR (fase setup). Il tap NON deve essere eseguito, e la chiamata
+        """Bug reale: GPT tappa lo SPIN mentre la posta e' ancora a 10 EUR
+        (fase setup). Il tap NON deve essere eseguito, e la chiamata
         successiva a ask_with_image deve ricevere una nota correttiva."""
         mocks["ocr_reader"].read_slot_state.return_value = _ocr_state(
             saldo=100.0, posta=10.0, spin_button_coords=(540, 1200),
         )
         mocks["engine"].ask_with_image.side_effect = [
-            Result.ok(_answers("tap", (540, 1200))),  # tenta di spinnare con posta alta -> bloccato
+            Result.ok(_answers("tap", _target(region="center"))),  # tenta di spinnare con posta alta -> bloccato
             Result.ok(_answers("stop")),
         ]
 
@@ -359,7 +472,7 @@ class TestRunAutonomousSession:
         mocks["ocr_reader"].read_slot_state.return_value = _ocr_state(
             saldo=100.0, posta=10.0, spin_button_coords=(540, 1200),
         )
-        mocks["engine"].ask_with_image.return_value = Result.ok(_answers("tap", (10, 10)))
+        mocks["engine"].ask_with_image.return_value = Result.ok(_answers("tap", _target(region="top-left")))
 
         with patch(
             "orchestrator.tests.validation.test_slot_autonomous.ask_human_help", return_value=("stop",),
@@ -376,9 +489,9 @@ class TestRunAutonomousSession:
         mocks["ocr_reader"].read_slot_state.return_value = _ocr_state(
             saldo=100.0, posta=10.0, spin_button_coords=(540, 1200),
         )
-        mocks["engine"].ask_with_image.side_effect = [Result.ok(_answers("tap", (10, 10)))] * 5 + [
-            Result.ok(_answers("stop"))
-        ]
+        mocks["engine"].ask_with_image.side_effect = [
+            Result.ok(_answers("tap", _target(region="top-left")))
+        ] * 5 + [Result.ok(_answers("stop"))]
 
         with patch(
             "orchestrator.tests.validation.test_slot_autonomous.ask_human_help", return_value=("skip",),
@@ -389,14 +502,17 @@ class TestRunAutonomousSession:
         assert mock_ask_human.call_count == 1
         assert mocks["engine"].ask_with_image.call_count == 6
 
-    def test_hitl_text_hint_passed_to_next_gpt_call(self, mocks):
-        """Se l'operatore descrive a parole cosa tappare, il suggerimento va
-        passato a GPT-4o come nota correttiva al turno successivo."""
+    def test_hitl_text_hint_accumulates_and_persists_across_turns(self, mocks):
+        """Il suggerimento testuale dell'operatore deve restare visibile a GPT
+        per piu' turni consecutivi, non sparire dopo il primo (Causa C)."""
         mocks["ocr_reader"].read_slot_state.return_value = _ocr_state(
             saldo=100.0, posta=10.0, spin_button_coords=(540, 1200),
         )
-        mocks["engine"].ask_with_image.side_effect = [Result.ok(_answers("tap", (10, 10)))] * 5 + [
-            Result.ok(_answers("stop"))
+        mocks["engine"].ask_with_image.side_effect = [
+            Result.ok(_answers("tap", _target(region="top-left")))
+        ] * 5 + [
+            Result.ok(_answers("tap", _target(region="top-right"))),
+            Result.ok(_answers("stop")),
         ]
 
         with patch(
@@ -406,8 +522,10 @@ class TestRunAutonomousSession:
             ok = run_autonomous_session("dev", target_amount=30.0, max_steps=20)
 
         assert ok is True
-        sixth_call_state_text = mocks["engine"].ask_with_image.call_args_list[5].args[1]
-        assert "The human operator suggests: tap the coins icon top left" in sixth_call_state_text
+        sixth_call = mocks["engine"].ask_with_image.call_args_list[5].args[1]
+        seventh_call = mocks["engine"].ask_with_image.call_args_list[6].args[1]
+        assert "The human operator suggests: tap the coins icon top left" in sixth_call
+        assert "The human operator suggests: tap the coins icon top left" in seventh_call
 
     def test_hitl_coords_resolve_session_when_bet_actually_lowers(self, mocks, capsys):
         """Se l'operatore da' coordinate e quel tap abbassa davvero la posta
@@ -426,9 +544,9 @@ class TestRunAutonomousSession:
 
         mocks["touch_injector"].tap_coordinates.side_effect = tap_side_effect
 
-        mocks["engine"].ask_with_image.side_effect = [Result.ok(_answers("tap", (10, 10)))] * 5 + [
-            Result.ok(_answers("stop"))
-        ]
+        mocks["engine"].ask_with_image.side_effect = [
+            Result.ok(_answers("tap", _target(region="top-left")))
+        ] * 5 + [Result.ok(_answers("stop"))]
 
         with patch(
             "orchestrator.tests.validation.test_slot_autonomous.ask_human_help", return_value=("coords", 700, 600),
@@ -440,46 +558,47 @@ class TestRunAutonomousSession:
         out = capsys.readouterr().out
         assert "Posta abbassata con successo" in out
 
-    def test_menu_open_detected_and_reflected_in_state_text(self, mocks):
-        """Quando appaiono nuovi testi OCR dopo un tap (es. le opzioni di un
-        menu posta), il sistema deve rilevare 'menu aperto' e cambiare le
-        istruzioni per GPT (selezionare il minimo e chiudere), senza bisogno
-        di alcuna logica specifica per slot."""
-        mocks["ocr_reader"].read_slot_state.side_effect = [
-            _ocr_state(
-                saldo=100.0, posta=10.0, spin_button_coords=(540, 1200),
-                raw_texts=[_text("PUNTATA €10.00", 100, 2000)],
-            ),
-            _ocr_state(
-                saldo=100.0, posta=10.0, spin_button_coords=(540, 1200),
-                raw_texts=[_text("PUNTATA €10.00", 100, 2000), _text("€0.10", 200, 1800), _text("CLOSE", 900, 1800)],
-            ),
-        ]
+    def test_screen_state_modal_gives_menu_patience_even_with_noisy_static_ocr(self, mocks):
+        """Bug reale: in produzione l'OCR legge testi leggermente diversi ad
+        ogni lettura anche a schermo fermo, quindi il vecchio confronto testi
+        non rilevava mai il menu aperto e un tap ripetuto a vuoto non veniva
+        mai bloccato per pazientare (l'anti-loop restava sempre alla soglia
+        'fuori menu'). Ora screen_state='modal' (dichiarato da GPT) basta da
+        solo, anche se i testi OCR letti sono SEMPRE identici (0 new/disappeared)."""
+        same_raw_texts = [_text("PUNTATA €10.00", 100, 2000)]  # mai cambia: simula la staticita'/rumore OCR
+        mocks["ocr_reader"].read_slot_state.return_value = _ocr_state(
+            saldo=100.0, posta=10.0, spin_button_coords=None, raw_texts=same_raw_texts,
+        )
         mocks["engine"].ask_with_image.side_effect = [
-            Result.ok(_answers("tap", (100, 2000))),  # apre il menu posta
+            Result.ok(_answers("tap", _target(region="bottom-left"), screen_state="idle")),  # apre il menu
+            Result.ok(_answers("tap", _target(region="top-left"), screen_state="modal")),  # tentativo 1 nel menu
+            Result.ok(_answers("tap", _target(region="top-left"), screen_state="modal")),  # tentativo 2
+            Result.ok(_answers("tap", _target(region="top-left"), screen_state="modal")),  # tentativo 3
+            Result.ok(_answers("tap", _target(region="top-left"), screen_state="modal")),  # tentativo 4 (soglia menu)
             Result.ok(_answers("stop")),
         ]
 
-        ok = run_autonomous_session("dev", target_amount=30.0, max_steps=10)
+        ok = run_autonomous_session("dev", target_amount=30.0, max_steps=20)
 
         assert ok is True
-        second_call_state_text = mocks["engine"].ask_with_image.call_args_list[1].args[1]
-        assert "NEW elements appeared" in second_call_state_text
-        assert "menu or popup may have opened" in second_call_state_text
-        assert "CLOSE/CONFIRM/OK" in second_call_state_text
+        # Se menu_open fosse rimasto False (vecchia logica basata sul diff OCR,
+        # che qui non cambia mai), la soglia sarebbe stata 2 e i tentativi 3-4
+        # sarebbero stati bloccati: qui invece vengono tutti eseguiti.
+        assert mocks["touch_injector"].tap_coordinates.call_count == 1 + MAX_REPEAT_ATTEMPTS_INSIDE_MENU
 
     def test_repeat_tap_without_effect_is_blocked_with_untried_suggestions(self, mocks):
         """Se GPT tappa lo stesso punto morto due volte senza alcun effetto
-        (ne' sul saldo ne' sui testi OCR), il terzo tentativo identico deve
-        essere bloccato e a GPT vanno suggeriti elementi mai provati."""
+        (ne' sul saldo ne' sui testi OCR, e screen_state resta 'idle'), il
+        terzo tentativo identico deve essere bloccato e a GPT vanno suggeriti
+        elementi mai provati."""
         raw_texts = [_text("SPIN", 540, 1200), _text("PUNTATA €0.10", 100, 2000)]
         mocks["ocr_reader"].read_slot_state.return_value = _ocr_state(
             saldo=100.0, posta=10.0, spin_button_coords=(540, 1200), raw_texts=raw_texts,
         )
         mocks["engine"].ask_with_image.side_effect = [
-            Result.ok(_answers("tap", (300, 300))),  # punto morto, primo tentativo
-            Result.ok(_answers("tap", (300, 300))),  # stesso punto, ancora nulla
-            Result.ok(_answers("tap", (300, 300))),  # terzo tentativo identico -> bloccato
+            Result.ok(_answers("tap", _target(region="top-left"))),  # punto morto, primo tentativo
+            Result.ok(_answers("tap", _target(region="top-left"))),  # stesso punto, ancora nulla
+            Result.ok(_answers("tap", _target(region="top-left"))),  # terzo tentativo identico -> bloccato
             Result.ok(_answers("stop")),
         ]
 
@@ -492,46 +611,42 @@ class TestRunAutonomousSession:
         assert "coins icon, settings gear, +/- buttons" in fourth_call_state_text
 
     def test_repeat_tap_inside_menu_gets_more_patience_and_nearby_suggestions(self, mocks):
-        """Bug reale (Causa B): dentro un menu, selezionare una cella diversa
-        non produce alcun segnale OCR distinguibile finche' il menu non si
-        chiude. 2 tentativi identici NON devono bastare per bloccare (soglia
-        piu' alta dentro un menu), e quando scatta il blocco il messaggio deve
-        suggerire coordinate VICINE da affinare, non di abbandonare l'area."""
-        menu_texts = [_text("PUNTATA €10.00", 100, 2000), _text("€0.20", 300, 600), _text("CLOSE", 900, 1800)]
-        mocks["ocr_reader"].read_slot_state.side_effect = [
-            _ocr_state(saldo=100.0, posta=10.0, spin_button_coords=(540, 1200), raw_texts=[]),  # initial: menu chiuso
-        ] + [
-            _ocr_state(saldo=100.0, posta=10.0, spin_button_coords=(540, 1200), raw_texts=menu_texts),  # menu aperto
-        ] * 5
+        """Dentro un menu (screen_state='modal'), 2 tentativi identici NON
+        devono bastare per bloccare (soglia piu' alta), e quando scatta il
+        blocco il messaggio deve suggerire coordinate VICINE da affinare, non
+        di abbandonare l'area."""
+        mocks["ocr_reader"].read_slot_state.return_value = _ocr_state(
+            saldo=100.0, posta=10.0, spin_button_coords=(540, 1200), raw_texts=[],
+        )
         mocks["engine"].ask_with_image.side_effect = [
-            Result.ok(_answers("tap", (100, 2000))),  # apre il menu
-            Result.ok(_answers("tap", (300, 600))),  # tentativo 1 nella cella (stima leggermente imprecisa)
-            Result.ok(_answers("tap", (300, 600))),  # tentativo 2 -> NON bloccato (fuori menu lo sarebbe)
-            Result.ok(_answers("tap", (300, 600))),  # tentativo 3 -> ancora non bloccato
-            Result.ok(_answers("tap", (300, 600))),  # tentativo 4 -> ancora non bloccato (soglia menu = 4)
-            Result.ok(_answers("tap", (300, 600))),  # tentativo 5 -> ORA bloccato
+            Result.ok(_answers("tap", _target(region="bottom-left"), screen_state="idle")),  # apre il menu
+            Result.ok(_answers("tap", _target(region="top-left"), screen_state="modal")),  # tentativo 1
+            Result.ok(_answers("tap", _target(region="top-left"), screen_state="modal")),  # tentativo 2 -> NON bloccato
+            Result.ok(_answers("tap", _target(region="top-left"), screen_state="modal")),  # tentativo 3
+            Result.ok(_answers("tap", _target(region="top-left"), screen_state="modal")),  # tentativo 4 (soglia menu)
+            Result.ok(_answers("tap", _target(region="top-left"), screen_state="modal")),  # tentativo 5 -> ORA bloccato
             Result.ok(_answers("stop")),
         ]
 
         ok = run_autonomous_session("dev", target_amount=30.0, max_steps=20)
 
         assert ok is True
-        # apertura menu + MAX_REPEAT_ATTEMPTS_INSIDE_MENU tentativi eseguiti, il successivo bloccato
         assert mocks["touch_injector"].tap_coordinates.call_count == 1 + MAX_REPEAT_ATTEMPTS_INSIDE_MENU
         last_call_state_text = mocks["engine"].ask_with_image.call_args_list[-1].args[1]
         assert "Try one of these nearby coordinates instead" in last_call_state_text
         assert "COMPLETELY DIFFERENT" not in last_call_state_text
 
     def test_repeat_tap_outside_menu_still_blocks_after_two_like_before(self, mocks):
-        """Fuori da un menu il comportamento precedente (soglia 2) non deve
-        regredire: e' li' un segnale affidabile di errore vero."""
+        """Fuori da un menu (screen_state='idle') il comportamento precedente
+        (soglia 2) non deve regredire: e' li' un segnale affidabile di errore
+        vero."""
         mocks["ocr_reader"].read_slot_state.return_value = _ocr_state(
             saldo=100.0, posta=10.0, spin_button_coords=(540, 1200), raw_texts=[],
         )
         mocks["engine"].ask_with_image.side_effect = [
-            Result.ok(_answers("tap", (300, 300))),
-            Result.ok(_answers("tap", (300, 300))),
-            Result.ok(_answers("tap", (300, 300))),  # 3° tentativo -> bloccato, come prima del fix
+            Result.ok(_answers("tap", _target(region="top-left"))),
+            Result.ok(_answers("tap", _target(region="top-left"))),
+            Result.ok(_answers("tap", _target(region="top-left"))),  # 3° tentativo -> bloccato, come prima del fix
             Result.ok(_answers("stop")),
         ]
 
@@ -540,45 +655,19 @@ class TestRunAutonomousSession:
         assert ok is True
         assert mocks["touch_injector"].tap_coordinates.call_count == MAX_REPEAT_ATTEMPTS_OUTSIDE_MENU
 
-    def test_sticky_hint_persists_across_multiple_turns(self, mocks):
-        """Il suggerimento testuale dell'operatore deve restare visibile a
-        GPT per piu' turni consecutivi, non sparire dopo il primo (Causa C)."""
-        mocks["ocr_reader"].read_slot_state.return_value = _ocr_state(
-            saldo=100.0, posta=10.0, spin_button_coords=(540, 1200),
-        )
-        mocks["engine"].ask_with_image.side_effect = [Result.ok(_answers("tap", (10, 10)))] * 5 + [
-            Result.ok(_answers("tap", (10, 10))),
-            Result.ok(_answers("stop")),
-        ]
-
-        with patch(
-            "orchestrator.tests.validation.test_slot_autonomous.ask_human_help",
-            return_value=("text", "tap the coins icon top left"),
-        ):
-            ok = run_autonomous_session("dev", target_amount=30.0, max_steps=20)
-
-        assert ok is True
-        sixth_call = mocks["engine"].ask_with_image.call_args_list[5].args[1]
-        seventh_call = mocks["engine"].ask_with_image.call_args_list[6].args[1]
-        assert "The human operator suggests: tap the coins icon top left" in sixth_call
-        assert "The human operator suggests: tap the coins icon top left" in seventh_call
-
     def test_menu_closed_transition_is_logged(self, mocks, capsys):
-        """Quando il menu passa da aperto a chiuso, il sistema deve segnalarlo
-        esplicitamente: e' l'unico momento in cui la posta reale diventa
-        visibile via OCR per un menu di questo tipo (Causa B/D)."""
+        """Quando lo stato passa da 'modal' a un altro stato, il sistema deve
+        segnalarlo esplicitamente: e' l'unico momento in cui la posta reale
+        diventa visibile via OCR per un menu di questo tipo."""
         mocks["ocr_reader"].read_slot_state.side_effect = [
             _ocr_state(saldo=100.0, posta=10.0, spin_button_coords=(540, 1200), raw_texts=[]),
-            _ocr_state(
-                saldo=100.0, posta=10.0, spin_button_coords=(540, 1200),
-                raw_texts=[_text("€0.20", 300, 600)],
-            ),
+            _ocr_state(saldo=100.0, posta=10.0, spin_button_coords=(540, 1200), raw_texts=[]),
             _ocr_state(saldo=100.0, posta=0.20, spin_button_coords=(540, 1200), raw_texts=[]),
         ]
         mocks["engine"].ask_with_image.side_effect = [
-            Result.ok(_answers("tap", (100, 2000))),  # apre il menu
-            Result.ok(_answers("tap", (300, 600))),  # seleziona 0.20
-            Result.ok(_answers("stop")),
+            Result.ok(_answers("tap", _target(region="bottom-left"), screen_state="idle")),  # apre il menu
+            Result.ok(_answers("tap", _target(region="top-left"), screen_state="modal")),  # seleziona 0.20
+            Result.ok(_answers("stop", screen_state="idle")),
         ]
 
         ok = run_autonomous_session("dev", target_amount=30.0, max_steps=10)
@@ -596,9 +685,9 @@ class TestRunAutonomousSession:
             saldo=100.0, posta=10.0, spin_button_coords=(540, 1200), raw_texts=raw_texts,
         )
         mocks["engine"].ask_with_image.side_effect = [
-            Result.ok(_answers("tap", (100, 100))),
-            Result.ok(_answers("tap", (200, 200))),
-            Result.ok(_answers("tap", (300, 300))),
+            Result.ok(_answers("tap", _target(region="top-left"))),
+            Result.ok(_answers("tap", _target(region="top-right"))),
+            Result.ok(_answers("tap", _target(region="bottom-left"))),
             Result.ok(_answers("stop")),
         ]
 
@@ -618,8 +707,8 @@ class TestRunAutonomousSession:
             _ocr_state(saldo=99.80, posta=0.10, spin_button_coords=(540, 1200)),  # dopo step2 tap -> total_played 0.20 == target
         ]
         mocks["engine"].ask_with_image.side_effect = [
-            Result.ok(_answers("tap", (540, 1200))),
-            Result.ok(_answers("tap", (540, 1200))),
+            Result.ok(_answers("tap", _target(region="center"))),
+            Result.ok(_answers("tap", _target(region="center"))),
         ]
 
         ok = run_autonomous_session("dev", target_amount=0.20, max_steps=10)
@@ -652,7 +741,7 @@ class TestRunAutonomousSession:
             _ocr_state(saldo=100.0, spin_button_coords=(540, 1200)),  # forced refresh (menu posta lontano dallo spin)
         ]
         mocks["engine"].ask_with_image.side_effect = [
-            Result.ok(_answers("tap", (10, 10))),  # lontano dallo spin (540,1200)
+            Result.ok(_answers("tap", _target(region="top-left"))),  # lontano dallo spin (540,1200)
             Result.ok(_answers("stop")),
         ]
 
@@ -696,3 +785,92 @@ class TestRunAutonomousSession:
         run_autonomous_session("dev", target_amount=30.0, max_steps=10)
 
         assert not (tmp_path / "screenshots").exists()
+
+    def test_slot_name_seeds_known_spin_coords_and_hints_from_memory(self, mocks, tmp_path, monkeypatch):
+        """La memoria di una slot gia' giocata in precedenza da' subito al
+        sistema un vantaggio: le coordinate spin imparate bloccano un tentativo
+        di spin prematuro fin dal primo step di questa nuova sessione, e i
+        suggerimenti confermati utili sono gia' attivi."""
+        monkeypatch.chdir(tmp_path)
+        save_slot_memory("Pirots 5", {"known_spin_coords": (540, 1200), "learned_hints": ["tap the bet display"]})
+
+        mocks["ocr_reader"].read_slot_state.return_value = _ocr_state(saldo=100.0, posta=10.0, spin_button_coords=None)
+        mocks["engine"].ask_with_image.side_effect = [
+            Result.ok(_answers("tap", _target(region="center"))),  # (540,1200) = spin noto dalla memoria
+            Result.ok(_answers("stop")),
+        ]
+
+        ok = run_autonomous_session("dev", target_amount=30.0, max_steps=10, slot_name="Pirots 5")
+
+        assert ok is True
+        mocks["touch_injector"].tap_coordinates.assert_not_called()  # bloccato subito, senza doverlo "riosservare"
+        second_call_state_text = mocks["engine"].ask_with_image.call_args_list[1].args[1]
+        assert "The human operator suggests: tap the bet display" in second_call_state_text
+
+    def test_learned_spin_coords_persisted_to_slot_memory(self, mocks, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        mocks["ocr_reader"].read_slot_state.side_effect = [
+            _ocr_state(saldo=100.0, posta=10.0, spin_button_coords=None),
+            _ocr_state(saldo=90.0, posta=10.0, spin_button_coords=None),
+        ]
+        mocks["engine"].ask_with_image.side_effect = [
+            Result.ok(_answers("tap", _target(region="center"))),
+            Result.ok(_answers("stop")),
+        ]
+
+        ok = run_autonomous_session("dev", target_amount=30.0, max_steps=10, slot_name="Big Bass")
+
+        assert ok is True
+        assert load_slot_memory("Big Bass")["known_spin_coords"] == (540, 1200)
+
+    def test_no_memory_used_or_written_without_slot_name(self, mocks, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        mocks["ocr_reader"].read_slot_state.side_effect = [
+            _ocr_state(saldo=100.0, posta=10.0, spin_button_coords=None),
+            _ocr_state(saldo=90.0, posta=10.0, spin_button_coords=None),
+        ]
+        mocks["engine"].ask_with_image.side_effect = [
+            Result.ok(_answers("tap", _target(region="center"))),
+            Result.ok(_answers("stop")),
+        ]
+
+        ok = run_autonomous_session("dev", target_amount=30.0, max_steps=10)
+
+        assert ok is True
+        assert not os.path.exists(SLOT_MEMORY_DIR)
+
+    def test_hints_persisted_when_bet_successfully_lowered(self, mocks, tmp_path, monkeypatch):
+        """Un suggerimento attivo nel momento in cui la posta scende al minimo
+        viene considerato confermato utile e salvato per la prossima volta che
+        si gioca questa slot — questo e' il modo in cui il sistema 'si allena'."""
+        monkeypatch.chdir(tmp_path)
+        state = {"posta": 10.0}
+
+        def ocr_side_effect(*_a, **_k):
+            return _ocr_state(saldo=100.0, posta=state["posta"], spin_button_coords=(540, 1200))
+
+        mocks["ocr_reader"].read_slot_state.side_effect = ocr_side_effect
+
+        def ask_human_help_side_effect(*_a, **_k):
+            state["posta"] = 0.10  # il suggerimento, una volta seguito da GPT, abbassa la posta
+            return ("text", "tap coins icon")
+
+        regions = ["top-left", "top-right", "bottom-left", "bottom-right", "middle-left", "top-center"]
+        call_count = {"n": 0}
+
+        def ask_side_effect(*_a, **_k):
+            call_count["n"] += 1
+            if call_count["n"] <= len(regions):
+                return Result.ok(_answers("tap", _target(region=regions[call_count["n"] - 1])))
+            return Result.ok(_answers("stop"))
+
+        mocks["engine"].ask_with_image.side_effect = ask_side_effect
+
+        with patch(
+            "orchestrator.tests.validation.test_slot_autonomous.ask_human_help",
+            side_effect=ask_human_help_side_effect,
+        ):
+            ok = run_autonomous_session("dev", target_amount=30.0, max_steps=20, slot_name="Big Bass 2")
+
+        assert ok is True
+        assert "tap coins icon" in load_slot_memory("Big Bass 2")["learned_hints"]

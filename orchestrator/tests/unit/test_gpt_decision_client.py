@@ -13,6 +13,11 @@ VISION_QUESTIONS = {
         "instructions": "...",
         "criteria": {"tap": "Touch a point on the screen", "stop": "Stop playing"},
     },
+    "target": {
+        "type": "choice",
+        "instructions": "...",
+        "criteria": {"PUNTATA €10.00": "...", "SPIN": "..."},
+    },
 }
 
 
@@ -207,29 +212,65 @@ class TestAsk:
 
 class TestAskWithImage:
 
-    def test_success(self, client: GPTDecisionClient, screenshot_path: str):
-        payload = {"action": "tap", "x": 270, "y": 600, "confidence": 0.8, "reasoning": "Tap the spin button."}
+    def test_success_with_target_text(self, client: GPTDecisionClient, screenshot_path: str):
+        payload = {
+            "action": "tap", "screen_state": "idle", "target_text": "PUNTATA €10.00",
+            "target_region": None, "confidence": 0.8, "reasoning": "Tap the bet display.",
+        }
         with patch.object(client.client.chat.completions, "create", return_value=_mock_completion(json.dumps(payload))) as mock_create:
             result = client.ask_with_image(screenshot_path, "state text", VISION_QUESTIONS, 540, 1200)
 
         assert result.success
         assert result.data["answers"]["action"] == {"choice": "tap", "confidence": 0.8}
-        assert result.data["answers"]["target"] == {"choice": (270, 600), "confidence": 0.8}
+        assert result.data["answers"]["target"] == {"choice": {"text": "PUNTATA €10.00", "region": None}, "confidence": 0.8}
+        assert result.data["answers"]["screen_state"] == {"choice": "idle", "confidence": 0.8}
 
         mock_create.assert_called_once()
         messages = mock_create.call_args.kwargs["messages"]
         assert mock_create.call_args.kwargs["max_tokens"] == 300
         user_content = messages[1]["content"]
-        assert user_content[0] == {"type": "text", "text": "state text"}
+        assert user_content[0]["type"] == "text"
+        assert "state text" in user_content[0]["text"]
+        assert "PUNTATA €10.00" in user_content[0]["text"]  # candidato elencato per il target
         assert user_content[1]["type"] == "image_url"
         assert user_content[1]["image_url"]["url"].startswith("data:image/png;base64,")
         assert "540x1200" in messages[0]["content"]
+
+    def test_success_with_target_region_when_no_label(self, client: GPTDecisionClient, screenshot_path: str):
+        """Nessuna etichetta testuale disponibile per l'icona: GPT usa una
+        regione grossolana invece di inventare coordinate precise."""
+        payload = {
+            "action": "tap", "screen_state": "idle", "target_text": None,
+            "target_region": "bottom-right", "confidence": 0.7,
+        }
+        with patch.object(client.client.chat.completions, "create", return_value=_mock_completion(json.dumps(payload))):
+            result = client.ask_with_image(screenshot_path, "state text", VISION_QUESTIONS, 540, 1200)
+
+        assert result.success
+        assert result.data["answers"]["target"] == {"choice": {"text": None, "region": "bottom-right"}, "confidence": 0.7}
+
+    def test_invalid_target_region_is_ignored(self, client: GPTDecisionClient, screenshot_path: str):
+        """Una regione fuori dal vocabolario noto non deve mai propagarsi."""
+        payload = {"action": "tap", "target_text": None, "target_region": "somewhere weird", "confidence": 0.5}
+        with patch.object(client.client.chat.completions, "create", return_value=_mock_completion(json.dumps(payload))):
+            result = client.ask_with_image(screenshot_path, "state", VISION_QUESTIONS, 540, 1200)
+
+        assert result.success
+        assert result.data["answers"]["target"]["choice"] is None
+
+    def test_unknown_screen_state_falls_back_to_other(self, client: GPTDecisionClient, screenshot_path: str):
+        payload = {"action": "stop", "screen_state": "something_unexpected", "confidence": 0.5}
+        with patch.object(client.client.chat.completions, "create", return_value=_mock_completion(json.dumps(payload))):
+            result = client.ask_with_image(screenshot_path, "state", VISION_QUESTIONS, 540, 1200)
+
+        assert result.success
+        assert result.data["answers"]["screen_state"]["choice"] == "other"
 
     def test_system_prompt_insists_on_lowering_bet_before_spinning(self, client: GPTDecisionClient, screenshot_path: str):
         """Regressione per il bug 'GPT non abbassa la puntata al minimo':
         il system prompt deve dire esplicitamente di impostare la posta al
         minimo PRIMA di cercare il tasto spin."""
-        payload = {"action": "tap", "x": 270, "y": 600, "confidence": 0.8}
+        payload = {"action": "tap", "target_text": "PUNTATA €10.00", "confidence": 0.8}
         with patch.object(client.client.chat.completions, "create", return_value=_mock_completion(json.dumps(payload))) as mock_create:
             client.ask_with_image(screenshot_path, "state text", VISION_QUESTIONS, 540, 1200)
 
@@ -238,10 +279,35 @@ class TestAskWithImage:
         assert "minimum" in system_message.lower()
         assert "before" in system_message.lower()
         assert "must not spin" in system_message.lower()
-        assert "do not tap it" in system_message.lower()
-        assert "open the bet menu" in system_message.lower()
-        assert "close the bet menu" in system_message.lower()
-        assert "do not just repeat the exact same tap" in system_message.lower()
+        assert "close a bet menu" in system_message.lower()
+        assert "do not just repeat the exact same" in system_message.lower()
+
+    def test_system_prompt_warns_about_coin_icon_ambiguity(self, client: GPTDecisionClient, screenshot_path: str):
+        """Regressione per il bug reale: un'icona a gettoni con '+' puo' essere
+        'aggiungi crediti demo' invece del selettore posta su alcune slot."""
+        payload = {"action": "stop", "confidence": 0.5}
+        with patch.object(client.client.chat.completions, "create", return_value=_mock_completion(json.dumps(payload))) as mock_create:
+            client.ask_with_image(screenshot_path, "state text", VISION_QUESTIONS, 540, 1200)
+
+        system_message = mock_create.call_args.kwargs["messages"][0]["content"].lower()
+        assert "add demo credits" in system_message
+        assert "bet amount text" in system_message
+
+    def test_system_prompt_forbids_pixel_coordinates_and_lists_regions(self, client: GPTDecisionClient, screenshot_path: str):
+        """gpt-4o-mini non e' affidabile nel grounding spaziale (slot_anatomy.md):
+        il prompt non deve chiedere coordinate x/y dirette, solo target_text o
+        una regione grossolana su griglia 3x3."""
+        payload = {"action": "stop", "confidence": 0.5}
+        with patch.object(client.client.chat.completions, "create", return_value=_mock_completion(json.dumps(payload))) as mock_create:
+            client.ask_with_image(screenshot_path, "state text", VISION_QUESTIONS, 540, 1200)
+
+        system_message = mock_create.call_args.kwargs["messages"][0]["content"]
+        assert '"x"' not in system_message
+        assert '"y"' not in system_message
+        assert "not reliable at that" in system_message.lower()
+        assert "target_region" in system_message
+        assert "bottom-right" in system_message
+        assert "screen_state" in system_message
 
     def test_stop_has_no_coordinates(self, client: GPTDecisionClient, screenshot_path: str):
         payload = {"action": "stop", "confidence": 0.9}
@@ -253,7 +319,7 @@ class TestAskWithImage:
         assert result.data["answers"]["target"]["choice"] is None
 
     def test_invalid_action_falls_back_to_stop(self, client: GPTDecisionClient, screenshot_path: str):
-        payload = {"action": "input_text", "x": 1, "y": 1, "confidence": 0.5}
+        payload = {"action": "input_text", "target_text": "PUNTATA €10.00", "confidence": 0.5}
         with patch.object(client.client.chat.completions, "create", return_value=_mock_completion(json.dumps(payload))):
             result = client.ask_with_image(screenshot_path, "state", VISION_QUESTIONS, 540, 1200)
 

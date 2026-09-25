@@ -19,6 +19,21 @@ _SLOT_SPIN_ACTIONS = {"spin", "stop"}
 _NAVIGATION_SIGNAL_ACTIONS = {"scroll", "done", "input_text", "wait"}
 _SLOT_TAP_ACTIONS = {"tap", "stop"}
 
+# Stati schermo di una slot online (da slot_anatomy.md, sez. 7): classificarli
+# permette di sapere se i numeri letti (saldo/posta) sono attendibili, ed e' un
+# segnale diretto e affidabile di "modale aperto" — molto piu' robusto di un
+# confronto tra testi OCR letti in momenti diversi, che nella pratica sono
+# leggermente diversi ad ogni lettura anche a schermo fermo (rumore OCR).
+_SCREEN_STATES = (
+    "loading", "intro", "idle", "spinning", "win_presentation",
+    "feature", "gamble", "modal", "error", "other",
+)
+_TARGET_REGIONS = (
+    "top-left", "top-center", "top-right",
+    "middle-left", "center", "middle-right",
+    "bottom-left", "bottom-center", "bottom-right",
+)
+
 
 class GPTDecisionClient(DecisionEngineClientInterface):
     """Client per il Decision Engine basato su GPT-4o-mini (OpenAI Chat Completions)."""
@@ -68,10 +83,15 @@ class GPTDecisionClient(DecisionEngineClientInterface):
         self, screenshot_path: str, state: str, questions: dict, image_width: int, image_height: int,
     ) -> Result[dict]:
         """Come ask(), ma invia anche lo screenshot (Vision API): GPT vede il layout
-        reale invece di un dump di testi OCR, e sceglie dove tappare restituendo
-        coordinate [x,y] nello spazio dell'immagine inviata (image_width x image_height)."""
+        reale invece di un dump di testi OCR. NON restituisce coordinate [x,y]
+        dirette (gpt-4o-mini e' inaffidabile nel grounding spaziale, vedi
+        slot_anatomy.md): sceglie invece un elemento tra i candidati OCR
+        (target_text, risolto con precisione dal chiamante) o, in mancanza di
+        un'etichetta, una regione grossolana su griglia 3x3 (target_region),
+        oltre a classificare lo stato dello schermo (screen_state)."""
         valid_actions = set(questions.get("action", {}).get("criteria") or {}) or _SLOT_TAP_ACTIONS
         system_prompt = self._build_vision_system_prompt(valid_actions, image_width, image_height)
+        user_text = self._build_user_prompt(state, questions)
 
         try:
             with open(screenshot_path, "rb") as img_file:
@@ -84,7 +104,7 @@ class GPTDecisionClient(DecisionEngineClientInterface):
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": [
-                {"type": "text", "text": state},
+                {"type": "text", "text": user_text},
                 {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}},
             ]},
         ]
@@ -96,12 +116,16 @@ class GPTDecisionClient(DecisionEngineClientInterface):
 
         action = self._resolve_action(data.get("action"), valid_actions)
         confidence = data.get("confidence", 0.0)
-        x, y = data.get("x"), data.get("y")
-        target = (x, y) if isinstance(x, (int, float)) and isinstance(y, (int, float)) else None
+        screen_state = self._resolve_screen_state(data.get("screen_state"))
+
+        target_text = data.get("target_text") or None
+        target_region = data.get("target_region") if data.get("target_region") in _TARGET_REGIONS else None
+        target = {"text": target_text, "region": target_region} if (target_text or target_region) else None
 
         answers = {
             "action": {"choice": action, "confidence": confidence},
             "target": {"choice": target, "confidence": confidence},
+            "screen_state": {"choice": screen_state, "confidence": confidence},
         }
         return Result.ok({"answers": answers})
 
@@ -176,6 +200,8 @@ class GPTDecisionClient(DecisionEngineClientInterface):
 
     def _build_vision_system_prompt(self, valid_actions: set, image_width: int, image_height: int) -> str:
         actions_list = "|".join(sorted(valid_actions))
+        states_list = "|".join(_SCREEN_STATES)
+        regions_list = "|".join(_TARGET_REGIONS)
         return "\n\n".join([
             "You are an AI agent controlling a slot machine on an Android phone via ADB. "
             "You can SEE the screen through the attached screenshot image.",
@@ -183,42 +209,63 @@ class GPTDecisionClient(DecisionEngineClientInterface):
             "Your goal is to: 1) set the bet to the minimum amount possible, 2) play spins until "
             "the total played reaches the target, 3) stop when done.",
 
-            "CRITICAL: Before spinning, you MUST set the bet to the minimum amount. Look for a bet "
-            "selector, menu, +/- buttons, or a bet amount display. Tap on it to open the bet "
-            "selection. Then tap the lowest amount available (e.g., €0.10 or €0.20). Only "
-            "after the bet is at minimum, find and tap the SPIN button. You MUST NOT spin until "
-            "the bet is at minimum. If you see a SPIN button but the bet is above minimum, DO NOT "
-            "tap it. Look for a bet menu, settings, or +/- buttons FIRST.",
+            "FIRST, classify the screen state (see 'screen_state' in the schema below): "
+            "loading (splash/progress bar), intro (welcome/'PLAY' screen), idle (reels stopped, "
+            "nothing overlaying, safe to act), spinning (reels blurred/moving, spin button turned "
+            "into stop), win_presentation (highlighted lines, a counter going up), feature (free "
+            "spins / bonus game running), gamble (a red/black double-or-nothing card screen — "
+            "avoid it), modal (a popup/menu covering part of the game), error (connection lost, "
+            "insufficient funds), other (anything else). Numbers you read (balance, bet) are only "
+            "reliable when screen_state is 'idle' or 'modal' (the modal's own text is fine to read) "
+            "— during loading/spinning/win_presentation they may be mid-transition.",
 
-            "TO OPEN THE BET MENU: tap on the bet amount display itself (e.g. '€10.00' or "
-            "'PUNTATA €10.00') — that display is usually the button that opens bet selection. "
-            "TO CLOSE THE BET MENU once you've selected the lowest amount: look for a "
-            "CLOSE/CONFIRM/OK button, or tap outside the menu area. A menu covering the screen "
-            "will hide the SPIN button, so you must close it before you can spin.",
+            "CRITICAL: Before spinning, you MUST set the bet to the minimum amount. Common places to "
+            "look for the bet selector (slot machines vary, but these patterns are widespread): a "
+            "+/- pair next to the bet amount, a coin/token icon, or a small settings panel — tapping "
+            "the bet AMOUNT TEXT ITSELF (e.g. 'PUNTATA €10.00', 'BET', 'STAKE') is usually the most "
+            "reliable way to open bet selection. A coin icon with a '+' can ALSO mean 'add demo "
+            "credits' on some slots (unrelated to the bet) — if tapping it does not lead to "
+            "screen_state 'modal' and does not lower the bet, it was probably the wrong icon: try "
+            "the bet amount text instead. Only after the bet is at minimum, find and tap the SPIN "
+            "button (usually a large circular icon, often at the bottom of the screen — it may turn "
+            "into a STOP icon while spinning). You MUST NOT spin until the bet is at minimum.",
 
-            "If you tap something and the screen does not change at all, do not just repeat the "
-            "exact same tap forever. The state message below will tell you specifically whether to "
-            "try a coordinate NEAR your last attempt (your estimate may be close but not exact — "
-            "common inside a menu, where the text on screen does not always change when you pick a "
-            "different option) or a COMPLETELY DIFFERENT element (when that area seems unrelated to "
-            "your goal). Follow that specific guidance rather than a fixed rule.",
+            "TO CLOSE A BET MENU once you've selected the lowest amount: look for a CLOSE/CONFIRM/OK "
+            "control, or tap outside the menu area. A menu covering the screen will hide the SPIN "
+            "button, so you must close it before you can spin.",
 
-            f"You can tap ANY pixel on the screen by returning coordinates. The image is "
-            f"{image_width}x{image_height} pixels; x must be in [0,{image_width}], y in [0,{image_height}]. "
-            "Buttons are usually colored rectangles; the SPIN button is usually large, at the "
-            "bottom of the screen.",
+            "If you tap something and the screen state does not change at all across turns, do not "
+            "just repeat the exact same choice forever. The state message below will tell you "
+            "specifically whether to try something near your last attempt (your estimate may be "
+            "close but not exact) or a COMPLETELY DIFFERENT element (when that area seems unrelated "
+            "to your goal). Follow that specific guidance rather than a fixed rule.",
+
+            "You do NOT provide pixel coordinates — you are not reliable at that. Instead, choose "
+            "'target_text': the EXACT text of one of the candidate elements listed in the message "
+            "below (preferred whenever the element you want has a visible label). If the element you "
+            "want has no text (a plain icon/button), choose 'target_region' instead: a rough location "
+            f"on a 3x3 grid ({regions_list}). Set the other target field to null. The image is "
+            f"{image_width}x{image_height} pixels, only for your own spatial reasoning about regions.",
 
             "Respond ONLY with a JSON object matching this exact schema, with no extra text:\n"
             "{\n"
             f'  "action": "{actions_list}",\n'
-            '  "x": integer,\n'
-            '  "y": integer,\n'
+            f'  "screen_state": "{states_list}",\n'
+            '  "target_text": "exact_text_of_a_candidate_element_or_null",\n'
+            f'  "target_region": "{regions_list}_or_null",\n'
             '  "confidence": 0.0-1.0,\n'
             '  "reasoning": "brief_explanation"\n'
             "}\n\n"
-            f'"action" must be one of: {", ".join(sorted(valid_actions))}. "x" and "y" are required '
-            'when action is "tap" and must point at the element you want to touch.',
+            f'"action" must be one of: {", ".join(sorted(valid_actions))}. Exactly one of "target_text"/'
+            '"target_region" should be non-null when action is "tap" (never both, never neither).',
         ])
+
+    def _resolve_screen_state(self, raw_state) -> str:
+        """'other' se GPT restituisce uno stato fuori dal vocabolario noto
+        (mai propagare un valore arbitrario al chiamante)."""
+        if raw_state in _SCREEN_STATES:
+            return raw_state
+        return "other"
 
     def _resolve_action(self, raw_action, valid_actions: set) -> str:
         """Se l'azione di GPT non e' tra quelle valide, prova un fuzzy match e poi
