@@ -196,13 +196,12 @@ class GPTDecisionClient(DecisionEngineClientInterface):
             "CLOSE/CONFIRM/OK button, or tap outside the menu area. A menu covering the screen "
             "will hide the SPIN button, so you must close it before you can spin.",
 
-            "If you tap something and the screen does not change at all, DO NOT repeat the exact "
-            "same tap. Try a completely different element instead — the state below will tell you "
-            "which elements you have already tried without success.",
-
-            "Look at the screenshot and decide: if a bet settings menu or modal is open, navigate "
-            "it to set the minimum bet and close it; if the bet is already at minimum, find the "
-            "SPIN button and tap it; if the total played has reached the target, choose stop.",
+            "If you tap something and the screen does not change at all, do not just repeat the "
+            "exact same tap forever. The state message below will tell you specifically whether to "
+            "try a coordinate NEAR your last attempt (your estimate may be close but not exact — "
+            "common inside a menu, where the text on screen does not always change when you pick a "
+            "different option) or a COMPLETELY DIFFERENT element (when that area seems unrelated to "
+            "your goal). Follow that specific guidance rather than a fixed rule.",
 
             f"You can tap ANY pixel on the screen by returning coordinates. The image is "
             f"{image_width}x{image_height} pixels; x must be in [0,{image_width}], y in [0,{image_height}]. "

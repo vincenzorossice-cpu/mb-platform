@@ -49,7 +49,9 @@ class SlotOCRReader:
     _SALDO_LABELS = ("SALDO", "DEMO", "MODALIT", "BALANCE")
     _POSTA_LABELS = ("POSTA", "PUNTATA", "BET", "STAKE")
     _VINCITA_LABELS = ("VINCITA", "WIN")
-    _SPIN_LABELS = ("SPIN", "XITER", "GIRA")
+    # "XITER" rimosso: e' il nome del bottone feature/bonus-buy di Wazdan
+    # ("X-iter"), un elemento distinto dal tasto spin, non un suo sinonimo.
+    _SPIN_LABELS = ("SPIN", "GIRA")
     _ALL_AMOUNT_LABELS = _SALDO_LABELS + _POSTA_LABELS + _VINCITA_LABELS
     _LABEL_Y_TOLERANCE = 50
 

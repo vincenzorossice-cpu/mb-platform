@@ -7,8 +7,15 @@ Engine VEDE lo screenshot del telefono (Vision API di GPT-4o-mini) invece di
 un dump di testi con coordinate: capisce il layout come un umano (bottoni,
 menu modali aperti, dove si trova il tasto SPIN) e sceglie autonomamente dove
 tappare restituendo coordinate [x,y]. L'OCR (EasyOCR, via SlotOCRReader) resta
-in uso solo per leggere saldo/posta (valori numerici: l'OCR e' piu' preciso e
-molto piu' economico della vision per questo).
+in uso per leggere saldo/posta (valori numerici: l'OCR e' piu' preciso e molto
+piu' economico della vision per questo) e per rilevare se un menu si e'
+aperto/chiuso confrontando i testi letti prima/dopo un tap.
+
+Include un safety-net anti-spin-prematuro (blocca i tentativi di spin mentre
+la posta non e' al minimo), un anti-loop consapevole se si e' dentro un menu
+o no, e un'escalation HITL da terminale se il sistema non riesce ad abbassare
+la posta da solo dopo troppi tentativi (l'operatore non vede mai lo
+screenshot: quello lo vede solo GPT via Vision API).
 
 Questo script richiede GPT-4o-mini (Vision e' una capacita' specifica di
 GPTDecisionClient, non fa parte del contratto generico DecisionEngineClientInterface
@@ -32,7 +39,6 @@ import argparse
 import logging
 import os
 import shutil
-import subprocess
 import sys
 import time
 from typing import Optional
@@ -56,6 +62,22 @@ MAX_CONSECUTIVE_SETUP_STEPS = 5  # oltre questa soglia in fase "setup" senza pro
 REPEAT_TAP_TOLERANCE_PX = 50  # tap entro questa distanza sono considerati "lo stesso punto"
 STUCK_SCREEN_THRESHOLD = 3  # step consecutivi senza cambiamenti a schermo -> nudge esplorativo
 MAX_TAPPED_TARGETS = 10  # quanti tap recenti tenere in memoria per anti-loop/elementi non provati
+MAX_REPEAT_ATTEMPTS_OUTSIDE_MENU = 2  # fuori da un menu, un tap fermo e' un segnale affidabile di errore
+MAX_REPEAT_ATTEMPTS_INSIDE_MENU = 4  # dentro un menu, selezionare una cella diversa non cambia l'OCR:
+# serve piu' pazienza prima di considerare un tap davvero "senza effetto" (vedi Causa B nel piano)
+NEARBY_OFFSETS_PX = (40, 80)  # offset (px) usati per suggerire coordinate vicine a un tap bloccato
+HINT_TTL_STEPS = 5  # per quanti step un suggerimento testuale dell'operatore resta attivo
+
+
+def nearby_offsets(x: int, y: int, offsets: tuple = NEARBY_OFFSETS_PX) -> list:
+    """Genera coordinate vicine a (x,y) nelle 4 direzioni cardinali, per
+    suggerire a GPT di affinare la stima invece di abbandonare l'area: utile
+    quando un tap e' "fermo" solo perche' e' dentro un menu che non produce
+    segnali OCR distinguibili (vedi Causa B), non perche' l'area sia sbagliata."""
+    candidates = []
+    for d in offsets:
+        candidates.extend([(x - d, y), (x + d, y), (x, y - d), (x, y + d)])
+    return candidates
 
 
 def normalize_texts(raw_texts: list) -> set:
@@ -70,6 +92,21 @@ def find_untried_elements(raw_texts: list, tapped_targets: list, tolerance: floa
         return any(abs(x - t["x"]) <= tolerance and abs(y - t["y"]) <= tolerance for t in tapped_targets)
 
     return [text for text, (x, y), _conf in raw_texts if text.strip() and not already_tried(x, y)]
+
+
+def count_consecutive_same_spot_failures(
+    tapped_targets: list, x: int, y: int, tolerance: float = REPEAT_TAP_TOLERANCE_PX,
+) -> int:
+    """Quanti tap PIU' RECENTI consecutivi sono caduti vicino a (x,y) senza mai
+    cambiare lo schermo (si ferma al primo tap diverso o riuscito, guardando
+    la cronologia a ritroso)."""
+    count = 0
+    for t in reversed(tapped_targets):
+        if abs(t["x"] - x) <= tolerance and abs(t["y"] - y) <= tolerance and not t["screen_changed"]:
+            count += 1
+        else:
+            break
+    return count
 
 
 def resize_screenshot_for_vision(screenshot_path: str, scale: float = VISION_RESIZE_SCALE) -> tuple:
@@ -216,23 +253,11 @@ def read_ocr_state(screen_reader: ScreenReader, ocr_reader: SlotOCRReader, devic
     return ocr_reader.read_slot_state(ss.data)
 
 
-def _open_screenshot(screenshot_path: str) -> None:
-    """Prova ad aprire lo screenshot col visualizzatore di default del SO,
-    cosi' l'operatore puo' guardarlo senza cercare il file a mano."""
-    try:
-        if sys.platform == "win32":
-            subprocess.Popen(["explorer", screenshot_path])
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", screenshot_path])
-        else:
-            subprocess.Popen(["xdg-open", screenshot_path])
-    except OSError:
-        pass  # nessun visualizzatore disponibile: l'operatore apre il file manualmente
-
-
-def ask_human_help(screenshot_path: Optional[str], current_bet: Optional[float], min_bet: float) -> tuple:
+def ask_human_help(current_bet: Optional[float], min_bet: float) -> tuple:
     """Chiede aiuto all'operatore via terminale quando il sistema non riesce
-    ad abbassare la posta da solo dopo troppi tentativi. Ritorna una tupla:
+    ad abbassare la posta da solo dopo troppi tentativi. Non mostra lo
+    screenshot: quello lo vede solo GPT-4o-mini via Vision API, non serve
+    aprirlo anche sul terminale/desktop dell'operatore. Ritorna una tupla:
     - ("stop",): l'operatore vuole fermare tutto
     - ("skip",): l'operatore vuole lasciar riprovare GPT-4o senza aiuto
     - ("coords", x, y): l'operatore ha dato coordinate da tappare
@@ -242,11 +267,7 @@ def ask_human_help(screenshot_path: Optional[str], current_bet: Optional[float],
     print(f"\n{'='*60}")
     print("HITL: Non riesco ad abbassare la puntata.")
     print(f"Puntata attuale: {bet_str} EUR | Minimo: {min_bet:.2f} EUR")
-    print(f"Screenshot: {screenshot_path or 'non disponibile'}")
     print(f"{'='*60}")
-
-    if screenshot_path:
-        _open_screenshot(screenshot_path)
 
     print("\nCosa devo tappare per abbassare la puntata?")
     print("Opzioni:")
@@ -291,10 +312,7 @@ def handle_hitl_escalation(
     - ("hint", descrizione) — suggerimento testuale da passare a GPT-4o
     """
     while True:
-        ss = screen_reader._screenshot(device_id)
-        screenshot_path = ss.data if ss.success else None
-
-        outcome = ask_human_help(screenshot_path, current_bet, min_bet)
+        outcome = ask_human_help(current_bet, min_bet)
 
         if outcome[0] == "stop":
             return ("stop", None)
@@ -327,18 +345,34 @@ def run_autonomous_session(
 ) -> bool:
     """Gioca la slot gia' aperta sul device lasciando che GPT-4o-mini Vision
     scelga autonomamente dove tappare guardando lo screenshot ad ogni passo.
-    L'OCR resta in uso solo per saldo/posta, riletto dopo ogni tap reale (per
-    rilevare in modo affidabile se il saldo e' sceso, cioe' se uno spin e'
-    avvenuto) e comunque almeno ogni OCR_REFRESH_INTERVAL step.
+    L'OCR resta in uso solo per saldo/posta/testi grezzi, riletto dopo ogni tap
+    reale (per rilevare in modo affidabile se il saldo e' sceso o se sono
+    apparsi/spariti testi, es. un menu) e comunque almeno ogni
+    OCR_REFRESH_INTERVAL step.
 
-    Se la posta e' sopra il minimo (fase "setup"), un tap su/vicino al tasto
-    spin noto viene BLOCCATO (mai eseguito) invece di essere inoltrato al
-    dispositivo: GPT riceve una nota correttiva al turno successivo. Questo
-    funziona su qualunque slot perche' si basa solo su known_spin_coords
-    (rilevato via OCR per quella specifica slot) e sulla posta letta via OCR,
-    non su coordinate hardcoded. Se dopo MAX_CONSECUTIVE_SETUP_STEPS step
-    consecutivi la fase resta "setup", la sessione si ferma e richiede
-    intervento umano (HITL).
+    Safety-net anti-spin-prematuro: se la posta e' sopra il minimo (fase
+    "setup"), un tap su/vicino al tasto spin noto viene BLOCCATO (mai
+    eseguito). known_spin_coords viene sia letto dall'OCR (label "SPIN"/"GIRA")
+    sia IMPARATO a runtime osservando un calo di saldo dopo un tap, cosi' il
+    primo spin "accidentale" (inevitabile: non possiamo bloccare coordinate
+    mai osservate prima) non si ripete piu' nella stessa sessione. Nessuna
+    coordinata o label e' hardcoded per una slot specifica.
+
+    Anti-loop consapevole del contesto: un tap ripetuto sullo stesso punto
+    senza alcun cambiamento a schermo viene bloccato dopo
+    MAX_REPEAT_ATTEMPTS_OUTSIDE_MENU tentativi fuori da un menu (segnale
+    affidabile di errore), ma solo dopo MAX_REPEAT_ATTEMPTS_INSIDE_MENU dentro
+    un menu (dove selezionare un'opzione diversa spesso non produce alcun
+    segnale OCR finche' il menu non si chiude): li' si suggeriscono coordinate
+    VICINE (nearby_offsets) per affinare la stima invece di abbandonare
+    l'area.
+
+    HITL: se dopo MAX_CONSECUTIVE_SETUP_STEPS step consecutivi la fase resta
+    "setup", il sistema chiede aiuto all'operatore da terminale
+    (handle_hitl_escalation/ask_human_help — mai uno screenshot aperto: lo
+    vede solo GPT via Vision API). Un suggerimento testuale dell'operatore
+    resta attivo (sticky_hint) per HINT_TTL_STEPS turni invece di sparire dopo
+    uno solo, finche' la fase non torna "playing".
 
     total_played e' la SOMMA delle poste piazzate, dedotta osservando il
     saldo: ogni volta che una lettura OCR fresca mostra un saldo piu' basso di
@@ -349,7 +383,7 @@ def run_autonomous_session(
 
     Ritorna True se la sessione si e' conclusa in modo pulito (stop deciso dal
     Decision Engine, target raggiunto o saldo insufficiente), False in caso di
-    errore o escalation HITL."""
+    errore o escalation HITL con stop dall'operatore."""
     screen_reader = ScreenReader()
     touch_injector = TouchInjector(screen_reader=screen_reader)
     ocr_reader = SlotOCRReader()
@@ -377,6 +411,8 @@ def run_autonomous_session(
     steps_since_ocr = 0
     force_ocr_refresh = False
     corrective_note: Optional[str] = None
+    sticky_hint: Optional[str] = None
+    hint_ttl = 0
     consecutive_setup_steps = 0
     tapped_targets: list[dict] = []
     last_tap_coords: Optional[tuple] = None
@@ -434,10 +470,17 @@ def run_autonomous_session(
                 previous_balance is not None and current_balance is not None and current_balance != previous_balance
             )
             screen_changed = bool(new_texts or disappeared_texts) or balance_changed
+            was_menu_open = menu_open
             if new_texts:
                 menu_open = True
             elif disappeared_texts:
                 menu_open = False
+            if was_menu_open and not menu_open:
+                # Il momento della verita' per un menu selezione-posta: la HUD
+                # sottostante (es. "PUNTATA €X") resta congelata finche' il
+                # menu e' aperto e si aggiorna solo qui, alla sua chiusura.
+                bet_str = f"{current_bet:.2f} EUR" if current_bet is not None else "sconosciuta"
+                print(f"Menu chiuso: posta ora {bet_str}.")
             steps_without_screen_change = 0 if screen_changed else steps_without_screen_change + 1
             previous_raw_texts = current_raw_texts
 
@@ -451,6 +494,12 @@ def run_autonomous_session(
         phase = determine_phase(current_bet)
         print(f"\n=== Step {step}/{max_steps} (fase: {phase}) ===")
         print(f"Saldo: {current_balance} | Posta: {current_bet} | Giocato finora: {total_played:.2f} EUR")
+
+        if sticky_hint:
+            hint_ttl -= 1
+            if phase == "playing" or hint_ttl <= 0:
+                sticky_hint = None
+                hint_ttl = 0
 
         if phase == "setup":
             consecutive_setup_steps += 1
@@ -479,7 +528,11 @@ def run_autonomous_session(
                     steps_since_ocr = 0
                     force_ocr_refresh = False
                 elif hitl_action == "hint":
-                    corrective_note = f"The human operator suggests: {hitl_data}"
+                    # Sticky, non usa-e-getta: l'operatore ha gia' dovuto
+                    # ripetersi troppe volte nei log reali perche' il
+                    # suggerimento spariva dopo un solo turno (Causa C).
+                    sticky_hint = f"The human operator suggests: {hitl_data}"
+                    hint_ttl = HINT_TTL_STEPS
                 # hitl_action == "skip": nessun'altra azione, si riprova con GPT
                 phase = determine_phase(current_bet)
         else:
@@ -504,9 +557,10 @@ def run_autonomous_session(
             if save_screenshots:
                 shutil.copy(resized_path, os.path.join(SCREENSHOTS_DIR, f"step_{step:04d}.png"))
 
+            combined_note = " ".join(note for note in (corrective_note, sticky_hint) if note) or None
             state_text = build_vision_state_text(
                 initial_balance, current_balance, current_bet, total_played, target_amount, step, action_history,
-                corrective_note=corrective_note, menu_open=menu_open, new_texts=new_texts,
+                corrective_note=combined_note, menu_open=menu_open, new_texts=new_texts,
                 disappeared_texts=disappeared_texts, steps_without_screen_change=steps_without_screen_change,
             )
             corrective_note = None
@@ -564,23 +618,39 @@ def run_autonomous_session(
             time.sleep(1.0)
             continue
 
-        recent_same_spot = [
-            t for t in tapped_targets[-2:]
-            if abs(t["x"] - real_x) <= REPEAT_TAP_TOLERANCE_PX
-            and abs(t["y"] - real_y) <= REPEAT_TAP_TOLERANCE_PX
-            and not t["screen_changed"]
-        ]
-        if len(recent_same_spot) >= 2:
-            print(f"BLOCCATO: tap ripetuto su ({real_x},{real_y}) senza effetto. Suggerisco elementi non provati.")
-            untried = find_untried_elements(ocr_state.get("raw_texts", []), tapped_targets)
-            bet_str = f"{current_bet:.2f}€" if current_bet is not None else "unknown"
-            corrective_note = (
-                "You tapped this area twice with no effect. "
-                f"The bet is still {bet_str}. Look at the screenshot AGAIN. Find a DIFFERENT element to "
-                "tap. Try: coins icon, settings gear, +/- buttons, or the bet amount text itself."
+        # Dentro un menu, selezionare una cella diversa spesso non cambia
+        # nessun testo OCR ne' il saldo/posta sottostanti (che si aggiornano
+        # solo alla chiusura del menu): un tap "fermo" li' non e' un segnale
+        # affidabile di errore quanto lo e' fuori da un menu, quindi serve
+        # piu' pazienza prima di considerarlo un vero loop.
+        repeat_threshold = MAX_REPEAT_ATTEMPTS_INSIDE_MENU if menu_open else MAX_REPEAT_ATTEMPTS_OUTSIDE_MENU
+        same_spot_failures = count_consecutive_same_spot_failures(tapped_targets, real_x, real_y)
+        if same_spot_failures >= repeat_threshold:
+            print(
+                f"BLOCCATO: tap ripetuto su ({real_x},{real_y}) senza effetto "
+                f"({same_spot_failures} volte, dentro un menu={menu_open})."
             )
-            if untried:
-                corrective_note += f" Elements you have NOT tried yet: {untried}."
+            if menu_open:
+                # Non spingere GPT ad abbandonare l'area: qui la mancanza di
+                # segnale OCR e' attesa anche per un tap corretto, quindi
+                # suggeriamo di affinare la stima invece di cambiare zona.
+                offsets = nearby_offsets(real_x, real_y)
+                corrective_note = (
+                    f"You tapped this area {same_spot_failures} times with no visible change in the "
+                    "text on screen — but inside a menu, selecting a different option often does not "
+                    "show up that way until the menu is closed. Your estimate might just be a bit off. "
+                    f"Try one of these nearby coordinates instead: {offsets}."
+                )
+            else:
+                untried = find_untried_elements(ocr_state.get("raw_texts", []), tapped_targets)
+                bet_str = f"{current_bet:.2f}€" if current_bet is not None else "unknown"
+                corrective_note = (
+                    "You tapped this area twice with no effect. "
+                    f"The bet is still {bet_str}. Look at the screenshot AGAIN. Find a DIFFERENT element to "
+                    "tap. Try: coins icon, settings gear, +/- buttons, or the bet amount text itself."
+                )
+                if untried:
+                    corrective_note += f" Elements you have NOT tried yet: {untried}."
             action_history.append({"step": step, "action": "blocked_repeat_tap", "target": (real_x, real_y), "phase": phase})
             action_history = action_history[-5:]
             time.sleep(1.0)

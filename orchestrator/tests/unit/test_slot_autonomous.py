@@ -5,11 +5,15 @@ import pytest
 
 from orchestrator.core.result import Result
 from orchestrator.tests.validation.test_slot_autonomous import (
+    MAX_REPEAT_ATTEMPTS_INSIDE_MENU,
+    MAX_REPEAT_ATTEMPTS_OUTSIDE_MENU,
     VISION_RESIZE_SCALE,
     ask_human_help,
+    count_consecutive_same_spot_failures,
     descale_coords,
     determine_phase,
     find_untried_elements,
+    nearby_offsets,
     normalize_texts,
     resize_screenshot_for_vision,
     run_autonomous_session,
@@ -106,36 +110,69 @@ class TestFindUntriedElements:
         assert find_untried_elements(raw_texts, tapped) == []
 
 
+class TestNearbyOffsets:
+
+    def test_generates_four_cardinal_points_per_distance(self):
+        offsets = nearby_offsets(500, 500, offsets=(40,))
+        assert set(offsets) == {(460, 500), (540, 500), (500, 460), (500, 540)}
+
+    def test_multiple_distances_are_all_included(self):
+        offsets = nearby_offsets(500, 500, offsets=(40, 80))
+        assert len(offsets) == 8
+        assert (420, 500) in offsets
+        assert (500, 580) in offsets
+
+
+class TestCountConsecutiveSameSpotFailures:
+
+    def test_counts_matching_recent_failures(self):
+        tapped = [
+            {"x": 100, "y": 100, "screen_changed": True},
+            {"x": 500, "y": 500, "screen_changed": False},
+            {"x": 500, "y": 500, "screen_changed": False},
+        ]
+        assert count_consecutive_same_spot_failures(tapped, 500, 500) == 2
+
+    def test_stops_at_first_non_matching_entry_going_backwards(self):
+        tapped = [
+            {"x": 500, "y": 500, "screen_changed": False},
+            {"x": 500, "y": 500, "screen_changed": True},  # questo tap e' riuscito: interrompe la serie
+            {"x": 500, "y": 500, "screen_changed": False},
+        ]
+        assert count_consecutive_same_spot_failures(tapped, 500, 500) == 1
+
+    def test_no_matches_returns_zero(self):
+        tapped = [{"x": 100, "y": 100, "screen_changed": False}]
+        assert count_consecutive_same_spot_failures(tapped, 500, 500) == 0
+
+
 class TestAskHumanHelp:
+    """Non deve mai aprire uno screenshot: solo GPT-4o-mini lo vede (via Vision
+    API), l'operatore interagisce esclusivamente da terminale."""
 
     def test_stop_returns_stop_tuple(self):
-        with patch("builtins.input", return_value="stop"), \
-             patch("orchestrator.tests.validation.test_slot_autonomous._open_screenshot"):
-            assert ask_human_help("/tmp/shot.png", 10.0, 0.10) == ("stop",)
+        with patch("builtins.input", return_value="stop"):
+            assert ask_human_help(10.0, 0.10) == ("stop",)
 
     def test_skip_returns_skip_tuple(self):
-        with patch("builtins.input", return_value="skip"), \
-             patch("orchestrator.tests.validation.test_slot_autonomous._open_screenshot"):
-            assert ask_human_help("/tmp/shot.png", 10.0, 0.10) == ("skip",)
+        with patch("builtins.input", return_value="skip"):
+            assert ask_human_help(10.0, 0.10) == ("skip",)
 
     def test_coordinates_are_parsed(self):
-        with patch("builtins.input", return_value="540, 600"), \
-             patch("orchestrator.tests.validation.test_slot_autonomous._open_screenshot"):
-            assert ask_human_help("/tmp/shot.png", 10.0, 0.10) == ("coords", 540, 600)
+        with patch("builtins.input", return_value="540, 600"):
+            assert ask_human_help(10.0, 0.10) == ("coords", 540, 600)
 
     def test_free_text_is_returned_as_hint(self):
-        with patch("builtins.input", return_value="tap the coins icon"), \
-             patch("orchestrator.tests.validation.test_slot_autonomous._open_screenshot"):
-            assert ask_human_help("/tmp/shot.png", 10.0, 0.10) == ("text", "tap the coins icon")
+        with patch("builtins.input", return_value="tap the coins icon"):
+            assert ask_human_help(10.0, 0.10) == ("text", "tap the coins icon")
 
     def test_malformed_coordinates_fall_back_to_text(self):
-        with patch("builtins.input", return_value="540, abc"), \
-             patch("orchestrator.tests.validation.test_slot_autonomous._open_screenshot"):
-            assert ask_human_help("/tmp/shot.png", 10.0, 0.10) == ("text", "540, abc")
+        with patch("builtins.input", return_value="540, abc"):
+            assert ask_human_help(10.0, 0.10) == ("text", "540, abc")
 
-    def test_missing_screenshot_does_not_crash(self):
+    def test_unknown_bet_does_not_crash(self):
         with patch("builtins.input", return_value="skip") as mock_input:
-            assert ask_human_help(None, 10.0, 0.10) == ("skip",)
+            assert ask_human_help(None, 0.10) == ("skip",)
         mock_input.assert_called_once()
 
 
@@ -453,8 +490,102 @@ class TestRunAutonomousSession:
         fourth_call_state_text = mocks["engine"].ask_with_image.call_args_list[3].args[1]
         assert "You tapped this area twice with no effect" in fourth_call_state_text
         assert "coins icon, settings gear, +/- buttons" in fourth_call_state_text
-        assert "SPIN" in fourth_call_state_text
-        assert "PUNTATA €0.10" in fourth_call_state_text
+
+    def test_repeat_tap_inside_menu_gets_more_patience_and_nearby_suggestions(self, mocks):
+        """Bug reale (Causa B): dentro un menu, selezionare una cella diversa
+        non produce alcun segnale OCR distinguibile finche' il menu non si
+        chiude. 2 tentativi identici NON devono bastare per bloccare (soglia
+        piu' alta dentro un menu), e quando scatta il blocco il messaggio deve
+        suggerire coordinate VICINE da affinare, non di abbandonare l'area."""
+        menu_texts = [_text("PUNTATA €10.00", 100, 2000), _text("€0.20", 300, 600), _text("CLOSE", 900, 1800)]
+        mocks["ocr_reader"].read_slot_state.side_effect = [
+            _ocr_state(saldo=100.0, posta=10.0, spin_button_coords=(540, 1200), raw_texts=[]),  # initial: menu chiuso
+        ] + [
+            _ocr_state(saldo=100.0, posta=10.0, spin_button_coords=(540, 1200), raw_texts=menu_texts),  # menu aperto
+        ] * 5
+        mocks["engine"].ask_with_image.side_effect = [
+            Result.ok(_answers("tap", (100, 2000))),  # apre il menu
+            Result.ok(_answers("tap", (300, 600))),  # tentativo 1 nella cella (stima leggermente imprecisa)
+            Result.ok(_answers("tap", (300, 600))),  # tentativo 2 -> NON bloccato (fuori menu lo sarebbe)
+            Result.ok(_answers("tap", (300, 600))),  # tentativo 3 -> ancora non bloccato
+            Result.ok(_answers("tap", (300, 600))),  # tentativo 4 -> ancora non bloccato (soglia menu = 4)
+            Result.ok(_answers("tap", (300, 600))),  # tentativo 5 -> ORA bloccato
+            Result.ok(_answers("stop")),
+        ]
+
+        ok = run_autonomous_session("dev", target_amount=30.0, max_steps=20)
+
+        assert ok is True
+        # apertura menu + MAX_REPEAT_ATTEMPTS_INSIDE_MENU tentativi eseguiti, il successivo bloccato
+        assert mocks["touch_injector"].tap_coordinates.call_count == 1 + MAX_REPEAT_ATTEMPTS_INSIDE_MENU
+        last_call_state_text = mocks["engine"].ask_with_image.call_args_list[-1].args[1]
+        assert "Try one of these nearby coordinates instead" in last_call_state_text
+        assert "COMPLETELY DIFFERENT" not in last_call_state_text
+
+    def test_repeat_tap_outside_menu_still_blocks_after_two_like_before(self, mocks):
+        """Fuori da un menu il comportamento precedente (soglia 2) non deve
+        regredire: e' li' un segnale affidabile di errore vero."""
+        mocks["ocr_reader"].read_slot_state.return_value = _ocr_state(
+            saldo=100.0, posta=10.0, spin_button_coords=(540, 1200), raw_texts=[],
+        )
+        mocks["engine"].ask_with_image.side_effect = [
+            Result.ok(_answers("tap", (300, 300))),
+            Result.ok(_answers("tap", (300, 300))),
+            Result.ok(_answers("tap", (300, 300))),  # 3° tentativo -> bloccato, come prima del fix
+            Result.ok(_answers("stop")),
+        ]
+
+        ok = run_autonomous_session("dev", target_amount=30.0, max_steps=10)
+
+        assert ok is True
+        assert mocks["touch_injector"].tap_coordinates.call_count == MAX_REPEAT_ATTEMPTS_OUTSIDE_MENU
+
+    def test_sticky_hint_persists_across_multiple_turns(self, mocks):
+        """Il suggerimento testuale dell'operatore deve restare visibile a
+        GPT per piu' turni consecutivi, non sparire dopo il primo (Causa C)."""
+        mocks["ocr_reader"].read_slot_state.return_value = _ocr_state(
+            saldo=100.0, posta=10.0, spin_button_coords=(540, 1200),
+        )
+        mocks["engine"].ask_with_image.side_effect = [Result.ok(_answers("tap", (10, 10)))] * 5 + [
+            Result.ok(_answers("tap", (10, 10))),
+            Result.ok(_answers("stop")),
+        ]
+
+        with patch(
+            "orchestrator.tests.validation.test_slot_autonomous.ask_human_help",
+            return_value=("text", "tap the coins icon top left"),
+        ):
+            ok = run_autonomous_session("dev", target_amount=30.0, max_steps=20)
+
+        assert ok is True
+        sixth_call = mocks["engine"].ask_with_image.call_args_list[5].args[1]
+        seventh_call = mocks["engine"].ask_with_image.call_args_list[6].args[1]
+        assert "The human operator suggests: tap the coins icon top left" in sixth_call
+        assert "The human operator suggests: tap the coins icon top left" in seventh_call
+
+    def test_menu_closed_transition_is_logged(self, mocks, capsys):
+        """Quando il menu passa da aperto a chiuso, il sistema deve segnalarlo
+        esplicitamente: e' l'unico momento in cui la posta reale diventa
+        visibile via OCR per un menu di questo tipo (Causa B/D)."""
+        mocks["ocr_reader"].read_slot_state.side_effect = [
+            _ocr_state(saldo=100.0, posta=10.0, spin_button_coords=(540, 1200), raw_texts=[]),
+            _ocr_state(
+                saldo=100.0, posta=10.0, spin_button_coords=(540, 1200),
+                raw_texts=[_text("€0.20", 300, 600)],
+            ),
+            _ocr_state(saldo=100.0, posta=0.20, spin_button_coords=(540, 1200), raw_texts=[]),
+        ]
+        mocks["engine"].ask_with_image.side_effect = [
+            Result.ok(_answers("tap", (100, 2000))),  # apre il menu
+            Result.ok(_answers("tap", (300, 600))),  # seleziona 0.20
+            Result.ok(_answers("stop")),
+        ]
+
+        ok = run_autonomous_session("dev", target_amount=30.0, max_steps=10)
+
+        assert ok is True
+        out = capsys.readouterr().out
+        assert "Menu chiuso: posta ora 0.20 EUR" in out
 
     def test_stuck_nudge_after_threshold_steps_without_change(self, mocks):
         """Anche tappando punti DIVERSI ogni volta, se lo schermo non cambia

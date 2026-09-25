@@ -3,7 +3,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from orchestrator.core.result import Result
-from orchestrator.flows.casino_flow import CasinoFlow, CasinoPhaseResult, CasinoResult, SlotOCRReader
+from orchestrator.flows.casino_flow import CasinoFlow, SlotOCRReader
 from orchestrator.modules.screen_reader.interface import BalanceReading
 
 
@@ -115,14 +115,23 @@ class TestSlotOCRReader:
         assert state["saldo"] == 100.00
         assert state["posta"] == 0.10
 
-    def test_spin_button_recognizes_xiter_and_gira(self):
-        ocr_reader = _ocr_reader_with([_detection("XITER", x=500, y=1900, conf=0.9)])
-        state = ocr_reader.read_slot_state("fake.png")
-        assert state["spin_button_coords"] == (550, 1920)
-
+    def test_spin_button_recognizes_gira(self):
         ocr_reader = _ocr_reader_with([_detection("GIRA", x=500, y=1900, conf=0.9)])
         state = ocr_reader.read_slot_state("fake.png")
         assert state["spin_button_coords"] == (550, 1920)
+
+    def test_xiter_feature_button_not_mistaken_for_spin(self):
+        """'X-iter' e' il bottone feature/bonus-buy di Wazdan, un elemento
+        distinto dal tasto spin: non deve mai essere riconosciuto come tale
+        (bug reale: un falso positivo qui sovrascriveva le coordinate spin
+        imparate correttamente, bloccando poi tap legittimi in quella zona)."""
+        ocr_reader = _ocr_reader_with([_detection("X-iter", x=50, y=1800, conf=0.9)])
+        state = ocr_reader.read_slot_state("fake.png")
+        assert state["spin_button_coords"] is None
+
+        ocr_reader = _ocr_reader_with([_detection("Xiter", x=50, y=1800, conf=0.9)])
+        state = ocr_reader.read_slot_state("fake.png")
+        assert state["spin_button_coords"] is None
 
     def test_balance_label_recognizes_balance_keyword(self):
         ocr_reader = _ocr_reader_with([_detection("BALANCE € 25.50", x=10, y=100, conf=0.9)])
