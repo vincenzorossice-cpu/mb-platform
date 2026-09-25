@@ -815,7 +815,7 @@ def run_autonomous_session(
     if slot_name:
         print(f"Slot: {slot_name} (memoria: {len(slot_memory['learned_hints'])} hint, "
               f"spin noto: {slot_memory['known_spin_coords']}, "
-              f"puntata minima nota: {slot_memory['known_min_bet']}, "
+              f"puntata minima nota: {slot_memory['known_min_bet']} (da riverificare in questa sessione), "
               f"icona menu nota: {slot_memory['known_bet_menu_toggle']})")
     print("Assicurati che la slot sia aperta in modalita' DEMO sul telefono.")
     input("Premi INVIO per iniziare...")
@@ -828,11 +828,17 @@ def run_autonomous_session(
     current_balance = initial_balance
     current_bet = ocr_state.get("posta")
     known_spin_coords = ocr_state.get("spin_button_coords") or slot_memory.get("known_spin_coords")
-    # known_min_bet passato esplicitamente (es. --min-bet, o gia' noto da un
-    # test/chiamante) ha priorita' sulla memoria; se nessuno dei due lo da',
-    # verra' scoperto a runtime (vedi plateau piu' sotto) o confermato dall'operatore.
-    known_min_bet: Optional[float] = known_min_bet if known_min_bet is not None else slot_memory.get("known_min_bet")
-    lowest_bet_seen: Optional[float] = current_bet
+    # known_min_bet_from_param e' un'affermazione ESPLICITA e attuale
+    # dell'operatore per QUESTA invocazione (es. --min-bet): resta fidata
+    # subito. Un valore che arriva SOLO dalla memoria su file (scoperto in
+    # una sessione passata, potenzialmente sbagliato) NON e' verificato: deve
+    # essere ri-confermato dal vivo (plateau o conferma HITL) prima di poter
+    # guidare la fase "playing" — mai piu' uno spin sulla sola fiducia nella
+    # memoria (bug reale: known_min_bet=4.0 salvato per errore, usato subito).
+    known_min_bet_from_param = known_min_bet
+    known_min_bet: Optional[float] = known_min_bet_from_param if known_min_bet_from_param is not None else slot_memory.get("known_min_bet")
+    min_bet_verified = known_min_bet_from_param is not None
+    lowest_bet_seen: Optional[float] = known_min_bet if known_min_bet is not None else current_bet
     steps_without_new_min = 0
     known_bet_menu_toggle_coords: Optional[tuple] = slot_memory.get("known_bet_menu_toggle")
     menu_toggle_autotap_pending = True
@@ -856,7 +862,7 @@ def run_autonomous_session(
     previous_raw_texts: Optional[set] = normalize_texts(ocr_state.get("raw_texts", []))
     new_texts: set = set()
     disappeared_texts: set = set()
-    previous_phase = determine_phase(current_bet, known_min_bet)
+    previous_phase = determine_phase(current_bet, known_min_bet if min_bet_verified else None)
 
     print(f"Saldo iniziale: {initial_balance}")
 
@@ -910,10 +916,17 @@ def run_autonomous_session(
                     )
                 last_seen_bet_for_awareness = current_bet
 
-                if known_min_bet is None:
-                    # La puntata minima di questa slot non e' un numero
-                    # hardcoded: si scopre osservando quando smette di
-                    # scendere nonostante si continui a provare (plateau).
+                if not min_bet_verified:
+                    # La puntata minima di questa slot non e' mai una verita'
+                    # assoluta finche' non e' stata OSSERVATA in QUESTA
+                    # sessione: un valore che arriva dalla memoria (magari
+                    # sbagliato, come nel bug reale known_min_bet=4.0 invece
+                    # di 0.20) deve essere ri-confermato, non solo assunto.
+                    # Si scopre/conferma osservando quando smette di scendere
+                    # nonostante si continui a provare (plateau) — se la
+                    # memoria era gia' corretta, lowest_bet_seen parte da li'
+                    # e la conferma arriva prima; se era sbagliata, un valore
+                    # piu' basso osservato la corregge naturalmente.
                     if lowest_bet_seen is None or current_bet < lowest_bet_seen:
                         lowest_bet_seen = current_bet
                         steps_without_new_min = 0
@@ -924,7 +937,8 @@ def run_autonomous_session(
                         and steps_without_new_min >= MIN_BET_DISCOVERY_PATIENCE_STEPS
                     ):
                         known_min_bet = lowest_bet_seen
-                        print(f"Puntata minima individuata per questa slot: {known_min_bet:.2f} EUR (memorizzata).")
+                        min_bet_verified = True
+                        print(f"Puntata minima verificata per questa slot in questa sessione: {known_min_bet:.2f} EUR (memorizzata).")
                         _persist_slot_memory(slot_name, known_min_bet=known_min_bet)
             if ocr_state.get("spin_button_coords") is not None:
                 known_spin_coords = ocr_state["spin_button_coords"]
@@ -952,7 +966,7 @@ def run_autonomous_session(
         else:
             steps_since_ocr += 1
 
-        phase = determine_phase(current_bet, known_min_bet)
+        phase = determine_phase(current_bet, known_min_bet if min_bet_verified else None)
         print(f"\n=== Step {step}/{max_steps} (fase: {phase}) ===")
         print(f"Saldo: {current_balance} | Posta: {current_bet} | Giocato finora: {total_played:.2f} EUR")
 
@@ -998,10 +1012,15 @@ def run_autonomous_session(
                     f"{MAX_CONSECUTIVE_SETUP_STEPS} step. Chiedo aiuto all'operatore."
                 )
                 hitl_action, hitl_data, confirmed_min_bet, hitl_tapped_coords = handle_hitl_escalation(
-                    screen_reader, ocr_reader, touch_injector, device_id, current_bet, known_min_bet,
+                    screen_reader, ocr_reader, touch_injector, device_id, current_bet,
+                    known_min_bet if min_bet_verified else None,
                 )
-                if confirmed_min_bet is not None and known_min_bet is None:
+                if confirmed_min_bet is not None and not min_bet_verified:
+                    # L'operatore ha guardato lo schermo ORA: e' gia' una
+                    # verifica dal vivo, anche se la memoria diceva un valore
+                    # diverso (la corregge).
                     known_min_bet = confirmed_min_bet
+                    min_bet_verified = True
                     print(f"Puntata minima confermata dall'operatore per questa slot: {known_min_bet:.2f} EUR (memorizzata).")
                     _persist_slot_memory(slot_name, known_min_bet=known_min_bet)
 
@@ -1055,7 +1074,7 @@ def run_autonomous_session(
                         print(f"Icona menu-puntata imparata dall'operatore per questa slot: {known_bet_menu_toggle_coords}.")
                         _persist_slot_memory(slot_name, known_bet_menu_toggle=known_bet_menu_toggle_coords)
                 # hitl_action == "skip": nessun'altra azione, si riprova con GPT
-                phase = determine_phase(current_bet, known_min_bet)
+                phase = determine_phase(current_bet, known_min_bet if min_bet_verified else None)
                 previous_phase = phase
         else:
             consecutive_setup_steps = 0
@@ -1080,7 +1099,17 @@ def run_autonomous_session(
                 shutil.copy(resized_path, os.path.join(SCREENSHOTS_DIR, f"step_{step:04d}.png"))
 
             min_bet_gap_note = None
-            if known_min_bet is not None and current_bet is not None and current_bet > known_min_bet:
+            verify_min_bet_note = None
+            if known_min_bet is not None and not min_bet_verified:
+                # La memoria non e' verita': va sempre ri-controllata dal vivo
+                # in questa sessione (bug reale: un minimo salvato per errore
+                # veniva usato subito senza mai riaprire il menu puntata).
+                verify_min_bet_note = (
+                    f"The remembered minimum bet for this slot is {known_min_bet:.2f} EUR from a previous "
+                    "session, but it has NOT been verified yet THIS session — open the bet menu and make "
+                    "sure the LOWEST amount actually available now is selected (it might be different)."
+                )
+            elif known_min_bet is not None and current_bet is not None and current_bet > known_min_bet:
                 min_bet_gap_note = (
                     f"The discovered minimum bet for this slot is {known_min_bet:.2f} EUR; the current "
                     f"bet is {current_bet:.2f} EUR — select the option that brings it back down to "
@@ -1091,6 +1120,7 @@ def run_autonomous_session(
             notes = (
                 ([corrective_note] if corrective_note else [])
                 + ([bet_change_note] if bet_change_note else [])
+                + ([verify_min_bet_note] if verify_min_bet_note else [])
                 + ([min_bet_gap_note] if min_bet_gap_note else [])
                 + hint_texts
             )
@@ -1099,9 +1129,10 @@ def run_autonomous_session(
             raw_texts = ocr_state.get("raw_texts", [])
             candidate_texts = [text for text, _coords, _conf in raw_texts]
 
+            effective_min_bet = known_min_bet if min_bet_verified else None
             state_text = build_vision_state_text(
                 initial_balance, current_balance, current_bet, total_played, target_amount, step, action_history,
-                known_min_bet=known_min_bet, corrective_note=combined_note, menu_open=menu_open, new_texts=new_texts,
+                known_min_bet=effective_min_bet, corrective_note=combined_note, menu_open=menu_open, new_texts=new_texts,
                 disappeared_texts=disappeared_texts, steps_without_screen_change=steps_without_screen_change,
             )
             corrective_note = None

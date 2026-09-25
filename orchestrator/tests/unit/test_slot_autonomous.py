@@ -1258,8 +1258,101 @@ class TestRunAutonomousSession:
 
         assert ok is True
         out = capsys.readouterr().out
-        assert "Puntata minima individuata per questa slot: 0.20 EUR" in out
+        assert "Puntata minima verificata per questa slot in questa sessione: 0.20 EUR" in out
         assert load_slot_memory("Pirots 5")["known_min_bet"] == 0.20
+
+    def test_memory_min_bet_not_trusted_without_live_verification(self, mocks, tmp_path, monkeypatch):
+        """Bug reale: una memoria con known_min_bet sbagliato (4.0 invece di
+        0.20) veniva usata subito, facendo spinnare a 4 EUR senza mai riaprire
+        il menu puntata per controllare. Un valore che arriva SOLO dalla
+        memoria (non da un parametro esplicito ne' da una conferma di questa
+        sessione) non basta da solo: la fase resta 'setup' (blocca lo spin
+        prematuro) finche' non arriva una verifica dal vivo."""
+        monkeypatch.chdir(tmp_path)
+        save_slot_memory("Pirots 5", {
+            "known_spin_coords": (540, 1200), "learned_hints": [],
+            "known_min_bet": 4.0, "known_bet_menu_toggle": None,
+        })
+        mocks["ocr_reader"].read_slot_state.return_value = _ocr_state(
+            saldo=100.0, posta=4.0, spin_button_coords=(540, 1200),
+        )
+        mocks["engine"].ask_with_image.side_effect = [
+            Result.ok(_answers("tap", _target(region="center"))),  # (540,1200) = spin noto -> deve restare bloccato
+            Result.ok(_answers("stop")),
+        ]
+
+        ok = run_autonomous_session("dev", target_amount=30.0, max_steps=10, slot_name="Pirots 5")
+
+        assert ok is True
+        mocks["touch_injector"].tap_coordinates.assert_not_called()  # niente spin sulla sola fiducia nella memoria
+        first_call_state_text = mocks["engine"].ask_with_image.call_args_list[0].args[1]
+        assert "has NOT been verified yet THIS session" in first_call_state_text
+
+    def test_stale_memory_min_bet_self_corrects_via_plateau(self, mocks, tmp_path, monkeypatch):
+        """La memoria sbagliata (4.0) si autocorregge non appena si osserva un
+        valore piu' basso abbastanza a lungo, esattamente come una scoperta
+        da zero — mai una seconda 'verita'' diversa da quella osservata."""
+        monkeypatch.chdir(tmp_path)
+        save_slot_memory("Pirots 5", {
+            "known_spin_coords": None, "learned_hints": [],
+            "known_min_bet": 4.0, "known_bet_menu_toggle": None,
+        })
+        posta_sequence = [4.0, 0.60, 0.20, 0.20, 0.20, 0.20]
+        mocks["ocr_reader"].read_slot_state.side_effect = [
+            _ocr_state(saldo=100.0, posta=p) for p in posta_sequence
+        ]
+        regions = ["top-left", "top-right", "bottom-left", "bottom-right", "middle-left"]
+        mocks["engine"].ask_with_image.side_effect = [
+            Result.ok(_answers("tap", _target(region=r))) for r in regions
+        ] + [Result.ok(_answers("stop"))]
+
+        ok = run_autonomous_session("dev", target_amount=30.0, max_steps=20, slot_name="Pirots 5")
+
+        assert ok is True
+        assert load_slot_memory("Pirots 5")["known_min_bet"] == 0.20
+
+    def test_hitl_confirmation_overrides_stale_memory_immediately(self, mocks, tmp_path, monkeypatch):
+        """Una conferma esplicita dell'operatore durante l'HITL e' gia' una
+        verifica dal vivo: corregge subito una memoria sbagliata, senza dover
+        aspettare il plateau."""
+        monkeypatch.chdir(tmp_path)
+        save_slot_memory("Pirots 5", {
+            "known_spin_coords": None, "learned_hints": [],
+            "known_min_bet": 4.0, "known_bet_menu_toggle": None,
+        })
+        mocks["ocr_reader"].read_slot_state.return_value = _ocr_state(saldo=100.0, posta=0.20)
+        mocks["engine"].ask_with_image.side_effect = [
+            Result.ok(_answers("tap", _target(region="top-left")))
+        ] * 5 + [Result.ok(_answers("stop"))]
+
+        with patch(
+            "orchestrator.tests.validation.test_slot_autonomous.ask_human_help",
+            side_effect=[("text", "abbiamo la puntata minima"), ("skip",)],
+        ):
+            ok = run_autonomous_session("dev", target_amount=30.0, max_steps=20, slot_name="Pirots 5")
+
+        assert ok is True
+        assert load_slot_memory("Pirots 5")["known_min_bet"] == 0.20
+
+    def test_explicit_param_min_bet_is_trusted_immediately_unlike_memory(self, mocks, tmp_path, monkeypatch):
+        """Un known_min_bet passato come PARAMETRO diretto (es. --min-bet) e'
+        un'affermazione esplicita e attuale dell'operatore: a differenza della
+        memoria su file, resta fidata subito (comportamento invariato)."""
+        monkeypatch.chdir(tmp_path)
+        mocks["ocr_reader"].read_slot_state.return_value = _ocr_state(
+            saldo=100.0, posta=0.20, spin_button_coords=(540, 1200),
+        )
+        mocks["engine"].ask_with_image.side_effect = [
+            Result.ok(_answers("tap", _target(region="center"))),  # (540,1200) = spin -> deve essere ESEGUITO
+            Result.ok(_answers("stop")),
+        ]
+
+        ok = run_autonomous_session(
+            "dev", target_amount=30.0, max_steps=10, slot_name="Pirots 5", known_min_bet=0.20,
+        )
+
+        assert ok is True
+        mocks["touch_injector"].tap_coordinates.assert_called_once_with("dev", 540, 1200)
 
     def test_hints_persisted_when_bet_successfully_lowered(self, mocks, tmp_path, monkeypatch):
         """Un suggerimento attivo nel momento in cui la posta scende al minimo
