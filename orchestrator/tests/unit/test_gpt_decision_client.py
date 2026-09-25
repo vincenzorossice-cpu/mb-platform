@@ -237,6 +237,11 @@ class TestAskWithImage:
         assert "CRITICAL" in system_message
         assert "minimum" in system_message.lower()
         assert "before" in system_message.lower()
+        assert "must not spin" in system_message.lower()
+        assert "do not tap it" in system_message.lower()
+        assert "open the bet menu" in system_message.lower()
+        assert "close the bet menu" in system_message.lower()
+        assert "do not repeat the exact" in system_message.lower()
 
     def test_stop_has_no_coordinates(self, client: GPTDecisionClient, screenshot_path: str):
         payload = {"action": "stop", "confidence": 0.9}

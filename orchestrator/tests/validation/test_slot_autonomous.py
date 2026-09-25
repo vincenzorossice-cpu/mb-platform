@@ -49,8 +49,26 @@ MIN_BET = 0.10  # posta minima assunta; usata per la fase setup/playing e per lo
 DEFAULT_MAX_STEPS = 50
 DEFAULT_TARGET_AMOUNT = 30.0
 VISION_RESIZE_SCALE = 1.0  # dimezza lo screenshot prima di inviarlo alla Vision API
-SPIN_PROXIMITY_PX = 100  # tap entro questa distanza dal tasto spin noto -> non serve rileggere l'OCR
+SPIN_PROXIMITY_PX = 100  # tap entro questa distanza dal tasto spin noto -> considerato un tentativo di spin
 SCREENSHOTS_DIR = "screenshots"
+MAX_CONSECUTIVE_SETUP_STEPS = 5  # oltre questa soglia in fase "setup" senza progressi -> HITL
+REPEAT_TAP_TOLERANCE_PX = 50  # tap entro questa distanza sono considerati "lo stesso punto"
+STUCK_SCREEN_THRESHOLD = 3  # step consecutivi senza cambiamenti a schermo -> nudge esplorativo
+MAX_TAPPED_TARGETS = 10  # quanti tap recenti tenere in memoria per anti-loop/elementi non provati
+
+
+def normalize_texts(raw_texts: list) -> set:
+    """Normalizza i testi OCR (spazi/maiuscole) per un confronto robusto al
+    rumore di lettura tra due screenshot dello stesso schermo statico."""
+    return {" ".join(text.split()).lower() for text, _coords, _conf in raw_texts if text.strip()}
+
+
+def find_untried_elements(raw_texts: list, tapped_targets: list, tolerance: float = REPEAT_TAP_TOLERANCE_PX) -> list:
+    """Testi OCR le cui coordinate non sono vicine a nessun tap gia' tentato."""
+    def already_tried(x, y):
+        return any(abs(x - t["x"]) <= tolerance and abs(y - t["y"]) <= tolerance for t in tapped_targets)
+
+    return [text for text, (x, y), _conf in raw_texts if text.strip() and not already_tried(x, y)]
 
 
 def resize_screenshot_for_vision(screenshot_path: str, scale: float = VISION_RESIZE_SCALE) -> tuple:
@@ -94,6 +112,11 @@ def build_vision_state_text(
     step: int,
     action_history: list,
     min_bet: float = MIN_BET,
+    corrective_note: Optional[str] = None,
+    menu_open: bool = False,
+    new_texts: Optional[set] = None,
+    disappeared_texts: Optional[set] = None,
+    steps_without_screen_change: int = 0,
 ) -> str:
     phase = determine_phase(current_bet, min_bet)
 
@@ -103,6 +126,35 @@ def build_vision_state_text(
             f"\nPHASE: BET SETUP - Lower the bet before spinning! Current bet {current_bet:.2f} EUR "
             f"is above the minimum ({min_bet:.2f} EUR)."
         )
+        if menu_open:
+            phase_banner += (
+                "\nA bet menu/overlay appears to be open. Select the LOWEST amount available, then "
+                "look for a CLOSE/CONFIRM/OK button or tap OUTSIDE the menu area to close it. Do NOT "
+                "tap the same bet amount again if you already selected it — you need to CLOSE the "
+                "menu now."
+            )
+        else:
+            phase_banner += (
+                "\nTO LOWER THE BET: look for the bet amount display (usually shows something like "
+                "'€10.00' or 'PUNTATA €10.00') and tap on it to open the bet selection menu. OR look "
+                "for +/- buttons near the bet amount. OR look for a coins/credits icon. DO NOT tap "
+                "the SPIN button. DO NOT tap random elements. Focus ONLY on finding the bet control."
+            )
+    else:
+        phase_banner = "\nBET IS AT MINIMUM. Now find and tap the SPIN button."
+
+    screen_diff_note = ""
+    if new_texts:
+        screen_diff_note = f"\nNEW elements appeared on screen: {sorted(new_texts)}. A menu or popup may have opened."
+    elif disappeared_texts:
+        screen_diff_note = f"\nSome elements disappeared: {sorted(disappeared_texts)}. A menu may have closed."
+    elif steps_without_screen_change >= STUCK_SCREEN_THRESHOLD:
+        screen_diff_note = (
+            f"\nThe screen has not changed for {steps_without_screen_change} attempts. Try tapping a "
+            "completely different area."
+        )
+
+    corrective_block = f"\n\nIMPORTANT: {corrective_note}" if corrective_note else ""
 
     net_profit_loss = "unknown"
     if initial_balance is not None and current_balance is not None:
@@ -124,12 +176,12 @@ def build_vision_state_text(
             "good reason to continue."
         )
 
-    return f"""You are playing a slot machine in DEMO mode on an Android phone.
+    return f"""You are playing a slot machine in DEMO mode on an Android phone.{corrective_block}
 
 GOAL: Set the bet to minimum (0.10 EUR if possible), play until total played reaches {target_amount} EUR, then stop.
 
 Step: {step}
-Step phase: {phase}{phase_banner}
+Step phase: {phase}{phase_banner}{screen_diff_note}
 Current balance (read via OCR): {current_balance if current_balance is not None else "unknown"} EUR
 Current bet: {current_bet if current_bet is not None else "unknown"} EUR (MINIMUM BET: {min_bet:.2f} EUR or lowest available)
 WARNING: If current bet is above minimum, you MUST lower it first. Do not spin with a high bet.
@@ -168,18 +220,29 @@ def run_autonomous_session(
 ) -> bool:
     """Gioca la slot gia' aperta sul device lasciando che GPT-4o-mini Vision
     scelga autonomamente dove tappare guardando lo screenshot ad ogni passo.
-    L'OCR resta in uso solo per saldo/posta (letti su una cadenza piu' rada,
-    riusata finche' l'ultimo tap e' stato vicino al tasto spin noto).
+    L'OCR resta in uso solo per saldo/posta, riletto dopo ogni tap reale (per
+    rilevare in modo affidabile se il saldo e' sceso, cioe' se uno spin e'
+    avvenuto) e comunque almeno ogni OCR_REFRESH_INTERVAL step.
 
-    total_played e' la SOMMA delle poste piazzate (non saldo_iniziale -
-    saldo_attuale, che sarebbe il net loss e diminuirebbe con le vincite): si
-    incrementa di current_bet solo quando un tap va a buon fine durante la
-    fase "playing" (posta gia' al minimo), assumendo che l'unico tap sensato
-    in quella fase sia uno spin.
+    Se la posta e' sopra il minimo (fase "setup"), un tap su/vicino al tasto
+    spin noto viene BLOCCATO (mai eseguito) invece di essere inoltrato al
+    dispositivo: GPT riceve una nota correttiva al turno successivo. Questo
+    funziona su qualunque slot perche' si basa solo su known_spin_coords
+    (rilevato via OCR per quella specifica slot) e sulla posta letta via OCR,
+    non su coordinate hardcoded. Se dopo MAX_CONSECUTIVE_SETUP_STEPS step
+    consecutivi la fase resta "setup", la sessione si ferma e richiede
+    intervento umano (HITL).
+
+    total_played e' la SOMMA delle poste piazzate, dedotta osservando il
+    saldo: ogni volta che una lettura OCR fresca mostra un saldo piu' basso di
+    quello precedente (segno che uno spin e' avvenuto, indipendentemente da
+    quale fase pensavamo di essere), si aggiunge la posta corrente (letta via
+    OCR) a total_played -- mai saldo_iniziale - saldo_attuale, che sarebbe il
+    net loss e diminuirebbe con le vincite.
 
     Ritorna True se la sessione si e' conclusa in modo pulito (stop deciso dal
     Decision Engine, target raggiunto o saldo insufficiente), False in caso di
-    errore."""
+    errore o escalation HITL."""
     screen_reader = ScreenReader()
     touch_injector = TouchInjector(screen_reader=screen_reader)
     ocr_reader = SlotOCRReader()
@@ -206,11 +269,21 @@ def run_autonomous_session(
     action_history: list[dict] = []
     steps_since_ocr = 0
     force_ocr_refresh = False
+    corrective_note: Optional[str] = None
+    consecutive_setup_steps = 0
+    tapped_targets: list[dict] = []
+    last_tap_coords: Optional[tuple] = None
+    menu_open = False
+    steps_without_screen_change = 0
+    previous_raw_texts: Optional[set] = normalize_texts(ocr_state.get("raw_texts", []))
+    new_texts: set = set()
+    disappeared_texts: set = set()
 
     print(f"Saldo iniziale: {initial_balance}")
 
     for step in range(1, max_steps + 1):
         if force_ocr_refresh or steps_since_ocr >= OCR_REFRESH_INTERVAL:
+            previous_balance = current_balance
             ocr_state = read_ocr_state(screen_reader, ocr_reader, device_id)
             if ocr_state is None:
                 return False
@@ -218,16 +291,61 @@ def run_autonomous_session(
             force_ocr_refresh = False
             if ocr_state.get("saldo") is not None:
                 current_balance = ocr_state["saldo"]
+                if previous_balance is not None and current_balance < previous_balance:
+                    spin_bet = current_bet if current_bet is not None else (previous_balance - current_balance)
+                    total_played += spin_bet
+                    print(
+                        f"Spin rilevato! Saldo: {previous_balance} -> {current_balance}. "
+                        f"Posta: {spin_bet:.2f}. Total played: {total_played:.2f}"
+                    )
             if ocr_state.get("posta") is not None:
                 current_bet = ocr_state["posta"]
             if ocr_state.get("spin_button_coords") is not None:
                 known_spin_coords = ocr_state["spin_button_coords"]
+
+            # Confronta i testi OCR con la lettura precedente per capire se lo
+            # schermo e' cambiato (menu aperto/chiuso) dopo l'ultimo tap reale.
+            # Un cambio di saldo conta anch'esso come "schermo cambiato" (uno
+            # spin normale spesso non altera altre etichette oltre al numero
+            # del saldo, che potrebbe comunque comparire identico all'OCR se
+            # il valore e' arrotondato uguale): senza questo, uno spin
+            # ripetuto legittimo sullo stesso tasto verrebbe scambiato per un
+            # loop e bloccato dall'anti-loop qui sotto.
+            current_raw_texts = normalize_texts(ocr_state.get("raw_texts", []))
+            new_texts = current_raw_texts - previous_raw_texts if previous_raw_texts is not None else set()
+            disappeared_texts = previous_raw_texts - current_raw_texts if previous_raw_texts is not None else set()
+            balance_changed = (
+                previous_balance is not None and current_balance is not None and current_balance != previous_balance
+            )
+            screen_changed = bool(new_texts or disappeared_texts) or balance_changed
+            if new_texts:
+                menu_open = True
+            elif disappeared_texts:
+                menu_open = False
+            steps_without_screen_change = 0 if screen_changed else steps_without_screen_change + 1
+            previous_raw_texts = current_raw_texts
+
+            if last_tap_coords is not None:
+                tapped_targets.append({"x": last_tap_coords[0], "y": last_tap_coords[1], "screen_changed": screen_changed})
+                tapped_targets = tapped_targets[-MAX_TAPPED_TARGETS:]
+                last_tap_coords = None
         else:
             steps_since_ocr += 1
 
         phase = determine_phase(current_bet)
         print(f"\n=== Step {step}/{max_steps} (fase: {phase}) ===")
         print(f"Saldo: {current_balance} | Posta: {current_bet} | Giocato finora: {total_played:.2f} EUR")
+
+        if phase == "setup":
+            consecutive_setup_steps += 1
+            if consecutive_setup_steps > MAX_CONSECUTIVE_SETUP_STEPS:
+                print(
+                    f"HITL: il sistema non e' riuscito ad abbassare la posta al minimo dopo "
+                    f"{MAX_CONSECUTIVE_SETUP_STEPS} step. Serve intervento manuale."
+                )
+                return False
+        else:
+            consecutive_setup_steps = 0
 
         if current_balance is not None and current_balance < MIN_BET:
             print(f"Saldo insufficiente (< {MIN_BET}). Stop automatico.")
@@ -250,7 +368,11 @@ def run_autonomous_session(
 
             state_text = build_vision_state_text(
                 initial_balance, current_balance, current_bet, total_played, target_amount, step, action_history,
+                corrective_note=corrective_note, menu_open=menu_open, new_texts=new_texts,
+                disappeared_texts=disappeared_texts, steps_without_screen_change=steps_without_screen_change,
             )
+            corrective_note = None
+            new_texts, disappeared_texts = set(), set()
             questions = build_questions()
 
             print("Chiedo a GPT-4o-mini Vision...")
@@ -288,16 +410,52 @@ def run_autonomous_session(
             and abs(real_x - known_spin_coords[0]) <= SPIN_PROXIMITY_PX
             and abs(real_y - known_spin_coords[1]) <= SPIN_PROXIMITY_PX
         )
-        force_ocr_refresh = not is_spin_tap
+
+        if phase == "setup" and is_spin_tap:
+            print(
+                f"BLOCCATO: GPT ha tentato di tappare SPIN con la posta ancora a {current_bet:.2f} EUR "
+                "(fase setup). Tap NON eseguito."
+            )
+            corrective_note = (
+                f"You tapped the SPIN button but the bet is still at {current_bet:.2f} EUR. "
+                "You MUST lower the bet first. Do NOT tap the SPIN button. Look for the bet selector."
+            )
+            action_history.append({"step": step, "action": "blocked_spin_attempt", "target": (real_x, real_y), "phase": phase})
+            action_history = action_history[-5:]
+            time.sleep(1.0)
+            continue
+
+        recent_same_spot = [
+            t for t in tapped_targets[-2:]
+            if abs(t["x"] - real_x) <= REPEAT_TAP_TOLERANCE_PX
+            and abs(t["y"] - real_y) <= REPEAT_TAP_TOLERANCE_PX
+            and not t["screen_changed"]
+        ]
+        if len(recent_same_spot) >= 2:
+            print(f"BLOCCATO: tap ripetuto su ({real_x},{real_y}) senza effetto. Suggerisco elementi non provati.")
+            untried = find_untried_elements(ocr_state.get("raw_texts", []), tapped_targets)
+            corrective_note = (
+                f"You already tapped this area ({real_x},{real_y}) twice and nothing changed. "
+                "Try a COMPLETELY DIFFERENT element."
+            )
+            if untried:
+                corrective_note += f" Here are elements you have NOT tried yet: {untried}. Pick one of these."
+            action_history.append({"step": step, "action": "blocked_repeat_tap", "target": (real_x, real_y), "phase": phase})
+            action_history = action_history[-5:]
+            time.sleep(1.0)
+            continue
 
         print(f"Tapping at ({real_x},{real_y})...")
         tap_result = touch_injector.tap_coordinates(device_id, real_x, real_y)
         if not tap_result.success:
             print(f"ERRORE: tap fallito: {tap_result.error} ({tap_result.error_code})")
-        elif phase == "playing" and current_bet is not None:
-            # Fase "playing" = posta gia' al minimo: l'unico tap sensato e' uno
-            # spin, quindi contiamo la posta come giocata.
-            total_played += current_bet
+        else:
+            # Ogni tap reale puo' aver cambiato lo stato (spin o aggiustamento
+            # posta): rileggiamo l'OCR al prossimo step per aggiornare
+            # saldo/posta e rilevare eventuali spin (vedi total_played sopra),
+            # e per valutare se ha cambiato lo schermo (vedi tapped_targets sopra).
+            force_ocr_refresh = True
+            last_tap_coords = (real_x, real_y)
 
         action_history.append({"step": step, "action": action, "target": (real_x, real_y), "phase": phase})
         action_history = action_history[-5:]

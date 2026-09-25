@@ -186,7 +186,19 @@ class GPTDecisionClient(DecisionEngineClientInterface):
             "CRITICAL: Before spinning, you MUST set the bet to the minimum amount. Look for a bet "
             "selector, menu, +/- buttons, or a bet amount display. Tap on it to open the bet "
             "selection. Then tap the lowest amount available (e.g., €0.10 or €0.20). Only "
-            "after the bet is at minimum, find and tap the SPIN button.",
+            "after the bet is at minimum, find and tap the SPIN button. You MUST NOT spin until "
+            "the bet is at minimum. If you see a SPIN button but the bet is above minimum, DO NOT "
+            "tap it. Look for a bet menu, settings, or +/- buttons FIRST.",
+
+            "TO OPEN THE BET MENU: tap on the bet amount display itself (e.g. '€10.00' or "
+            "'PUNTATA €10.00') — that display is usually the button that opens bet selection. "
+            "TO CLOSE THE BET MENU once you've selected the lowest amount: look for a "
+            "CLOSE/CONFIRM/OK button, or tap outside the menu area. A menu covering the screen "
+            "will hide the SPIN button, so you must close it before you can spin.",
+
+            "If you tap something and the screen does not change at all, DO NOT repeat the exact "
+            "same tap. Try a completely different element instead — the state below will tell you "
+            "which elements you have already tried without success.",
 
             "Look at the screenshot and decide: if a bet settings menu or modal is open, navigate "
             "it to set the minimum bet and close it; if the bet is already at minimum, find the "
