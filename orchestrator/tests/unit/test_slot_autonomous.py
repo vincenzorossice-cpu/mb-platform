@@ -664,6 +664,54 @@ class TestRunAutonomousSession:
         assert "Do NOT tap anything else" in state_text
         assert "autospin" in state_text.lower()
 
+    def test_browser_chrome_top_margin_blocks_tap_and_asks_gpt_to_look_lower(self, mocks, capsys):
+        """Bug reale: la slot gira dentro Chrome, e GPT ha scambiato il badge
+        delle schede aperte del browser (vicino al bordo superiore) per
+        un'opzione di gioco. Un target risolto li' non deve mai essere
+        eseguito: potrebbe far uscire dall'app."""
+        raw_texts = [_text("5", 891, 163)]  # badge schede Chrome, non un elemento di gioco
+        mocks["ocr_reader"].read_slot_state.return_value = _ocr_state(
+            saldo=100.0, posta=0.10, raw_texts=raw_texts,
+        )
+        mocks["engine"].ask_with_image.side_effect = [
+            Result.ok(_answers("tap", _target(text="5"))),
+            Result.ok(_answers("stop")),
+        ]
+
+        ok = run_autonomous_session("dev", target_amount=30.0, max_steps=10, known_min_bet=0.10)
+
+        assert ok is True
+        mocks["touch_injector"].tap_coordinates.assert_not_called()
+        out = capsys.readouterr().out
+        assert "BLOCCATO: target a (891,163)" in out
+        second_call_state_text = mocks["engine"].ask_with_image.call_args_list[1].args[1]
+        assert "BROWSER's own UI" in second_call_state_text
+
+    def test_browser_chrome_margin_still_allows_a_known_trusted_coordinate(self, mocks, tmp_path, monkeypatch):
+        """Una coordinata gia' imparata e fidata per questa slot resta
+        permessa anche se ricadesse nel margine superiore: la conoscenza
+        verificata ha priorita' sulla regola generica anti-browser."""
+        monkeypatch.chdir(tmp_path)
+        save_slot_memory("Pirots 5", {
+            "known_spin_coords": None, "learned_hints": [],
+            "known_min_bet": 0.10, "known_bet_menu_toggle": (200, 100),
+        })
+        raw_texts = [_text("MONETE", 200, 100)]
+        mocks["ocr_reader"].read_slot_state.return_value = _ocr_state(
+            saldo=100.0, posta=0.10, raw_texts=raw_texts,
+        )
+        mocks["engine"].ask_with_image.side_effect = [
+            Result.ok(_answers("tap", _target(text="MONETE"))),
+            Result.ok(_answers("stop")),
+        ]
+
+        ok = run_autonomous_session(
+            "dev", target_amount=30.0, max_steps=10, slot_name="Pirots 5", known_min_bet=0.10,
+        )
+
+        assert ok is True
+        mocks["touch_injector"].tap_coordinates.assert_called_once_with("dev", 200, 100)
+
     def test_tap_uses_ocr_measured_coordinates_for_text_target(self, mocks):
         """GPT non restituisce mai pixel: sceglie un testo tra i candidati OCR
         e il sistema tappa esattamente dove l'OCR ha misurato quell'elemento

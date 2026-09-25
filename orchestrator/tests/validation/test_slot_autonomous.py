@@ -89,6 +89,9 @@ MIN_BET_DISCOVERY_PATIENCE_STEPS = 3  # letture consecutive senza un nuovo minim
 _TRANSIENT_SCREEN_STATES = {"loading", "spinning", "win_presentation", "feature"}  # animazioni/minigiochi:
 # un fotogramma qui non e' affidabile per decidere alcun tap (vedi slot_anatomy.md sez. 7)
 TRANSIENT_STATE_WAIT_SECONDS = 3.0  # attesa extra prima di richiedere di nuovo un parere a GPT
+BROWSER_CHROME_TOP_MARGIN_FRACTION = 0.103  # misurato su uno screenshot reale (Chrome, 576x1280):
+# la barra del browser (indirizzo/schede) finisce a y=131/1280, il gioco (incl. il tasto "Esci")
+# inizia subito dopo a y=134/1280 — nessun elemento di gioco osservato in questa fascia
 _RELATIVE_OFFSET_PX = 100  # scostamento generico per descrizioni HITL relative ("sopra X", "a destra di X")
 _HITL_SCREEN_CHANGED_DIRECTIVE = (
     "The screen changed after the operator's tap. Look at the CURRENT screenshot: if a bet menu is "
@@ -1213,6 +1216,34 @@ def run_autonomous_session(
             force_ocr_refresh = True
             continue
         real_x, real_y = real_target
+
+        is_known_trusted_coords = (
+            known_spin_coords is not None
+            and abs(real_x - known_spin_coords[0]) <= REPEAT_TAP_TOLERANCE_PX
+            and abs(real_y - known_spin_coords[1]) <= REPEAT_TAP_TOLERANCE_PX
+        ) or (
+            known_bet_menu_toggle_coords is not None
+            and abs(real_x - known_bet_menu_toggle_coords[0]) <= REPEAT_TAP_TOLERANCE_PX
+            and abs(real_y - known_bet_menu_toggle_coords[1]) <= REPEAT_TAP_TOLERANCE_PX
+        )
+        if real_y <= orig_h * BROWSER_CHROME_TOP_MARGIN_FRACTION and not is_known_trusted_coords:
+            # Bug reale: la slot gira dentro Chrome, e GPT ha scambiato un
+            # elemento della barra del browser (es. il badge delle schede
+            # aperte) per un'opzione di gioco. Una coordinata gia' imparata e
+            # fidata per QUESTA slot resta sempre permessa anche qui.
+            print(
+                f"BLOCCATO: target a ({real_x},{real_y}) troppo vicino al bordo superiore "
+                "(probabile barra del browser, non del gioco). Tap NON eseguito."
+            )
+            corrective_note = (
+                "BLOCKED: that target is in the very top area of the screen, which is likely the "
+                "BROWSER's own UI (address bar, open tabs) and NOT part of the game. Look further "
+                "down on the screen for the actual game element."
+            )
+            action_history.append({"step": step, "action": "blocked_browser_chrome_tap", "target": (real_x, real_y), "phase": phase})
+            action_history = action_history[-5:]
+            time.sleep(1.0)
+            continue
 
         is_spin_tap = (
             known_spin_coords is not None
