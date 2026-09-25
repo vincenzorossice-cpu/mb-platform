@@ -6,6 +6,7 @@ import pytest
 from orchestrator.core.result import Result
 from orchestrator.tests.validation.test_slot_autonomous import (
     VISION_RESIZE_SCALE,
+    ask_human_help,
     descale_coords,
     determine_phase,
     find_untried_elements,
@@ -103,6 +104,39 @@ class TestFindUntriedElements:
         raw_texts = [_text("SPIN", 545, 1205)]
         tapped = [{"x": 540, "y": 1200, "screen_changed": False}]
         assert find_untried_elements(raw_texts, tapped) == []
+
+
+class TestAskHumanHelp:
+
+    def test_stop_returns_stop_tuple(self):
+        with patch("builtins.input", return_value="stop"), \
+             patch("orchestrator.tests.validation.test_slot_autonomous._open_screenshot"):
+            assert ask_human_help("/tmp/shot.png", 10.0, 0.10) == ("stop",)
+
+    def test_skip_returns_skip_tuple(self):
+        with patch("builtins.input", return_value="skip"), \
+             patch("orchestrator.tests.validation.test_slot_autonomous._open_screenshot"):
+            assert ask_human_help("/tmp/shot.png", 10.0, 0.10) == ("skip",)
+
+    def test_coordinates_are_parsed(self):
+        with patch("builtins.input", return_value="540, 600"), \
+             patch("orchestrator.tests.validation.test_slot_autonomous._open_screenshot"):
+            assert ask_human_help("/tmp/shot.png", 10.0, 0.10) == ("coords", 540, 600)
+
+    def test_free_text_is_returned_as_hint(self):
+        with patch("builtins.input", return_value="tap the coins icon"), \
+             patch("orchestrator.tests.validation.test_slot_autonomous._open_screenshot"):
+            assert ask_human_help("/tmp/shot.png", 10.0, 0.10) == ("text", "tap the coins icon")
+
+    def test_malformed_coordinates_fall_back_to_text(self):
+        with patch("builtins.input", return_value="540, abc"), \
+             patch("orchestrator.tests.validation.test_slot_autonomous._open_screenshot"):
+            assert ask_human_help("/tmp/shot.png", 10.0, 0.10) == ("text", "540, abc")
+
+    def test_missing_screenshot_does_not_crash(self):
+        with patch("builtins.input", return_value="skip") as mock_input:
+            assert ask_human_help(None, 10.0, 0.10) == ("skip",)
+        mock_input.assert_called_once()
 
 
 @pytest.fixture
@@ -235,6 +269,30 @@ class TestRunAutonomousSession:
         out = capsys.readouterr().out
         assert "Totale giocato: 0.00 EUR" in out
 
+    def test_learns_spin_coords_from_observed_spin_and_blocks_next_attempt(self, mocks):
+        """Bug reale: quando l'OCR non etichetta mai il tasto SPIN (nessun
+        testo 'SPIN'/'XITER'/'GIRA' riconosciuto), il primo tap che causa uno
+        spin non e' bloccabile in anticipo (non sappiamo ancora dove sia lo
+        SPIN) - ma una volta osservato il calo di saldo, il sistema impara
+        quelle coordinate e blocca i tentativi successivi durante il setup,
+        invece di limitarsi a rilevarli 'Spin rilevato!' dopo il fatto."""
+        mocks["ocr_reader"].read_slot_state.side_effect = [
+            _ocr_state(saldo=5000.0, posta=10.0, spin_button_coords=None),  # OCR non trova mai lo SPIN
+            _ocr_state(saldo=4990.0, posta=10.0, spin_button_coords=None),  # dopo il 1o tap: spin avvenuto
+        ]
+        mocks["engine"].ask_with_image.side_effect = [
+            Result.ok(_answers("tap", (540, 2100))),  # 1o tentativo: non bloccabile, spin ancora sconosciuto
+            Result.ok(_answers("tap", (540, 2100))),  # 2o tentativo identico: ORA deve essere bloccato
+            Result.ok(_answers("stop")),
+        ]
+
+        ok = run_autonomous_session("dev", target_amount=30.0, max_steps=10)
+
+        assert ok is True
+        assert mocks["touch_injector"].tap_coordinates.call_count == 1  # solo il primo tap eseguito
+        third_call_state_text = mocks["engine"].ask_with_image.call_args_list[2].args[1]
+        assert "BLOCKED: You tried to tap the SPIN button" in third_call_state_text
+
     def test_spin_tap_blocked_during_setup_phase(self, mocks):
         """Bug reale: GPT tappa SPIN (540,1200) mentre la posta e' ancora a
         10 EUR (fase setup). Il tap NON deve essere eseguito, e la chiamata
@@ -254,25 +312,96 @@ class TestRunAutonomousSession:
         assert mocks["engine"].ask_with_image.call_count == 2
 
         second_call_state_text = mocks["engine"].ask_with_image.call_args_list[1].args[1]
-        assert "You tapped the SPIN button but the bet is still at 10.00 EUR" in second_call_state_text
-        assert "Do NOT tap the SPIN button" in second_call_state_text
+        assert "BLOCKED: You tried to tap the SPIN button but the bet is still 10.00" in second_call_state_text
+        assert "DO NOT tap the SPIN button" in second_call_state_text
 
-    def test_hitl_escalation_after_max_consecutive_setup_steps(self, mocks):
-        """Se GPT continua a non abbassare la posta (tap non-spin ripetuti, ma
-        la fase resta sempre 'setup'), dopo MAX_CONSECUTIVE_SETUP_STEPS step la
-        sessione deve fermarsi da sola e segnalare la necessita' di intervento
-        umano, senza proseguire fino a max_steps."""
+    def test_hitl_stop_ends_session(self, mocks):
+        """Se GPT continua a non abbassare la posta per MAX_CONSECUTIVE_SETUP_STEPS
+        step, il sistema chiede aiuto all'operatore via terminale; se l'operatore
+        scrive 'stop', la sessione finisce immediatamente."""
         mocks["ocr_reader"].read_slot_state.return_value = _ocr_state(
             saldo=100.0, posta=10.0, spin_button_coords=(540, 1200),
         )
-        # Tap lontano dallo spin: non viene bloccato, ma non abbassa mai la posta
-        # (il mock OCR continua a restituire posta=10.0 sempre).
         mocks["engine"].ask_with_image.return_value = Result.ok(_answers("tap", (10, 10)))
 
-        ok = run_autonomous_session("dev", target_amount=30.0, max_steps=20)
+        with patch(
+            "orchestrator.tests.validation.test_slot_autonomous.ask_human_help", return_value=("stop",),
+        ) as mock_ask_human:
+            ok = run_autonomous_session("dev", target_amount=30.0, max_steps=20)
 
         assert ok is False
+        assert mock_ask_human.call_count == 1
         assert mocks["engine"].ask_with_image.call_count == 5
+
+    def test_hitl_skip_lets_gpt_keep_trying(self, mocks):
+        """Se l'operatore scrive 'skip', il sistema resetta il contatore e
+        lascia che GPT-4o riprovi da solo senza fermarsi."""
+        mocks["ocr_reader"].read_slot_state.return_value = _ocr_state(
+            saldo=100.0, posta=10.0, spin_button_coords=(540, 1200),
+        )
+        mocks["engine"].ask_with_image.side_effect = [Result.ok(_answers("tap", (10, 10)))] * 5 + [
+            Result.ok(_answers("stop"))
+        ]
+
+        with patch(
+            "orchestrator.tests.validation.test_slot_autonomous.ask_human_help", return_value=("skip",),
+        ) as mock_ask_human:
+            ok = run_autonomous_session("dev", target_amount=30.0, max_steps=20)
+
+        assert ok is True
+        assert mock_ask_human.call_count == 1
+        assert mocks["engine"].ask_with_image.call_count == 6
+
+    def test_hitl_text_hint_passed_to_next_gpt_call(self, mocks):
+        """Se l'operatore descrive a parole cosa tappare, il suggerimento va
+        passato a GPT-4o come nota correttiva al turno successivo."""
+        mocks["ocr_reader"].read_slot_state.return_value = _ocr_state(
+            saldo=100.0, posta=10.0, spin_button_coords=(540, 1200),
+        )
+        mocks["engine"].ask_with_image.side_effect = [Result.ok(_answers("tap", (10, 10)))] * 5 + [
+            Result.ok(_answers("stop"))
+        ]
+
+        with patch(
+            "orchestrator.tests.validation.test_slot_autonomous.ask_human_help",
+            return_value=("text", "tap the coins icon top left"),
+        ):
+            ok = run_autonomous_session("dev", target_amount=30.0, max_steps=20)
+
+        assert ok is True
+        sixth_call_state_text = mocks["engine"].ask_with_image.call_args_list[5].args[1]
+        assert "The human operator suggests: tap the coins icon top left" in sixth_call_state_text
+
+    def test_hitl_coords_resolve_session_when_bet_actually_lowers(self, mocks, capsys):
+        """Se l'operatore da' coordinate e quel tap abbassa davvero la posta
+        (verificato rileggendo l'OCR), il sistema riprende normalmente."""
+        state = {"posta": 10.0}
+
+        def ocr_side_effect(*_args, **_kwargs):
+            return _ocr_state(saldo=100.0, posta=state["posta"], spin_button_coords=(540, 1200))
+
+        mocks["ocr_reader"].read_slot_state.side_effect = ocr_side_effect
+
+        def tap_side_effect(_device_id, x, y):
+            if (x, y) == (700, 600):
+                state["posta"] = 0.10
+            return Result.ok(True)
+
+        mocks["touch_injector"].tap_coordinates.side_effect = tap_side_effect
+
+        mocks["engine"].ask_with_image.side_effect = [Result.ok(_answers("tap", (10, 10)))] * 5 + [
+            Result.ok(_answers("stop"))
+        ]
+
+        with patch(
+            "orchestrator.tests.validation.test_slot_autonomous.ask_human_help", return_value=("coords", 700, 600),
+        ):
+            ok = run_autonomous_session("dev", target_amount=30.0, max_steps=20)
+
+        assert ok is True
+        assert state["posta"] == 0.10
+        out = capsys.readouterr().out
+        assert "Posta abbassata con successo" in out
 
     def test_menu_open_detected_and_reflected_in_state_text(self, mocks):
         """Quando appaiono nuovi testi OCR dopo un tap (es. le opzioni di un
@@ -322,7 +451,8 @@ class TestRunAutonomousSession:
         assert ok is True
         assert mocks["touch_injector"].tap_coordinates.call_count == 2  # solo i primi 2 tap eseguiti
         fourth_call_state_text = mocks["engine"].ask_with_image.call_args_list[3].args[1]
-        assert "twice and nothing changed" in fourth_call_state_text
+        assert "You tapped this area twice with no effect" in fourth_call_state_text
+        assert "coins icon, settings gear, +/- buttons" in fourth_call_state_text
         assert "SPIN" in fourth_call_state_text
         assert "PUNTATA €0.10" in fourth_call_state_text
 

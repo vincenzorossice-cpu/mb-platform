@@ -32,6 +32,7 @@ import argparse
 import logging
 import os
 import shutil
+import subprocess
 import sys
 import time
 from typing import Optional
@@ -215,6 +216,112 @@ def read_ocr_state(screen_reader: ScreenReader, ocr_reader: SlotOCRReader, devic
     return ocr_reader.read_slot_state(ss.data)
 
 
+def _open_screenshot(screenshot_path: str) -> None:
+    """Prova ad aprire lo screenshot col visualizzatore di default del SO,
+    cosi' l'operatore puo' guardarlo senza cercare il file a mano."""
+    try:
+        if sys.platform == "win32":
+            subprocess.Popen(["explorer", screenshot_path])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", screenshot_path])
+        else:
+            subprocess.Popen(["xdg-open", screenshot_path])
+    except OSError:
+        pass  # nessun visualizzatore disponibile: l'operatore apre il file manualmente
+
+
+def ask_human_help(screenshot_path: Optional[str], current_bet: Optional[float], min_bet: float) -> tuple:
+    """Chiede aiuto all'operatore via terminale quando il sistema non riesce
+    ad abbassare la posta da solo dopo troppi tentativi. Ritorna una tupla:
+    - ("stop",): l'operatore vuole fermare tutto
+    - ("skip",): l'operatore vuole lasciar riprovare GPT-4o senza aiuto
+    - ("coords", x, y): l'operatore ha dato coordinate da tappare
+    - ("text", descrizione): suggerimento testuale da passare a GPT-4o
+    """
+    bet_str = f"{current_bet:.2f}" if current_bet is not None else "unknown"
+    print(f"\n{'='*60}")
+    print("HITL: Non riesco ad abbassare la puntata.")
+    print(f"Puntata attuale: {bet_str} EUR | Minimo: {min_bet:.2f} EUR")
+    print(f"Screenshot: {screenshot_path or 'non disponibile'}")
+    print(f"{'='*60}")
+
+    if screenshot_path:
+        _open_screenshot(screenshot_path)
+
+    print("\nCosa devo tappare per abbassare la puntata?")
+    print("Opzioni:")
+    print("  - Descrivi l'elemento (es. 'tappa sulle monete in alto')")
+    print("  - Dai le coordinate (es. '540,600')")
+    print("  - Scrivi 'skip' per saltare e continuare con GPT")
+    print("  - Scrivi 'stop' per fermare tutto")
+
+    user_input = input("> ").strip()
+
+    if user_input.lower() == "stop":
+        return ("stop",)
+    if user_input.lower() == "skip":
+        return ("skip",)
+
+    if "," in user_input:
+        parts = user_input.split(",")
+        if len(parts) == 2:
+            try:
+                x, y = int(parts[0].strip()), int(parts[1].strip())
+                return ("coords", x, y)
+            except ValueError:
+                pass
+
+    return ("text", user_input)
+
+
+def handle_hitl_escalation(
+    screen_reader: ScreenReader,
+    ocr_reader: SlotOCRReader,
+    touch_injector: TouchInjector,
+    device_id: str,
+    current_bet: Optional[float],
+    min_bet: float,
+) -> tuple:
+    """Gestisce l'escalation HITL: chiede ripetutamente aiuto all'operatore
+    finche' non arriva uno stop, uno skip, un suggerimento testuale, o
+    coordinate che abbassano davvero la posta. Ritorna:
+    - ("stop", None)
+    - ("skip", None)
+    - ("resolved", ocr_state) — posta abbassata con successo, stato fresco
+    - ("hint", descrizione) — suggerimento testuale da passare a GPT-4o
+    """
+    while True:
+        ss = screen_reader._screenshot(device_id)
+        screenshot_path = ss.data if ss.success else None
+
+        outcome = ask_human_help(screenshot_path, current_bet, min_bet)
+
+        if outcome[0] == "stop":
+            return ("stop", None)
+        if outcome[0] == "skip":
+            return ("skip", None)
+
+        if outcome[0] == "coords":
+            _, x, y = outcome
+            print(f"Eseguo il tap suggerito dall'operatore: ({x},{y})")
+            touch_injector.tap_coordinates(device_id, x, y)
+            time.sleep(3)
+            ocr_state = read_ocr_state(screen_reader, ocr_reader, device_id)
+            if ocr_state is None:
+                continue
+            new_bet = ocr_state.get("posta")
+            if new_bet is not None and current_bet is not None and new_bet < current_bet:
+                print(f"Posta abbassata con successo: {current_bet:.2f} -> {new_bet:.2f} EUR.")
+                return ("resolved", ocr_state)
+            print("La posta non sembra essere cambiata. Richiedo di nuovo aiuto.")
+            if new_bet is not None:
+                current_bet = new_bet
+            continue
+
+        # outcome[0] == "text"
+        return ("hint", outcome[1])
+
+
 def run_autonomous_session(
     device_id: str, target_amount: float, max_steps: int, save_screenshots: bool = False,
 ) -> bool:
@@ -298,6 +405,15 @@ def run_autonomous_session(
                         f"Spin rilevato! Saldo: {previous_balance} -> {current_balance}. "
                         f"Posta: {spin_bet:.2f}. Total played: {total_played:.2f}"
                     )
+                    if last_tap_coords is not None:
+                        # Anche se l'OCR non ha mai etichettato il tasto SPIN
+                        # (nessun testo "SPIN"/"XITER"/"GIRA" trovato), abbiamo
+                        # appena OSSERVATO che tappare qui causa uno spin:
+                        # impariamo queste coordinate cosi' il safety-net qui
+                        # sotto puo' bloccare i tentativi successivi durante il
+                        # setup, invece di rilevarli solo a posteriori.
+                        known_spin_coords = last_tap_coords
+                        print(f"Coordinate del tasto SPIN apprese da questo spin: {known_spin_coords}")
             if ocr_state.get("posta") is not None:
                 current_bet = ocr_state["posta"]
             if ocr_state.get("spin_button_coords") is not None:
@@ -341,9 +457,31 @@ def run_autonomous_session(
             if consecutive_setup_steps > MAX_CONSECUTIVE_SETUP_STEPS:
                 print(
                     f"HITL: il sistema non e' riuscito ad abbassare la posta al minimo dopo "
-                    f"{MAX_CONSECUTIVE_SETUP_STEPS} step. Serve intervento manuale."
+                    f"{MAX_CONSECUTIVE_SETUP_STEPS} step. Chiedo aiuto all'operatore."
                 )
-                return False
+                hitl_action, hitl_data = handle_hitl_escalation(
+                    screen_reader, ocr_reader, touch_injector, device_id, current_bet, MIN_BET,
+                )
+                if hitl_action == "stop":
+                    print("Operatore ha richiesto lo stop. Fine sessione.")
+                    return False
+
+                consecutive_setup_steps = 0
+                if hitl_action == "resolved":
+                    ocr_state = hitl_data
+                    if ocr_state.get("saldo") is not None:
+                        current_balance = ocr_state["saldo"]
+                    if ocr_state.get("posta") is not None:
+                        current_bet = ocr_state["posta"]
+                    if ocr_state.get("spin_button_coords") is not None:
+                        known_spin_coords = ocr_state["spin_button_coords"]
+                    previous_raw_texts = normalize_texts(ocr_state.get("raw_texts", []))
+                    steps_since_ocr = 0
+                    force_ocr_refresh = False
+                elif hitl_action == "hint":
+                    corrective_note = f"The human operator suggests: {hitl_data}"
+                # hitl_action == "skip": nessun'altra azione, si riprova con GPT
+                phase = determine_phase(current_bet)
         else:
             consecutive_setup_steps = 0
 
@@ -417,8 +555,9 @@ def run_autonomous_session(
                 "(fase setup). Tap NON eseguito."
             )
             corrective_note = (
-                f"You tapped the SPIN button but the bet is still at {current_bet:.2f} EUR. "
-                "You MUST lower the bet first. Do NOT tap the SPIN button. Look for the bet selector."
+                f"BLOCKED: You tried to tap the SPIN button but the bet is still {current_bet:.2f}€ "
+                f"(minimum is {MIN_BET:.2f}€). You MUST lower the bet FIRST. Look for the bet amount "
+                "display, a coins icon, or +/- buttons. DO NOT tap the SPIN button."
             )
             action_history.append({"step": step, "action": "blocked_spin_attempt", "target": (real_x, real_y), "phase": phase})
             action_history = action_history[-5:]
@@ -434,12 +573,14 @@ def run_autonomous_session(
         if len(recent_same_spot) >= 2:
             print(f"BLOCCATO: tap ripetuto su ({real_x},{real_y}) senza effetto. Suggerisco elementi non provati.")
             untried = find_untried_elements(ocr_state.get("raw_texts", []), tapped_targets)
+            bet_str = f"{current_bet:.2f}€" if current_bet is not None else "unknown"
             corrective_note = (
-                f"You already tapped this area ({real_x},{real_y}) twice and nothing changed. "
-                "Try a COMPLETELY DIFFERENT element."
+                "You tapped this area twice with no effect. "
+                f"The bet is still {bet_str}. Look at the screenshot AGAIN. Find a DIFFERENT element to "
+                "tap. Try: coins icon, settings gear, +/- buttons, or the bet amount text itself."
             )
             if untried:
-                corrective_note += f" Here are elements you have NOT tried yet: {untried}. Pick one of these."
+                corrective_note += f" Elements you have NOT tried yet: {untried}."
             action_history.append({"step": step, "action": "blocked_repeat_tap", "target": (real_x, real_y), "phase": phase})
             action_history = action_history[-5:]
             time.sleep(1.0)
