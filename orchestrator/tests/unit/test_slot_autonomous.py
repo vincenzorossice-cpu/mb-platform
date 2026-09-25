@@ -617,6 +617,53 @@ class TestRunAutonomousSession:
         mocks["engine"].ask_with_image.assert_not_called()
         mocks["touch_injector"].tap_coordinates.assert_not_called()
 
+    def test_transient_screen_state_waits_and_ignores_the_decision(self, mocks, capsys):
+        """Bug reale: un minigioco lungo produceva tap ripetuti a vuoto
+        (rispinnare, toccare elementi a caso) perche' lo script agiva sul
+        fotogramma a meta' animazione. Ora uno screen_state transitorio fa
+        aspettare e ricontrollare, ignorando la decisione (azione e target)."""
+        mocks["ocr_reader"].read_slot_state.return_value = _ocr_state(
+            saldo=100.0, posta=0.10, spin_button_coords=(540, 1200),
+        )
+        mocks["engine"].ask_with_image.side_effect = [
+            Result.ok(_answers("tap", _target(region="center"), screen_state="win_presentation")),
+            Result.ok(_answers("stop")),
+        ]
+
+        ok = run_autonomous_session("dev", target_amount=30.0, max_steps=10, known_min_bet=0.10)
+
+        assert ok is True
+        mocks["touch_injector"].tap_coordinates.assert_not_called()
+        assert mocks["engine"].ask_with_image.call_count == 2
+        out = capsys.readouterr().out
+        assert "Schermo in transizione (win_presentation): aspetto" in out
+
+    def test_transient_screen_state_ignores_even_a_stop_decision(self, mocks):
+        """Anche uno 'stop' non e' affidabile a meta' animazione: la sessione
+        non deve fermarsi finche' lo stato non si stabilizza."""
+        mocks["ocr_reader"].read_slot_state.return_value = _ocr_state(saldo=100.0, posta=0.10)
+        mocks["engine"].ask_with_image.side_effect = [
+            Result.ok(_answers("stop", screen_state="spinning")),
+            Result.ok(_answers("stop")),
+        ]
+
+        ok = run_autonomous_session("dev", target_amount=30.0, max_steps=10, known_min_bet=0.10)
+
+        assert ok is True
+        assert mocks["engine"].ask_with_image.call_count == 2
+
+    def test_playing_phase_prompt_forbids_other_buttons(self, mocks):
+        mocks["ocr_reader"].read_slot_state.return_value = _ocr_state(
+            saldo=100.0, posta=0.10, spin_button_coords=(540, 1200),
+        )
+        mocks["engine"].ask_with_image.return_value = Result.ok(_answers("stop"))
+
+        run_autonomous_session("dev", target_amount=30.0, max_steps=10, known_min_bet=0.10)
+
+        state_text = mocks["engine"].ask_with_image.call_args.args[1]
+        assert "Do NOT tap anything else" in state_text
+        assert "autospin" in state_text.lower()
+
     def test_tap_uses_ocr_measured_coordinates_for_text_target(self, mocks):
         """GPT non restituisce mai pixel: sceglie un testo tra i candidati OCR
         e il sistema tappa esattamente dove l'OCR ha misurato quell'elemento

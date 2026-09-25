@@ -86,6 +86,9 @@ NEARBY_OFFSETS_PX = (40, 80)  # offset (px) usati per suggerire coordinate vicin
 HINT_TTL_STEPS = 5  # per quanti step un suggerimento resta attivo nello state text
 MIN_BET_DISCOVERY_PATIENCE_STEPS = 3  # letture consecutive senza un nuovo minimo -> il piu' basso
 # visto finora diventa il minimo scoperto per questa slot (nessun numero hardcoded)
+_TRANSIENT_SCREEN_STATES = {"loading", "spinning", "win_presentation", "feature"}  # animazioni/minigiochi:
+# un fotogramma qui non e' affidabile per decidere alcun tap (vedi slot_anatomy.md sez. 7)
+TRANSIENT_STATE_WAIT_SECONDS = 3.0  # attesa extra prima di richiedere di nuovo un parere a GPT
 _RELATIVE_OFFSET_PX = 100  # scostamento generico per descrizioni HITL relative ("sopra X", "a destra di X")
 _HITL_SCREEN_CHANGED_DIRECTIVE = (
     "The screen changed after the operator's tap. Look at the CURRENT screenshot: if a bet menu is "
@@ -404,7 +407,11 @@ def build_vision_state_text(
                 "ONLY on finding the bet control."
             )
     else:
-        phase_banner = "\nBET IS AT MINIMUM. Now find and tap the SPIN button."
+        phase_banner = (
+            "\nBET IS AT MINIMUM. Now find and tap the SPIN button. Do NOT tap anything else — not "
+            "autospin/auto-play, not settings, not the bet menu, not any other button — unless SPIN "
+            "itself is not visible on screen right now."
+        )
 
     screen_diff_note = ""
     if new_texts:
@@ -1184,6 +1191,17 @@ def run_autonomous_session(
             menu_toggle_autotap_pending = True
 
         print(f"Decisione: {action} target={target} screen_state={screen_state} (confidence: {confidence:.2f})")
+
+        if screen_state in _TRANSIENT_SCREEN_STATES:
+            # Un fotogramma a meta' animazione/minigioco non e' affidabile per
+            # decidere alcun tap (ne' per un'azione ne' per un target): si
+            # ignora l'intera decisione e si aspetta che lo stato si stabilizzi,
+            # invece di ritentare a vuoto (bug reale: tap ripetuti su SPIN o su
+            # elementi a caso mentre un minigioco lungo era ancora in corso).
+            print(f"Schermo in transizione ({screen_state}): aspetto che l'animazione/minigioco finisca prima di riprovare.")
+            time.sleep(TRANSIENT_STATE_WAIT_SECONDS)
+            force_ocr_refresh = True
+            continue
 
         if action == "stop":
             print("Il Decision Engine dice STOP. Fine del test.")
