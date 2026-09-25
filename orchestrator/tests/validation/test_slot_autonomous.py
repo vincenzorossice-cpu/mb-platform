@@ -67,7 +67,8 @@ from orchestrator.modules.touch_injector.injector import TouchInjector
 logger = logging.getLogger(__name__)
 
 OCR_REFRESH_INTERVAL = 3  # step tra una lettura OCR (saldo/posta) e l'altra
-MIN_BET = 0.10  # posta minima assunta; usata per la fase setup/playing e per lo stop su saldo basso
+MIN_BET = 0.10  # SOLO soglia di sicurezza "saldo troppo basso, fermati": la puntata
+# minima REALE di ogni slot e' scoperta a runtime (known_min_bet), mai assunta fissa qui.
 DEFAULT_MAX_STEPS = 50
 DEFAULT_TARGET_AMOUNT = 30.0
 VISION_RESIZE_SCALE = 1.0  # dimezza lo screenshot prima di inviarlo alla Vision API
@@ -83,10 +84,30 @@ MAX_REPEAT_ATTEMPTS_INSIDE_MENU = 4  # dentro un menu, selezionare una cella div
 # serve piu' pazienza prima di considerare un tap davvero "senza effetto" (vedi Causa B nel piano)
 NEARBY_OFFSETS_PX = (40, 80)  # offset (px) usati per suggerire coordinate vicine a un tap bloccato
 HINT_TTL_STEPS = 5  # per quanti step un suggerimento resta attivo nello state text
+MIN_BET_DISCOVERY_PATIENCE_STEPS = 3  # letture consecutive senza un nuovo minimo -> il piu' basso
+# visto finora diventa il minimo scoperto per questa slot (nessun numero hardcoded)
 _RELATIVE_OFFSET_PX = 100  # scostamento generico per descrizioni HITL relative ("sopra X", "a destra di X")
-_HITL_MENU_OPENED_DIRECTIVE = (
-    "A menu just opened after the operator's tap. Select the MINIMUM bet option now."
+_HITL_SCREEN_CHANGED_DIRECTIVE = (
+    "The screen changed after the operator's tap. Look at the CURRENT screenshot: if a bet menu is "
+    "open, select the LOWEST amount available; if you are back on the main game screen with the bet "
+    "at minimum, look for the SPIN button."
 )
+
+# Parole chiave generiche (italiano) per riconoscere l'INTENTO dell'operatore
+# in una descrizione HITL testuale, senza alcun riferimento a una slot specifica.
+_SPIN_INTENT_KEYWORDS = ("spin", "gira", "girare", "gioca", "freccia circolare")
+_MIN_BET_SUBJECT_PHRASES = ("puntata minima", "posta minima", "puntata al minimo", "posta al minimo")
+_MIN_BET_CONFIRMATION_MARKERS = ("abbiamo", "gia", "già", "corretta", "raggiunta", "ok", "va bene")
+
+
+def _looks_like_min_bet_confirmation(description: str) -> bool:
+    """Vero se l'operatore sta confermando che la puntata ATTUALE e' gia' il
+    minimo per questa slot (es. 'abbiamo la puntata minima corretta'):
+    vocabolario generico, nessun riferimento a una slot specifica."""
+    text = description.lower()
+    has_subject = any(p in text for p in _MIN_BET_SUBJECT_PHRASES)
+    has_marker = any(m in text for m in _MIN_BET_CONFIRMATION_MARKERS)
+    return has_subject and has_marker
 
 # Frazioni (larghezza, altezza) del centro di ciascuna cella di una griglia 3x3,
 # usate per tradurre una regione grossolana (target_region) in un punto reale
@@ -322,11 +343,16 @@ def get_image_dimensions(image_path: str) -> tuple:
         return img.size
 
 
-def determine_phase(current_bet: Optional[float], min_bet: float = MIN_BET) -> str:
-    """'setup' finche' la posta letta via OCR e' sopra il minimo, 'playing' quando
-    e' al minimo (o sconosciuta: non possiamo chiedere di abbassarla se non
-    sappiamo qual e')."""
-    if current_bet is not None and current_bet > min_bet:
+def determine_phase(current_bet: Optional[float], known_min_bet: Optional[float]) -> str:
+    """'setup' se la puntata minima per QUESTA slot non e' ancora nota (si sta
+    ancora esplorando), o e' nota ma la posta letta e' ancora sopra di essa;
+    'playing' quando la posta e' al minimo scoperto (o sconosciuta: non
+    possiamo chiedere di abbassarla se non sappiamo nemmeno qual e')."""
+    if current_bet is None:
+        return "playing"
+    if known_min_bet is None:
+        return "setup"
+    if current_bet > known_min_bet:
         return "setup"
     return "playing"
 
@@ -339,27 +365,34 @@ def build_vision_state_text(
     target_amount: float,
     step: int,
     action_history: list,
-    min_bet: float = MIN_BET,
+    known_min_bet: Optional[float] = None,
     corrective_note: Optional[str] = None,
     menu_open: bool = False,
     new_texts: Optional[set] = None,
     disappeared_texts: Optional[set] = None,
     steps_without_screen_change: int = 0,
 ) -> str:
-    phase = determine_phase(current_bet, min_bet)
+    phase = determine_phase(current_bet, known_min_bet)
+    min_bet_str = f"{known_min_bet:.2f} EUR" if known_min_bet is not None else "not yet known for this slot"
 
     phase_banner = ""
     if phase == "setup":
-        phase_banner = (
-            f"\nPHASE: BET SETUP - Lower the bet before spinning! Current bet {current_bet:.2f} EUR "
-            f"is above the minimum ({min_bet:.2f} EUR)."
-        )
+        if current_bet is not None:
+            phase_banner = (
+                f"\nPHASE: BET SETUP - Lower the bet before spinning! Current bet {current_bet:.2f} EUR "
+                f"is above the minimum ({min_bet_str})."
+            )
+        else:
+            phase_banner = "\nPHASE: BET SETUP - Lower the bet before spinning!"
         if menu_open:
             phase_banner += (
-                "\nA bet menu/overlay appears to be open. Select the LOWEST amount available, then "
-                "look for a CLOSE/CONFIRM/OK button or tap OUTSIDE the menu area to close it. Do NOT "
-                "tap the same bet amount again if you already selected it — you need to CLOSE the "
-                "menu now."
+                "\nA bet menu/overlay appears to be open. This slot's total bet may be made of more "
+                "than one selectable option (e.g. a bet-per-line amount AND a number of lines): try the "
+                "LOWEST value in EACH selectable row, and watch the TOTAL bet shown on screen — once it "
+                "stops decreasing no matter what you try, that is the minimum for this slot. Then look "
+                "for a CLOSE/CONFIRM/OK button, or tap the SAME icon you used to open this menu, to "
+                "return to the main game screen. Do NOT tap the same bet amount again if you already "
+                "selected it — you need to CLOSE the menu now."
             )
         else:
             phase_banner += (
@@ -408,12 +441,12 @@ def build_vision_state_text(
 
     return f"""You are playing a slot machine in DEMO mode on an Android phone.{corrective_block}
 
-GOAL: Set the bet to minimum (0.10 EUR if possible), play until total played reaches {target_amount} EUR, then stop.
+GOAL: Lower the bet to the LOWEST amount this slot allows, play until total played reaches {target_amount} EUR, then stop.
 
 Step: {step}
 Step phase: {phase}{phase_banner}{screen_diff_note}
 Current balance (read via OCR): {current_balance if current_balance is not None else "unknown"} EUR
-Current bet: {current_bet if current_bet is not None else "unknown"} EUR (MINIMUM BET: {min_bet:.2f} EUR or lowest available)
+Current bet: {current_bet if current_bet is not None else "unknown"} EUR (minimum bet for this slot: {min_bet_str})
 WARNING: If current bet is above minimum, you MUST lower it first. Do not spin with a high bet.
 Total played so far: {total_played:.2f} EUR (this is the SUM of all bets, NOT the balance difference)
 Net profit/loss: {net_profit_loss} EUR
@@ -450,20 +483,24 @@ def read_ocr_state(screen_reader: ScreenReader, ocr_reader: SlotOCRReader, devic
     return ocr_reader.read_slot_state(ss.data)
 
 
-def ask_human_help(current_bet: Optional[float], min_bet: float) -> tuple:
+def ask_human_help(current_bet: Optional[float], min_bet: Optional[float]) -> tuple:
     """Chiede aiuto all'operatore via terminale quando il sistema non riesce
     ad abbassare la posta da solo dopo troppi tentativi. Non mostra lo
     screenshot: quello lo vede solo GPT-4o-mini via Vision API, non serve
-    aprirlo anche sul terminale/desktop dell'operatore. Ritorna una tupla:
+    aprirlo anche sul terminale/desktop dell'operatore. `min_bet` puo' essere
+    `None` se il minimo per questa slot non e' ancora stato scoperto. Ritorna
+    una tupla:
     - ("stop",): l'operatore vuole fermare tutto
     - ("skip",): l'operatore vuole lasciar riprovare GPT-4o senza aiuto
     - ("coords", x, y): l'operatore ha dato coordinate da tappare
-    - ("text", descrizione): suggerimento testuale da passare a GPT-4o
+    - ("text", descrizione): comando testuale da eseguire (posizione e/o
+      conferma della puntata minima)
     """
     bet_str = f"{current_bet:.2f}" if current_bet is not None else "unknown"
+    min_bet_str = f"{min_bet:.2f} EUR" if min_bet is not None else "non ancora nota"
     print(f"\n{'='*60}")
     print("HITL: Non riesco ad abbassare la puntata.")
-    print(f"Puntata attuale: {bet_str} EUR | Minimo: {min_bet:.2f} EUR")
+    print(f"Puntata attuale: {bet_str} EUR | Minimo: {min_bet_str}")
     print(f"{'='*60}")
 
     print("\nCosa devo tappare per abbassare la puntata?")
@@ -498,7 +535,7 @@ def handle_hitl_escalation(
     touch_injector: TouchInjector,
     device_id: str,
     current_bet: Optional[float],
-    min_bet: float,
+    min_bet: Optional[float],
 ) -> tuple:
     """Gestisce l'escalation HITL: chiede ripetutamente aiuto all'operatore
     finche' non arriva uno stop, uno skip, o un comando (coordinate o
@@ -510,21 +547,33 @@ def handle_hitl_escalation(
     descrizione si traduce in coordinate con parse_operator_description
     (etichetta OCR + scostamento relativo, o regione grossolana a griglia
     3x3): se non e' interpretabile si richiede di nuovo aiuto senza tappare
-    nulla. Ritorna:
-    - ("stop", None)
-    - ("skip", None)
-    - ("resolved", ocr_state) — posta abbassata con successo, stato fresco
-    - ("hint", direttiva) — un menu e' apparso dopo il tap dell'operatore:
-      direttiva generica sullo stato osservato (non la frase dell'operatore)
-      da passare a GPT per riprendere in autonomia
-    """
+    nulla.
+
+    La descrizione viene anche ispezionata per due segnali generici
+    indipendenti dal parsing posizionale: una CONFERMA esplicita che la
+    puntata attuale e' il minimo per questa slot, e un INTENTO esplicito di
+    spin (nel qual caso un calo di saldo non e' trattato come un incidente).
+
+    Ritorna sempre una quadrupla (azione, dati, puntata_minima_confermata,
+    coordinate_tappate):
+    - ("stop", None, conferma, None)
+    - ("skip", None, conferma, None)
+    - ("resolved", ocr_state, conferma, (x, y)) — posta abbassata con successo
+    - ("spin_confirmed", ocr_state, conferma, (x, y)) — calo di saldo ma
+      l'operatore aveva esplicitamente chiesto di spinnare
+    - ("hint", direttiva, conferma, (x, y)) — lo schermo e' cambiato dopo il
+      tap dell'operatore: direttiva generica sullo stato osservato (mai la
+      frase originale, che GPT ha gia' dimostrato di ignorare)
+    'conferma' e 'coordinate_tappate' possono essere None se non applicabili
+    a quell'esito."""
+    confirmed_min_bet: Optional[float] = None
     while True:
         outcome = ask_human_help(current_bet, min_bet)
 
         if outcome[0] == "stop":
-            return ("stop", None)
+            return ("stop", None, confirmed_min_bet, None)
         if outcome[0] == "skip":
-            return ("skip", None)
+            return ("skip", None, confirmed_min_bet, None)
 
         if outcome[0] == "coords":
             _, x, y = outcome
@@ -537,7 +586,7 @@ def handle_hitl_escalation(
             new_bet = ocr_state.get("posta")
             if new_bet is not None and current_bet is not None and new_bet < current_bet:
                 print(f"Posta abbassata con successo: {current_bet:.2f} -> {new_bet:.2f} EUR.")
-                return ("resolved", ocr_state)
+                return ("resolved", ocr_state, confirmed_min_bet, (x, y))
             print("La posta non sembra essere cambiata. Richiedo di nuovo aiuto.")
             if new_bet is not None:
                 current_bet = new_bet
@@ -546,6 +595,12 @@ def handle_hitl_escalation(
         # outcome[0] == "text": descrizione libera dell'operatore, e' un
         # COMANDO da eseguire subito, non un suggerimento per GPT.
         description = outcome[1]
+
+        if _looks_like_min_bet_confirmation(description):
+            confirmed_min_bet = current_bet
+            bet_str = f"{current_bet:.2f} EUR" if current_bet is not None else "sconosciuta"
+            print(f"Operatore conferma: {bet_str} e' la puntata minima per questa slot.")
+
         ss = screen_reader._screenshot(device_id)
         if not ss.success:
             print(f"ERRORE: screenshot fallito: {ss.error} ({ss.error_code})")
@@ -572,11 +627,16 @@ def handle_hitl_escalation(
         new_bet = ocr_state.get("posta")
         if new_bet is not None and current_bet is not None and new_bet < current_bet:
             print(f"Posta abbassata con successo: {current_bet:.2f} -> {new_bet:.2f} EUR.")
-            return ("resolved", ocr_state)
+            return ("resolved", ocr_state, confirmed_min_bet, (x, y))
 
         pre_tap_balance = pre_tap_state.get("saldo")
         new_balance = ocr_state.get("saldo")
         if new_balance is not None and pre_tap_balance is not None and new_balance < pre_tap_balance:
+            if any(kw in description.lower() for kw in _SPIN_INTENT_KEYWORDS):
+                print(f"Spin eseguito su richiesta esplicita dell'operatore: saldo {pre_tap_balance} -> {new_balance}.")
+                if new_bet is not None:
+                    current_bet = new_bet
+                return ("spin_confirmed", ocr_state, confirmed_min_bet, (x, y))
             print(f"ATTENZIONE: il saldo e' sceso ({pre_tap_balance} -> {new_balance}): hai spinato per errore?")
             if new_bet is not None:
                 current_bet = new_bet
@@ -585,8 +645,8 @@ def handle_hitl_escalation(
         pre_tap_texts = normalize_texts(pre_tap_state.get("raw_texts", []))
         post_tap_texts = normalize_texts(ocr_state.get("raw_texts", []))
         if post_tap_texts - pre_tap_texts:
-            print("Sembra essersi aperto un nuovo menu. Segnalo a GPT di selezionare la puntata minima.")
-            return ("hint", _HITL_MENU_OPENED_DIRECTIVE)
+            print("Lo schermo e' cambiato dopo il tap. Segnalo a GPT lo stato osservato (non la frase originale).")
+            return ("hint", _HITL_SCREEN_CHANGED_DIRECTIVE, confirmed_min_bet, (x, y))
 
         print("Non sembra essere cambiato nulla. Richiedo di nuovo aiuto.")
         if new_bet is not None:
@@ -601,9 +661,13 @@ def _slot_memory_path(slot_name: str) -> str:
 
 def load_slot_memory(slot_name: str) -> dict:
     """Carica cio' che e' stato imparato su questa slot in esecuzioni
-    precedenti (coordinate spin, suggerimenti confermati utili). Ritorna una
-    memoria vuota se non esiste ancora nulla o il file e' illeggibile."""
-    empty = {"known_spin_coords": None, "learned_hints": []}
+    precedenti (coordinate spin, suggerimenti confermati utili, puntata
+    minima scoperta, icona di apertura/chiusura del menu puntata). Ritorna
+    una memoria vuota se non esiste ancora nulla o il file e' illeggibile."""
+    empty = {
+        "known_spin_coords": None, "learned_hints": [],
+        "known_min_bet": None, "known_bet_menu_toggle": None,
+    }
     path = _slot_memory_path(slot_name)
     if not os.path.exists(path):
         return empty
@@ -613,9 +677,12 @@ def load_slot_memory(slot_name: str) -> dict:
     except (OSError, json.JSONDecodeError):
         return empty
     coords = data.get("known_spin_coords")
+    toggle = data.get("known_bet_menu_toggle")
     return {
         "known_spin_coords": tuple(coords) if coords else None,
         "learned_hints": list(data.get("learned_hints", [])),
+        "known_min_bet": data.get("known_min_bet"),
+        "known_bet_menu_toggle": tuple(toggle) if toggle else None,
     }
 
 
@@ -625,12 +692,22 @@ def save_slot_memory(slot_name: str, memory: dict) -> None:
     serializable = {
         "known_spin_coords": list(memory["known_spin_coords"]) if memory.get("known_spin_coords") else None,
         "learned_hints": list(memory.get("learned_hints", [])),
+        "known_min_bet": memory.get("known_min_bet"),
+        "known_bet_menu_toggle": (
+            list(memory["known_bet_menu_toggle"]) if memory.get("known_bet_menu_toggle") else None
+        ),
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(serializable, f, indent=2)
 
 
-def _persist_slot_memory(slot_name: Optional[str], known_spin_coords: Optional[tuple], new_hints: list) -> None:
+def _persist_slot_memory(
+    slot_name: Optional[str],
+    known_spin_coords: Optional[tuple] = None,
+    new_hints: Optional[list] = None,
+    known_min_bet: Optional[float] = None,
+    known_bet_menu_toggle: Optional[tuple] = None,
+) -> None:
     """Aggiorna la memoria su file per questa slot (se un nome e' stato dato):
     unisce quanto gia' salvato con le nuove informazioni, senza perdere nulla."""
     if not slot_name:
@@ -638,9 +715,14 @@ def _persist_slot_memory(slot_name: Optional[str], known_spin_coords: Optional[t
     memory = load_slot_memory(slot_name)
     if known_spin_coords is not None:
         memory["known_spin_coords"] = known_spin_coords
-    hints = set(memory.get("learned_hints", []))
-    hints.update(new_hints)
-    memory["learned_hints"] = sorted(hints)
+    if new_hints:
+        hints = set(memory.get("learned_hints", []))
+        hints.update(new_hints)
+        memory["learned_hints"] = sorted(hints)
+    if known_min_bet is not None:
+        memory["known_min_bet"] = known_min_bet
+    if known_bet_menu_toggle is not None:
+        memory["known_bet_menu_toggle"] = known_bet_menu_toggle
     save_slot_memory(slot_name, memory)
 
 
@@ -650,6 +732,7 @@ def run_autonomous_session(
     max_steps: int,
     save_screenshots: bool = False,
     slot_name: Optional[str] = None,
+    known_min_bet: Optional[float] = None,
 ) -> bool:
     """Gioca la slot gia' aperta sul device lasciando che GPT-4o-mini Vision
     scelga autonomamente cosa tappare guardando lo screenshot ad ogni passo.
@@ -685,10 +768,24 @@ def run_autonomous_session(
     screenshot aperto). I suggerimenti si accumulano (active_hints, ciascuno
     con il proprio TTL) invece di sovrascriversi.
 
-    Memoria persistente: se slot_name e' dato, le coordinate spin imparate e i
-    suggerimenti che hanno portato la fase da "setup" a "playing" vengono
-    salvati su file e ricaricati automaticamente in esecuzioni future sulla
-    stessa slot (vedi load_slot_memory/save_slot_memory).
+    Memoria persistente: se slot_name e' dato, le coordinate spin imparate, i
+    suggerimenti che hanno portato la fase da "setup" a "playing", la puntata
+    minima scoperta per questa slot e l'icona di apertura del menu puntata
+    vengono salvati su file e ricaricati automaticamente in esecuzioni future
+    sulla stessa slot (vedi load_slot_memory/save_slot_memory).
+
+    Puntata minima: MAI assunta fissa. Si traccia il valore piu' basso
+    osservato mentre non e' ancora nota (lowest_bet_seen); dopo
+    MIN_BET_DISCOVERY_PATIENCE_STEPS letture senza un nuovo minimo, quel
+    valore diventa known_min_bet (scoperta empirica). Una conferma esplicita
+    dell'operatore durante l'HITL ("abbiamo la puntata minima corretta") la
+    stabilisce subito, come fallback.
+
+    Icona menu puntata: se un tap (di GPT o dell'operatore via HITL) precede
+    una transizione dello schermo a "modal", le sue coordinate vengono
+    imparate come known_bet_menu_toggle_coords e riusate in AUTONOMIA (un
+    tap diretto, senza interpellare GPT) per aprire il menu al bisogno —
+    mai un default globale: solo se gia' osservato per QUESTA slot.
 
     total_played e' la SOMMA delle poste piazzate, dedotta osservando il
     saldo — mai saldo_iniziale - saldo_attuale — e contata solo quando l'ultimo
@@ -706,14 +803,20 @@ def run_autonomous_session(
     if save_screenshots:
         os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
 
-    slot_memory = load_slot_memory(slot_name) if slot_name else {"known_spin_coords": None, "learned_hints": []}
+    empty_memory = {
+        "known_spin_coords": None, "learned_hints": [],
+        "known_min_bet": None, "known_bet_menu_toggle": None,
+    }
+    slot_memory = load_slot_memory(slot_name) if slot_name else empty_memory
 
     print("=== TEST GIOCO SLOT AUTONOMO (GPT-4o-mini Vision) ===")
     print(f"Device: {device_id}")
     print(f"Target giocato: {target_amount} EUR, max {max_steps} step")
     if slot_name:
         print(f"Slot: {slot_name} (memoria: {len(slot_memory['learned_hints'])} hint, "
-              f"spin noto: {slot_memory['known_spin_coords']})")
+              f"spin noto: {slot_memory['known_spin_coords']}, "
+              f"puntata minima nota: {slot_memory['known_min_bet']}, "
+              f"icona menu nota: {slot_memory['known_bet_menu_toggle']})")
     print("Assicurati che la slot sia aperta in modalita' DEMO sul telefono.")
     input("Premi INVIO per iniziare...")
 
@@ -725,6 +828,17 @@ def run_autonomous_session(
     current_balance = initial_balance
     current_bet = ocr_state.get("posta")
     known_spin_coords = ocr_state.get("spin_button_coords") or slot_memory.get("known_spin_coords")
+    # known_min_bet passato esplicitamente (es. --min-bet, o gia' noto da un
+    # test/chiamante) ha priorita' sulla memoria; se nessuno dei due lo da',
+    # verra' scoperto a runtime (vedi plateau piu' sotto) o confermato dall'operatore.
+    known_min_bet: Optional[float] = known_min_bet if known_min_bet is not None else slot_memory.get("known_min_bet")
+    lowest_bet_seen: Optional[float] = current_bet
+    steps_without_new_min = 0
+    known_bet_menu_toggle_coords: Optional[tuple] = slot_memory.get("known_bet_menu_toggle")
+    menu_toggle_autotap_pending = True
+    last_menu_toggle_candidate: Optional[tuple] = None
+    last_seen_bet_for_awareness: Optional[float] = current_bet
+    bet_change_note: Optional[str] = None
     total_played = 0.0
     action_history: list[dict] = []
     steps_since_ocr = 0
@@ -742,7 +856,7 @@ def run_autonomous_session(
     previous_raw_texts: Optional[set] = normalize_texts(ocr_state.get("raw_texts", []))
     new_texts: set = set()
     disappeared_texts: set = set()
-    previous_phase = determine_phase(current_bet)
+    previous_phase = determine_phase(current_bet, known_min_bet)
 
     print(f"Saldo iniziale: {initial_balance}")
 
@@ -783,6 +897,35 @@ def run_autonomous_session(
                         )
             if ocr_state.get("posta") is not None:
                 current_bet = ocr_state["posta"]
+                if (
+                    last_seen_bet_for_awareness is not None
+                    and current_bet != last_seen_bet_for_awareness
+                ):
+                    # Non solo il log a terminale: anche GPT deve "accorgersi"
+                    # esplicitamente di aver cambiato la puntata, invece di
+                    # continuare a cercare come se nulla fosse successo.
+                    bet_change_note = (
+                        f"NOTE: the displayed bet changed from {last_seen_bet_for_awareness:.2f} EUR "
+                        f"to {current_bet:.2f} EUR since your last observation."
+                    )
+                last_seen_bet_for_awareness = current_bet
+
+                if known_min_bet is None:
+                    # La puntata minima di questa slot non e' un numero
+                    # hardcoded: si scopre osservando quando smette di
+                    # scendere nonostante si continui a provare (plateau).
+                    if lowest_bet_seen is None or current_bet < lowest_bet_seen:
+                        lowest_bet_seen = current_bet
+                        steps_without_new_min = 0
+                    else:
+                        steps_without_new_min += 1
+                    if (
+                        lowest_bet_seen is not None
+                        and steps_without_new_min >= MIN_BET_DISCOVERY_PATIENCE_STEPS
+                    ):
+                        known_min_bet = lowest_bet_seen
+                        print(f"Puntata minima individuata per questa slot: {known_min_bet:.2f} EUR (memorizzata).")
+                        _persist_slot_memory(slot_name, known_min_bet=known_min_bet)
             if ocr_state.get("spin_button_coords") is not None:
                 known_spin_coords = ocr_state["spin_button_coords"]
 
@@ -809,7 +952,7 @@ def run_autonomous_session(
         else:
             steps_since_ocr += 1
 
-        phase = determine_phase(current_bet)
+        phase = determine_phase(current_bet, known_min_bet)
         print(f"\n=== Step {step}/{max_steps} (fase: {phase}) ===")
         print(f"Saldo: {current_balance} | Posta: {current_bet} | Giocato finora: {total_played:.2f} EUR")
 
@@ -818,7 +961,7 @@ def run_autonomous_session(
             # minimo vengono considerati confermati utili e salvati per la
             # prossima volta che si gioca questa slot.
             print("Posta al minimo raggiunta: salvo i suggerimenti attivi come confermati utili.")
-            _persist_slot_memory(slot_name, None, [h["raw"] for h in active_hints])
+            _persist_slot_memory(slot_name, new_hints=[h["raw"] for h in active_hints])
         previous_phase = phase
 
         for h in active_hints:
@@ -827,6 +970,26 @@ def run_autonomous_session(
         if phase == "playing":
             active_hints = []
 
+        if (
+            phase == "setup"
+            and not menu_open
+            and known_bet_menu_toggle_coords is not None
+            and menu_toggle_autotap_pending
+        ):
+            # "Training" reale: questa icona ha gia' aperto il menu puntata su
+            # QUESTA slot (imparata da un tap precedente, di GPT o
+            # dell'operatore) - la ritappiamo subito in autonomia invece di
+            # far ripetere a GPT/operatore un lavoro gia' fatto. Un solo
+            # tentativo per ciclo: se non funziona si ricade su GPT/HITL.
+            tx, ty = known_bet_menu_toggle_coords
+            print(f"Riuso l'icona menu-puntata gia' nota per questa slot: tap autonomo in ({tx},{ty}).")
+            touch_injector.tap_coordinates(device_id, tx, ty)
+            menu_toggle_autotap_pending = False
+            last_menu_toggle_candidate = (tx, ty)
+            force_ocr_refresh = True
+            time.sleep(1.5)
+            continue
+
         if phase == "setup":
             consecutive_setup_steps += 1
             if consecutive_setup_steps > MAX_CONSECUTIVE_SETUP_STEPS:
@@ -834,9 +997,14 @@ def run_autonomous_session(
                     f"HITL: il sistema non e' riuscito ad abbassare la posta al minimo dopo "
                     f"{MAX_CONSECUTIVE_SETUP_STEPS} step. Chiedo aiuto all'operatore."
                 )
-                hitl_action, hitl_data = handle_hitl_escalation(
-                    screen_reader, ocr_reader, touch_injector, device_id, current_bet, MIN_BET,
+                hitl_action, hitl_data, confirmed_min_bet, hitl_tapped_coords = handle_hitl_escalation(
+                    screen_reader, ocr_reader, touch_injector, device_id, current_bet, known_min_bet,
                 )
+                if confirmed_min_bet is not None and known_min_bet is None:
+                    known_min_bet = confirmed_min_bet
+                    print(f"Puntata minima confermata dall'operatore per questa slot: {known_min_bet:.2f} EUR (memorizzata).")
+                    _persist_slot_memory(slot_name, known_min_bet=known_min_bet)
+
                 if hitl_action == "stop":
                     print("Operatore ha richiesto lo stop. Fine sessione.")
                     return False
@@ -853,13 +1021,41 @@ def run_autonomous_session(
                     previous_raw_texts = normalize_texts(ocr_state.get("raw_texts", []))
                     steps_since_ocr = 0
                     force_ocr_refresh = False
+                elif hitl_action == "spin_confirmed":
+                    # L'operatore ha chiesto esplicitamente di spinnare: non e'
+                    # un incidente, va contato regolarmente e la coordinata
+                    # imparata come tasto SPIN (come se l'avesse trovato GPT).
+                    ocr_state = hitl_data
+                    played_amount = None
+                    if current_balance is not None and ocr_state.get("saldo") is not None:
+                        played_amount = current_balance - ocr_state["saldo"]
+                    if ocr_state.get("saldo") is not None:
+                        current_balance = ocr_state["saldo"]
+                    if ocr_state.get("posta") is not None:
+                        current_bet = ocr_state["posta"]
+                    if hitl_tapped_coords is not None:
+                        known_spin_coords = hitl_tapped_coords
+                        _persist_slot_memory(slot_name, known_spin_coords=known_spin_coords)
+                    if played_amount is not None and played_amount > 0:
+                        total_played += played_amount
+                        print(f"Spin confermato dall'operatore: {played_amount:.2f} EUR. Totale giocato: {total_played:.2f} EUR.")
+                    previous_raw_texts = normalize_texts(ocr_state.get("raw_texts", []))
+                    steps_since_ocr = 0
+                    force_ocr_refresh = False
                 elif hitl_action == "hint":
                     # Cumulativo, non usa-e-getta: l'operatore ha gia' dovuto
                     # ripetersi troppe volte nei log reali perche' il
                     # suggerimento spariva dopo un solo turno (Causa C).
                     active_hints.append({"raw": hitl_data, "ttl": HINT_TTL_STEPS})
+                    if known_bet_menu_toggle_coords is None and hitl_tapped_coords is not None:
+                        # Lo schermo e' cambiato dopo QUESTO tap dell'operatore:
+                        # e' il segnale generico di un'icona menu-puntata,
+                        # imparata qui esattamente come se l'avesse trovata GPT.
+                        known_bet_menu_toggle_coords = hitl_tapped_coords
+                        print(f"Icona menu-puntata imparata dall'operatore per questa slot: {known_bet_menu_toggle_coords}.")
+                        _persist_slot_memory(slot_name, known_bet_menu_toggle=known_bet_menu_toggle_coords)
                 # hitl_action == "skip": nessun'altra azione, si riprova con GPT
-                phase = determine_phase(current_bet)
+                phase = determine_phase(current_bet, known_min_bet)
                 previous_phase = phase
         else:
             consecutive_setup_steps = 0
@@ -883,8 +1079,21 @@ def run_autonomous_session(
             if save_screenshots:
                 shutil.copy(resized_path, os.path.join(SCREENSHOTS_DIR, f"step_{step:04d}.png"))
 
+            min_bet_gap_note = None
+            if known_min_bet is not None and current_bet is not None and current_bet > known_min_bet:
+                min_bet_gap_note = (
+                    f"The discovered minimum bet for this slot is {known_min_bet:.2f} EUR; the current "
+                    f"bet is {current_bet:.2f} EUR — select the option that brings it back down to "
+                    f"{known_min_bet:.2f} EUR."
+                )
+
             hint_texts = [f"The human operator suggests: {h['raw']}" for h in active_hints]
-            notes = ([corrective_note] if corrective_note else []) + hint_texts
+            notes = (
+                ([corrective_note] if corrective_note else [])
+                + ([bet_change_note] if bet_change_note else [])
+                + ([min_bet_gap_note] if min_bet_gap_note else [])
+                + hint_texts
+            )
             combined_note = " ".join(notes) or None
 
             raw_texts = ocr_state.get("raw_texts", [])
@@ -892,10 +1101,11 @@ def run_autonomous_session(
 
             state_text = build_vision_state_text(
                 initial_balance, current_balance, current_bet, total_played, target_amount, step, action_history,
-                corrective_note=combined_note, menu_open=menu_open, new_texts=new_texts,
+                known_min_bet=known_min_bet, corrective_note=combined_note, menu_open=menu_open, new_texts=new_texts,
                 disappeared_texts=disappeared_texts, steps_without_screen_change=steps_without_screen_change,
             )
             corrective_note = None
+            bet_change_note = None
             new_texts, disappeared_texts = set(), set()
             questions = build_questions(candidate_texts)
 
@@ -920,6 +1130,14 @@ def run_autonomous_session(
         last_screen_state = screen_state
         was_menu_open = menu_open
         menu_open = (screen_state == "modal")
+        if not was_menu_open and menu_open and known_bet_menu_toggle_coords is None and last_menu_toggle_candidate is not None:
+            # Il tap dell'ultimo step (di GPT, non serve che sia stato
+            # l'operatore) precede l'apertura del menu: impariamo queste
+            # coordinate come icona menu-puntata per questa slot, cosi' un
+            # prossimo ciclo (o una prossima sessione) puo' riaprirlo subito.
+            known_bet_menu_toggle_coords = last_menu_toggle_candidate
+            print(f"Icona menu-puntata imparata per questa slot: {known_bet_menu_toggle_coords}.")
+            _persist_slot_memory(slot_name, known_bet_menu_toggle=known_bet_menu_toggle_coords)
         if was_menu_open and not menu_open:
             # Il momento della verita' per un menu selezione-posta: la HUD
             # sottostante (es. "PUNTATA €X") resta congelata finche' il menu
@@ -927,6 +1145,7 @@ def run_autonomous_session(
             # e' piu' in stato 'modal'.
             bet_str = f"{current_bet:.2f} EUR" if current_bet is not None else "sconosciuta"
             print(f"Menu chiuso: posta ora {bet_str}.")
+            menu_toggle_autotap_pending = True
 
         print(f"Decisione: {action} target={target} screen_state={screen_state} (confidence: {confidence:.2f})")
 
@@ -952,10 +1171,11 @@ def run_autonomous_session(
                 f"BLOCCATO: GPT ha tentato di tappare SPIN con la posta ancora a {current_bet:.2f} EUR "
                 "(fase setup). Tap NON eseguito."
             )
+            min_bet_display = f"{known_min_bet:.2f}€" if known_min_bet is not None else "not yet known — keep lowering it"
             corrective_note = (
                 f"BLOCKED: You tried to tap the SPIN button but the bet is still {current_bet:.2f}€ "
-                f"(minimum is {MIN_BET:.2f}€). You MUST lower the bet FIRST. Look for the bet amount "
-                "display, a coins icon, or +/- buttons. DO NOT tap the SPIN button."
+                f"(minimum for this slot is {min_bet_display}). You MUST lower the bet FIRST. Look for the bet "
+                "amount display, a coins icon, or +/- buttons. DO NOT tap the SPIN button."
             )
             action_history.append({"step": step, "action": "blocked_spin_attempt", "target": (real_x, real_y), "phase": phase})
             action_history = action_history[-5:]
@@ -1011,6 +1231,8 @@ def run_autonomous_session(
             # e per valutare se ha cambiato lo schermo (vedi tapped_targets sopra).
             force_ocr_refresh = True
             last_tap_coords = (real_x, real_y)
+            if phase == "setup":
+                last_menu_toggle_candidate = (real_x, real_y)
 
         action_history.append({"step": step, "action": action, "target": (real_x, real_y), "phase": phase})
         action_history = action_history[-5:]
@@ -1043,7 +1265,14 @@ def main() -> None:
     parser.add_argument(
         "--slot-name", default=None,
         help="Nome della slot (es. 'Pirots 5'): abilita la memoria persistente tra esecuzioni "
-        f"(coordinate spin e suggerimenti confermati utili, salvati in {SLOT_MEMORY_DIR}/).",
+        f"(coordinate spin, puntata minima scoperta, icona menu-puntata e suggerimenti confermati "
+        f"utili, salvati in {SLOT_MEMORY_DIR}/).",
+    )
+    parser.add_argument(
+        "--min-bet", type=float, default=None,
+        help="Puntata minima gia' nota per questa slot (EUR), se la conosci gia': salta la fase di "
+        "scoperta automatica. Se omesso, viene scoperta osservando le opzioni disponibili (o "
+        "confermata dall'operatore durante un'eventuale escalation HITL).",
     )
     args = parser.parse_args()
 
@@ -1053,6 +1282,7 @@ def main() -> None:
         max_steps=args.max_steps,
         save_screenshots=args.save_screenshots,
         slot_name=args.slot_name,
+        known_min_bet=args.min_bet,
     )
     sys.exit(0 if ok else 1)
 

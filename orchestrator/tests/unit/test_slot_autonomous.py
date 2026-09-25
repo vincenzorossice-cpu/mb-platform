@@ -207,7 +207,7 @@ class TestHandleHitlEscalation:
             result = handle_hitl_escalation(screen_reader, ocr_reader, touch_injector, "dev", 10.0, 0.10)
 
         touch_injector.tap_coordinates.assert_called_once_with("dev", 180, 400)
-        assert result == ("skip", None)
+        assert result == ("skip", None, None, None)
         assert "Non sembra essere cambiato nulla" in capsys.readouterr().out
 
     def test_unparseable_description_does_not_tap_and_asks_again(self, capsys):
@@ -223,7 +223,7 @@ class TestHandleHitlEscalation:
             result = handle_hitl_escalation(screen_reader, ocr_reader, touch_injector, "dev", 10.0, 0.10)
 
         touch_injector.tap_coordinates.assert_not_called()
-        assert result == ("stop", None)
+        assert result == ("stop", None, None, None)
         assert "Non ho capito dove tappare" in capsys.readouterr().out
 
     def test_resolvable_description_resolves_session_when_bet_lowers(self):
@@ -239,13 +239,18 @@ class TestHandleHitlEscalation:
             "orchestrator.tests.validation.test_slot_autonomous.ask_human_help",
             return_value=("text", "sopra PUNTATA"),
         ):
-            action, data = handle_hitl_escalation(screen_reader, ocr_reader, touch_injector, "dev", 10.0, 0.10)
+            action, data, confirmed, tapped = handle_hitl_escalation(screen_reader, ocr_reader, touch_injector, "dev", 10.0, 0.10)
 
         assert action == "resolved"
         assert data["posta"] == 0.10
+        assert confirmed is None
+        assert tapped == (500, 500)
         touch_injector.tap_coordinates.assert_called_once_with("dev", 500, 500)
 
     def test_resolvable_description_warns_operator_on_accidental_balance_drop(self, capsys):
+        """Senza parole di intento spin nella frase dell'operatore, un calo di
+        saldo resta trattato come un possibile incidente (comportamento di
+        default, invariato)."""
         screen_reader, ocr_reader, touch_injector = self._deps()
         ocr_reader.read_slot_state.side_effect = [
             _ocr_state(saldo=100.0, posta=10.0, raw_texts=[_text("PUNTATA", 500, 600)]),  # pre-tap
@@ -260,21 +265,51 @@ class TestHandleHitlEscalation:
         ):
             result = handle_hitl_escalation(screen_reader, ocr_reader, touch_injector, "dev", 10.0, 0.10)
 
-        assert result == ("stop", None)
+        assert result == ("stop", None, None, None)
         assert "spinato per errore" in capsys.readouterr().out.lower()
+
+    def test_explicit_spin_intent_confirms_spin_instead_of_warning(self, capsys):
+        """Bug reale: l'operatore ha chiesto esplicitamente di spinnare
+        ('clicca sulla freccia circolare... devi giocare') e il sistema lo ha
+        comunque trattato come un incidente. Ora le parole di intento spin
+        generiche (spin/gira/gioca/freccia circolare) fanno riconoscere lo
+        spin come VOLUTO."""
+        screen_reader, ocr_reader, touch_injector = self._deps()
+        ocr_reader.read_slot_state.side_effect = [
+            _ocr_state(saldo=5000.0, posta=0.20, raw_texts=[_text("SPIN", 540, 2000)]),  # pre-tap
+            _ocr_state(saldo=4999.8, posta=0.20, raw_texts=[_text("SPIN", 540, 2000)]),  # post-tap: spin avvenuto
+        ]
+
+        with patch(
+            "orchestrator.tests.validation.test_slot_autonomous.get_image_dimensions", return_value=(1080, 2400),
+        ), patch(
+            "orchestrator.tests.validation.test_slot_autonomous.ask_human_help",
+            return_value=("text", "ora devi giocare, clicca sulla freccia circolare al centro in basso"),
+        ):
+            action, data, confirmed, tapped = handle_hitl_escalation(screen_reader, ocr_reader, touch_injector, "dev", 0.20, 0.10)
+
+        assert action == "spin_confirmed"
+        assert data["saldo"] == 4999.8
+        assert confirmed is None
+        assert tapped is not None
+        out = capsys.readouterr().out.lower()
+        assert "spinato per errore" not in out
+        assert "richiesta esplicita dell'operatore" in out
 
     def test_resolvable_description_returns_generic_directive_when_menu_opens(self):
         """Se il tap dell'operatore fa apparire nuovi elementi OCR (menu), si
         segnala a GPT lo stato osservato con una direttiva generica — MAI la
         frase originale dell'operatore, che GPT ha gia' dimostrato di
-        ignorare quando passata come semplice suggerimento."""
+        ignorare quando passata come semplice suggerimento. La direttiva e'
+        neutra (non presume apertura O chiusura): la frase reale che l'ha
+        generata potrebbe essere l'una o l'altra."""
         screen_reader, ocr_reader, touch_injector = self._deps()
         ocr_reader.read_slot_state.side_effect = [
             _ocr_state(saldo=100.0, posta=10.0, raw_texts=[_text("MONETE", 500, 500)]),  # pre-tap
             _ocr_state(
                 saldo=100.0, posta=10.0,
                 raw_texts=[_text("MONETE", 500, 500), _text("SELEZIONA PUNTATA MINIMA", 700, 700)],
-            ),  # post-tap: menu aperto
+            ),  # post-tap: lo schermo e' cambiato
         ]
 
         with patch(
@@ -283,11 +318,60 @@ class TestHandleHitlEscalation:
             "orchestrator.tests.validation.test_slot_autonomous.ask_human_help",
             return_value=("text", "in alto a sinistra"),
         ):
-            action, directive = handle_hitl_escalation(screen_reader, ocr_reader, touch_injector, "dev", 10.0, 0.10)
+            action, directive, confirmed, tapped = handle_hitl_escalation(screen_reader, ocr_reader, touch_injector, "dev", 10.0, 0.10)
 
         assert action == "hint"
         assert "in alto a sinistra" not in directive
-        assert "minimum" in directive.lower()
+        assert confirmed is None
+        assert tapped == (180, 400)
+        directive_lower = directive.lower()
+        assert "screen changed" in directive_lower
+        assert "if" in directive_lower  # condizionale: copre sia apertura sia chiusura, non presume
+
+    def test_min_bet_confirmation_is_extracted_alongside_a_position_command(self):
+        """Log reale: l'operatore ha scritto in un'unica frase sia la conferma
+        del minimo sia un comando di posizione ('Hai gia selezionato la
+        puntata minima corretta ora devi tornare... cliccando sull'icona in
+        basso a destra'). Entrambi i segnali vanno estratti."""
+        screen_reader, ocr_reader, touch_injector = self._deps()
+        ocr_reader.read_slot_state.side_effect = [
+            _ocr_state(saldo=100.0, posta=0.20, raw_texts=[_text("MONETE", 500, 500)]),  # pre-tap
+            _ocr_state(saldo=100.0, posta=0.20, raw_texts=[_text("MONETE", 500, 500)]),  # post-tap: nulla cambia
+        ]
+
+        with patch(
+            "orchestrator.tests.validation.test_slot_autonomous.get_image_dimensions", return_value=(1080, 2400),
+        ), patch(
+            "orchestrator.tests.validation.test_slot_autonomous.ask_human_help",
+            side_effect=[
+                (
+                    "text",
+                    "Hai gia selezionato la puntata minima corretta ora devi tornare cliccando "
+                    "sull'icona in basso a destra",
+                ),
+                ("stop",),
+            ],
+        ):
+            result = handle_hitl_escalation(screen_reader, ocr_reader, touch_injector, "dev", 0.20, 0.10)
+
+        assert result == ("stop", None, 0.20, None)
+        touch_injector.tap_coordinates.assert_called_once_with("dev", 900, 2000)
+
+    def test_min_bet_confirmation_survives_until_the_eventual_return(self):
+        """La conferma della puntata minima non deve andare persa se lo
+        scambio HITL continua per altri turni dopo di essa."""
+        screen_reader, ocr_reader, touch_injector = self._deps()
+        ocr_reader.read_slot_state.return_value = _ocr_state(saldo=100.0, posta=0.20, raw_texts=[])
+
+        with patch(
+            "orchestrator.tests.validation.test_slot_autonomous.get_image_dimensions", return_value=(1080, 2400),
+        ), patch(
+            "orchestrator.tests.validation.test_slot_autonomous.ask_human_help",
+            side_effect=[("text", "abbiamo la puntata minima"), ("skip",)],
+        ):
+            result = handle_hitl_escalation(screen_reader, ocr_reader, touch_injector, "dev", 0.20, 0.10)
+
+        assert result == ("skip", None, 0.20, None)
 
     def test_coords_and_skip_stop_paths_are_unaffected(self):
         """Il ramo coordinate e i comandi stop/skip restano invariati."""
@@ -296,27 +380,36 @@ class TestHandleHitlEscalation:
         with patch(
             "orchestrator.tests.validation.test_slot_autonomous.ask_human_help", return_value=("stop",),
         ):
-            assert handle_hitl_escalation(screen_reader, ocr_reader, touch_injector, "dev", 10.0, 0.10) == ("stop", None)
+            assert handle_hitl_escalation(screen_reader, ocr_reader, touch_injector, "dev", 10.0, 0.10) == ("stop", None, None, None)
 
         with patch(
             "orchestrator.tests.validation.test_slot_autonomous.ask_human_help", return_value=("skip",),
         ):
-            assert handle_hitl_escalation(screen_reader, ocr_reader, touch_injector, "dev", 10.0, 0.10) == ("skip", None)
+            assert handle_hitl_escalation(screen_reader, ocr_reader, touch_injector, "dev", 10.0, 0.10) == ("skip", None, None, None)
 
 
 class TestDeterminePhase:
 
-    def test_above_minimum_is_setup(self):
-        assert determine_phase(10.0) == "setup"
+    def test_unknown_minimum_is_always_setup(self):
+        """La puntata minima non e' mai assunta: finche' non e' stata
+        scoperta per questa slot, la fase resta 'setup' qualunque sia il
+        valore letto (anche uno che 'sembra' gia' basso)."""
+        assert determine_phase(10.0, None) == "setup"
+        assert determine_phase(0.10, None) == "setup"
+        assert determine_phase(0.01, None) == "setup"
 
-    def test_at_minimum_is_playing(self):
-        assert determine_phase(0.10) == "playing"
+    def test_above_known_minimum_is_setup(self):
+        assert determine_phase(10.0, 0.20) == "setup"
 
-    def test_below_minimum_is_playing(self):
-        assert determine_phase(0.05) == "playing"
+    def test_at_known_minimum_is_playing(self):
+        assert determine_phase(0.20, 0.20) == "playing"
+
+    def test_below_known_minimum_is_playing(self):
+        assert determine_phase(0.05, 0.20) == "playing"
 
     def test_unknown_bet_is_playing(self):
-        assert determine_phase(None) == "playing"
+        assert determine_phase(None, None) == "playing"
+        assert determine_phase(None, 0.20) == "playing"
 
 
 class TestNormalizeTexts:
@@ -411,29 +504,56 @@ class TestAskHumanHelp:
             assert ask_human_help(None, 0.10) == ("skip",)
         mock_input.assert_called_once()
 
+    def test_unknown_minimum_does_not_crash(self, capsys):
+        """min_bet puo' essere None (minimo non ancora scoperto per questa
+        slot): il messaggio all'operatore deve restare leggibile."""
+        with patch("builtins.input", return_value="skip"):
+            assert ask_human_help(10.0, None) == ("skip",)
+        assert "non ancora nota" in capsys.readouterr().out
+
+
+_EMPTY_SLOT_MEMORY = {
+    "known_spin_coords": None, "learned_hints": [],
+    "known_min_bet": None, "known_bet_menu_toggle": None,
+}
+
 
 class TestSlotMemory:
 
     def test_load_returns_empty_when_missing(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
-        assert load_slot_memory("Nonexistent Slot") == {"known_spin_coords": None, "learned_hints": []}
+        assert load_slot_memory("Nonexistent Slot") == _EMPTY_SLOT_MEMORY
 
     def test_save_and_load_round_trip(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
-        save_slot_memory("Pirots 5", {"known_spin_coords": (540, 2100), "learned_hints": ["tap coin icon"]})
-        assert load_slot_memory("Pirots 5") == {"known_spin_coords": (540, 2100), "learned_hints": ["tap coin icon"]}
+        save_slot_memory("Pirots 5", {
+            "known_spin_coords": (540, 2100), "learned_hints": ["tap coin icon"],
+            "known_min_bet": 0.20, "known_bet_menu_toggle": (900, 2000),
+        })
+        assert load_slot_memory("Pirots 5") == {
+            "known_spin_coords": (540, 2100), "learned_hints": ["tap coin icon"],
+            "known_min_bet": 0.20, "known_bet_menu_toggle": (900, 2000),
+        }
 
     def test_persist_merges_without_losing_existing_data(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         save_slot_memory("Pirots 5", {"known_spin_coords": (540, 2100), "learned_hints": ["hint A"]})
-        _persist_slot_memory("Pirots 5", None, ["hint B"])
+        _persist_slot_memory("Pirots 5", new_hints=["hint B"])
         memory = load_slot_memory("Pirots 5")
         assert memory["known_spin_coords"] == (540, 2100)
         assert set(memory["learned_hints"]) == {"hint A", "hint B"}
 
+    def test_persist_known_min_bet_and_menu_toggle(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        _persist_slot_memory("Pirots 5", known_min_bet=0.20)
+        _persist_slot_memory("Pirots 5", known_bet_menu_toggle=(900, 2000))
+        memory = load_slot_memory("Pirots 5")
+        assert memory["known_min_bet"] == 0.20
+        assert memory["known_bet_menu_toggle"] == (900, 2000)
+
     def test_persist_does_nothing_without_slot_name(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
-        _persist_slot_memory(None, (1, 2), ["x"])
+        _persist_slot_memory(None, known_spin_coords=(1, 2), new_hints=["x"])
         assert not os.path.exists(SLOT_MEMORY_DIR)
 
     def test_corrupted_file_returns_empty(self, tmp_path, monkeypatch):
@@ -441,7 +561,7 @@ class TestSlotMemory:
         os.makedirs(SLOT_MEMORY_DIR, exist_ok=True)
         with open(_slot_memory_path("Broken"), "w") as f:
             f.write("not json")
-        assert load_slot_memory("Broken") == {"known_spin_coords": None, "learned_hints": []}
+        assert load_slot_memory("Broken") == _EMPTY_SLOT_MEMORY
 
 
 @pytest.fixture
@@ -510,7 +630,7 @@ class TestRunAutonomousSession:
             Result.ok(_answers("stop")),
         ]
 
-        ok = run_autonomous_session("dev", target_amount=30.0, max_steps=10)
+        ok = run_autonomous_session("dev", target_amount=30.0, max_steps=10, known_min_bet=0.10)
 
         assert ok is True
         mocks["touch_injector"].tap_coordinates.assert_called_once_with("dev", 543, 2107)
@@ -560,7 +680,7 @@ class TestRunAutonomousSession:
             Result.ok(_answers("stop")),
         ]
 
-        ok = run_autonomous_session("dev", target_amount=30.0, max_steps=10)
+        ok = run_autonomous_session("dev", target_amount=30.0, max_steps=10, known_min_bet=0.10)
 
         assert ok is True
         out = capsys.readouterr().out
@@ -581,7 +701,7 @@ class TestRunAutonomousSession:
             Result.ok(_answers("stop")),
         ]
 
-        ok = run_autonomous_session("dev", target_amount=30.0, max_steps=10)
+        ok = run_autonomous_session("dev", target_amount=30.0, max_steps=10, known_min_bet=0.10)
 
         assert ok is True
         out = capsys.readouterr().out
@@ -729,7 +849,7 @@ class TestRunAutonomousSession:
             "orchestrator.tests.validation.test_slot_autonomous.ask_human_help",
             return_value=("text", "in alto a sinistra"),
         ) as mock_ask_human:
-            ok = run_autonomous_session("dev", target_amount=30.0, max_steps=20)
+            ok = run_autonomous_session("dev", target_amount=30.0, max_steps=20, known_min_bet=0.10)
 
         assert ok is True
         assert mock_ask_human.call_count == 1  # risolto al primo giro: il tap e' stato eseguito subito, non "suggerito"
@@ -740,7 +860,7 @@ class TestRunAutonomousSession:
         assert "minimum" in sixth_call_state_text.lower()
 
         out = capsys.readouterr().out
-        assert "Sembra essersi aperto un nuovo menu" in out
+        assert "Lo schermo e' cambiato dopo il tap" in out
 
     def test_hitl_coords_resolve_session_when_bet_actually_lowers(self, mocks, capsys):
         """Se l'operatore da' coordinate e quel tap abbassa davvero la posta
@@ -939,7 +1059,7 @@ class TestRunAutonomousSession:
             Result.ok(_answers("tap", _target(region="center"))),
         ]
 
-        ok = run_autonomous_session("dev", target_amount=0.20, max_steps=10)
+        ok = run_autonomous_session("dev", target_amount=0.20, max_steps=10, known_min_bet=0.10)
 
         assert ok is True
         assert mocks["engine"].ask_with_image.call_count == 2
@@ -1067,6 +1187,80 @@ class TestRunAutonomousSession:
         assert ok is True
         assert not os.path.exists(SLOT_MEMORY_DIR)
 
+    def test_known_bet_menu_toggle_used_autonomously_before_asking_gpt(self, mocks, tmp_path, monkeypatch):
+        """'Ma se le ricorda ogni volta che facciamo una cosa?' — se l'icona
+        che apre il menu puntata e' gia' nota per questa slot (da questa
+        sessione o da una precedente), il sistema la ritappa SUBITO, senza
+        nemmeno interpellare GPT per il primo step: e' training reale, non
+        solo un suggerimento con scadenza."""
+        monkeypatch.chdir(tmp_path)
+        save_slot_memory("Pirots 5", {
+            "known_spin_coords": None, "learned_hints": [],
+            "known_min_bet": None, "known_bet_menu_toggle": (900, 2000),
+        })
+        mocks["ocr_reader"].read_slot_state.return_value = _ocr_state(saldo=100.0, posta=10.0, spin_button_coords=None)
+        mocks["engine"].ask_with_image.side_effect = [
+            Result.ok(_answers("stop", screen_state="modal")),
+        ]
+
+        ok = run_autonomous_session("dev", target_amount=30.0, max_steps=10, slot_name="Pirots 5")
+
+        assert ok is True
+        mocks["touch_injector"].tap_coordinates.assert_called_once_with("dev", 900, 2000)
+        assert mocks["engine"].ask_with_image.call_count == 1  # niente GPT per il tap autonomo del 1o step
+
+    def test_menu_toggle_autotap_retried_after_menu_closes_again(self, mocks, tmp_path, monkeypatch):
+        """Il tentativo autonomo non e' 'una tantum': si riattiva ogni volta
+        che si esce di nuovo dal menu, cosi' puo' riaprirlo la prossima volta
+        che serve senza richiedere di nuovo GPT o l'operatore."""
+        monkeypatch.chdir(tmp_path)
+        save_slot_memory("Pirots 5", {
+            "known_spin_coords": None, "learned_hints": [],
+            "known_min_bet": None, "known_bet_menu_toggle": (900, 2000),
+        })
+        mocks["ocr_reader"].read_slot_state.return_value = _ocr_state(saldo=100.0, posta=10.0, spin_button_coords=None)
+        mocks["engine"].ask_with_image.side_effect = [
+            Result.ok(_answers("tap", _target(region="top-left"), screen_state="modal")),  # step2: dentro il menu
+            Result.ok(_answers("tap", _target(region="top-left"), screen_state="idle")),  # step3: il menu si e' chiuso
+            Result.ok(_answers("stop", screen_state="idle")),  # step5, dopo il 2o autotap
+        ]
+
+        # known_min_bet esplicito: la posta resta costante a 10.0 in questo
+        # test (isola il comportamento del toggle), quindi senza un minimo
+        # noto scatterebbe anche la scoperta automatica del minimo — non e'
+        # l'oggetto di questo test.
+        ok = run_autonomous_session(
+            "dev", target_amount=30.0, max_steps=10, slot_name="Pirots 5", known_min_bet=0.10,
+        )
+
+        assert ok is True
+        assert mocks["engine"].ask_with_image.call_count == 3
+        tap_calls = mocks["touch_injector"].tap_coordinates.call_args_list
+        assert len(tap_calls) == 4
+        assert tap_calls[0].args == ("dev", 900, 2000)  # 1o tap autonomo (step1)
+        assert tap_calls[3].args == ("dev", 900, 2000)  # 2o tap autonomo (step4), dopo la chiusura al step3
+
+    def test_min_bet_discovered_via_plateau_when_no_longer_improving(self, mocks, tmp_path, monkeypatch, capsys):
+        """La puntata minima non e' mai assunta: si scopre osservando quando
+        smette di scendere nonostante si continui a provare (nessun numero
+        hardcoded), e si salva per questa slot."""
+        monkeypatch.chdir(tmp_path)
+        posta_sequence = [10.0, 0.60, 0.20, 0.60, 0.20, 0.20]
+        mocks["ocr_reader"].read_slot_state.side_effect = [
+            _ocr_state(saldo=100.0, posta=p, spin_button_coords=(540, 1200)) for p in posta_sequence
+        ]
+        regions = ["top-left", "top-right", "bottom-left", "bottom-right", "middle-left"]
+        mocks["engine"].ask_with_image.side_effect = [
+            Result.ok(_answers("tap", _target(region=r))) for r in regions
+        ] + [Result.ok(_answers("stop"))]
+
+        ok = run_autonomous_session("dev", target_amount=30.0, max_steps=20, slot_name="Pirots 5")
+
+        assert ok is True
+        out = capsys.readouterr().out
+        assert "Puntata minima individuata per questa slot: 0.20 EUR" in out
+        assert load_slot_memory("Pirots 5")["known_min_bet"] == 0.20
+
     def test_hints_persisted_when_bet_successfully_lowered(self, mocks, tmp_path, monkeypatch):
         """Un suggerimento attivo nel momento in cui la posta scende al minimo
         viene considerato confermato utile e salvato per la prossima volta che
@@ -1109,9 +1303,11 @@ class TestRunAutonomousSession:
             "orchestrator.tests.validation.test_slot_autonomous.ask_human_help",
             return_value=("text", "in alto a sinistra"),
         ):
-            ok = run_autonomous_session("dev", target_amount=30.0, max_steps=20, slot_name="Big Bass 2")
+            ok = run_autonomous_session(
+                "dev", target_amount=30.0, max_steps=20, slot_name="Big Bass 2", known_min_bet=0.10,
+            )
 
         assert ok is True
         learned_hints = load_slot_memory("Big Bass 2")["learned_hints"]
-        assert any("menu just opened" in h.lower() and "minimum" in h.lower() for h in learned_hints)
+        assert any("screen changed" in h.lower() and "spin" in h.lower() for h in learned_hints)
         assert not any("in alto a sinistra" in h.lower() for h in learned_hints)
