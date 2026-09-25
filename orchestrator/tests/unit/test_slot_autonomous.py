@@ -14,9 +14,12 @@ from orchestrator.tests.validation.test_slot_autonomous import (
     count_consecutive_same_spot_failures,
     determine_phase,
     find_untried_elements,
+    get_image_dimensions,
+    handle_hitl_escalation,
     load_slot_memory,
     nearby_offsets,
     normalize_texts,
+    parse_operator_description,
     region_to_point,
     resize_screenshot_for_vision,
     resolve_target,
@@ -73,6 +76,17 @@ class TestResizeScreenshotForVision:
         os.remove(resized_path)
 
 
+class TestGetImageDimensions:
+
+    def test_returns_real_width_and_height(self, tmp_path):
+        from PIL import Image
+
+        path = tmp_path / "shot.png"
+        Image.new("RGB", (1080, 2400), color="white").save(path)
+
+        assert get_image_dimensions(str(path)) == (1080, 2400)
+
+
 class TestRegionToPoint:
 
     def test_known_regions_are_generic_geometry_not_slot_specific(self):
@@ -116,6 +130,178 @@ class TestResolveTarget:
 
     def test_no_text_and_no_valid_region_returns_none(self):
         assert resolve_target({"text": "NOPE", "region": "nowhere"}, [], 1080, 2400) is None
+
+
+class TestParseOperatorDescription:
+    """Interpreta una descrizione libera dell'operatore (italiano) in
+    coordinate da tappare SUBITO, senza passare da GPT (Causa del bug reale:
+    GPT ignorava le descrizioni passate come 'suggerimento')."""
+
+    def test_grid_keyword_phrases_resolve_via_region_geometry(self):
+        assert parse_operator_description("in basso a destra", [], 1080, 2400) == region_to_point("bottom-right", 1080, 2400)
+        assert parse_operator_description("in alto a sinistra", [], 1080, 2400) == region_to_point("top-left", 1080, 2400)
+        assert parse_operator_description("al centro", [], 1080, 2400) == region_to_point("center", 1080, 2400)
+        assert parse_operator_description("un po' a sinistra", [], 1080, 2400) == region_to_point("middle-left", 1080, 2400)
+        assert parse_operator_description("piu' in basso", [], 1080, 2400) == region_to_point("bottom-center", 1080, 2400)
+
+    def test_relative_to_ocr_label_applies_generic_offset(self):
+        raw_texts = [_text("PUNTATA", 500, 600)]
+        assert parse_operator_description("sopra PUNTATA", raw_texts, 1080, 2400) == (500, 500)
+        assert parse_operator_description("sotto PUNTATA", raw_texts, 1080, 2400) == (500, 700)
+        assert parse_operator_description("a destra di PUNTATA", raw_texts, 1080, 2400) == (600, 600)
+        assert parse_operator_description("a sinistra di PUNTATA", raw_texts, 1080, 2400) == (400, 600)
+        assert parse_operator_description("un pochino piu' in alto di PUNTATA", raw_texts, 1080, 2400) == (500, 500)
+
+    def test_relative_reference_is_fuzzy_matched_like_resolve_target(self):
+        raw_texts = [_text("PUNTATA €10.00", 100, 2000)]
+        assert parse_operator_description("vicino a PUNTATA 10.00", raw_texts, 1080, 2400) == (100, 2000)
+
+    def test_relative_reference_to_unknown_label_falls_back_to_directional_region(self):
+        """L'etichetta 'IL BOTTONE MAGICO' non e' tra i testi OCR: la
+        preposizione 'sopra' porta comunque un'informazione direzionale
+        generica, quindi si degrada alla regione grossolana corrispondente
+        invece di arrendersi subito."""
+        assert parse_operator_description("sopra IL BOTTONE MAGICO", [], 1080, 2400) == region_to_point(
+            "top-center", 1080, 2400,
+        )
+
+    def test_offset_is_clamped_to_image_bounds(self):
+        raw_texts = [_text("PUNTATA", 10, 10)]
+        x, y = parse_operator_description("sopra PUNTATA", raw_texts, 1080, 2400)
+        assert (x, y) == (10, 0)
+
+    def test_unparseable_description_returns_none(self):
+        assert parse_operator_description("le monete impilate col piu' in cima", [], 1080, 2400) is None
+        assert parse_operator_description("boh non saprei", [], 1080, 2400) is None
+
+
+class TestHandleHitlEscalation:
+    """handle_hitl_escalation non riceve mai un riferimento al Decision
+    Engine: il bypass di GPT durante l'esecuzione del comando dell'operatore
+    e' strutturale, non solo comportamentale. Coordinate e descrizioni
+    testuali sono COMANDI eseguiti subito, non suggerimenti per GPT (bug
+    reale: GPT ignorava le descrizioni passate come hint)."""
+
+    def _deps(self):
+        screen_reader = MagicMock()
+        screen_reader._screenshot.return_value = Result.ok("shot.png")
+        ocr_reader = MagicMock()
+        touch_injector = MagicMock()
+        touch_injector.tap_coordinates.return_value = Result.ok(True)
+        return screen_reader, ocr_reader, touch_injector
+
+    def test_resolvable_description_taps_directly_and_asks_again_if_nothing_changes(self, capsys):
+        screen_reader, ocr_reader, touch_injector = self._deps()
+        static_texts = [_text("MONETE", 500, 500)]
+        ocr_reader.read_slot_state.side_effect = [
+            _ocr_state(saldo=100.0, posta=10.0, raw_texts=static_texts),  # pre-tap
+            _ocr_state(saldo=100.0, posta=10.0, raw_texts=static_texts),  # post-tap: nulla cambia
+        ]
+
+        with patch(
+            "orchestrator.tests.validation.test_slot_autonomous.get_image_dimensions", return_value=(1080, 2400),
+        ), patch(
+            "orchestrator.tests.validation.test_slot_autonomous.ask_human_help",
+            side_effect=[("text", "in alto a sinistra"), ("skip",)],
+        ):
+            result = handle_hitl_escalation(screen_reader, ocr_reader, touch_injector, "dev", 10.0, 0.10)
+
+        touch_injector.tap_coordinates.assert_called_once_with("dev", 180, 400)
+        assert result == ("skip", None)
+        assert "Non sembra essere cambiato nulla" in capsys.readouterr().out
+
+    def test_unparseable_description_does_not_tap_and_asks_again(self, capsys):
+        screen_reader, ocr_reader, touch_injector = self._deps()
+        ocr_reader.read_slot_state.return_value = _ocr_state(saldo=100.0, posta=10.0, raw_texts=[])
+
+        with patch(
+            "orchestrator.tests.validation.test_slot_autonomous.get_image_dimensions", return_value=(1080, 2400),
+        ), patch(
+            "orchestrator.tests.validation.test_slot_autonomous.ask_human_help",
+            side_effect=[("text", "le monete impilate col piu' in cima"), ("stop",)],
+        ):
+            result = handle_hitl_escalation(screen_reader, ocr_reader, touch_injector, "dev", 10.0, 0.10)
+
+        touch_injector.tap_coordinates.assert_not_called()
+        assert result == ("stop", None)
+        assert "Non ho capito dove tappare" in capsys.readouterr().out
+
+    def test_resolvable_description_resolves_session_when_bet_lowers(self):
+        screen_reader, ocr_reader, touch_injector = self._deps()
+        ocr_reader.read_slot_state.side_effect = [
+            _ocr_state(saldo=100.0, posta=10.0, raw_texts=[_text("PUNTATA", 500, 600)]),  # pre-tap
+            _ocr_state(saldo=100.0, posta=0.10, raw_texts=[_text("PUNTATA", 500, 600)]),  # post-tap: posta scesa
+        ]
+
+        with patch(
+            "orchestrator.tests.validation.test_slot_autonomous.get_image_dimensions", return_value=(1080, 2400),
+        ), patch(
+            "orchestrator.tests.validation.test_slot_autonomous.ask_human_help",
+            return_value=("text", "sopra PUNTATA"),
+        ):
+            action, data = handle_hitl_escalation(screen_reader, ocr_reader, touch_injector, "dev", 10.0, 0.10)
+
+        assert action == "resolved"
+        assert data["posta"] == 0.10
+        touch_injector.tap_coordinates.assert_called_once_with("dev", 500, 500)
+
+    def test_resolvable_description_warns_operator_on_accidental_balance_drop(self, capsys):
+        screen_reader, ocr_reader, touch_injector = self._deps()
+        ocr_reader.read_slot_state.side_effect = [
+            _ocr_state(saldo=100.0, posta=10.0, raw_texts=[_text("PUNTATA", 500, 600)]),  # pre-tap
+            _ocr_state(saldo=90.0, posta=10.0, raw_texts=[_text("PUNTATA", 500, 600)]),  # post-tap: spin per errore
+        ]
+
+        with patch(
+            "orchestrator.tests.validation.test_slot_autonomous.get_image_dimensions", return_value=(1080, 2400),
+        ), patch(
+            "orchestrator.tests.validation.test_slot_autonomous.ask_human_help",
+            side_effect=[("text", "sopra PUNTATA"), ("stop",)],
+        ):
+            result = handle_hitl_escalation(screen_reader, ocr_reader, touch_injector, "dev", 10.0, 0.10)
+
+        assert result == ("stop", None)
+        assert "spinato per errore" in capsys.readouterr().out.lower()
+
+    def test_resolvable_description_returns_generic_directive_when_menu_opens(self):
+        """Se il tap dell'operatore fa apparire nuovi elementi OCR (menu), si
+        segnala a GPT lo stato osservato con una direttiva generica — MAI la
+        frase originale dell'operatore, che GPT ha gia' dimostrato di
+        ignorare quando passata come semplice suggerimento."""
+        screen_reader, ocr_reader, touch_injector = self._deps()
+        ocr_reader.read_slot_state.side_effect = [
+            _ocr_state(saldo=100.0, posta=10.0, raw_texts=[_text("MONETE", 500, 500)]),  # pre-tap
+            _ocr_state(
+                saldo=100.0, posta=10.0,
+                raw_texts=[_text("MONETE", 500, 500), _text("SELEZIONA PUNTATA MINIMA", 700, 700)],
+            ),  # post-tap: menu aperto
+        ]
+
+        with patch(
+            "orchestrator.tests.validation.test_slot_autonomous.get_image_dimensions", return_value=(1080, 2400),
+        ), patch(
+            "orchestrator.tests.validation.test_slot_autonomous.ask_human_help",
+            return_value=("text", "in alto a sinistra"),
+        ):
+            action, directive = handle_hitl_escalation(screen_reader, ocr_reader, touch_injector, "dev", 10.0, 0.10)
+
+        assert action == "hint"
+        assert "in alto a sinistra" not in directive
+        assert "minimum" in directive.lower()
+
+    def test_coords_and_skip_stop_paths_are_unaffected(self):
+        """Il ramo coordinate e i comandi stop/skip restano invariati."""
+        screen_reader, ocr_reader, touch_injector = self._deps()
+
+        with patch(
+            "orchestrator.tests.validation.test_slot_autonomous.ask_human_help", return_value=("stop",),
+        ):
+            assert handle_hitl_escalation(screen_reader, ocr_reader, touch_injector, "dev", 10.0, 0.10) == ("stop", None)
+
+        with patch(
+            "orchestrator.tests.validation.test_slot_autonomous.ask_human_help", return_value=("skip",),
+        ):
+            assert handle_hitl_escalation(screen_reader, ocr_reader, touch_injector, "dev", 10.0, 0.10) == ("skip", None)
 
 
 class TestDeterminePhase:
@@ -502,30 +688,59 @@ class TestRunAutonomousSession:
         assert mock_ask_human.call_count == 1
         assert mocks["engine"].ask_with_image.call_count == 6
 
-    def test_hitl_text_hint_accumulates_and_persists_across_turns(self, mocks):
-        """Il suggerimento testuale dell'operatore deve restare visibile a GPT
-        per piu' turni consecutivi, non sparire dopo il primo (Causa C)."""
-        mocks["ocr_reader"].read_slot_state.return_value = _ocr_state(
-            saldo=100.0, posta=10.0, spin_button_coords=(540, 1200),
-        )
-        mocks["engine"].ask_with_image.side_effect = [
-            Result.ok(_answers("tap", _target(region="top-left")))
-        ] * 5 + [
-            Result.ok(_answers("tap", _target(region="top-right"))),
-            Result.ok(_answers("stop")),
-        ]
+    def test_hitl_text_description_taps_directly_and_menu_directive_persists_across_turns(self, mocks, capsys):
+        """Bug reale: una descrizione testuale dell'operatore veniva passata a
+        GPT come semplice 'suggerimento' e ignorata. Ora si traduce subito in
+        un tap ESEGUITO (nessuna chiamata a GPT nel frattempo): se quel tap fa
+        apparire un menu, GPT riceve una direttiva generica sullo stato
+        osservato (non la frase originale) che resta visibile per piu' turni,
+        finche' non porta la posta al minimo."""
+        coin_text = _text("MONETE", 500, 500)
+        min_bet_text = _text("SELEZIONA PUNTATA MINIMA", 900, 1200)  # coincide con la regione "middle-right"
+        state = {"posta": 10.0, "raw_texts": [coin_text]}
+
+        def ocr_side_effect(*_a, **_k):
+            return _ocr_state(saldo=100.0, posta=state["posta"], spin_button_coords=(540, 1200), raw_texts=state["raw_texts"])
+
+        mocks["ocr_reader"].read_slot_state.side_effect = ocr_side_effect
+
+        def tap_side_effect(_device_id, x, y):
+            if (x, y) == (180, 400) and min_bet_text not in state["raw_texts"]:
+                state["raw_texts"] = state["raw_texts"] + [min_bet_text]  # il tap dell'operatore apre il menu posta
+            elif (x, y) == (900, 1200):
+                state["posta"] = 0.10  # GPT segue la direttiva e seleziona la puntata minima
+            return Result.ok(True)
+
+        mocks["touch_injector"].tap_coordinates.side_effect = tap_side_effect
+
+        call_count = {"n": 0}
+
+        def ask_side_effect(*_a, **_k):
+            call_count["n"] += 1
+            if call_count["n"] <= 5:
+                return Result.ok(_answers("tap", _target(region="top-right")))  # non risolve nulla, non collide con l'HITL
+            if call_count["n"] == 6:
+                return Result.ok(_answers("tap", _target(region="middle-right")))  # segue la direttiva del menu
+            return Result.ok(_answers("stop"))
+
+        mocks["engine"].ask_with_image.side_effect = ask_side_effect
 
         with patch(
             "orchestrator.tests.validation.test_slot_autonomous.ask_human_help",
-            return_value=("text", "tap the coins icon top left"),
-        ):
+            return_value=("text", "in alto a sinistra"),
+        ) as mock_ask_human:
             ok = run_autonomous_session("dev", target_amount=30.0, max_steps=20)
 
         assert ok is True
-        sixth_call = mocks["engine"].ask_with_image.call_args_list[5].args[1]
-        seventh_call = mocks["engine"].ask_with_image.call_args_list[6].args[1]
-        assert "The human operator suggests: tap the coins icon top left" in sixth_call
-        assert "The human operator suggests: tap the coins icon top left" in seventh_call
+        assert mock_ask_human.call_count == 1  # risolto al primo giro: il tap e' stato eseguito subito, non "suggerito"
+        mocks["touch_injector"].tap_coordinates.assert_any_call("dev", 180, 400)
+
+        sixth_call_state_text = mocks["engine"].ask_with_image.call_args_list[5].args[1]
+        assert "in alto a sinistra" not in sixth_call_state_text  # mai la frase originale dell'operatore
+        assert "minimum" in sixth_call_state_text.lower()
+
+        out = capsys.readouterr().out
+        assert "Sembra essersi aperto un nuovo menu" in out
 
     def test_hitl_coords_resolve_session_when_bet_actually_lowers(self, mocks, capsys):
         """Se l'operatore da' coordinate e quel tap abbassa davvero la posta
@@ -578,7 +793,14 @@ class TestRunAutonomousSession:
             Result.ok(_answers("stop")),
         ]
 
-        ok = run_autonomous_session("dev", target_amount=30.0, max_steps=20)
+        # La posta resta 10.0 per tutto lo script (mai al minimo): al 6o step
+        # scatta comunque l'HITL prima che GPT possa rispondere "stop" — non è
+        # l'oggetto di questo test (che verifica solo la pazienza dentro un
+        # menu), quindi 'skip' fa proseguire GPT senza intervento.
+        with patch(
+            "orchestrator.tests.validation.test_slot_autonomous.ask_human_help", return_value=("skip",),
+        ):
+            ok = run_autonomous_session("dev", target_amount=30.0, max_steps=20)
 
         assert ok is True
         # Se menu_open fosse rimasto False (vecchia logica basata sul diff OCR,
@@ -628,7 +850,13 @@ class TestRunAutonomousSession:
             Result.ok(_answers("stop")),
         ]
 
-        ok = run_autonomous_session("dev", target_amount=30.0, max_steps=20)
+        # La posta resta 10.0 per tutto lo script: al 6o step scatta comunque
+        # l'HITL prima che GPT possa rispondere — non e' l'oggetto di questo
+        # test (che verifica solo la pazienza dentro un menu).
+        with patch(
+            "orchestrator.tests.validation.test_slot_autonomous.ask_human_help", return_value=("skip",),
+        ):
+            ok = run_autonomous_session("dev", target_amount=30.0, max_steps=20)
 
         assert ok is True
         assert mocks["touch_injector"].tap_coordinates.call_count == 1 + MAX_REPEAT_ATTEMPTS_INSIDE_MENU
@@ -842,35 +1070,48 @@ class TestRunAutonomousSession:
     def test_hints_persisted_when_bet_successfully_lowered(self, mocks, tmp_path, monkeypatch):
         """Un suggerimento attivo nel momento in cui la posta scende al minimo
         viene considerato confermato utile e salvato per la prossima volta che
-        si gioca questa slot — questo e' il modo in cui il sistema 'si allena'."""
+        si gioca questa slot — questo e' il modo in cui il sistema 'si allena'.
+        Cio' che si salva e' la direttiva generica emessa dopo il tap DIRETTO
+        dell'operatore (un menu si e' aperto), non la sua frase originale:
+        quella e' gia' stata eseguita subito, non deve piu' tornare a GPT."""
         monkeypatch.chdir(tmp_path)
-        state = {"posta": 10.0}
+        coin_text = _text("MONETE", 500, 500)
+        min_bet_text = _text("SELEZIONA PUNTATA MINIMA", 900, 1200)  # coincide con la regione "middle-right"
+        state = {"posta": 10.0, "raw_texts": [coin_text]}
 
         def ocr_side_effect(*_a, **_k):
-            return _ocr_state(saldo=100.0, posta=state["posta"], spin_button_coords=(540, 1200))
+            return _ocr_state(saldo=100.0, posta=state["posta"], spin_button_coords=(540, 1200), raw_texts=state["raw_texts"])
 
         mocks["ocr_reader"].read_slot_state.side_effect = ocr_side_effect
 
-        def ask_human_help_side_effect(*_a, **_k):
-            state["posta"] = 0.10  # il suggerimento, una volta seguito da GPT, abbassa la posta
-            return ("text", "tap coins icon")
+        def tap_side_effect(_device_id, x, y):
+            if (x, y) == (180, 400) and min_bet_text not in state["raw_texts"]:
+                state["raw_texts"] = state["raw_texts"] + [min_bet_text]  # il tap dell'operatore apre il menu posta
+            elif (x, y) == (900, 1200):
+                state["posta"] = 0.10  # GPT segue la direttiva e seleziona la puntata minima
+            return Result.ok(True)
 
-        regions = ["top-left", "top-right", "bottom-left", "bottom-right", "middle-left", "top-center"]
+        mocks["touch_injector"].tap_coordinates.side_effect = tap_side_effect
+
         call_count = {"n": 0}
 
         def ask_side_effect(*_a, **_k):
             call_count["n"] += 1
-            if call_count["n"] <= len(regions):
-                return Result.ok(_answers("tap", _target(region=regions[call_count["n"] - 1])))
+            if call_count["n"] <= 5:
+                return Result.ok(_answers("tap", _target(region="top-right")))  # non risolve nulla, non collide con l'HITL
+            if call_count["n"] == 6:
+                return Result.ok(_answers("tap", _target(region="middle-right")))  # segue la direttiva del menu
             return Result.ok(_answers("stop"))
 
         mocks["engine"].ask_with_image.side_effect = ask_side_effect
 
         with patch(
             "orchestrator.tests.validation.test_slot_autonomous.ask_human_help",
-            side_effect=ask_human_help_side_effect,
+            return_value=("text", "in alto a sinistra"),
         ):
             ok = run_autonomous_session("dev", target_amount=30.0, max_steps=20, slot_name="Big Bass 2")
 
         assert ok is True
-        assert "tap coins icon" in load_slot_memory("Big Bass 2")["learned_hints"]
+        learned_hints = load_slot_memory("Big Bass 2")["learned_hints"]
+        assert any("menu just opened" in h.lower() and "minimum" in h.lower() for h in learned_hints)
+        assert not any("in alto a sinistra" in h.lower() for h in learned_hints)

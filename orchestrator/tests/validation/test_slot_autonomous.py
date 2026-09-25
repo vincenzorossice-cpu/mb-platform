@@ -52,6 +52,7 @@ import difflib
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import time
@@ -82,6 +83,10 @@ MAX_REPEAT_ATTEMPTS_INSIDE_MENU = 4  # dentro un menu, selezionare una cella div
 # serve piu' pazienza prima di considerare un tap davvero "senza effetto" (vedi Causa B nel piano)
 NEARBY_OFFSETS_PX = (40, 80)  # offset (px) usati per suggerire coordinate vicine a un tap bloccato
 HINT_TTL_STEPS = 5  # per quanti step un suggerimento resta attivo nello state text
+_RELATIVE_OFFSET_PX = 100  # scostamento generico per descrizioni HITL relative ("sopra X", "a destra di X")
+_HITL_MENU_OPENED_DIRECTIVE = (
+    "A menu just opened after the operator's tap. Select the MINIMUM bet option now."
+)
 
 # Frazioni (larghezza, altezza) del centro di ciascuna cella di una griglia 3x3,
 # usate per tradurre una regione grossolana (target_region) in un punto reale
@@ -111,6 +116,26 @@ def region_to_point(region: Optional[str], width: int, height: int) -> Optional[
     return (int(round(width * fx)), int(round(height * fy)))
 
 
+def _find_text_coords(query: str, raw_texts: list) -> Optional[tuple]:
+    """Cerca `query` tra i testi OCR: match esatto, poi case-insensitive, poi
+    fuzzy (difflib). Ritorna le coordinate ESATTE misurate dall'OCR per il
+    primo match trovato, o None se nessuno supera la soglia di somiglianza."""
+    for text, (x, y), _conf in raw_texts:
+        if text == query:
+            return (x, y)
+    query_lower = query.lower()
+    for text, (x, y), _conf in raw_texts:
+        if text.lower() == query_lower:
+            return (x, y)
+    texts = [text for text, _coords, _conf in raw_texts]
+    match = difflib.get_close_matches(query_lower, [t.lower() for t in texts], n=1, cutoff=0.6)
+    if match:
+        for text, (x, y), _conf in raw_texts:
+            if text.lower() == match[0]:
+                return (x, y)
+    return None
+
+
 def resolve_target(
     target: Optional[dict], raw_texts: list, real_width: int, real_height: int,
 ) -> Optional[tuple]:
@@ -124,23 +149,104 @@ def resolve_target(
 
     target_text = target.get("text")
     if target_text:
-        for text, (x, y), _conf in raw_texts:
-            if text == target_text:
-                return (x, y)
-        target_lower = target_text.lower()
-        for text, (x, y), _conf in raw_texts:
-            if text.lower() == target_lower:
-                return (x, y)
-        texts = [text for text, _coords, _conf in raw_texts]
-        match = difflib.get_close_matches(target_lower, [t.lower() for t in texts], n=1, cutoff=0.6)
-        if match:
-            for text, (x, y), _conf in raw_texts:
-                if text.lower() == match[0]:
-                    return (x, y)
+        coords = _find_text_coords(target_text, raw_texts)
+        if coords is not None:
+            return coords
 
     target_region = target.get("region")
     if target_region:
         return region_to_point(target_region, real_width, real_height)
+
+    return None
+
+
+# Preposizioni italiane generiche (valide per qualunque slot) che indicano una
+# posizione RELATIVA a un elemento OCR gia' visibile, con la direzione dello
+# scostamento da applicare (dx, dy) in unita' di _RELATIVE_OFFSET_PX.
+_RELATIVE_PATTERNS = (
+    (re.compile(r"pi[uù]'?\s+in\s+alto\s+di\s+(.+)", re.IGNORECASE), (0, -1)),
+    (re.compile(r"pi[uù]'?\s+in\s+basso\s+di\s+(.+)", re.IGNORECASE), (0, 1)),
+    (re.compile(r"sopra\s+(?:a\s+)?(.+)", re.IGNORECASE), (0, -1)),
+    (re.compile(r"sotto\s+(?:a\s+)?(.+)", re.IGNORECASE), (0, 1)),
+    (re.compile(r"a\s+sinistra\s+di\s+(.+)", re.IGNORECASE), (-1, 0)),
+    (re.compile(r"a\s+destra\s+di\s+(.+)", re.IGNORECASE), (1, 0)),
+    (re.compile(r"vicino\s+a\s+(.+)", re.IGNORECASE), (0, 0)),
+    (re.compile(r"accanto\s+a\s+(.+)", re.IGNORECASE), (0, 0)),
+)
+
+# Parole chiave italiane generiche per la griglia 3x3, combinate in una delle
+# 9 regioni di _REGION_FRACTIONS.
+_TOP_WORDS = ("alto", "sopra")
+_BOTTOM_WORDS = ("basso", "sotto")
+_LEFT_WORDS = ("sinistra",)
+_RIGHT_WORDS = ("destra",)
+_CENTER_WORDS = ("centro", "centrale")
+
+
+def _keyword_region(description: str) -> Optional[str]:
+    text = description.lower()
+    has_top = any(w in text for w in _TOP_WORDS)
+    has_bottom = any(w in text for w in _BOTTOM_WORDS)
+    has_left = any(w in text for w in _LEFT_WORDS)
+    has_right = any(w in text for w in _RIGHT_WORDS)
+    has_center = any(w in text for w in _CENTER_WORDS)
+
+    if has_top and has_left:
+        return "top-left"
+    if has_top and has_right:
+        return "top-right"
+    if has_bottom and has_left:
+        return "bottom-left"
+    if has_bottom and has_right:
+        return "bottom-right"
+    if has_top:
+        return "top-center"
+    if has_bottom:
+        return "bottom-center"
+    if has_left:
+        return "middle-left"
+    if has_right:
+        return "middle-right"
+    if has_center:
+        return "center"
+    return None
+
+
+def parse_operator_description(
+    description: str, raw_texts: list, width: int, height: int,
+) -> Optional[tuple]:
+    """Interpreta una descrizione libera dell'operatore (in italiano) in
+    coordinate reali da tappare SUBITO, senza passare da GPT — vocabolario e
+    geometria generici, validi per qualunque slot:
+
+    1. Riferimento relativo a un'etichetta OCR visibile ("sopra PUNTATA", "a
+       destra di PUNTATA", "vicino a X"): l'etichetta viene cercata tra i
+       testi OCR (stesso fuzzy-match di resolve_target) e si applica uno
+       scostamento fisso generico nella direzione indicata.
+    2. Regione grossolana a griglia 3x3 ("in basso a destra", "al centro"):
+       tradotta geometricamente con region_to_point, nessuna coordinata
+       hardcoded per slot.
+
+    Ritorna None se la descrizione non contiene alcun riferimento posizionale
+    riconoscibile (l'operatore va interpellato di nuovo con piu' dettagli)."""
+    for pattern, (dx_sign, dy_sign) in _RELATIVE_PATTERNS:
+        match = pattern.search(description)
+        if not match:
+            continue
+        label = match.group(1).strip(" .!?")
+        if not label:
+            continue
+        coords = _find_text_coords(label, raw_texts)
+        if coords is None:
+            continue
+        x, y = coords
+        x = min(max(x + dx_sign * _RELATIVE_OFFSET_PX, 0), width)
+        y = min(max(y + dy_sign * _RELATIVE_OFFSET_PX, 0), height)
+        return (x, y)
+
+    region = _keyword_region(description)
+    if region is not None:
+        return region_to_point(region, width, height)
 
     return None
 
@@ -204,6 +310,16 @@ def resize_screenshot_for_vision(screenshot_path: str, scale: float = VISION_RES
         resized.save(resized_path)
 
     return resized_path, resized_w, resized_h, orig_w, orig_h
+
+
+def get_image_dimensions(image_path: str) -> tuple:
+    """Larghezza/altezza reali di uno screenshot, per risolvere una
+    descrizione HITL o una regione grossolana senza dover ridimensionare
+    nulla (uso al di fuori del percorso Vision, che quello lo fa gia' da se')."""
+    from PIL import Image
+
+    with Image.open(image_path) as img:
+        return img.size
 
 
 def determine_phase(current_bet: Optional[float], min_bet: float = MIN_BET) -> str:
@@ -385,12 +501,22 @@ def handle_hitl_escalation(
     min_bet: float,
 ) -> tuple:
     """Gestisce l'escalation HITL: chiede ripetutamente aiuto all'operatore
-    finche' non arriva uno stop, uno skip, un suggerimento testuale, o
-    coordinate che abbassano davvero la posta. Ritorna:
+    finche' non arriva uno stop, uno skip, o un comando (coordinate o
+    descrizione) che abbassa davvero la posta. Sia le coordinate sia le
+    descrizioni testuali sono COMANDI eseguiti DIRETTAMENTE qui (tap subito,
+    GPT-4o-mini non viene mai interpellato in questa funzione — non ne ha
+    nemmeno un riferimento): un log reale ha mostrato che passare la
+    descrizione dell'operatore a GPT come "suggerimento" viene ignorato. Una
+    descrizione si traduce in coordinate con parse_operator_description
+    (etichetta OCR + scostamento relativo, o regione grossolana a griglia
+    3x3): se non e' interpretabile si richiede di nuovo aiuto senza tappare
+    nulla. Ritorna:
     - ("stop", None)
     - ("skip", None)
     - ("resolved", ocr_state) — posta abbassata con successo, stato fresco
-    - ("hint", descrizione) — suggerimento testuale da passare a GPT-4o
+    - ("hint", direttiva) — un menu e' apparso dopo il tap dell'operatore:
+      direttiva generica sullo stato osservato (non la frase dell'operatore)
+      da passare a GPT per riprendere in autonomia
     """
     while True:
         outcome = ask_human_help(current_bet, min_bet)
@@ -417,8 +543,55 @@ def handle_hitl_escalation(
                 current_bet = new_bet
             continue
 
-        # outcome[0] == "text"
-        return ("hint", outcome[1])
+        # outcome[0] == "text": descrizione libera dell'operatore, e' un
+        # COMANDO da eseguire subito, non un suggerimento per GPT.
+        description = outcome[1]
+        ss = screen_reader._screenshot(device_id)
+        if not ss.success:
+            print(f"ERRORE: screenshot fallito: {ss.error} ({ss.error_code})")
+            continue
+        pre_tap_state = ocr_reader.read_slot_state(ss.data)
+        width, height = get_image_dimensions(ss.data)
+
+        parsed_target = parse_operator_description(description, pre_tap_state.get("raw_texts", []), width, height)
+        if parsed_target is None:
+            print(
+                "Non ho capito dove tappare. Prova con coordinate (es. '540,600') o una "
+                "descrizione posizionale (es. 'in basso a destra', 'sopra PUNTATA')."
+            )
+            continue
+
+        x, y = parsed_target
+        print(f"Eseguo il tap suggerito dall'operatore ('{description}') in ({x},{y})")
+        touch_injector.tap_coordinates(device_id, x, y)
+        time.sleep(3)
+        ocr_state = read_ocr_state(screen_reader, ocr_reader, device_id)
+        if ocr_state is None:
+            continue
+
+        new_bet = ocr_state.get("posta")
+        if new_bet is not None and current_bet is not None and new_bet < current_bet:
+            print(f"Posta abbassata con successo: {current_bet:.2f} -> {new_bet:.2f} EUR.")
+            return ("resolved", ocr_state)
+
+        pre_tap_balance = pre_tap_state.get("saldo")
+        new_balance = ocr_state.get("saldo")
+        if new_balance is not None and pre_tap_balance is not None and new_balance < pre_tap_balance:
+            print(f"ATTENZIONE: il saldo e' sceso ({pre_tap_balance} -> {new_balance}): hai spinato per errore?")
+            if new_bet is not None:
+                current_bet = new_bet
+            continue
+
+        pre_tap_texts = normalize_texts(pre_tap_state.get("raw_texts", []))
+        post_tap_texts = normalize_texts(ocr_state.get("raw_texts", []))
+        if post_tap_texts - pre_tap_texts:
+            print("Sembra essersi aperto un nuovo menu. Segnalo a GPT di selezionare la puntata minima.")
+            return ("hint", _HITL_MENU_OPENED_DIRECTIVE)
+
+        print("Non sembra essere cambiato nulla. Richiedo di nuovo aiuto.")
+        if new_bet is not None:
+            current_bet = new_bet
+        continue
 
 
 def _slot_memory_path(slot_name: str) -> str:
