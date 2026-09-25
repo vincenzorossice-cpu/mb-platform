@@ -1311,6 +1311,57 @@ class TestRunAutonomousSession:
         assert ok is True
         assert load_slot_memory("Pirots 5")["known_min_bet"] == 0.20
 
+    def test_plateau_does_not_verify_when_only_the_toggle_icon_was_retapped(self, mocks, tmp_path, monkeypatch, capsys):
+        """Bug reale: GPT ha ritappato SEMPRE la stessa icona nota (mai
+        un'opzione diversa) mentre la posta restava sempre 4.0: il plateau non
+        deve 'verificare' un valore mai davvero messo alla prova. La sessione
+        deve proseguire verso l'HITL invece di passare a 'playing' e spinnare."""
+        monkeypatch.chdir(tmp_path)
+        save_slot_memory("Pirots 5", {
+            "known_spin_coords": (540, 2000), "learned_hints": [],
+            "known_min_bet": 4.0, "known_bet_menu_toggle": (719, 2225),
+        })
+        mocks["ocr_reader"].read_slot_state.return_value = _ocr_state(
+            saldo=100.0, posta=4.0, spin_button_coords=(540, 2000),
+            raw_texts=[_text("PUNTATA € 4.00", 719, 2225)],
+        )
+        # GPT ritappa SEMPRE lo stesso testo/icona nota, mai un'opzione diversa.
+        mocks["engine"].ask_with_image.side_effect = [
+            Result.ok(_answers("tap", _target(text="PUNTATA € 4.00")))
+        ] * 5 + [Result.ok(_answers("stop"))]
+
+        with patch(
+            "orchestrator.tests.validation.test_slot_autonomous.ask_human_help", return_value=("skip",),
+        ):
+            ok = run_autonomous_session("dev", target_amount=30.0, max_steps=20, slot_name="Pirots 5")
+
+        assert ok is True
+        out = capsys.readouterr().out
+        assert "Puntata minima verificata" not in out
+        assert load_slot_memory("Pirots 5")["known_min_bet"] == 4.0  # mai confermata: resta quella (sbagliata) di prima
+        spin_calls = [c for c in mocks["touch_injector"].tap_coordinates.call_args_list if c.args[1:] == (540, 2000)]
+        assert spin_calls == []  # niente spin: la fase non e' mai diventata 'playing'
+
+    def test_plateau_still_verifies_when_a_different_option_was_tried(self, mocks, tmp_path, monkeypatch, capsys):
+        """Controllo di non regressione: se GPT prova un elemento DIVERSO
+        dall'icona nota (anche se poi la posta resta uguale), il plateau puo'
+        comunque verificare normalmente."""
+        monkeypatch.chdir(tmp_path)
+        save_slot_memory("Pirots 5", {
+            "known_spin_coords": None, "learned_hints": [],
+            "known_min_bet": 0.20, "known_bet_menu_toggle": (719, 2225),
+        })
+        mocks["ocr_reader"].read_slot_state.return_value = _ocr_state(saldo=100.0, posta=0.20)
+        mocks["engine"].ask_with_image.side_effect = [
+            Result.ok(_answers("tap", _target(region="top-left")))  # elemento diverso dall'icona nota
+        ] * 3 + [Result.ok(_answers("stop"))]
+
+        ok = run_autonomous_session("dev", target_amount=30.0, max_steps=20, slot_name="Pirots 5")
+
+        assert ok is True
+        out = capsys.readouterr().out
+        assert "Puntata minima verificata per questa slot in questa sessione: 0.20 EUR" in out
+
     def test_hitl_confirmation_overrides_stale_memory_immediately(self, mocks, tmp_path, monkeypatch):
         """Una conferma esplicita dell'operatore durante l'HITL e' gia' una
         verifica dal vivo: corregge subito una memoria sbagliata, senza dover

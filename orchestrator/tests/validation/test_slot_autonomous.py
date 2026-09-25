@@ -843,6 +843,10 @@ def run_autonomous_session(
     known_bet_menu_toggle_coords: Optional[tuple] = slot_memory.get("known_bet_menu_toggle")
     menu_toggle_autotap_pending = True
     last_menu_toggle_candidate: Optional[tuple] = None
+    # Diventa vero solo con un tap su un elemento DIVERSO dall'icona
+    # apri/chiudi nota: senza un'icona nota (scoperta da zero) qualunque tap
+    # in setup conta gia' come esplorazione (nessuna icona con cui confrontare).
+    explored_bet_options_this_session = known_bet_menu_toggle_coords is None
     last_seen_bet_for_awareness: Optional[float] = current_bet
     bet_change_note: Optional[str] = None
     total_played = 0.0
@@ -935,6 +939,7 @@ def run_autonomous_session(
                     if (
                         lowest_bet_seen is not None
                         and steps_without_new_min >= MIN_BET_DISCOVERY_PATIENCE_STEPS
+                        and explored_bet_options_this_session
                     ):
                         known_min_bet = lowest_bet_seen
                         min_bet_verified = True
@@ -1264,6 +1269,19 @@ def run_autonomous_session(
             last_tap_coords = (real_x, real_y)
             if phase == "setup":
                 last_menu_toggle_candidate = (real_x, real_y)
+                # La verifica del minimo (plateau piu' sotto) deve poter
+                # contare su un tentativo VERO su un'opzione, non solo su
+                # apri/chiudi ripetuto della stessa icona (bug reale: GPT ha
+                # ritappato solo l'icona nota 3 volte, la posta non e' mai
+                # cambiata, e il plateau ha "verificato" un valore mai messo
+                # alla prova).
+                is_toggle_tap = (
+                    known_bet_menu_toggle_coords is not None
+                    and abs(real_x - known_bet_menu_toggle_coords[0]) <= REPEAT_TAP_TOLERANCE_PX
+                    and abs(real_y - known_bet_menu_toggle_coords[1]) <= REPEAT_TAP_TOLERANCE_PX
+                )
+                if not is_toggle_tap:
+                    explored_bet_options_this_session = True
 
         action_history.append({"step": step, "action": action, "target": (real_x, real_y), "phase": phase})
         action_history = action_history[-5:]
