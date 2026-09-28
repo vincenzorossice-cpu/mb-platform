@@ -1,0 +1,42 @@
+{
+  "slot_name": "pirots5",
+  "provider": "Hacksaw Gaming",
+  "screen_width": 1080,
+  "screen_height": 2400,
+  "verified": true,
+  "canvas_bbox": [0, 247, 1080, 2400],
+  "known_min_bet": 0.20,
+  "elements": {
+    "spin": {
+      "norm_x": 0.5,
+      "norm_y": 0.814212,
+      "ocr_labels": ["SPIN", "GIRA"],
+      "notes": "Confermato da spin rilevato (calo saldo) durante un run reale di test_slot_autonomous.py. Assoluto: (540, 2000) su 1080x2400."
+    },
+    "bet_menu_toggle": {
+      "norm_x": 0.665741,
+      "norm_y": 0.918718,
+      "notes": "Confermato da GPT-4o-mini Vision: icona che apre/chiude il menu puntata. Assoluto: (719, 2225) su 1080x2400."
+    },
+    "exit": {
+      "norm_x": 0.872222,
+      "norm_y": 0.009754,
+      "notes": "Tasto 'Esci' dalla slot. Misurato ma NON ancora usato da nessun controller (uscita non implementata in questo giro). Assoluto: (942, 268) su 1080x2400."
+    },
+    "balance_display": {
+      "norm_x": 0.012037,
+      "norm_y": 0.915931,
+      "ocr_labels": ["SALDO", "DEMO", "MODALIT", "BALANCE"],
+      "notes": "Label letta come 'MODALITA' DEMO € 5,000.00'. Non e' un elemento tappabile, solo una posizione di riferimento per l'OCR. Assoluto: (13, 2219) su 1080x2400."
+    },
+    "bet_display": {
+      "norm_x": 0.675,
+      "norm_y": 0.918718,
+      "ocr_labels": ["PUNTATA", "BET", "STAKE"],
+      "notes": "Label letta come 'PUNTATA € 1.00'. Non e' un elemento tappabile, solo una posizione di riferimento per l'OCR. Assoluto: (729, 2225) su 1080x2400."
+    }
+  },
+  "states": {},
+  "macros": {},
+  "_notes": "Dati raccolti da esecuzioni reali di orchestrator/tests/validation/test_slot_autonomous.py su dispositivo Android (ZT322ZSJVS), slot Pirots 5 in modalita' demo dentro Chrome. canvas_bbox misurato scalando la frazione gia' validata in produzione BROWSER_CHROME_TOP_MARGIN_FRACTION=0.103 (test_slot_autonomous.py) alla risoluzione reale 1080x2400: round(0.103*2400)=247. 'bet_minus' non e' incluso: nessuna coordinata reale confermata per questo elemento in questo giro, resta scoperto a runtime da OCR/spatial-heuristic/GPT/HITL."
+}

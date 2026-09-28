@@ -48,3 +48,14 @@ class TestProfileStrategy:
         result = strategy.locate("spin", _context(profile=profile))
         assert not result.success
         assert result.error_code == "PROFILE_ELEMENT_HAS_NO_COORDS"
+
+    def test_canvas_bbox_shifts_abs_coords(self):
+        profile = ProviderProfile(
+            slot_name="pirots5", provider="hacksaw", screen_width=1080, screen_height=2400,
+            elements={"spin": ElementSpec(name="spin", norm_x=0.5, norm_y=0.814212)},
+            canvas_bbox=(0, 247, 1080, 2400),
+        )
+        strategy = ProfileStrategy(ProviderProfileLoader())
+        result = strategy.locate("spin", _context(profile=profile))
+        assert result.success
+        assert (result.data.x, result.data.y) == (540, 2000)

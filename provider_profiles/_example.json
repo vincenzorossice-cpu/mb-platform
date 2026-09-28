@@ -1,35 +1,13 @@
 {
   "slot_name": "_example",
-  "provider": "example_provider",
+  "provider": "",
   "screen_width": 1080,
   "screen_height": 2400,
   "verified": false,
-  "elements": {
-    "spin": {
-      "ocr_labels": ["SPIN", "GIRA"],
-      "region_hint": "bottom-center",
-      "notes": "Non verificato: profilo di esempio usato solo nei test."
-    },
-    "bet_minus": {
-      "ocr_labels": ["-"],
-      "region_hint": "bottom-left",
-      "notes": "Non verificato: profilo di esempio usato solo nei test."
-    },
-    "bet_menu_toggle": {
-      "norm_x": 0.5,
-      "norm_y": 0.9,
-      "notes": "Non verificato: profilo di esempio usato solo nei test."
-    }
-  },
-  "states": {
-    "idle": {
-      "ocr_signature": ["SPIN"]
-    }
-  },
-  "macros": {
-    "lower_bet": {
-      "steps": ["bet_menu_toggle", "bet_minus"]
-    }
-  },
-  "known_min_bet": null
+  "canvas_bbox": null,
+  "known_min_bet": null,
+  "elements": {},
+  "states": {},
+  "macros": {},
+  "_notes": "Template vuoto per una nuova slot. Copia questo file in <slug-slot>.json e riempi SOLO con dati confermati da un test reale (mai coordinate indovinate). canvas_bbox=[x1,y1,x2,y2] in pixel assoluti dello schermo, se il gioco gira dentro un browser con una barra da escludere (null = usa lo schermo intero, nessun offset). Ogni elemento in 'elements' richiede almeno uno tra: norm_x+norm_y, ocr_labels, template_path, region_hint."
 }

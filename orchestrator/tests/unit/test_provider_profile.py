@@ -143,3 +143,87 @@ class TestExampleProfile:
         result = loader.load("_example")
         assert result.success
         assert result.data.verified is False
+
+
+class TestCanvasBbox:
+    def test_to_abs_applies_canvas_offset(self):
+        loader = ProviderProfileLoader()
+        element = ElementSpec(name="spin", norm_x=0.5, norm_y=0.814212)
+        result = loader.to_abs(element, 1080, 2400, canvas_bbox=(0, 247, 1080, 2400))
+        assert result.success
+        assert result.data == (540, 2000)
+
+    def test_to_norm_applies_canvas_offset(self):
+        loader = ProviderProfileLoader()
+        result = loader.to_norm(719, 2225, 1080, 2400, canvas_bbox=(0, 247, 1080, 2400))
+        assert result.success
+        norm_x, norm_y = result.data
+        assert abs(norm_x - 0.665741) < 1e-4
+        assert abs(norm_y - 0.918718) < 1e-4
+
+    def test_to_abs_to_norm_round_trip_with_canvas(self):
+        loader = ProviderProfileLoader()
+        canvas_bbox = (0, 247, 1080, 2400)
+        norm_result = loader.to_norm(942, 268, 1080, 2400, canvas_bbox=canvas_bbox)
+        assert norm_result.success
+        norm_x, norm_y = norm_result.data
+        element = ElementSpec(name="exit", norm_x=norm_x, norm_y=norm_y)
+        abs_result = loader.to_abs(element, 1080, 2400, canvas_bbox=canvas_bbox)
+        assert abs_result.success
+        x, y = abs_result.data
+        assert abs(x - 942) <= 1
+        assert abs(y - 268) <= 1
+
+    def test_to_abs_without_canvas_bbox_uses_full_screen(self):
+        """Nessuna regressione: canvas_bbox=None (default) si comporta come oggi."""
+        loader = ProviderProfileLoader()
+        element = ElementSpec(name="spin", norm_x=0.5, norm_y=0.9)
+        result = loader.to_abs(element, 1080, 2400)
+        assert result.success
+        assert result.data == (540, 2160)
+
+    def test_validate_rejects_inverted_canvas_bbox(self):
+        profile = ProviderProfile(
+            slot_name="x", provider="p", screen_width=1080, screen_height=2400,
+            canvas_bbox=(1080, 247, 0, 2400),
+        )
+        loader = ProviderProfileLoader()
+        result = loader.validate(profile)
+        assert not result.success
+        assert result.error_code == "PROFILE_INVALID_CANVAS_BBOX"
+
+    def test_validate_rejects_canvas_bbox_out_of_screen_bounds(self):
+        profile = ProviderProfile(
+            slot_name="x", provider="p", screen_width=1080, screen_height=2400,
+            canvas_bbox=(0, 247, 1080, 3000),
+        )
+        loader = ProviderProfileLoader()
+        result = loader.validate(profile)
+        assert not result.success
+        assert result.error_code == "PROFILE_INVALID_CANVAS_BBOX"
+
+    def test_validate_accepts_valid_canvas_bbox(self):
+        profile = ProviderProfile(
+            slot_name="x", provider="p", screen_width=1080, screen_height=2400,
+            elements={"spin": ElementSpec(name="spin", norm_x=0.5, norm_y=0.81)},
+            canvas_bbox=(0, 247, 1080, 2400),
+        )
+        loader = ProviderProfileLoader()
+        result = loader.validate(profile)
+        assert result.success
+
+    def test_load_parses_canvas_bbox_from_json(self, tmp_path):
+        data = _valid_profile_data()
+        data["canvas_bbox"] = [0, 247, 1080, 2400]
+        _write_profile(tmp_path, "pirots5.json", data)
+        loader = ProviderProfileLoader(profiles_dir=str(tmp_path))
+        result = loader.load("pirots5")
+        assert result.success
+        assert result.data.canvas_bbox == (0, 247, 1080, 2400)
+
+    def test_load_without_canvas_bbox_defaults_to_none(self, tmp_path):
+        _write_profile(tmp_path, "pirots5.json", _valid_profile_data())
+        loader = ProviderProfileLoader(profiles_dir=str(tmp_path))
+        result = loader.load("pirots5")
+        assert result.success
+        assert result.data.canvas_bbox is None

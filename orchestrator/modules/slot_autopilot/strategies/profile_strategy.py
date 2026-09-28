@@ -22,7 +22,10 @@ class ProfileStrategy(LocatorStrategy):
         if element is None:
             return Result.fail(f"Unknown element in profile: {element_name}", "PROFILE_ELEMENT_UNKNOWN")
 
-        abs_result = self.profile_loader.to_abs(element, context.screen_width, context.screen_height)
+        abs_result = self.profile_loader.to_abs(
+            element, context.screen_width, context.screen_height,
+            canvas_bbox=context.profile.canvas_bbox,
+        )
         if not abs_result.success:
             return Result.fail(abs_result.error, "PROFILE_ELEMENT_HAS_NO_COORDS")
 

@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from typing import Optional
 
 from orchestrator.core.result import Result
 from orchestrator.modules.provider_profile.profile import (
@@ -61,6 +62,7 @@ class ProviderProfileLoader:
                 macros=macros,
                 known_min_bet=data.get("known_min_bet"),
                 verified=data.get("verified", False),
+                canvas_bbox=tuple(data["canvas_bbox"]) if data.get("canvas_bbox") else None,
             )
         except TypeError as exc:
             return Result.fail(f"Invalid profile JSON: {exc}", "PROFILE_INVALID_JSON")
@@ -105,19 +107,56 @@ class ProviderProfileLoader:
                         f"Macro '{macro.name}' references unknown element '{step}'",
                         "PROFILE_INVALID_MACRO",
                     )
+        if profile.canvas_bbox is not None:
+            if len(profile.canvas_bbox) != 4:
+                return Result.fail(
+                    f"canvas_bbox must have 4 values, got {profile.canvas_bbox}",
+                    "PROFILE_INVALID_CANVAS_BBOX",
+                )
+            x1, y1, x2, y2 = profile.canvas_bbox
+            if x1 >= x2 or y1 >= y2:
+                return Result.fail(
+                    f"canvas_bbox has non-positive width/height: {profile.canvas_bbox}",
+                    "PROFILE_INVALID_CANVAS_BBOX",
+                )
+            if x1 < 0 or y1 < 0 or x2 > profile.screen_width or y2 > profile.screen_height:
+                return Result.fail(
+                    f"canvas_bbox {profile.canvas_bbox} out of screen bounds "
+                    f"{profile.screen_width}x{profile.screen_height}",
+                    "PROFILE_INVALID_CANVAS_BBOX",
+                )
         return Result.ok(True)
 
-    def to_abs(self, element: ElementSpec, screen_width: int, screen_height: int) -> Result[tuple]:
+    def to_abs(
+        self, element: ElementSpec, screen_width: int, screen_height: int,
+        canvas_bbox: Optional[tuple] = None,
+    ) -> Result[tuple]:
         if element.norm_x is None or element.norm_y is None:
             return Result.fail(
                 f"Element '{element.name}' has no normalized coordinates",
                 "ELEMENT_HAS_NO_NORM_COORDS",
             )
+        if canvas_bbox is not None:
+            x1, y1, x2, y2 = canvas_bbox
+            x = x1 + round(element.norm_x * (x2 - x1))
+            y = y1 + round(element.norm_y * (y2 - y1))
+            return Result.ok((x, y))
         x = round(element.norm_x * screen_width)
         y = round(element.norm_y * screen_height)
         return Result.ok((x, y))
 
-    def to_norm(self, x: int, y: int, screen_width: int, screen_height: int) -> Result[tuple]:
+    def to_norm(
+        self, x: int, y: int, screen_width: int, screen_height: int,
+        canvas_bbox: Optional[tuple] = None,
+    ) -> Result[tuple]:
+        if canvas_bbox is not None:
+            x1, y1, x2, y2 = canvas_bbox
+            width, height = x2 - x1, y2 - y1
+            if width <= 0 or height <= 0:
+                return Result.fail(
+                    f"Invalid canvas_bbox dimensions: {canvas_bbox}", "INVALID_SCREEN_DIMENSIONS",
+                )
+            return Result.ok(((x - x1) / width, (y - y1) / height))
         if screen_width <= 0 or screen_height <= 0:
             return Result.fail(
                 f"Invalid screen dimensions: {screen_width}x{screen_height}",

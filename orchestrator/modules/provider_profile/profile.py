@@ -50,3 +50,8 @@ class ProviderProfile:
     macros: dict = field(default_factory=dict)      # name -> MacroSpec
     known_min_bet: Optional[float] = None
     verified: bool = False
+    # (x1, y1, x2, y2) in pixel assoluti dello schermo intero: l'area di gioco
+    # vera, esclusa la barra del browser. None = nessun canvas dichiarato,
+    # le coordinate normalizzate sono relative allo schermo intero (comportamento
+    # storico, retrocompatibile).
+    canvas_bbox: Optional[tuple] = None
