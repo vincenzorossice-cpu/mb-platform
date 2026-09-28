@@ -1,8 +1,22 @@
+import logging
+
 from orchestrator.core.result import Result
 from orchestrator.modules.provider_profile.autopilot_memory import save_autopilot_element
 from orchestrator.modules.slot_autopilot.strategies.base import LocateCandidate, LocateContext
 from orchestrator.modules.slot_autopilot.strategies.memory_strategy import _LEGACY_MEMORY_FIELDS
 from orchestrator.tests.validation.test_slot_autonomous import _persist_slot_memory
+
+logger = logging.getLogger(__name__)
+
+# Fonti gia' curate/verificate a monte: un candidato da qui non viene mai
+# scartato dal controllo canvas, esattamente come nel vecchio script un
+# comando dell'operatore o una coordinata memorizzata restavano sempre fidati.
+_TRUSTED_STRATEGIES = {"profile", "memory", "hitl"}
+
+
+def _within_canvas(x: int, y: int, canvas_bbox: tuple) -> bool:
+    x1, y1, x2, y2 = canvas_bbox
+    return x1 <= x <= x2 and y1 <= y <= y2
 
 
 class ElementLocator:
@@ -30,12 +44,31 @@ class ElementLocator:
 
             result = strategy.locate(element_name, context)
             if result.success:
+                candidate = result.data
+                if (
+                    strategy_name not in _TRUSTED_STRATEGIES
+                    and context.profile is not None
+                    and context.profile.canvas_bbox is not None
+                    and not _within_canvas(candidate.x, candidate.y, context.profile.canvas_bbox)
+                ):
+                    logger.warning(
+                        "'%s' via '%s' a (%d,%d) e' fuori dal canvas %s: scartato, non tappato.",
+                        element_name, strategy_name, candidate.x, candidate.y, context.profile.canvas_bbox,
+                    )
+                    collected.append(f"{strategy_name}:TARGET_OUTSIDE_CANVAS")
+                    self._failure_counts[key] = self._failure_counts.get(key, 0) + 1
+                    continue
+
                 self._failure_counts[key] = 0
+                logger.info(
+                    "'%s' localizzato via '%s' a (%d,%d)", element_name, strategy_name, candidate.x, candidate.y,
+                )
                 return result
 
             collected.append(f"{strategy_name}:{result.error_code}")
             self._failure_counts[key] = self._failure_counts.get(key, 0) + 1
 
+        logger.warning("Impossibile localizzare '%s' con nessuna strategia: %s", element_name, collected)
         return Result.fail(
             f"Could not locate '{element_name}' with any strategy: {collected}",
             "ELEMENT_NOT_LOCATABLE",

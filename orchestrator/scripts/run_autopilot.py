@@ -77,15 +77,23 @@ def build_autopilot(args: argparse.Namespace) -> Result[SlotAutoPilot]:
 
 
 def _run_session(autopilot: SlotAutoPilot, args: argparse.Namespace) -> int:
+    logger.info("Preparazione: profilo '%s', dispositivo %s...", args.slot, args.device)
     prepare_result = autopilot.prepare(args.device)
     if not prepare_result.success:
         logger.error("prepare() fallito: %s (%s)", prepare_result.error, prepare_result.error_code)
         return 1
+    logger.info("Preparazione completata.")
 
+    logger.info("Verifica puntata minima in corso...")
     bet_result = autopilot.set_min_bet(args.device)
     if not bet_result.success or not bet_result.data.min_bet_verified:
-        logger.error("Impossibile verificare la puntata minima: mi fermo senza spinnare.")
+        reason = bet_result.data.aborted_reason if bet_result.success else bet_result.error_code
+        logger.error("Impossibile verificare la puntata minima (%s): mi fermo senza spinnare.", reason)
         return 1
+    logger.info(
+        "Puntata minima verificata: %s EUR (outcome=%s, tentativi=%d)",
+        bet_result.data.final_bet, bet_result.data.outcome, bet_result.data.attempts,
+    )
 
     target = Decimal(str(args.target))
     total_played = Decimal("0.00")
@@ -98,9 +106,11 @@ def _run_session(autopilot: SlotAutoPilot, args: argparse.Namespace) -> int:
             return 1
         if spin_result.data.outcome == "success" and spin_result.data.bet_amount:
             total_played += spin_result.data.bet_amount
+            logger.info("Progresso: %s/%s EUR giocati dopo lo spin %d", total_played, target, spin_index)
         elif spin_result.data.outcome == "blocked":
             logger.warning("Spin bloccato da un'invariante di sicurezza: %s", spin_result.data.violated_invariant)
             break
+    logger.info("Sessione conclusa: %s/%s EUR giocati in %d spin.", total_played, target, spin_index)
     return 0
 
 

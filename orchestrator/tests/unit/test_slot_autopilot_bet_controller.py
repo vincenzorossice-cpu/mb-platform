@@ -80,7 +80,28 @@ class TestSetMinBetWithMockedCollaborators:
         assert step_logger.log_step.call_count == 6
         assert locator.save_verified_candidate.call_count == 3
 
-    def test_already_at_minimum_from_the_start(self):
+    def test_progress_is_logged(self, caplog):
+        locator = MagicMock()
+        locator.locate.return_value = _ok_candidate()
+        verifier = MagicMock()
+        verifier.verified_tap.return_value = Result.ok(
+            _tap_outcome(Decimal("1.00"), Decimal("0.50"), True, "success")
+        )
+        controller, _ = _controller(locator, verifier, config=_config(stable_reads_for_min=1))
+
+        with caplog.at_level("INFO"):
+            controller.set_min_bet("dev", "pirots5", "ep1", _context_provider())
+        messages = [record.getMessage() for record in caplog.records]
+        assert any("puntata iniziale" in m for m in messages)
+        assert any("tentativo" in m for m in messages)
+        assert any("plateau raggiunto" in m for m in messages)
+
+    def test_plateau_without_any_decrease_and_without_a_trusted_profile_is_not_verified(self):
+        """Senza un profilo verificato che confermi il minimo, un plateau
+        senza MAI una discesa vera non puo' essere fidato: potremmo essere
+        gia' al minimo, oppure star tappando il posto sbagliato (es. le
+        schede di Chrome) - non possiamo distinguere i due casi, quindi non
+        si procede a spinnare su un'ipotesi mai verificata."""
         locator = MagicMock()
         locator.locate.return_value = _ok_candidate()
         verifier = MagicMock()
@@ -92,9 +113,66 @@ class TestSetMinBetWithMockedCollaborators:
         result = controller.set_min_bet("dev", "pirots5", "ep1", _context_provider())
         assert result.success
         assert result.data.outcome == "unchanged_already_min"
-        assert result.data.min_bet_verified is True
+        assert result.data.min_bet_verified is False
+        assert result.data.aborted_reason == "NO_DECREASE_OBSERVED"
         assert result.data.final_bet == Decimal("1.00")
         assert result.data.attempts == 3
+
+    def test_plateau_without_decrease_but_matching_a_verified_profile_min_bet_is_trusted(self):
+        """Lo stesso plateau di sopra, ma con un profilo curato e verificato
+        (es. pirots5.json, known_min_bet=0.20) la cui puntata nota coincide
+        con quella attuale: qui il riscontro incrociato conferma che siamo
+        davvero al minimo documentato, quindi si puo' procedere."""
+        profile = ProviderProfile(
+            slot_name="pirots5", provider="hacksaw", screen_width=1080, screen_height=2400,
+            verified=True, known_min_bet=0.20,
+        )
+        context_provider = MagicMock(return_value=Result.ok(LocateContext(
+            device_id="dev", slot_name="pirots5", screenshot_path="/tmp/x.png",
+            screen_width=1080, screen_height=2400, slot_ocr_state={"posta": 0.20},
+            profile=profile,
+        )))
+        locator = MagicMock()
+        locator.locate.return_value = _ok_candidate()
+        verifier = MagicMock()
+        verifier.verified_tap.return_value = Result.ok(
+            _tap_outcome(Decimal("0.20"), Decimal("0.20"), False, "no_effect")
+        )
+        controller, _ = _controller(locator, verifier)
+
+        result = controller.set_min_bet("dev", "pirots5", "ep1", context_provider)
+        assert result.success
+        assert result.data.outcome == "unchanged_already_min"
+        assert result.data.min_bet_verified is True
+        assert result.data.aborted_reason is None
+        assert result.data.final_bet == Decimal("0.20")
+
+    def test_plateau_without_decrease_and_profile_min_bet_mismatch_is_not_trusted(self):
+        """Il profilo dice che il minimo e' 0.20, ma il plateau si e' fermato
+        a 1.00: il riscontro incrociato NON conferma, quindi non ci si fida
+        (esattamente il caso in cui GPT potrebbe aver tappato il posto
+        sbagliato mentre la vera puntata minima resta piu' bassa)."""
+        profile = ProviderProfile(
+            slot_name="pirots5", provider="hacksaw", screen_width=1080, screen_height=2400,
+            verified=True, known_min_bet=0.20,
+        )
+        context_provider = MagicMock(return_value=Result.ok(LocateContext(
+            device_id="dev", slot_name="pirots5", screenshot_path="/tmp/x.png",
+            screen_width=1080, screen_height=2400, slot_ocr_state={"posta": 1.00},
+            profile=profile,
+        )))
+        locator = MagicMock()
+        locator.locate.return_value = _ok_candidate()
+        verifier = MagicMock()
+        verifier.verified_tap.return_value = Result.ok(
+            _tap_outcome(Decimal("1.00"), Decimal("1.00"), False, "no_effect")
+        )
+        controller, _ = _controller(locator, verifier)
+
+        result = controller.set_min_bet("dev", "pirots5", "ep1", context_provider)
+        assert result.success
+        assert result.data.min_bet_verified is False
+        assert result.data.aborted_reason == "NO_DECREASE_OBSERVED"
 
     def test_bet_rising_aborts_immediately(self):
         locator = MagicMock()
@@ -198,7 +276,11 @@ class TestEndToEndWithFakeSlotDevice:
     def test_dead_zone_profile_coords_produce_false_floor(self, tmp_path):
         """Limite noto e dichiarato nel piano: coordinate del profilo su una
         zona morta non fanno mai scendere la catena a Memory/OCR/GPT/HITL
-        perche' localizzare e avere-effetto sono passi distinti per design."""
+        perche' localizzare e avere-effetto sono passi distinti per design.
+        Il plateau che ne risulta pero' NON viene piu' marcato verificato
+        (nessuna discesa vera osservata, nessun known_min_bet a riscontro nel
+        profilo di questo test): l'esito resta reso sicuro da Fix 2, non solo
+        documentato."""
         device = FakeSlotDevice(tmp_path, balance=Decimal("10.00"), bet=Decimal("1.00"))
         # Nessun elemento registrato in quella posizione: sempre zona morta.
         profile = ProviderProfile(
@@ -222,3 +304,5 @@ class TestEndToEndWithFakeSlotDevice:
         assert result.success
         assert result.data.outcome == "unchanged_already_min"
         assert result.data.final_bet == Decimal("1.00")
+        assert result.data.min_bet_verified is False
+        assert result.data.aborted_reason == "NO_DECREASE_OBSERVED"

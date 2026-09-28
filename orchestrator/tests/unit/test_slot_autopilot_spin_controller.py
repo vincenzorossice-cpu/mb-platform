@@ -64,6 +64,15 @@ class TestSafetyInvariants:
         locator.locate.assert_not_called()
         assert step_logger.log_step.call_count == 1
 
+    def test_blocked_invariant_is_logged(self, caplog):
+        controller, _, _, _ = _controller()
+        context_provider = MagicMock(return_value=_context_result(Decimal("10.00")))
+
+        with caplog.at_level("WARNING"):
+            controller.spin("dev", "pirots5", "ep1", 1, context_provider, False, Decimal("0.10"))
+        messages = [record.getMessage() for record in caplog.records]
+        assert any("MIN_BET_NOT_VERIFIED" in m for m in messages)
+
     def test_insufficient_balance_blocks(self):
         controller, _, locator, _ = _controller()
         context_provider = MagicMock(return_value=_context_result(Decimal("0.05")))

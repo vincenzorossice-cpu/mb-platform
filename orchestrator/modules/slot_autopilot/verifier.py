@@ -1,3 +1,4 @@
+import logging
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Optional
@@ -5,6 +6,8 @@ from typing import Optional
 from orchestrator.core.result import Result
 from orchestrator.modules.slot_autopilot.config import AutoPilotConfig
 from orchestrator.modules.slot_autopilot.frame_diff import diff_score, wait_until_stable
+
+logger = logging.getLogger(__name__)
 
 
 def classify_screen_state(ocr_state: dict) -> str:
@@ -85,8 +88,10 @@ class ActionVerifier:
         except Exception as exc:
             return Result.fail(f"OCR error before tap: {exc}", "VERIFICATION_ERROR")
 
+        logger.info("verified_tap: tap (%d,%d), attesa '%s'", x, y, expectation.kind)
         tap_result = self.touch_injector.tap_coordinates(device_id, x, y)
         if not tap_result.success:
+            logger.warning("verified_tap: tap fallito: %s (%s)", tap_result.error, tap_result.error_code)
             return Result.fail(tap_result.error, tap_result.error_code)
 
         wait_result = wait_until_stable(
@@ -119,6 +124,10 @@ class ActionVerifier:
             expectation, diff, balance_before, balance_after, bet_before, bet_after,
         )
         outcome = _classify_outcome(verified, diff, state_before, state_after, self.config)
+        logger.info(
+            "verified_tap: esito=%s verified=%s diff=%.3f (bet %s->%s, saldo %s->%s)",
+            outcome, verified, diff, bet_before, bet_after, balance_before, balance_after,
+        )
 
         return Result.ok(TapOutcome(
             tapped_coords=(x, y),

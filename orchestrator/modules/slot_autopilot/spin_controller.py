@@ -1,3 +1,4 @@
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -9,6 +10,8 @@ from orchestrator.modules.slot_autopilot.locator import ElementLocator
 from orchestrator.modules.slot_autopilot.value_parser import parse_amount
 from orchestrator.modules.slot_autopilot.verifier import ActionVerifier, Expectation, classify_screen_state
 from orchestrator.modules.step_logger.interface import StepLoggerInterface, StepRecord
+
+logger = logging.getLogger(__name__)
 
 _ELEMENT = "spin"
 
@@ -58,6 +61,7 @@ class SpinController:
 
         violated = self._check_invariants(min_bet_verified, balance_before, expected_bet, context)
         if violated is not None:
+            logger.warning("spin %d bloccato da invariante di sicurezza: %s", spin_index, violated)
             self._log_step(
                 episode_id, spin_index, slot_name, device_id, None, None,
                 balance_before, balance_before, outcome="blocked", notes=violated,
@@ -118,6 +122,12 @@ class SpinController:
         if outcome == "success":
             accounting_anomaly = self._check_accounting(balance_before, expected_bet, win_amount, balance_after)
 
+        if accounting_anomaly:
+            logger.warning("spin %d: anomalia contabile: %s", spin_index, accounting_anomaly)
+        logger.info(
+            "spin %d: outcome=%s verified=%s saldo %s->%s vincita=%s",
+            spin_index, outcome, verified, balance_before, balance_after, win_amount,
+        )
         self._log_step(
             episode_id, spin_index, slot_name, device_id, candidate.strategy_name,
             (candidate.x, candidate.y), balance_before, balance_after,

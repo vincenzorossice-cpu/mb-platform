@@ -23,7 +23,8 @@ class BetResult:
     min_bet_verified: bool
     attempts: int
     strategy_sequence: list = field(default_factory=list)
-    aborted_reason: Optional[str] = None  # None | "VALUE_ROSE" | "MAX_ATTEMPTS" | "HITL_STOP" | "ELEMENT_NOT_LOCATABLE"
+    # None | "VALUE_ROSE" | "MAX_ATTEMPTS" | "HITL_STOP" | "ELEMENT_NOT_LOCATABLE" | "NO_DECREASE_OBSERVED"
+    aborted_reason: Optional[str] = None
     outcome: str = "aborted"  # "min_bet_confirmed" | "unchanged_already_min" | "aborted"
 
 
@@ -50,7 +51,16 @@ class BetController:
             return Result.fail(context_result.error, context_result.error_code)
         context = context_result.data
 
+        # Riscontro incrociato fidato solo se e' un valore curato e confermato
+        # a monte (profilo verificato), mai da un profilo non verificato: e'
+        # cio' che manca oggi e che permette di distinguere "siamo davvero
+        # gia' al minimo documentato" da "stiamo tappando il posto sbagliato".
+        trusted_min_bet = None
+        if context.profile is not None and context.profile.verified and context.profile.known_min_bet is not None:
+            trusted_min_bet = Decimal(str(context.profile.known_min_bet))
+
         starting_bet = self._read_bet(context)
+        logger.info("set_min_bet: puntata iniziale=%s, riscontro fidato=%s", starting_bet, trusted_min_bet)
         lowest_bet_seen = starting_bet
         current_bet = starting_bet
         stable_reads = 0
@@ -65,6 +75,10 @@ class BetController:
                 aborted_reason = (
                     "HITL_STOP" if locate_result.error_code == "HITL_STOP_REQUESTED"
                     else "ELEMENT_NOT_LOCATABLE"
+                )
+                logger.warning(
+                    "set_min_bet: impossibile localizzare '%s' (%s), abort=%s",
+                    _ELEMENT, locate_result.error_code, aborted_reason,
                 )
                 self._log_step(
                     episode_id, attempts, slot_name, device_id, None, None,
@@ -106,6 +120,11 @@ class BetController:
                 verified = outcome_data.verified
                 outcome = outcome_data.outcome
 
+            logger.info(
+                "set_min_bet: tentativo %d/%d: %s -> %s (outcome=%s, strategia=%s, coords=(%d,%d))",
+                attempts, self.config.max_bet_lower_attempts, current_bet, new_bet, outcome,
+                candidate.strategy_name, candidate.x, candidate.y,
+            )
             self._log_step(
                 episode_id, attempts, slot_name, device_id, candidate.strategy_name,
                 (candidate.x, candidate.y), current_bet, new_bet, outcome=outcome,
@@ -113,6 +132,7 @@ class BetController:
             )
 
             if new_bet is not None and current_bet is not None and new_bet > current_bet:
+                logger.error("set_min_bet: la puntata e' SALITA (%s -> %s): abort immediato", current_bet, new_bet)
                 return Result.ok(BetResult(
                     slot_name=slot_name, starting_bet=starting_bet, final_bet=new_bet,
                     min_bet_verified=False, attempts=attempts, strategy_sequence=strategy_sequence,
@@ -133,17 +153,27 @@ class BetController:
                 stable_reads += 1
 
             if stable_reads >= self.config.stable_reads_for_min:
+                already_at_known_min = (
+                    trusted_min_bet is not None and current_bet is not None and current_bet <= trusted_min_bet
+                )
+                min_bet_verified = any_decrease_seen or already_at_known_min
+                outcome_label = "min_bet_confirmed" if any_decrease_seen else "unchanged_already_min"
+                logger.info(
+                    "set_min_bet: plateau raggiunto (outcome=%s, min_bet_verified=%s, puntata finale=%s)",
+                    outcome_label, min_bet_verified, current_bet,
+                )
                 return Result.ok(BetResult(
                     slot_name=slot_name, starting_bet=starting_bet, final_bet=current_bet,
-                    min_bet_verified=True, attempts=attempts, strategy_sequence=strategy_sequence,
-                    aborted_reason=None,
-                    outcome="min_bet_confirmed" if any_decrease_seen else "unchanged_already_min",
+                    min_bet_verified=min_bet_verified, attempts=attempts, strategy_sequence=strategy_sequence,
+                    aborted_reason=None if min_bet_verified else "NO_DECREASE_OBSERVED",
+                    outcome=outcome_label,
                 ))
 
             refreshed = context_provider()
             if refreshed.success:
                 context = refreshed.data
 
+        logger.warning("set_min_bet: tentativi esauriti (%d) senza plateau", attempts)
         return Result.ok(BetResult(
             slot_name=slot_name, starting_bet=starting_bet, final_bet=current_bet,
             min_bet_verified=False, attempts=attempts, strategy_sequence=strategy_sequence,

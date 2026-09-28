@@ -2,14 +2,22 @@ import json
 from unittest.mock import MagicMock, patch
 
 from orchestrator.core.result import Result
+from orchestrator.modules.provider_profile.profile import ProviderProfile
 from orchestrator.modules.slot_autopilot.locator import ElementLocator
 from orchestrator.modules.slot_autopilot.strategies.base import LocateCandidate, LocateContext
 
 
-def _context():
+def _context(profile=None):
     return LocateContext(
         device_id="dev", slot_name="pirots5", screenshot_path="/tmp/shot.png",
-        screen_width=1080, screen_height=2400,
+        screen_width=1080, screen_height=2400, profile=profile,
+    )
+
+
+def _profile_with_canvas(canvas_bbox=(0, 247, 1080, 2400)):
+    return ProviderProfile(
+        slot_name="pirots5", provider="hacksaw", screen_width=1080, screen_height=2400,
+        canvas_bbox=canvas_bbox,
     )
 
 
@@ -125,3 +133,67 @@ class TestLocateOrder:
         assert template.locate.call_count == 2  # elemento diverso: contatore indipendente
         locator.locate("bet_minus", _context())
         assert template.locate.call_count == 2  # bet_minus: gia' disabilitato
+
+
+class TestCanvasExclusion:
+    def test_untrusted_candidate_outside_canvas_is_discarded_falls_through(self):
+        # GPT propone un punto nella barra Chrome (y=163 < canvas y1=247);
+        # deve essere scartato e la catena deve scendere a hitl.
+        gpt = _ok_strategy("gpt", x=891, y=163)
+        hitl = _ok_strategy("hitl", x=540, y=2000)
+        locator = ElementLocator({"gpt": gpt, "hitl": hitl})
+
+        result = locator.locate("bet_minus", _context(profile=_profile_with_canvas()))
+        assert result.success
+        assert result.data.strategy_name == "hitl"
+        gpt.locate.assert_called_once()
+
+    def test_trusted_strategy_outside_canvas_is_not_discarded(self):
+        # Una coordinata da "memory" (fidata a monte) non viene mai scartata,
+        # anche se ricade fuori dal canvas dichiarato.
+        memory = _ok_strategy("memory", x=891, y=163)
+        locator = ElementLocator({"memory": memory})
+
+        result = locator.locate("bet_minus", _context(profile=_profile_with_canvas()))
+        assert result.success
+        assert result.data.strategy_name == "memory"
+        assert (result.data.x, result.data.y) == (891, 163)
+
+    def test_no_canvas_bbox_means_no_check(self):
+        profile = _profile_with_canvas(canvas_bbox=None)
+        gpt = _ok_strategy("gpt", x=891, y=163)
+        locator = ElementLocator({"gpt": gpt})
+
+        result = locator.locate("bet_minus", _context(profile=profile))
+        assert result.success
+        assert result.data.strategy_name == "gpt"
+
+    def test_no_profile_means_no_check(self):
+        gpt = _ok_strategy("gpt", x=891, y=163)
+        locator = ElementLocator({"gpt": gpt})
+
+        result = locator.locate("bet_minus", _context(profile=None))
+        assert result.success
+        assert result.data.strategy_name == "gpt"
+
+    def test_discarded_candidate_is_logged(self, caplog):
+        gpt = _ok_strategy("gpt", x=891, y=163)
+        hitl = _ok_strategy("hitl", x=540, y=2000)
+        locator = ElementLocator({"gpt": gpt, "hitl": hitl})
+
+        with caplog.at_level("WARNING"):
+            locator.locate("bet_minus", _context(profile=_profile_with_canvas()))
+        assert any("fuori dal canvas" in record.getMessage() for record in caplog.records)
+
+    def test_discarded_candidate_counts_as_a_failure(self):
+        gpt = _ok_strategy("gpt", x=891, y=163)  # sempre fuori canvas
+        locator = ElementLocator({"gpt": gpt}, max_consecutive_failures_per_strategy=2)
+        context = _context(profile=_profile_with_canvas())
+
+        locator.locate("bet_minus", context)
+        locator.locate("bet_minus", context)
+        assert gpt.locate.call_count == 2
+
+        result = locator.locate("bet_minus", context)
+        assert not result.success
+        assert gpt.locate.call_count == 2  # soglia raggiunta, non richiamato una terza volta
