@@ -4,6 +4,7 @@ __pycache__/
 .pytest_cache/
 venv/
 chroma_db/
+dataset/
 *.egg-info/
 .DS_Store
 *.session

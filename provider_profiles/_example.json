@@ -1,0 +1,35 @@
+{
+  "slot_name": "_example",
+  "provider": "example_provider",
+  "screen_width": 1080,
+  "screen_height": 2400,
+  "verified": false,
+  "elements": {
+    "spin": {
+      "ocr_labels": ["SPIN", "GIRA"],
+      "region_hint": "bottom-center",
+      "notes": "Non verificato: profilo di esempio usato solo nei test."
+    },
+    "bet_minus": {
+      "ocr_labels": ["-"],
+      "region_hint": "bottom-left",
+      "notes": "Non verificato: profilo di esempio usato solo nei test."
+    },
+    "bet_menu_toggle": {
+      "norm_x": 0.5,
+      "norm_y": 0.9,
+      "notes": "Non verificato: profilo di esempio usato solo nei test."
+    }
+  },
+  "states": {
+    "idle": {
+      "ocr_signature": ["SPIN"]
+    }
+  },
+  "macros": {
+    "lower_bet": {
+      "steps": ["bet_menu_toggle", "bet_minus"]
+    }
+  },
+  "known_min_bet": null
+}

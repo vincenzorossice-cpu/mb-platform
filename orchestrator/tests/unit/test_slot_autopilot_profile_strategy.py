@@ -1,0 +1,50 @@
+from orchestrator.modules.provider_profile.loader import ProviderProfileLoader
+from orchestrator.modules.provider_profile.profile import ElementSpec, ProviderProfile
+from orchestrator.modules.slot_autopilot.strategies.base import LocateContext
+from orchestrator.modules.slot_autopilot.strategies.profile_strategy import ProfileStrategy
+
+
+def _context(profile=None, **overrides):
+    defaults = dict(
+        device_id="dev", slot_name="pirots5", screenshot_path="/tmp/shot.png",
+        screen_width=1080, screen_height=2400, profile=profile,
+    )
+    defaults.update(overrides)
+    return LocateContext(**defaults)
+
+
+def _profile(elements):
+    return ProviderProfile(
+        slot_name="pirots5", provider="elk", screen_width=1080, screen_height=2400,
+        elements=elements,
+    )
+
+
+class TestProfileStrategy:
+    def test_norm_coords_resolve_to_abs_pixels(self):
+        profile = _profile({"spin": ElementSpec(name="spin", norm_x=0.5, norm_y=0.9)})
+        strategy = ProfileStrategy(ProviderProfileLoader())
+        result = strategy.locate("spin", _context(profile=profile))
+        assert result.success
+        assert (result.data.x, result.data.y) == (540, 2160)
+        assert result.data.confidence == 1.0
+
+    def test_unknown_element(self):
+        profile = _profile({"spin": ElementSpec(name="spin", norm_x=0.5, norm_y=0.9)})
+        strategy = ProfileStrategy(ProviderProfileLoader())
+        result = strategy.locate("bet_minus", _context(profile=profile))
+        assert not result.success
+        assert result.error_code == "PROFILE_ELEMENT_UNKNOWN"
+
+    def test_no_profile_loaded(self):
+        strategy = ProfileStrategy(ProviderProfileLoader())
+        result = strategy.locate("spin", _context(profile=None))
+        assert not result.success
+        assert result.error_code == "PROFILE_NOT_LOADED"
+
+    def test_element_with_only_ocr_labels_has_no_coords(self):
+        profile = _profile({"spin": ElementSpec(name="spin", ocr_labels=["SPIN"])})
+        strategy = ProfileStrategy(ProviderProfileLoader())
+        result = strategy.locate("spin", _context(profile=profile))
+        assert not result.success
+        assert result.error_code == "PROFILE_ELEMENT_HAS_NO_COORDS"
