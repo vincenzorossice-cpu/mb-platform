@@ -66,7 +66,12 @@ class ElementLocator:
                     self._failure_counts[key] = self._failure_counts.get(key, 0) + 1
                     continue
 
-                self._failure_counts[key] = 0
+                # NON azzerare qui il contatore: "localizzato" non vuol dire
+                # "ha funzionato" (passi distinti per design, vedi docstring
+                # della classe). Solo record_success(), chiamato dal chiamante
+                # dopo aver verificato l'effetto reale del tap, puo' azzerarlo -
+                # altrimenti una strategia che "trova sempre qualcosa" ma
+                # tappa a vuoto non accumulerebbe mai fallimenti.
                 logger.info(
                     "'%s' localizzato via '%s' a (%d,%d)", element_name, strategy_name, candidate.x, candidate.y,
                 )
@@ -90,6 +95,24 @@ class ElementLocator:
     def record_failure(self, strategy_name: str, element_name: str) -> None:
         key = (strategy_name, element_name)
         self._failure_counts[key] = self._failure_counts.get(key, 0) + 1
+
+    def record_success(self, strategy_name: str, element_name: str) -> None:
+        """Da chiamare quando il chiamante ha confermato che il tap sulla
+        coordinata restituita da questa strategia ha davvero avuto l'effetto
+        voluto - azzera esplicitamente lo storico di fallimenti."""
+        self._failure_counts[(strategy_name, element_name)] = 0
+
+    def is_exhausted(self, strategy_name: str, element_name: str) -> bool:
+        """True se questa coppia ha gia' raggiunto la soglia di fallimenti
+        consecutivi: il prossimo locate() e' garantito saltarla."""
+        return self._failure_counts.get((strategy_name, element_name), 0) >= self.max_consecutive_failures_per_strategy
+
+    def is_trusted_strategy(self, strategy_name: str) -> bool:
+        """Una fonte gia' curata/verificata a monte (profile/memory/hitl) che
+        smette di far progredire un valore e' proprio la firma di un plateau
+        vero, non di una coordinata sbagliata: il chiamante non deve
+        applicarle lo stesso sospetto riservato a gpt/template/euristiche."""
+        return strategy_name in _TRUSTED_STRATEGIES
 
     def reset_failures(self, element_name: str = None) -> None:
         if element_name is None:

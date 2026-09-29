@@ -146,6 +146,19 @@ class BetController:
                 verified = outcome_data.verified
                 outcome = outcome_data.outcome
 
+            # Localizzare e avere-effetto sono passi distinti (vedi
+            # ElementLocator): solo qui, dopo aver visto l'esito reale del
+            # tap, sappiamo se questa strategia sta davvero funzionando per
+            # questo elemento o sta solo restituendo una coordinata inerte.
+            # Le fonti gia' fidate (profile/memory/hitl) sono escluse: un
+            # loro plateau e' la firma di un minimo vero, non di un bersaglio
+            # sbagliato, e non va mai fatto esaurire da questo meccanismo.
+            is_trusted = self.locator.is_trusted_strategy(candidate.strategy_name)
+            if verified:
+                self.locator.record_success(candidate.strategy_name, _ELEMENT)
+            elif not is_trusted:
+                self.locator.record_failure(candidate.strategy_name, _ELEMENT)
+
             logger.info(
                 "set_min_bet: tentativo %d/%d: %s -> %s (outcome=%s, strategia=%s, coords=(%d,%d))",
                 attempts, self.config.max_bet_lower_attempts, current_bet, new_bet, outcome,
@@ -175,6 +188,24 @@ class BetController:
                 lowest_bet_seen = current_bet
                 any_decrease_seen = True
                 stable_reads = 0
+            elif not verified and not is_trusted and self.locator.is_exhausted(candidate.strategy_name, _ELEMENT):
+                # Questa strategia ha appena esaurito i suoi tentativi: il
+                # prossimo locate() e' garantito saltarla e scendere nella
+                # catena (es. verso hitl). Un tap a vuoto da una strategia
+                # ormai screditata non e' un'evidenza valida di "gia' al
+                # minimo" - e' evidenza che stiamo tappando il posto
+                # sbagliato. Non contarlo come lettura stabile: si passa
+                # subito al tentativo successivo, dando alla strategia
+                # successiva la sua occasione prima di concludere il plateau.
+                logger.info(
+                    "set_min_bet: strategia '%s' esaurita per '%s' senza effetto reale: non e' evidenza di "
+                    "plateau, riprovo con la prossima strategia disponibile.",
+                    candidate.strategy_name, _ELEMENT,
+                )
+                refreshed = context_provider()
+                if refreshed.success:
+                    context = refreshed.data
+                continue
             else:
                 stable_reads += 1
 

@@ -74,7 +74,14 @@ class TestLocateOrder:
         locator.locate("spin", _context())
         assert template.locate.call_count == 4
 
-    def test_success_resets_failure_counter(self):
+    def test_locate_success_alone_does_not_reset_failure_counter(self):
+        # Localizzare e avere-effetto sono passi distinti per design: un
+        # locate() riuscito NON prova che il tap funzioni, quindi non deve
+        # azzerare da solo uno storico di fallimenti - solo record_success()
+        # esplicito (chiamato dal controller dopo aver verificato l'effetto
+        # reale) puo' farlo. Qui nessuno chiama record_success: i 2 fallimenti
+        # precedenti restano "in memoria" (2 < soglia 3), quindi il 4°
+        # tentativo (un altro NOT_FOUND) viene comunque provato.
         flaky = MagicMock()
         flaky.locate.side_effect = [
             Result.fail("no", "NOT_FOUND"),
@@ -87,9 +94,43 @@ class TestLocateOrder:
         locator.locate("bet_minus", _context())
         result = locator.locate("bet_minus", _context())
         assert result.success
-        # dopo il successo il contatore e' azzerato: un nuovo fallimento non disabilita subito
         locator.locate("bet_minus", _context())
         assert flaky.locate.call_count == 4
+
+    def test_record_success_resets_a_partially_accumulated_counter(self):
+        template = _fail_strategy("template")
+        gpt = _ok_strategy("gpt")
+        locator = ElementLocator({"template": template, "gpt": gpt}, max_consecutive_failures_per_strategy=3)
+
+        locator.locate("bet_minus", _context())
+        locator.locate("bet_minus", _context())
+        assert template.locate.call_count == 2
+
+        locator.record_success("template", "bet_minus")
+
+        # Senza il reset esplicito, un 3° fallimento avrebbe raggiunto la
+        # soglia e disabilitato "template"; dopo record_success riparte da 0.
+        locator.locate("bet_minus", _context())
+        locator.locate("bet_minus", _context())
+        locator.locate("bet_minus", _context())
+        assert template.locate.call_count == 5
+
+    def test_record_failure_and_is_exhausted(self):
+        template = _fail_strategy("template")
+        gpt = _ok_strategy("gpt")
+        locator = ElementLocator({"template": template, "gpt": gpt}, max_consecutive_failures_per_strategy=2)
+
+        assert not locator.is_exhausted("gpt", "bet_minus")
+        locator.record_failure("gpt", "bet_minus")
+        assert not locator.is_exhausted("gpt", "bet_minus")
+        locator.record_failure("gpt", "bet_minus")
+        assert locator.is_exhausted("gpt", "bet_minus")
+
+        # Con "gpt" esaurito, la catena scende su "template" (che qui fallisce
+        # davvero), quindi il locate complessivo fallisce.
+        result = locator.locate("bet_minus", _context())
+        assert not result.success
+        gpt.locate.assert_not_called()
 
     def test_save_verified_candidate_noop_for_profile_and_memory(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)

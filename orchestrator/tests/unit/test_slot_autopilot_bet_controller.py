@@ -50,6 +50,19 @@ def _tap_outcome(bet_before, bet_after, verified, outcome):
     )
 
 
+def _locator_mock():
+    """MagicMock generico per il locator con is_exhausted()/is_trusted_strategy()
+    gia' impostati (rispettivamente False e False, coerente col default
+    "ocr_anchor" non fidato di _ok_candidate()): senza questo, MagicMock()
+    restituirebbe un Mock (sempre truthy) per qualunque chiamata non
+    configurata, facendo scattare per errore il nuovo ramo "strategia
+    esaurita" in OGNI test che non lo sta esercitando di proposito."""
+    locator = MagicMock()
+    locator.is_exhausted.return_value = False
+    locator.is_trusted_strategy.return_value = False
+    return locator
+
+
 def _controller(locator, verifier, config=None, step_logger=None):
     step_logger = step_logger or MagicMock()
     step_logger.log_step.return_value = Result.ok(True)
@@ -58,7 +71,7 @@ def _controller(locator, verifier, config=None, step_logger=None):
 
 class TestSetMinBetWithMockedCollaborators:
     def test_converges_to_minimum_after_plateau(self):
-        locator = MagicMock()
+        locator = _locator_mock()
         locator.locate.return_value = _ok_candidate()
         verifier = MagicMock()
         verifier.verified_tap.side_effect = [
@@ -81,7 +94,7 @@ class TestSetMinBetWithMockedCollaborators:
         assert locator.save_verified_candidate.call_count == 3
 
     def test_progress_is_logged(self, caplog):
-        locator = MagicMock()
+        locator = _locator_mock()
         locator.locate.return_value = _ok_candidate()
         verifier = MagicMock()
         verifier.verified_tap.return_value = Result.ok(
@@ -102,7 +115,7 @@ class TestSetMinBetWithMockedCollaborators:
         gia' al minimo, oppure star tappando il posto sbagliato (es. le
         schede di Chrome) - non possiamo distinguere i due casi, quindi non
         si procede a spinnare su un'ipotesi mai verificata."""
-        locator = MagicMock()
+        locator = _locator_mock()
         locator.locate.return_value = _ok_candidate()
         verifier = MagicMock()
         verifier.verified_tap.return_value = Result.ok(
@@ -132,7 +145,7 @@ class TestSetMinBetWithMockedCollaborators:
             screen_width=1080, screen_height=2400, slot_ocr_state={"posta": 0.20},
             profile=profile,
         )))
-        locator = MagicMock()
+        locator = _locator_mock()
         verifier = MagicMock()
         controller, step_logger = _controller(locator, verifier)
 
@@ -161,7 +174,7 @@ class TestSetMinBetWithMockedCollaborators:
             screen_width=1080, screen_height=2400, slot_ocr_state={"posta": 1.00},
             profile=profile,
         )))
-        locator = MagicMock()
+        locator = _locator_mock()
         locator.locate.return_value = _ok_candidate()
         verifier = MagicMock()
         verifier.verified_tap.return_value = Result.ok(
@@ -175,7 +188,7 @@ class TestSetMinBetWithMockedCollaborators:
         assert result.data.aborted_reason == "NO_DECREASE_OBSERVED"
 
     def test_bet_rising_aborts_immediately(self):
-        locator = MagicMock()
+        locator = _locator_mock()
         locator.locate.return_value = _ok_candidate()
         verifier = MagicMock()
         verifier.verified_tap.return_value = Result.ok(
@@ -191,7 +204,7 @@ class TestSetMinBetWithMockedCollaborators:
         assert verifier.verified_tap.call_count == 1
 
     def test_hitl_stop_mid_loop_aborts(self):
-        locator = MagicMock()
+        locator = _locator_mock()
         locator.locate.side_effect = [
             _ok_candidate(), _ok_candidate(),
             Result.fail("operator stopped", "HITL_STOP_REQUESTED"),
@@ -212,7 +225,7 @@ class TestSetMinBetWithMockedCollaborators:
         """Comportamento cambiato deliberatamente: un fallimento generico di
         locate() non abortisce piu' al primo colpo (solo HITL_STOP_REQUESTED
         lo fa) - riprova fino al limite configurato."""
-        locator = MagicMock()
+        locator = _locator_mock()
         locator.locate.return_value = Result.fail("nothing found", "ELEMENT_NOT_LOCATABLE")
         verifier = MagicMock()
         controller, _ = _controller(locator, verifier, config=_config(max_bet_lower_attempts=2))
@@ -228,7 +241,7 @@ class TestSetMinBetWithMockedCollaborators:
         """L'operatore ha gia' interagito utilmente (es. aperto il menu
         giusto) ma la puntata non e' ancora scesa: HITL_HINT_ONLY non deve
         fermare tutto al primo scambio, deve dare una seconda possibilita'."""
-        locator = MagicMock()
+        locator = _locator_mock()
         locator.locate.side_effect = [
             Result.fail("screen changed, hint only", "HITL_HINT_ONLY"),
             Result.fail("screen changed, hint only", "HITL_HINT_ONLY"),
@@ -244,7 +257,7 @@ class TestSetMinBetWithMockedCollaborators:
         verifier.verified_tap.assert_not_called()
 
     def test_hitl_skipped_does_not_abort_immediately(self):
-        locator = MagicMock()
+        locator = _locator_mock()
         locator.locate.side_effect = [
             Result.fail("operator skipped", "HITL_SKIPPED"),
             Result.fail("operator skipped", "HITL_SKIPPED"),
@@ -262,7 +275,7 @@ class TestSetMinBetWithMockedCollaborators:
         primo 'hint' seguito da tentativi che trovano e abbassano davvero la
         puntata converge comunque al minimo, invece di fermarsi al primo
         scambio."""
-        locator = MagicMock()
+        locator = _locator_mock()
         locator.locate.side_effect = [
             Result.fail("screen changed, hint only", "HITL_HINT_ONLY"),
             _ok_candidate(),
@@ -284,8 +297,88 @@ class TestSetMinBetWithMockedCollaborators:
         assert result.data.final_bet == Decimal("0.50")
         assert result.data.attempts == 4
 
+    def test_no_effect_from_an_exhausted_strategy_is_not_a_stable_read(self):
+        """Riproduce l'incidente reale: una strategia non fidata (es. 'gpt')
+        restituisce sempre la STESSA coordinata inerte, tap sempre
+        'no_effect'. Prima del fix, 3 letture 'no_effect' di fila bastavano
+        a dichiarare plateau/gia'-al-minimo anche se la strategia era ormai
+        esaurita (e quindi al prossimo locate() la catena sarebbe scesa su
+        un'altra, es. hitl). Ora una lettura da una strategia esaurita non
+        conta come prova di plateau: il sistema continua a riprovare, senza
+        mai dichiarare un falso 'gia' al minimo'."""
+        locator = _locator_mock()
+        locator.locate.return_value = _ok_candidate("gpt")
+        locator.is_exhausted.side_effect = [False, False, True, True, True]
+        verifier = MagicMock()
+        verifier.verified_tap.return_value = Result.ok(
+            _tap_outcome(Decimal("6.00"), Decimal("6.00"), False, "no_effect")
+        )
+        controller, _ = _controller(locator, verifier, config=_config(max_bet_lower_attempts=5))
+
+        result = controller.set_min_bet("dev", "pirots5", "ep1", _context_provider(Decimal("6.00")))
+        assert result.success
+        assert result.data.outcome == "aborted"
+        assert result.data.aborted_reason == "MAX_ATTEMPTS"
+        assert result.data.min_bet_verified is False
+        assert result.data.attempts == 5
+        assert locator.record_failure.call_count == 5
+
+    def test_recovers_by_switching_strategy_after_one_is_exhausted(self):
+        """Nella realta', dopo che 'gpt' si esaurisce, il prossimo locate()
+        scende automaticamente alla strategia successiva nella catena (fino
+        a hitl). Qui lo simuliamo direttamente: 3 tap inerti da 'gpt', poi
+        una strategia diversa che decrementa davvero - il plateau finale
+        riflette il minimo VERO, non quello inventato da gpt."""
+        locator = _locator_mock()
+        locator.locate.side_effect = [
+            _ok_candidate("gpt"), _ok_candidate("gpt"), _ok_candidate("gpt"),
+            _ok_candidate("hitl"), _ok_candidate("hitl"), _ok_candidate("hitl"), _ok_candidate("hitl"),
+        ]
+        locator.is_exhausted.side_effect = [False, False, True, False, False, False]
+        verifier = MagicMock()
+        verifier.verified_tap.side_effect = [
+            Result.ok(_tap_outcome(Decimal("6.00"), Decimal("6.00"), False, "no_effect")),
+            Result.ok(_tap_outcome(Decimal("6.00"), Decimal("6.00"), False, "no_effect")),
+            Result.ok(_tap_outcome(Decimal("6.00"), Decimal("6.00"), False, "no_effect")),
+            Result.ok(_tap_outcome(Decimal("6.00"), Decimal("0.20"), True, "success")),
+            Result.ok(_tap_outcome(Decimal("0.20"), Decimal("0.20"), False, "no_effect")),
+            Result.ok(_tap_outcome(Decimal("0.20"), Decimal("0.20"), False, "no_effect")),
+            Result.ok(_tap_outcome(Decimal("0.20"), Decimal("0.20"), False, "no_effect")),
+        ]
+        controller, _ = _controller(locator, verifier, config=_config(max_bet_lower_attempts=10))
+
+        result = controller.set_min_bet("dev", "pirots5", "ep1", _context_provider(Decimal("6.00")))
+        assert result.success
+        assert result.data.outcome == "min_bet_confirmed"
+        assert result.data.min_bet_verified is True
+        assert result.data.final_bet == Decimal("0.20")
+        assert result.data.attempts == 7
+        assert locator.save_verified_candidate.call_count == 1
+
+    def test_trusted_strategy_no_effect_still_counts_as_a_stable_read(self):
+        """Una strategia fidata (profile/memory/hitl) che smette di far
+        scendere la puntata e' proprio la firma di un plateau vero, non di
+        un bersaglio sbagliato: a differenza di una strategia non fidata, il
+        conteggio verso stable_reads non viene mai sospeso, e il meccanismo
+        record_failure/is_exhausted non viene nemmeno interpellato."""
+        locator = _locator_mock()
+        locator.locate.return_value = _ok_candidate("hitl")
+        locator.is_trusted_strategy.return_value = True
+        verifier = MagicMock()
+        verifier.verified_tap.return_value = Result.ok(
+            _tap_outcome(Decimal("1.00"), Decimal("1.00"), False, "no_effect")
+        )
+        controller, _ = _controller(locator, verifier)
+
+        result = controller.set_min_bet("dev", "pirots5", "ep1", _context_provider())
+        assert result.success
+        assert result.data.outcome == "unchanged_already_min"
+        assert result.data.attempts == 3
+        locator.is_exhausted.assert_not_called()
+        locator.record_failure.assert_not_called()
+
     def test_max_attempts_exhausted(self):
-        locator = MagicMock()
+        locator = _locator_mock()
         locator.locate.return_value = _ok_candidate()
         verifier = MagicMock()
         verifier.verified_tap.return_value = Result.ok(
