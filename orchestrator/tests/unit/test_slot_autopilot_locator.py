@@ -197,3 +197,47 @@ class TestCanvasExclusion:
         result = locator.locate("bet_minus", context)
         assert not result.success
         assert gpt.locate.call_count == 2  # soglia raggiunta, non richiamato una terza volta
+
+
+class TestHitlOutcomePropagation:
+    def test_hitl_stop_requested_is_propagated_as_outer_code(self):
+        hitl = _fail_strategy("hitl", code="HITL_STOP_REQUESTED")
+        locator = ElementLocator({"hitl": hitl})
+        result = locator.locate("bet_minus", _context())
+        assert not result.success
+        assert result.error_code == "HITL_STOP_REQUESTED"
+
+    def test_hitl_hint_only_is_propagated_as_outer_code(self):
+        hitl = _fail_strategy("hitl", code="HITL_HINT_ONLY")
+        locator = ElementLocator({"hitl": hitl})
+        result = locator.locate("bet_minus", _context())
+        assert not result.success
+        assert result.error_code == "HITL_HINT_ONLY"
+
+    def test_hitl_skipped_is_propagated_as_outer_code(self):
+        hitl = _fail_strategy("hitl", code="HITL_SKIPPED")
+        locator = ElementLocator({"hitl": hitl})
+        result = locator.locate("bet_minus", _context())
+        assert not result.success
+        assert result.error_code == "HITL_SKIPPED"
+
+    def test_hitl_no_coords_is_propagated_as_outer_code(self):
+        hitl = _fail_strategy("hitl", code="HITL_NO_COORDS")
+        locator = ElementLocator({"hitl": hitl})
+        result = locator.locate("bet_minus", _context())
+        assert not result.success
+        assert result.error_code == "HITL_NO_COORDS"
+
+    def test_hitl_generic_failure_stays_element_not_locatable(self):
+        hitl = _fail_strategy("hitl", code="SOME_OTHER_CODE")
+        locator = ElementLocator({"hitl": hitl})
+        result = locator.locate("bet_minus", _context())
+        assert not result.success
+        assert result.error_code == "ELEMENT_NOT_LOCATABLE"
+
+    def test_no_hitl_registered_stays_element_not_locatable(self):
+        profile = _fail_strategy("profile")
+        locator = ElementLocator({"profile": profile})
+        result = locator.locate("bet_minus", _context())
+        assert not result.success
+        assert result.error_code == "ELEMENT_NOT_LOCATABLE"

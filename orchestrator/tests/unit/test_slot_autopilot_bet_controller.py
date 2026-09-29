@@ -118,11 +118,11 @@ class TestSetMinBetWithMockedCollaborators:
         assert result.data.final_bet == Decimal("1.00")
         assert result.data.attempts == 3
 
-    def test_plateau_without_decrease_but_matching_a_verified_profile_min_bet_is_trusted(self):
-        """Lo stesso plateau di sopra, ma con un profilo curato e verificato
-        (es. pirots5.json, known_min_bet=0.20) la cui puntata nota coincide
-        con quella attuale: qui il riscontro incrociato conferma che siamo
-        davvero al minimo documentato, quindi si puo' procedere."""
+    def test_starting_bet_already_at_verified_profile_min_bet_skips_everything(self):
+        """Se la puntata di partenza combacia gia' col known_min_bet di un
+        profilo verificato, il riscontro incrociato lo riconosce SUBITO: non
+        si tenta nemmeno di localizzare/tappare bet_minus (e quindi non si
+        corre alcun rischio, es. GPT che sceglie un punto sbagliato)."""
         profile = ProviderProfile(
             slot_name="pirots5", provider="hacksaw", screen_width=1080, screen_height=2400,
             verified=True, known_min_bet=0.20,
@@ -133,12 +133,8 @@ class TestSetMinBetWithMockedCollaborators:
             profile=profile,
         )))
         locator = MagicMock()
-        locator.locate.return_value = _ok_candidate()
         verifier = MagicMock()
-        verifier.verified_tap.return_value = Result.ok(
-            _tap_outcome(Decimal("0.20"), Decimal("0.20"), False, "no_effect")
-        )
-        controller, _ = _controller(locator, verifier)
+        controller, step_logger = _controller(locator, verifier)
 
         result = controller.set_min_bet("dev", "pirots5", "ep1", context_provider)
         assert result.success
@@ -146,6 +142,10 @@ class TestSetMinBetWithMockedCollaborators:
         assert result.data.min_bet_verified is True
         assert result.data.aborted_reason is None
         assert result.data.final_bet == Decimal("0.20")
+        assert result.data.attempts == 0
+        locator.locate.assert_not_called()
+        verifier.verified_tap.assert_not_called()
+        step_logger.log_step.assert_not_called()
 
     def test_plateau_without_decrease_and_profile_min_bet_mismatch_is_not_trusted(self):
         """Il profilo dice che il minimo e' 0.20, ma il plateau si e' fermato
@@ -208,17 +208,81 @@ class TestSetMinBetWithMockedCollaborators:
         assert result.data.aborted_reason == "HITL_STOP"
         assert result.data.attempts == 3
 
-    def test_element_not_locatable_on_first_attempt(self):
+    def test_generic_locate_failure_is_soft_and_exhausts_to_max_attempts(self):
+        """Comportamento cambiato deliberatamente: un fallimento generico di
+        locate() non abortisce piu' al primo colpo (solo HITL_STOP_REQUESTED
+        lo fa) - riprova fino al limite configurato."""
         locator = MagicMock()
         locator.locate.return_value = Result.fail("nothing found", "ELEMENT_NOT_LOCATABLE")
         verifier = MagicMock()
-        controller, _ = _controller(locator, verifier)
+        controller, _ = _controller(locator, verifier, config=_config(max_bet_lower_attempts=2))
 
         result = controller.set_min_bet("dev", "pirots5", "ep1", _context_provider())
         assert result.success
-        assert result.data.aborted_reason == "ELEMENT_NOT_LOCATABLE"
-        assert result.data.attempts == 1
+        assert result.data.aborted_reason == "MAX_ATTEMPTS"
+        assert result.data.attempts == 2
+        assert locator.locate.call_count == 2
         verifier.verified_tap.assert_not_called()
+
+    def test_hitl_hint_only_does_not_abort_immediately(self):
+        """L'operatore ha gia' interagito utilmente (es. aperto il menu
+        giusto) ma la puntata non e' ancora scesa: HITL_HINT_ONLY non deve
+        fermare tutto al primo scambio, deve dare una seconda possibilita'."""
+        locator = MagicMock()
+        locator.locate.side_effect = [
+            Result.fail("screen changed, hint only", "HITL_HINT_ONLY"),
+            Result.fail("screen changed, hint only", "HITL_HINT_ONLY"),
+        ]
+        verifier = MagicMock()
+        controller, _ = _controller(locator, verifier, config=_config(max_bet_lower_attempts=2))
+
+        result = controller.set_min_bet("dev", "pirots5", "ep1", _context_provider())
+        assert result.success
+        assert result.data.aborted_reason == "MAX_ATTEMPTS"
+        assert result.data.attempts == 2
+        assert locator.locate.call_count == 2
+        verifier.verified_tap.assert_not_called()
+
+    def test_hitl_skipped_does_not_abort_immediately(self):
+        locator = MagicMock()
+        locator.locate.side_effect = [
+            Result.fail("operator skipped", "HITL_SKIPPED"),
+            Result.fail("operator skipped", "HITL_SKIPPED"),
+        ]
+        verifier = MagicMock()
+        controller, _ = _controller(locator, verifier, config=_config(max_bet_lower_attempts=2))
+
+        result = controller.set_min_bet("dev", "pirots5", "ep1", _context_provider())
+        assert result.success
+        assert result.data.aborted_reason == "MAX_ATTEMPTS"
+        assert result.data.attempts == 2
+
+    def test_recovers_after_a_soft_failure_then_succeeds(self):
+        """Dimostra che l'interazione HITL a piu' scambi ora funziona: un
+        primo 'hint' seguito da tentativi che trovano e abbassano davvero la
+        puntata converge comunque al minimo, invece di fermarsi al primo
+        scambio."""
+        locator = MagicMock()
+        locator.locate.side_effect = [
+            Result.fail("screen changed, hint only", "HITL_HINT_ONLY"),
+            _ok_candidate(),
+            _ok_candidate(),
+            _ok_candidate(),
+        ]
+        verifier = MagicMock()
+        verifier.verified_tap.side_effect = [
+            Result.ok(_tap_outcome(Decimal("1.00"), Decimal("0.50"), True, "success")),
+            Result.ok(_tap_outcome(Decimal("0.50"), Decimal("0.50"), False, "no_effect")),
+            Result.ok(_tap_outcome(Decimal("0.50"), Decimal("0.50"), False, "no_effect")),
+        ]
+        controller, _ = _controller(locator, verifier, config=_config(stable_reads_for_min=2))
+
+        result = controller.set_min_bet("dev", "pirots5", "ep1", _context_provider())
+        assert result.success
+        assert result.data.min_bet_verified is True
+        assert result.data.outcome == "min_bet_confirmed"
+        assert result.data.final_bet == Decimal("0.50")
+        assert result.data.attempts == 4
 
     def test_max_attempts_exhausted(self):
         locator = MagicMock()

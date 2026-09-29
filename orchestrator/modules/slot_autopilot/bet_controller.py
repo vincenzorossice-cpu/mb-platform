@@ -61,6 +61,18 @@ class BetController:
 
         starting_bet = self._read_bet(context)
         logger.info("set_min_bet: puntata iniziale=%s, riscontro fidato=%s", starting_bet, trusted_min_bet)
+
+        if trusted_min_bet is not None and starting_bet is not None and starting_bet <= trusted_min_bet:
+            logger.info(
+                "set_min_bet: puntata gia' al minimo confermato dal profilo (%s <= %s): nessun tap necessario.",
+                starting_bet, trusted_min_bet,
+            )
+            return Result.ok(BetResult(
+                slot_name=slot_name, starting_bet=starting_bet, final_bet=starting_bet,
+                min_bet_verified=True, attempts=0, strategy_sequence=[],
+                aborted_reason=None, outcome="unchanged_already_min",
+            ))
+
         lowest_bet_seen = starting_bet
         current_bet = starting_bet
         stable_reads = 0
@@ -72,23 +84,37 @@ class BetController:
             attempts += 1
             locate_result = self.locator.locate(_ELEMENT, context)
             if not locate_result.success:
-                aborted_reason = (
-                    "HITL_STOP" if locate_result.error_code == "HITL_STOP_REQUESTED"
-                    else "ELEMENT_NOT_LOCATABLE"
-                )
+                if locate_result.error_code == "HITL_STOP_REQUESTED":
+                    logger.warning("set_min_bet: l'operatore ha chiesto di fermarsi, abort=HITL_STOP")
+                    self._log_step(
+                        episode_id, attempts, slot_name, device_id, None, None,
+                        current_bet, current_bet, outcome="error", error_code=locate_result.error_code,
+                    )
+                    return Result.ok(BetResult(
+                        slot_name=slot_name, starting_bet=starting_bet, final_bet=current_bet,
+                        min_bet_verified=False, attempts=attempts, strategy_sequence=strategy_sequence,
+                        aborted_reason="HITL_STOP", outcome="aborted",
+                    ))
+
+                # Fallimento "morbido": non abortisce. Copre sia il caso
+                # generico (nessuna strategia ha funzionato QUESTO giro, ma
+                # potrebbe funzionare al prossimo con uno schermo diverso) sia
+                # HITL_HINT_ONLY/HITL_SKIPPED (l'operatore ha gia' interagito
+                # utilmente - es. aperto il menu giusto - e serve solo un
+                # altro scambio, non un abort). Consuma un tentativo e
+                # riprova con un contesto fresco.
                 logger.warning(
-                    "set_min_bet: impossibile localizzare '%s' (%s), abort=%s",
-                    _ELEMENT, locate_result.error_code, aborted_reason,
+                    "set_min_bet: tentativo %d/%d fallito (%s), riprovo",
+                    attempts, self.config.max_bet_lower_attempts, locate_result.error_code,
                 )
                 self._log_step(
                     episode_id, attempts, slot_name, device_id, None, None,
                     current_bet, current_bet, outcome="error", error_code=locate_result.error_code,
                 )
-                return Result.ok(BetResult(
-                    slot_name=slot_name, starting_bet=starting_bet, final_bet=current_bet,
-                    min_bet_verified=False, attempts=attempts, strategy_sequence=strategy_sequence,
-                    aborted_reason=aborted_reason, outcome="aborted",
-                ))
+                refreshed = context_provider()
+                if refreshed.success:
+                    context = refreshed.data
+                continue
 
             candidate = locate_result.data
             strategy_sequence.append(candidate.strategy_name)

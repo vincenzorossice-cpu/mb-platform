@@ -13,6 +13,12 @@ logger = logging.getLogger(__name__)
 # comando dell'operatore o una coordinata memorizzata restavano sempre fidati.
 _TRUSTED_STRATEGIES = {"profile", "memory", "hitl"}
 
+# Esiti strutturati di handle_hitl_escalation (vedi HITLStrategy): quando hitl
+# fallisce con uno di questi, il chiamante deve poterli distinguere (es. uno
+# stop esplicito e' definitivo, un hint no) - non vanno annegati nel generico
+# ELEMENT_NOT_LOCATABLE.
+_HITL_OUTCOME_CODES = {"HITL_STOP_REQUESTED", "HITL_SKIPPED", "HITL_HINT_ONLY", "HITL_NO_COORDS"}
+
 
 def _within_canvas(x: int, y: int, canvas_bbox: tuple) -> bool:
     x1, y1, x2, y2 = canvas_bbox
@@ -34,6 +40,7 @@ class ElementLocator:
 
     def locate(self, element_name: str, context: LocateContext) -> Result[LocateCandidate]:
         collected = []
+        hitl_error_code = None
         for strategy_name in self._STRATEGY_ORDER:
             strategy = self.strategies.get(strategy_name)
             if strategy is None:
@@ -65,10 +72,16 @@ class ElementLocator:
                 )
                 return result
 
+            if strategy_name == "hitl":
+                hitl_error_code = result.error_code
             collected.append(f"{strategy_name}:{result.error_code}")
             self._failure_counts[key] = self._failure_counts.get(key, 0) + 1
 
         logger.warning("Impossibile localizzare '%s' con nessuna strategia: %s", element_name, collected)
+        if hitl_error_code in _HITL_OUTCOME_CODES:
+            return Result.fail(
+                f"HITL outcome for '{element_name}': {hitl_error_code}", hitl_error_code,
+            )
         return Result.fail(
             f"Could not locate '{element_name}' with any strategy: {collected}",
             "ELEMENT_NOT_LOCATABLE",
