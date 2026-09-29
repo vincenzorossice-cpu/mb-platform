@@ -48,6 +48,12 @@ class SlotAutoPilot:
         self._total_spins = 0
         self._total_steps = 0
         self._total_played = Decimal("0.00")
+        # Riepilogo finale affidabile (saldo iniziale vs ultimo osservato),
+        # invece di sommare le vincite lette ad ogni spin (inaffidabili via
+        # OCR - vedi Fix 11): _last_known_balance si aggiorna gratis da
+        # SpinResult.balance_after, nessuna lettura extra.
+        self._initial_balance: Optional[Decimal] = None
+        self._last_known_balance: Optional[Decimal] = None
 
     def prepare(self, device_id: str) -> Result[bool]:
         try:
@@ -63,6 +69,13 @@ class SlotAutoPilot:
             if not episode_result.success:
                 return Result.fail(episode_result.error, episode_result.error_code)
             self._episode_id = episode_result.data
+
+            context_result = self._build_context(device_id)
+            if context_result.success:
+                value = context_result.data.slot_ocr_state.get("saldo")
+                self._initial_balance = Decimal(str(value)) if value is not None else None
+                self._last_known_balance = self._initial_balance
+
             return Result.ok(True)
         except Exception as exc:
             return Result.fail(f"Unexpected error in prepare: {exc}", "UNEXPECTED_ERROR")
@@ -93,9 +106,17 @@ class SlotAutoPilot:
                     self._total_spins += 1
                     if result.data.bet_amount is not None:
                         self._total_played += result.data.bet_amount
+                    if result.data.balance_after is not None:
+                        self._last_known_balance = result.data.balance_after
             return result
         except Exception as exc:
             return Result.fail(f"Unexpected error in spin: {exc}", "UNEXPECTED_ERROR")
+
+    def get_balance_summary(self) -> tuple:
+        """(saldo_iniziale, ultimo_saldo_osservato) - per un riepilogo netto
+        vinto/perso affidabile a fine sessione, senza dover sommare le
+        vincite lette (inaffidabili) ad ogni singolo spin."""
+        return self._initial_balance, self._last_known_balance
 
     def shutdown(self, device_id: str) -> Result[bool]:
         try:

@@ -75,6 +75,57 @@ class TestPrepare:
         deps["step_logger"].start_episode.assert_called_once()
 
 
+class TestBalanceSummary:
+    def _png(self, tmp_path):
+        path = str(tmp_path / "shot.png")
+        Image.new("RGB", (1080, 2400), color="black").save(path)
+        return path
+
+    def test_prepare_captures_initial_balance(self, tmp_path):
+        deps = _collaborators()
+        screenshot_path = self._png(tmp_path)
+        deps["screen_reader"]._screenshot.return_value = Result.ok(screenshot_path)
+        deps["ocr_reader"].read_slot_state.return_value = {"posta": 1.0, "saldo": 10.0, "raw_texts": []}
+        deps["ocr_reader"].read_text_boxes.return_value = Result.ok([])
+        deps["profile_loader"].load.return_value = Result.ok(
+            ProviderProfile(slot_name="pirots5", provider="x", screen_width=1080, screen_height=2400)
+        )
+        deps["step_logger"].start_episode.return_value = Result.ok("ep-123")
+        autopilot = SlotAutoPilot(**deps)
+
+        assert autopilot.prepare("dev").success
+        initial, last = autopilot.get_balance_summary()
+        assert initial == Decimal("10.0")
+        assert last == Decimal("10.0")
+
+    def test_spin_updates_last_known_balance_at_no_extra_cost(self, tmp_path):
+        deps = _collaborators()
+        screenshot_path = self._png(tmp_path)
+        deps["screen_reader"]._screenshot.return_value = Result.ok(screenshot_path)
+        deps["ocr_reader"].read_slot_state.return_value = {"posta": 0.10, "saldo": 10.0, "raw_texts": []}
+        deps["ocr_reader"].read_text_boxes.return_value = Result.ok([])
+        deps["profile_loader"].load.return_value = Result.ok(
+            ProviderProfile(slot_name="pirots5", provider="x", screen_width=1080, screen_height=2400)
+        )
+        deps["step_logger"].start_episode.return_value = Result.ok("ep-123")
+        deps["spin_controller"].spin.return_value = Result.ok(
+            MagicMock(outcome="success", bet_amount=Decimal("0.10"), balance_after=Decimal("9.90"))
+        )
+        autopilot = SlotAutoPilot(**deps)
+
+        autopilot.prepare("dev")
+        autopilot.spin("dev", 1)
+
+        initial, last = autopilot.get_balance_summary()
+        assert initial == Decimal("10.0")
+        assert last == Decimal("9.90")
+
+    def test_balance_summary_none_when_never_prepared(self):
+        deps = _collaborators()
+        autopilot = SlotAutoPilot(**deps)
+        assert autopilot.get_balance_summary() == (None, None)
+
+
 class TestSetMinBetAndSpinWiring:
     def _png(self, tmp_path):
         path = str(tmp_path / "shot.png")
@@ -247,6 +298,10 @@ class TestEndToEndSmoke:
         for i in range(1, 4):
             spin_result = autopilot.spin("dev", i)
             assert spin_result.success
+
+        initial, last = autopilot.get_balance_summary()
+        assert initial == Decimal("10.00")
+        assert last == device.balance
 
         assert autopilot.shutdown("dev").success
 

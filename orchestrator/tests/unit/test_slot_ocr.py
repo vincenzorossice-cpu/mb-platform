@@ -99,6 +99,30 @@ class TestReadTextBoxes:
             assert fake_easyocr_module.Reader.call_count == 1
 
 
+class TestRawDetectionCache:
+    """Fix velocita': read_slot_state + read_text_boxes sullo STESSO
+    screenshot non devono rileggere l'immagine con l'OCR due volte."""
+
+    def test_same_path_reuses_the_raw_ocr_result(self):
+        r = _ocr_reader_with([_detection("SALDO 114,36", 10, 10)])
+        r.read_slot_state("/tmp/shot.png")
+        r.read_text_boxes("/tmp/shot.png")
+        assert r._ocr.readtext.call_count == 1
+
+    def test_different_path_triggers_a_fresh_ocr_call(self):
+        r = _ocr_reader_with([_detection("SALDO 114,36", 10, 10)])
+        r.read_slot_state("/tmp/shot_a.png")
+        r.read_text_boxes("/tmp/shot_b.png")
+        assert r._ocr.readtext.call_count == 2
+
+    def test_cached_result_still_produces_correct_data(self):
+        r = _ocr_reader_with([_detection("SALDO 114,36", 10, 10)])
+        state = r.read_slot_state("/tmp/shot.png")
+        boxes_result = r.read_text_boxes("/tmp/shot.png")
+        assert state["saldo"] == 114.36
+        assert boxes_result.data[0].text == "SALDO 114,36"
+
+
 class TestReExport:
     def test_casino_flow_reexports_same_class(self):
         assert ReExportedSlotOCRReader is SlotOCRReader

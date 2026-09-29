@@ -20,7 +20,11 @@ class AutoPilotConfig:
     max_spin_attempts_per_step: int = 3
     frame_diff_stable_threshold: float = 0.02
     frame_diff_poll_interval: float = 0.3
-    frame_diff_max_wait_seconds: float = 5.0
+    # 20s, non 5: alcune slot (es. Pirots5) hanno animazioni di vincita piu'
+    # lunghe del normale - il ciclo di attesa esce comunque subito appena lo
+    # schermo si stabilizza, quindi un tetto piu' alto non rallenta gli spin
+    # normali, da' solo piu' pazienza a quelli con un'animazione lunga.
+    frame_diff_max_wait_seconds: float = 20.0
     balance_rise_abort_margin: Decimal = Decimal("0.00")
     accounting_tolerance: Decimal = Decimal("0.01")
     enable_gpt_fallback: bool = True

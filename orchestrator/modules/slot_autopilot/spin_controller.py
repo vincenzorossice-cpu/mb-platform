@@ -84,18 +84,32 @@ class SpinController:
                 verified=False, attempts=0, outcome="error",
             ))
         candidate = locate_result.data
-        min_decrease = expected_bet if expected_bet is not None else Decimal("0.00")
 
         attempts = 0
         if candidate.verified:
+            # Ramo HITL: nessun verified_tap di mezzo (l'operatore ha gia'
+            # tappato e verificato), quindi nessun TapOutcome da cui leggere
+            # saldo/vincita - qui, e solo qui, serve una lettura di contesto
+            # dedicata. Caso raro (fallback), non ottimizzato.
             verified = True
+            final_context_result = context_provider()
+            final_context = final_context_result.data if final_context_result.success else None
+            balance_after = self._read_amount(final_context, "saldo") if final_context else balance_before
+            win_amount = self._read_amount(final_context, "vincita") if final_context else None
         else:
             verified = False
+            balance_after = balance_before
+            win_amount = None
             for _ in range(self.config.max_spin_attempts_per_step):
                 attempts += 1
+                # "balance_changed", non "balance_decrease": una vincita puo'
+                # far salire il saldo invece di scenderlo della puntata -
+                # richiedere specificamente un calo classificherebbe una
+                # vincita come spin fallito, causando ritap inutili (e
+                # rischiosi) su uno spin gia' riuscito.
                 tap_result = self.verifier.verified_tap(
                     device_id, candidate.x, candidate.y,
-                    Expectation(kind="balance_decrease", min_decrease=min_decrease),
+                    Expectation(kind="balance_changed"),
                 )
                 if not tap_result.success:
                     self._log_step(
@@ -108,14 +122,15 @@ class SpinController:
                         balance_before=balance_before, balance_after=balance_before, win_amount=None,
                         verified=False, attempts=attempts, outcome="error",
                     ))
+                # Gia' disponibili dal tap appena verificato: nessuna lettura
+                # di contesto aggiuntiva necessaria (era la ridondanza da
+                # eliminare per velocita').
+                if tap_result.data.balance_after is not None:
+                    balance_after = tap_result.data.balance_after
+                win_amount = tap_result.data.win_amount
                 if tap_result.data.verified:
                     verified = True
                     break
-
-        final_context_result = context_provider()
-        final_context = final_context_result.data if final_context_result.success else None
-        balance_after = self._read_amount(final_context, "saldo") if final_context else balance_before
-        win_amount = self._read_amount(final_context, "vincita") if final_context else None
 
         outcome = "success" if verified else "no_effect"
         accounting_anomaly = None

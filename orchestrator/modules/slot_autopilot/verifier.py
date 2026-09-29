@@ -34,7 +34,7 @@ def classify_screen_state(ocr_state: dict) -> str:
 
 @dataclass
 class Expectation:
-    kind: str  # "balance_decrease" | "bet_decrease" | "bet_unchanged_confirms_min" | "screen_changed"
+    kind: str  # "balance_decrease" | "balance_changed" | "bet_decrease" | "bet_unchanged_confirms_min" | "screen_changed"
     min_decrease: Decimal = Decimal("0.00")
     region: Optional[tuple] = None
 
@@ -54,6 +54,10 @@ class TapOutcome:
     screen_state_after: Optional[str]
     outcome: str  # "success" | "no_effect" | "unexpected_change" | "error"
     error_code: Optional[str] = None
+    # Letta dallo stesso state_after gia' usato per verificare il tap: zero
+    # chiamate OCR aggiuntive. Puo' essere None anche dopo una vincita reale
+    # se l'OCR non legge l'etichetta "VINCITA" in quel preciso momento.
+    win_amount: Optional[Decimal] = None
 
 
 def _to_decimal(value) -> Optional[Decimal]:
@@ -132,6 +136,7 @@ class ActionVerifier:
         balance_after = _to_decimal(state_after.get("saldo"))
         bet_before = _to_decimal(state_before.get("posta"))
         bet_after = _to_decimal(state_after.get("posta"))
+        win_amount = _to_decimal(state_after.get("vincita"))
 
         verified = self._evaluate_expectation(
             expectation, diff, balance_before, balance_after, bet_before, bet_after,
@@ -155,6 +160,7 @@ class ActionVerifier:
             screen_state_before=classify_screen_state(state_before),
             screen_state_after=classify_screen_state(state_after),
             outcome=outcome,
+            win_amount=win_amount,
         ))
 
     def _evaluate_expectation(self, expectation: Expectation, diff: float,
@@ -163,6 +169,15 @@ class ActionVerifier:
             if balance_before is None or balance_after is None:
                 return False
             return (balance_before - balance_after) >= expectation.min_decrease
+        if expectation.kind == "balance_changed":
+            # Usata per verificare lo spin: una vincita puo' far RIMANERE
+            # UGUALE o SALIRE il saldo invece di scendere della puntata -
+            # richiedere specificamente un calo (come "balance_decrease")
+            # classificherebbe una vincita come spin fallito, causando
+            # ritap inutili (e rischiosi) sullo stesso spin gia' riuscito.
+            if balance_before is None or balance_after is None:
+                return False
+            return balance_after != balance_before
         if expectation.kind == "bet_decrease":
             if bet_before is None or bet_after is None:
                 return False

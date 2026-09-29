@@ -111,6 +111,14 @@ def _run_session(autopilot: SlotAutoPilot, args: argparse.Namespace) -> int:
             logger.warning("Spin bloccato da un'invariante di sicurezza: %s", spin_result.data.violated_invariant)
             break
     logger.info("Sessione conclusa: %s/%s EUR giocati in %d spin.", total_played, target, spin_index)
+
+    initial_balance, final_balance = autopilot.get_balance_summary()
+    if initial_balance is not None and final_balance is not None:
+        net = final_balance - initial_balance
+        logger.info(
+            "Riepilogo: saldo iniziale=%s, saldo finale=%s, netto=%s EUR",
+            initial_balance, final_balance, net,
+        )
     return 0
 
 

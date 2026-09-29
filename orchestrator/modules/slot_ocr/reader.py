@@ -34,12 +34,27 @@ class SlotOCRReader:
 
     def __init__(self):
         self._ocr = None
+        self._last_screenshot_path = None
+        self._last_raw_results = None
 
     def _get_ocr(self):
         if self._ocr is None:
             import easyocr
             self._ocr = easyocr.Reader(['it', 'en'], gpu=False)
         return self._ocr
+
+    def _get_raw_detections(self, screenshot_path: str):
+        """Cache di un solo elemento: read_slot_state e read_text_boxes sono
+        tipicamente chiamati in sequenza sullo STESSO screenshot (costruzione
+        di un contesto) - senza questa cache l'OCR (il vero collo di
+        bottiglia su CPU) verrebbe eseguito due volte sulla stessa immagine."""
+        if screenshot_path == self._last_screenshot_path and self._last_raw_results is not None:
+            return self._last_raw_results
+        ocr = self._get_ocr()
+        results = ocr.readtext(screenshot_path)
+        self._last_screenshot_path = screenshot_path
+        self._last_raw_results = results
+        return results
 
     def read_slot_state(self, screenshot_path: str) -> dict:
         """Legge lo stato della slot da uno screenshot.
@@ -54,8 +69,7 @@ class SlotOCRReader:
             "raw_texts": [(text, coords, confidence), ...]
         }
         """
-        ocr = self._get_ocr()
-        results = ocr.readtext(screenshot_path)
+        results = self._get_raw_detections(screenshot_path)
 
         state = {
             "saldo": None,
@@ -141,8 +155,7 @@ class SlotOCRReader:
         il punto top-left) di ogni rilevazione OCR, per i locator che devono
         ragionare sull'area occupata da un elemento (es. SpatialHeuristicStrategy)."""
         try:
-            ocr = self._get_ocr()
-            results = ocr.readtext(screenshot_path)
+            results = self._get_raw_detections(screenshot_path)
         except Exception as exc:
             return Result.fail(f"OCR error: {exc}", "OCR_ERROR")
 

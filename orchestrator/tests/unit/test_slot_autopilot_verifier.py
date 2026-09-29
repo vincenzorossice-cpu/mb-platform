@@ -105,6 +105,64 @@ class TestVerifiedTapHappyPaths:
         assert result.success
         assert result.data.tapped_coords == (321, 654)
 
+    def test_balance_changed_verifies_a_decrease(self, tmp_path):
+        device = FakeSlotDevice(tmp_path, balance=Decimal("10.00"), bet=Decimal("0.20"))
+        device.add_element("spin", 540, 2000, lambda d: setattr(d, "balance", d.balance - Decimal("0.20")))
+        verifier = _verifier_for(device)
+
+        result = verifier.verified_tap("dev", 540, 2000, Expectation(kind="balance_changed"))
+        assert result.success
+        assert result.data.verified is True
+
+    def test_balance_changed_verifies_an_increase(self, tmp_path):
+        """Una vincita che supera la puntata fa SALIRE il saldo: deve comunque
+        contare come spin verificato, non come tap fallito."""
+        device = FakeSlotDevice(tmp_path, balance=Decimal("10.00"), bet=Decimal("0.20"))
+        device.add_element("spin", 540, 2000, lambda d: setattr(d, "balance", d.balance + Decimal("5.00")))
+        verifier = _verifier_for(device)
+
+        result = verifier.verified_tap("dev", 540, 2000, Expectation(kind="balance_changed"))
+        assert result.success
+        assert result.data.verified is True
+
+    def test_balance_changed_not_verified_when_truly_unchanged(self, tmp_path):
+        device = FakeSlotDevice(tmp_path, balance=Decimal("10.00"), bet=Decimal("0.20"))
+        verifier = _verifier_for(device)
+
+        result = verifier.verified_tap("dev", 900, 900, Expectation(kind="balance_changed"))
+        assert result.success
+        assert result.data.verified is False
+
+    def test_win_amount_populated_from_state_after_at_no_extra_cost(self, tmp_path):
+        device = FakeSlotDevice(tmp_path, balance=Decimal("10.00"), bet=Decimal("0.20"))
+
+        def _spin_with_win(d):
+            d.balance = d.balance + Decimal("0.25")
+            d.win = Decimal("0.45")
+
+        device.add_element("spin", 540, 2000, _spin_with_win)
+        verifier = _verifier_for(device)
+
+        result = verifier.verified_tap("dev", 540, 2000, Expectation(kind="balance_changed"))
+        assert result.success
+        assert result.data.win_amount == Decimal("0.45")
+
+    def test_win_amount_none_when_not_detected(self, tmp_path):
+        device = FakeSlotDevice(tmp_path)
+        screen_reader = fake_screen_reader(device)
+        touch_injector = fake_touch_injector(device)
+        ocr_reader = MagicMock()
+        state_without_vincita = {"saldo": 9.80, "posta": 0.20, "spin_button_coords": (540, 2000)}
+        ocr_reader.read_slot_state.side_effect = [
+            {"saldo": 10.00, "posta": 0.20, "spin_button_coords": (540, 2000)},
+            state_without_vincita,
+        ]
+        verifier = ActionVerifier(touch_injector, screen_reader, ocr_reader, _config())
+
+        result = verifier.verified_tap("dev", 540, 2000, Expectation(kind="balance_changed"))
+        assert result.success
+        assert result.data.win_amount is None
+
 
 class TestVerifiedTapFailurePaths:
     def test_injector_failure_propagates_verbatim_without_second_screenshot(self, tmp_path):

@@ -33,7 +33,7 @@ def _candidate(strategy_name="ocr_anchor", verified=False):
     return Result.ok(LocateCandidate(x=540, y=2000, confidence=0.75, strategy_name=strategy_name, verified=verified))
 
 
-def _tap_outcome(verified, balance_after=None):
+def _tap_outcome(verified, balance_after=None, win_amount=None):
     return Result.ok(TapOutcome(
         tapped_coords=(540, 2000), verified=verified, screenshot_before="/tmp/a.png",
         screenshot_after="/tmp/b.png", diff_score=0.5,
@@ -41,6 +41,7 @@ def _tap_outcome(verified, balance_after=None):
         bet_before=Decimal("0.10"), bet_after=Decimal("0.10"),
         screen_state_before="idle", screen_state_after="idle",
         outcome="success" if verified else "no_effect",
+        win_amount=win_amount,
     ))
 
 
@@ -139,12 +140,11 @@ class TestCleanSpins:
         locator = MagicMock()
         locator.locate.return_value = _candidate()
         verifier = MagicMock()
-        verifier.verified_tap.return_value = _tap_outcome(True)
+        verifier.verified_tap.return_value = _tap_outcome(
+            True, balance_after=Decimal("10.40"), win_amount=Decimal("0.50"),
+        )
         controller, _, _, _ = _controller(locator=locator, verifier=verifier)
-
-        context_provider = MagicMock(side_effect=[
-            _context_result(Decimal("10.00")), _context_result(Decimal("10.40"), win=Decimal("0.50")),
-        ])
+        context_provider = MagicMock(return_value=_context_result(Decimal("10.00")))
 
         result = controller.spin("dev", "pirots5", "ep1", 1, context_provider, True, Decimal("0.10"))
         assert result.success
@@ -155,14 +155,11 @@ class TestCleanSpins:
         locator = MagicMock()
         locator.locate.return_value = _candidate()
         verifier = MagicMock()
-        verifier.verified_tap.return_value = _tap_outcome(True)
-        controller, _, _, _ = _controller(locator=locator, verifier=verifier)
-
         # Atteso 9.90 (10.00 - 0.10 + 0), osservato 10.40: scarto enorme, ma il
         # tap era verificato -> successo comunque, anomalia solo annotata.
-        context_provider = MagicMock(side_effect=[
-            _context_result(Decimal("10.00")), _context_result(Decimal("10.40")),
-        ])
+        verifier.verified_tap.return_value = _tap_outcome(True, balance_after=Decimal("10.40"))
+        controller, _, _, _ = _controller(locator=locator, verifier=verifier)
+        context_provider = MagicMock(return_value=_context_result(Decimal("10.00")))
 
         result = controller.spin("dev", "pirots5", "ep1", 1, context_provider, True, Decimal("0.10"))
         assert result.success  # la Result e' comunque ok
@@ -173,16 +170,47 @@ class TestCleanSpins:
         locator = MagicMock()
         locator.locate.return_value = _candidate()
         verifier = MagicMock()
-        verifier.verified_tap.return_value = _tap_outcome(True)
+        verifier.verified_tap.return_value = _tap_outcome(True, balance_after=Decimal("9.895"))
         controller, _, _, _ = _controller(locator=locator, verifier=verifier)
-
-        context_provider = MagicMock(side_effect=[
-            _context_result(Decimal("10.00")), _context_result(Decimal("9.895")),
-        ])
+        context_provider = MagicMock(return_value=_context_result(Decimal("10.00")))
 
         result = controller.spin("dev", "pirots5", "ep1", 1, context_provider, True, Decimal("0.10"))
         assert result.success
         assert result.data.accounting_anomaly is None
+
+    def test_win_that_increases_balance_is_success_on_first_attempt(self):
+        """Fix 7: una vincita che supera la puntata fa SALIRE il saldo - deve
+        contare come spin riuscito al primo tentativo, non un fallimento che
+        scatena ritap inutili (e rischiosi) su uno spin gia' riuscito."""
+        locator = MagicMock()
+        locator.locate.return_value = _candidate()
+        verifier = MagicMock()
+        verifier.verified_tap.return_value = _tap_outcome(
+            True, balance_after=Decimal("15.43"), win_amount=Decimal("5.43"),
+        )
+        controller, _, _, _ = _controller(locator=locator, verifier=verifier)
+        context_provider = MagicMock(return_value=_context_result(Decimal("10.00")))
+
+        result = controller.spin("dev", "pirots5", "ep1", 1, context_provider, True, Decimal("0.10"))
+        assert result.success
+        assert result.data.outcome == "success"
+        assert result.data.attempts == 1
+        verifier.verified_tap.assert_called_once()
+
+    def test_no_extra_context_read_after_a_verified_non_hitl_tap(self):
+        """Fix 9: niente terza lettura di contesto per rileggere saldo/vincita
+        dopo un tap gia' verificato - i dati vengono da tap_result, gratis."""
+        locator = MagicMock()
+        locator.locate.return_value = _candidate()
+        verifier = MagicMock()
+        verifier.verified_tap.return_value = _tap_outcome(True, balance_after=Decimal("9.80"))
+        controller, _, _, _ = _controller(locator=locator, verifier=verifier)
+        context_provider = MagicMock(return_value=_context_result(Decimal("10.00")))
+
+        result = controller.spin("dev", "pirots5", "ep1", 1, context_provider, True, Decimal("0.10"))
+        assert result.success
+        assert result.data.balance_after == Decimal("9.80")
+        assert context_provider.call_count == 1
 
 
 class TestLocateAndHitl:
