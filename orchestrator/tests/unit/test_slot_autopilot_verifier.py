@@ -151,3 +151,18 @@ class TestClassifyScreenState:
 
     def test_unsafe_when_spin_button_absent(self):
         assert classify_screen_state({"spin_button_coords": None}) == "unsafe"
+
+    def test_idle_via_readable_saldo_and_posta_when_spin_button_is_icon_only(self):
+        """Pirots5 e molte altre slot hanno un bottone spin puramente
+        iconografico (una freccia circolare), mai un testo 'SPIN'/'GIRA'
+        leggibile: senza questo fallback resterebbe sempre 'unsafe'."""
+        ocr_state = {"spin_button_coords": None, "saldo": 5000.0, "posta": 0.20}
+        assert classify_screen_state(ocr_state) == "idle"
+
+    def test_unsafe_when_spin_button_absent_and_saldo_missing(self):
+        ocr_state = {"spin_button_coords": None, "saldo": None, "posta": 0.20}
+        assert classify_screen_state(ocr_state) == "unsafe"
+
+    def test_unsafe_when_spin_button_absent_and_posta_missing(self):
+        ocr_state = {"spin_button_coords": None, "saldo": 5000.0, "posta": None}
+        assert classify_screen_state(ocr_state) == "unsafe"

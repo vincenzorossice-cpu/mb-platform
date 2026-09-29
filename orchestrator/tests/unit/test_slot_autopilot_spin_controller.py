@@ -91,6 +91,29 @@ class TestSafetyInvariants:
         assert result.data.violated_invariant == "UNSAFE_SCREEN_STATE"
         locator.locate.assert_not_called()
 
+    def test_icon_only_spin_button_is_not_blocked_when_saldo_and_posta_are_readable(self):
+        """Pirots5 ha un bottone spin puramente iconografico: spin_button_coords
+        non viene mai valorizzato dall'OCR, ma saldo e puntata si leggono
+        entrambi puliti - lo spin non deve essere bloccato in questo caso."""
+        locator = MagicMock()
+        locator.locate.return_value = _candidate()
+        verifier = MagicMock()
+        verifier.verified_tap.return_value = _tap_outcome(True, balance_after=Decimal("9.90"))
+        controller, _, _, _ = _controller(locator=locator, verifier=verifier)
+
+        context = LocateContext(
+            device_id="dev", slot_name="pirots5", screenshot_path="/tmp/x.png",
+            screen_width=1080, screen_height=2400,
+            slot_ocr_state={"spin_button_coords": None, "saldo": 10.00, "posta": 0.10},
+        )
+        context_provider = MagicMock(return_value=Result.ok(context))
+
+        result = controller.spin("dev", "pirots5", "ep1", 1, context_provider, True, Decimal("0.10"))
+        assert result.success
+        assert result.data.violated_invariant is None
+        assert result.data.outcome == "success"
+        locator.locate.assert_called_once()
+
 
 class TestCleanSpins:
     def test_clean_spin_no_win(self):

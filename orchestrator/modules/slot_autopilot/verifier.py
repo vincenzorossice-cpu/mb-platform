@@ -15,8 +15,21 @@ def classify_screen_state(ocr_state: dict) -> str:
     nell'ultima lettura OCR, altrimenti 'unsafe'. Semplificazione deliberata
     (2 soli valori, contro i 10 di screen_state via GPT Vision) - errare
     per eccesso di cautela piuttosto che rischiare un tap durante una
-    transizione. Vedi punto aperto nel report finale."""
-    return "idle" if ocr_state.get("spin_button_coords") is not None else "unsafe"
+    transizione. Vedi punto aperto nel report finale.
+
+    Fallback: molte slot (es. Pirots5) hanno un bottone spin puramente
+    iconografico, senza mai il testo "SPIN"/"GIRA" leggibile via OCR - senza
+    questo fallback classify_screen_state ritornerebbe sempre 'unsafe' per
+    quelle slot, bloccando ogni spin per sempre. Se saldo e puntata sono
+    entrambi leggibili puliti, e' un segnale ragionevole (anche se non
+    preciso quanto un giudizio visivo) che lo schermo e' fermo: durante un
+    caricamento, uno spin in corso o una vincita questi numeri sono
+    tipicamente in transizione o coperti da animazioni."""
+    if ocr_state.get("spin_button_coords") is not None:
+        return "idle"
+    if ocr_state.get("saldo") is not None and ocr_state.get("posta") is not None:
+        return "idle"
+    return "unsafe"
 
 
 @dataclass
