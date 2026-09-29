@@ -317,3 +317,31 @@ class TestReuseOfContextForTap:
         assert first.kwargs["screenshot_before"] is not None
         assert second.kwargs["screenshot_before"] is None
         assert second.kwargs["state_before"] is None
+
+
+class TestSpinIsRemembered:
+    def _run(self, strategy_name):
+        controller, _, locator, verifier = _controller()
+        locator.locate.return_value = _candidate(strategy_name)
+        verifier.verified_tap.return_value = _tap_outcome(True, balance_after=Decimal("9.90"))
+        result = controller.spin(
+            "dev", "pirots5", "ep", 1, MagicMock(return_value=_context_result(Decimal("10.00"))),
+            True, Decimal("0.10"),
+        )
+        return result, locator
+
+    def test_verified_spin_is_offered_to_memory_and_strategy_is_reported(self):
+        result, locator = self._run("gpt")
+        assert result.data.strategy_name == "gpt"
+        locator.save_verified_candidate.assert_called_once()
+        assert locator.save_verified_candidate.call_args.args[0] == "spin"
+
+    def test_unverified_spin_is_not_remembered(self):
+        controller, _, locator, verifier = _controller()
+        locator.locate.return_value = _candidate("gpt")
+        verifier.verified_tap.return_value = _tap_outcome(False)
+        controller.spin(
+            "dev", "pirots5", "ep", 1, MagicMock(return_value=_context_result(Decimal("10.00"))),
+            True, Decimal("0.10"),
+        )
+        locator.save_verified_candidate.assert_not_called()

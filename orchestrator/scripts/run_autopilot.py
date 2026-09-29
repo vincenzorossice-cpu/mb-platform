@@ -6,6 +6,7 @@ from decimal import Decimal
 from orchestrator.core.result import Result
 from orchestrator.modules.decision_engine.gpt_client import GPTDecisionClient
 from orchestrator.modules.provider_profile.loader import ProviderProfileLoader
+from orchestrator.modules.provider_profile.profile_builder import ProfileBuilder
 from orchestrator.modules.screen_reader.reader import ScreenReader
 from orchestrator.modules.slot_autopilot.autopilot import SlotAutoPilot
 from orchestrator.modules.slot_autopilot.bet_controller import BetController
@@ -34,6 +35,10 @@ def build_autopilot(args: argparse.Namespace) -> Result[SlotAutoPilot]:
         device_id=args.device, slot_name=args.slot, target_played_amount=Decimal(str(args.target)),
         max_steps=args.max_steps, enable_gpt_fallback=not args.no_gpt,
         enable_hitl_fallback=not args.no_hitl, dry_run=not getattr(args, "live", False),
+        # Una slot nuova non ha ancora un profilo: deve poter partire e
+        # impararlo (vedi ProfileBuilder). --require-profile ripristina il
+        # blocco per chi vuole solo slot gia' curate.
+        require_profile=getattr(args, "require_profile", False),
     )
     config_result = config.validate()
     if not config_result.success:
@@ -72,6 +77,7 @@ def build_autopilot(args: argparse.Namespace) -> Result[SlotAutoPilot]:
         config=config, screen_reader=screen_reader, touch_injector=touch_injector,
         ocr_reader=ocr_reader, profile_loader=profile_loader, locator=locator,
         bet_controller=bet_controller, spin_controller=spin_controller, step_logger=step_logger,
+        profile_builder=ProfileBuilder(profiles_dir=config.profiles_dir, memory_dir=config.slot_memory_dir),
     )
     return Result.ok(autopilot)
 
@@ -133,6 +139,7 @@ def _parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="Non esegue tap reali (comportamento di default).")
     parser.add_argument("--live", action="store_true", help="Disattiva il dry-run: esegue tap reali.")
     parser.add_argument("--no-gpt", action="store_true", help="Disabilita il fallback GPT-4o-mini Vision.")
+    parser.add_argument("--require-profile", action="store_true", help="Rifiuta le slot senza profilo in provider_profiles/.")
     parser.add_argument("--no-hitl", action="store_true", help="Disabilita il fallback HITL da terminale.")
     return parser.parse_args(argv)
 

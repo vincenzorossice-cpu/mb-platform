@@ -29,6 +29,7 @@ class SpinResult:
     outcome: str  # "success" | "blocked" | "no_effect" | "error"
     violated_invariant: Optional[str] = None  # "MIN_BET_NOT_VERIFIED" | "INSUFFICIENT_BALANCE" | "UNSAFE_SCREEN_STATE"
     accounting_anomaly: Optional[str] = None
+    strategy_name: Optional[str] = None  # strategia che ha localizzato lo spin (None se non tappato)
 
 
 class SpinController:
@@ -139,6 +140,13 @@ class SpinController:
                     break
 
         outcome = "success" if verified else "no_effect"
+        if verified:
+            # Come fa BetController: una coordinata verificata dal vivo e
+            # trovata da GPT/HITL va ricordata, altrimenti ogni sessione la
+            # ritrova da capo (save_verified_candidate ignora profile/memory).
+            self.locator.save_verified_candidate(
+                _ELEMENT, candidate, slot_name, context.screen_width, context.screen_height,
+            )
         accounting_anomaly = None
         if outcome == "success":
             accounting_anomaly = self._check_accounting(balance_before, expected_bet, win_amount, balance_after)
@@ -159,7 +167,7 @@ class SpinController:
             slot_name=slot_name, spin_index=spin_index, bet_amount=expected_bet,
             balance_before=balance_before, balance_after=balance_after, win_amount=win_amount,
             verified=verified, attempts=attempts, outcome=outcome,
-            accounting_anomaly=accounting_anomaly,
+            accounting_anomaly=accounting_anomaly, strategy_name=candidate.strategy_name,
         ))
 
     def _check_invariants(self, min_bet_verified, balance_before, expected_bet, context) -> Optional[str]:

@@ -55,3 +55,9 @@ class ProviderProfile:
     # le coordinate normalizzate sono relative allo schermo intero (comportamento
     # storico, retrocompatibile).
     canvas_bbox: Optional[tuple] = None
+    # Profilo generato dal sistema (non curato a mano) da una sessione reale.
+    # Finche' verified=False non e' fidato: ProfileStrategy lo ignora e
+    # auto_sessions_ok conta le sessioni consecutive "pulite" (nessun aiuto
+    # di GPT/HITL, nessun tap a vuoto) necessarie per promuoverlo.
+    auto_generated: bool = False
+    auto_sessions_ok: int = 0

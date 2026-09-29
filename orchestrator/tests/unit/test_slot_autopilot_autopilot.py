@@ -10,7 +10,7 @@ from orchestrator.modules.slot_autopilot.autopilot import SlotAutoPilot
 from orchestrator.modules.slot_autopilot.bet_controller import BetController, BetResult
 from orchestrator.modules.slot_autopilot.config import AutoPilotConfig
 from orchestrator.modules.slot_autopilot.locator import ElementLocator
-from orchestrator.modules.slot_autopilot.spin_controller import SpinController
+from orchestrator.modules.slot_autopilot.spin_controller import SpinController, SpinResult
 from orchestrator.modules.slot_autopilot.strategies.profile_strategy import ProfileStrategy
 from orchestrator.modules.slot_autopilot.verifier import ActionVerifier
 from orchestrator.modules.step_logger.logger import JSONLStepLogger
@@ -343,3 +343,73 @@ class TestEndToEndSmoke:
         with open(jsonl_files[0]) as f:
             lines = f.readlines()
         assert len(lines) >= 4
+
+
+class TestProfileEvidence:
+    def _autopilot(self, profile, builder):
+        deps = _collaborators()
+        deps["profile_loader"].load.return_value = (
+            Result.ok(profile) if profile is not None else Result.fail("nf", "PROFILE_NOT_FOUND")
+        )
+        deps["config"] = _config(require_profile=False)
+        deps["step_logger"].start_episode.return_value = Result.ok("ep-1")
+        deps["step_logger"].end_episode.return_value = Result.ok(True)
+        autopilot = SlotAutoPilot(**deps, profile_builder=builder)
+        autopilot._screen_size = (1080, 2400)
+        autopilot.prepare("dev")
+        return autopilot
+
+    def _spin_result(self, outcome="success", strategy="memory"):
+        return Result.ok(SpinResult(
+            slot_name="pirots5", spin_index=1, bet_amount=Decimal("0.20"), balance_before=None,
+            balance_after=None, win_amount=None, verified=outcome == "success", attempts=1,
+            outcome=outcome, strategy_name=strategy,
+        ))
+
+    def test_builder_gets_evidence_when_slot_has_no_profile(self):
+        builder = MagicMock()
+        builder.record_session.return_value = Result.ok("draft_written")
+        autopilot = self._autopilot(None, builder)
+        autopilot._min_bet_verified, autopilot._current_bet = True, Decimal("0.20")
+        autopilot.spin_controller.spin.return_value = self._spin_result(strategy="gpt")
+        autopilot.spin("dev", 1)
+
+        autopilot.shutdown("dev")
+
+        evidence = builder.record_session.call_args.args[0]
+        assert evidence.min_bet_verified and evidence.spins_ok == 1
+        assert evidence.assisted and evidence.no_effect_spins == 0
+
+    def test_unassisted_session_is_reported_as_clean(self):
+        builder = MagicMock()
+        builder.record_session.return_value = Result.ok("draft_written")
+        autopilot = self._autopilot(None, builder)
+        autopilot.spin_controller.spin.return_value = self._spin_result(strategy="memory")
+        autopilot.spin("dev", 1)
+        autopilot.spin_controller.spin.return_value = self._spin_result(outcome="no_effect", strategy="memory")
+        autopilot.spin("dev", 2)
+
+        autopilot.shutdown("dev")
+
+        evidence = builder.record_session.call_args.args[0]
+        assert not evidence.assisted and evidence.no_effect_spins == 1
+
+    def test_curated_profile_is_never_sent_to_the_builder(self):
+        builder = MagicMock()
+        profile = ProviderProfile(slot_name="pirots5", provider="x", screen_width=1080, screen_height=2400, verified=True)
+        self._autopilot(profile, builder).shutdown("dev")
+        builder.record_session.assert_not_called()
+
+    def test_unverified_auto_profile_is_sent_to_the_builder(self):
+        builder = MagicMock()
+        builder.record_session.return_value = Result.ok("draft_written")
+        profile = ProviderProfile(
+            slot_name="pirots5", provider="x", screen_width=1080, screen_height=2400, auto_generated=True,
+        )
+        self._autopilot(profile, builder).shutdown("dev")
+        builder.record_session.assert_called_once()
+
+    def test_builder_failure_never_breaks_shutdown(self):
+        builder = MagicMock()
+        builder.record_session.side_effect = RuntimeError("disk full")
+        assert self._autopilot(None, builder).shutdown("dev").success

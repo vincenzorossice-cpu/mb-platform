@@ -18,6 +18,11 @@ class ProfileStrategy(LocatorStrategy):
     def locate(self, element_name: str, context: LocateContext) -> Result[LocateCandidate]:
         if context.profile is None:
             return Result.fail("No profile loaded", "PROFILE_NOT_LOADED")
+        if context.profile.auto_generated and not context.profile.verified:
+            # Bozza generata dal sistema, non ancora promossa: non e' una
+            # fonte curata. Le stesse coordinate arrivano comunque dalla
+            # memoria della slot, che le ha viste verificate dal vivo.
+            return Result.fail("Auto-generated profile not yet verified", "PROFILE_NOT_VERIFIED")
         element = context.profile.elements.get(element_name)
         if element is None:
             return Result.fail(f"Unknown element in profile: {element_name}", "PROFILE_ELEMENT_UNKNOWN")

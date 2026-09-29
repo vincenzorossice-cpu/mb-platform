@@ -63,6 +63,8 @@ class ProviderProfileLoader:
                 known_min_bet=data.get("known_min_bet"),
                 verified=data.get("verified", False),
                 canvas_bbox=tuple(data["canvas_bbox"]) if data.get("canvas_bbox") else None,
+                auto_generated=bool(data.get("auto_generated", False)),
+                auto_sessions_ok=int(data.get("auto_sessions_ok", 0)),
             )
         except TypeError as exc:
             return Result.fail(f"Invalid profile JSON: {exc}", "PROFILE_INVALID_JSON")

@@ -1,9 +1,11 @@
+import logging
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional
 
 from orchestrator.core.result import Result
 from orchestrator.modules.provider_profile.loader import ProviderProfileLoader
+from orchestrator.modules.provider_profile.profile_builder import ProfileBuilder, SessionEvidence
 from orchestrator.modules.screen_reader.interface import ScreenReaderInterface
 from orchestrator.modules.slot_autopilot.bet_controller import BetController, BetResult
 from orchestrator.modules.slot_autopilot.config import AutoPilotConfig
@@ -13,6 +15,12 @@ from orchestrator.modules.slot_autopilot.strategies.base import LocateContext
 from orchestrator.modules.slot_ocr.reader import SlotOCRReader
 from orchestrator.modules.step_logger.interface import EpisodeSummary, StepLoggerInterface
 from orchestrator.modules.touch_injector.interface import TouchInjectorInterface
+
+
+logger = logging.getLogger(__name__)
+
+# Strategie che non implicano alcun aiuto esterno: dati gia' curati/verificati.
+_UNASSISTED_STRATEGIES = {"profile", "memory"}
 
 
 def _now() -> str:
@@ -29,7 +37,7 @@ class SlotAutoPilot:
         touch_injector: TouchInjectorInterface, ocr_reader: SlotOCRReader,
         profile_loader: ProviderProfileLoader, locator: ElementLocator,
         bet_controller: BetController, spin_controller: SpinController,
-        step_logger: StepLoggerInterface,
+        step_logger: StepLoggerInterface, profile_builder: Optional[ProfileBuilder] = None,
     ):
         self.config = config
         self.screen_reader = screen_reader
@@ -40,8 +48,12 @@ class SlotAutoPilot:
         self.bet_controller = bet_controller
         self.spin_controller = spin_controller
         self.step_logger = step_logger
+        self.profile_builder = profile_builder
 
         self._profile = None
+        self._screen_size: Optional[tuple] = None
+        self._assisted = False
+        self._no_effect_spins = 0
         self._episode_id: Optional[str] = None
         self._min_bet_verified = False
         self._current_bet: Optional[Decimal] = None
@@ -95,6 +107,8 @@ class SlotAutoPilot:
                 self._total_steps += result.data.attempts
                 self._min_bet_verified = result.data.min_bet_verified
                 self._current_bet = result.data.final_bet
+                if any(name not in _UNASSISTED_STRATEGIES for name in result.data.strategy_sequence):
+                    self._assisted = True
             return result
         except Exception as exc:
             return Result.fail(f"Unexpected error in set_min_bet: {exc}", "UNEXPECTED_ERROR")
@@ -107,6 +121,10 @@ class SlotAutoPilot:
             )
             if result.success:
                 self._total_steps += 1
+                if result.data.strategy_name is not None and result.data.strategy_name not in _UNASSISTED_STRATEGIES:
+                    self._assisted = True
+                if result.data.outcome in ("no_effect", "error"):
+                    self._no_effect_spins += 1
                 if result.data.outcome == "success":
                     self._total_spins += 1
                     if result.data.bet_amount is not None:
@@ -123,10 +141,31 @@ class SlotAutoPilot:
         vincite lette (inaffidabili) ad ogni singolo spin."""
         return self._initial_balance, self._last_known_balance
 
+    def _record_profile_evidence(self) -> None:
+        """Bozza/promozione del profilo dalla sessione appena conclusa. Solo se
+        la slot non ha un profilo curato; mai bloccante per lo shutdown."""
+        if self.profile_builder is None or self._screen_size is None:
+            return
+        if self._profile is not None and not (self._profile.auto_generated and not self._profile.verified):
+            return
+        try:
+            result = self.profile_builder.record_session(SessionEvidence(
+                slot_name=self.config.slot_name,
+                screen_width=self._screen_size[0], screen_height=self._screen_size[1],
+                min_bet_verified=self._min_bet_verified, final_bet=self._current_bet,
+                spins_ok=self._total_spins, assisted=self._assisted,
+                no_effect_spins=self._no_effect_spins,
+            ))
+            if not result.success:
+                logger.warning("Profilo auto-generato non aggiornato: %s (%s)", result.error, result.error_code)
+        except Exception as exc:
+            logger.warning("Profilo auto-generato non aggiornato: %s", exc)
+
     def shutdown(self, device_id: str) -> Result[bool]:
         try:
             if self._episode_id is None:
                 return Result.ok(True)
+            self._record_profile_evidence()
             summary = EpisodeSummary(
                 episode_id=self._episode_id, slot_name=self.config.slot_name, device_id=device_id,
                 started_at=_now(), ended_at=_now(), total_steps=self._total_steps,
@@ -162,6 +201,7 @@ class SlotAutoPilot:
         except OSError as exc:
             return Result.fail(f"Cannot read screenshot dimensions: {exc}", "CONTEXT_BUILD_ERROR")
 
+        self._screen_size = (width, height)
         return Result.ok(LocateContext(
             device_id=device_id, slot_name=self.config.slot_name, screenshot_path=screenshot_path,
             screen_width=width, screen_height=height,
