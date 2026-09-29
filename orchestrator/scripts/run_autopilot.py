@@ -10,6 +10,7 @@ from orchestrator.modules.provider_profile.profile_builder import ProfileBuilder
 from orchestrator.modules.screen_reader.reader import ScreenReader
 from orchestrator.modules.slot_autopilot.autopilot import SlotAutoPilot
 from orchestrator.modules.slot_autopilot.bet_controller import BetController
+from orchestrator.modules.slot_autopilot.bet_menu import BetMenuSelector
 from orchestrator.modules.slot_autopilot.config import AutoPilotConfig
 from orchestrator.modules.slot_autopilot.locator import ElementLocator
 from orchestrator.modules.slot_autopilot.spin_controller import SpinController
@@ -70,7 +71,9 @@ def build_autopilot(args: argparse.Namespace) -> Result[SlotAutoPilot]:
 
     locator = ElementLocator(strategies)
     verifier = ActionVerifier(touch_injector, screen_reader, ocr_reader, config)
-    bet_controller = BetController(locator, verifier, step_logger, config)
+    bet_controller = BetController(
+        locator, verifier, step_logger, config, menu_selector=BetMenuSelector(locator, verifier),
+    )
     spin_controller = SpinController(locator, verifier, step_logger, config)
 
     autopilot = SlotAutoPilot(

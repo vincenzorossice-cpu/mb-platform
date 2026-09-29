@@ -24,13 +24,14 @@ def load_autopilot_element_memory(slot_name: str, memory_dir: str = "slot_memory
     collisione/perdita di dati con quel file."""
     path = _path(slot_name, memory_dir)
     if not os.path.exists(path):
-        return Result.ok({"elements": {}})
+        return Result.ok({"elements": {}, "flags": {}})
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError) as exc:
         return Result.fail(f"Invalid autopilot memory JSON: {exc}", "AUTOPILOT_MEMORY_INVALID_JSON")
     data.setdefault("elements", {})
+    data.setdefault("flags", {})
     return Result.ok(data)
 
 
@@ -54,3 +55,27 @@ def save_autopilot_element(
     except OSError as exc:
         return Result.fail(f"Cannot write autopilot memory: {exc}", "AUTOPILOT_MEMORY_WRITE_ERROR")
     return Result.ok(True)
+
+
+def save_autopilot_flag(
+    slot_name: str, flag_name: str, value: bool, memory_dir: str = "slot_memory",
+) -> Result[bool]:
+    """Fatti booleani sulla slot (es. 'bet_via_menu': la puntata si cambia
+    dal menu, non con un tasto meno). Stesso file satellite degli elementi."""
+    load_result = load_autopilot_element_memory(slot_name, memory_dir)
+    if not load_result.success:
+        return Result.fail(load_result.error, load_result.error_code)
+    data = load_result.data
+    data["flags"][flag_name] = bool(value)
+    try:
+        os.makedirs(memory_dir, exist_ok=True)
+        with open(_path(slot_name, memory_dir), "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except OSError as exc:
+        return Result.fail(f"Cannot write autopilot memory: {exc}", "AUTOPILOT_MEMORY_WRITE_ERROR")
+    return Result.ok(True)
+
+
+def load_autopilot_flag(slot_name: str, flag_name: str, memory_dir: str = "slot_memory") -> bool:
+    result = load_autopilot_element_memory(slot_name, memory_dir)
+    return bool(result.success and result.data.get("flags", {}).get(flag_name, False))

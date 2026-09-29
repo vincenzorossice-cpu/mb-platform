@@ -62,3 +62,23 @@ class TestMemoryStrategy:
         result = strategy.locate("bet_minus", _context())
         assert not result.success
         assert result.error_code == "MEMORY_ELEMENT_UNKNOWN"
+
+
+class TestAutopilotFlags:
+    def test_flag_defaults_to_false_and_roundtrips(self, tmp_path):
+        from orchestrator.modules.provider_profile.autopilot_memory import load_autopilot_flag, save_autopilot_flag
+        assert load_autopilot_flag("slot_x", "bet_via_menu", str(tmp_path)) is False
+        save_autopilot_flag("slot_x", "bet_via_menu", True, str(tmp_path))
+        assert load_autopilot_flag("slot_x", "bet_via_menu", str(tmp_path)) is True
+
+    def test_flags_and_elements_do_not_overwrite_each_other(self, tmp_path):
+        from orchestrator.modules.provider_profile.autopilot_memory import (
+            load_autopilot_element_memory, save_autopilot_element, save_autopilot_flag,
+        )
+        save_autopilot_element("slot_x", "bet_minus", 1, 2, 0.1, 0.2, str(tmp_path))
+        save_autopilot_flag("slot_x", "bet_via_menu", True, str(tmp_path))
+        save_autopilot_element("slot_x", "spin", 3, 4, 0.3, 0.4, str(tmp_path))
+
+        data = load_autopilot_element_memory("slot_x", str(tmp_path)).data
+        assert set(data["elements"]) == {"bet_minus", "spin"}
+        assert data["flags"] == {"bet_via_menu": True}

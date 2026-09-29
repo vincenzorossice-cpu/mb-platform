@@ -20,7 +20,7 @@ from orchestrator.modules.touch_injector.interface import TouchInjectorInterface
 logger = logging.getLogger(__name__)
 
 # Strategie che non implicano alcun aiuto esterno: dati gia' curati/verificati.
-_UNASSISTED_STRATEGIES = {"profile", "memory"}
+_UNASSISTED_STRATEGIES = {"profile", "memory", "menu"}
 
 
 def _now() -> str:

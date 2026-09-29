@@ -4,7 +4,9 @@ from unittest.mock import MagicMock
 from orchestrator.core.result import Result
 from orchestrator.modules.provider_profile.loader import ProviderProfileLoader
 from orchestrator.modules.provider_profile.profile import ElementSpec, ProviderProfile
+from orchestrator.modules.provider_profile.autopilot_memory import load_autopilot_flag, save_autopilot_flag
 from orchestrator.modules.slot_autopilot.bet_controller import BetController
+from orchestrator.modules.slot_autopilot.bet_menu import MenuSelection
 from orchestrator.modules.slot_autopilot.config import AutoPilotConfig
 from orchestrator.modules.slot_autopilot.locator import ElementLocator
 from orchestrator.modules.slot_autopilot.strategies.base import LocateCandidate, LocateContext
@@ -647,3 +649,64 @@ class TestEndToEndWithFakeSlotDevice:
         assert result.data.final_bet == Decimal("1.00")
         assert result.data.min_bet_verified is False
         assert result.data.aborted_reason == "NO_DECREASE_OBSERVED"
+
+
+class TestMenuFallback:
+    def _exhausting_setup(self, tmp_path, selector_result, flag=False):
+        config = _config(slot_memory_dir=str(tmp_path), max_bet_lower_attempts=6)
+        if flag:
+            save_autopilot_flag("pirots5", "bet_via_menu", True, str(tmp_path))
+        locator = _locator_mock()
+        locator.locate.return_value = _ok_candidate("gpt")
+        locator.is_exhausted.side_effect = [False, False, True] + [True] * 10
+        verifier = MagicMock()
+        verifier.verified_tap.return_value = Result.ok(_tap_outcome(Decimal("2.00"), Decimal("2.00"), False, "no_effect"))
+        selector = MagicMock()
+        selector.select_lowest.return_value = selector_result
+        step_logger = MagicMock()
+        step_logger.log_step.return_value = Result.ok(True)
+        controller = BetController(locator, verifier, step_logger, config, menu_selector=selector)
+        return controller, selector, config
+
+    def _selection(self):
+        return Result.ok(MenuSelection(final_bet=Decimal("0.10"), lowest_listed=Decimal("0.10"), toggle_strategy="gpt"))
+
+    def test_menu_is_tried_when_the_minus_button_strategy_is_exhausted(self, tmp_path):
+        controller, selector, config = self._exhausting_setup(tmp_path, self._selection())
+
+        result = controller.set_min_bet("dev", "pirots5", "ep", _context_provider(Decimal("2.00")))
+
+        assert result.data.min_bet_verified and result.data.final_bet == Decimal("0.10")
+        assert result.data.strategy_sequence[-2:] == ["gpt", "menu"]
+        selector.select_lowest.assert_called_once()
+        assert load_autopilot_flag("pirots5", "bet_via_menu", str(tmp_path))
+
+    def test_failed_menu_falls_through_and_is_tried_only_once(self, tmp_path):
+        controller, selector, _ = self._exhausting_setup(tmp_path, Result.fail("x", "MENU_NOT_READABLE"))
+
+        result = controller.set_min_bet("dev", "pirots5", "ep", _context_provider(Decimal("2.00")))
+
+        assert not result.data.min_bet_verified
+        selector.select_lowest.assert_called_once()
+        assert not load_autopilot_flag("pirots5", "bet_via_menu", str(tmp_path))
+
+    def test_remembered_menu_route_goes_first_without_any_minus_attempt(self, tmp_path):
+        controller, selector, _ = self._exhausting_setup(tmp_path, self._selection(), flag=True)
+
+        result = controller.set_min_bet("dev", "pirots5", "ep", _context_provider(Decimal("2.00")))
+
+        assert result.data.min_bet_verified and result.data.attempts == 1
+        controller.verifier.verified_tap.assert_not_called()
+        controller.locator.locate.assert_not_called()
+
+    def test_without_a_selector_nothing_changes(self, tmp_path):
+        config = _config(slot_memory_dir=str(tmp_path), max_bet_lower_attempts=4)
+        save_autopilot_flag("pirots5", "bet_via_menu", True, str(tmp_path))
+        locator = _locator_mock()
+        locator.locate.return_value = _ok_candidate()
+        verifier = MagicMock()
+        verifier.verified_tap.return_value = Result.ok(_tap_outcome(Decimal("1.00"), Decimal("0.50"), True, "success"))
+        controller, _ = _controller(locator, verifier, config=_config(slot_memory_dir=str(tmp_path), stable_reads_for_min=1))
+
+        assert controller.set_min_bet("dev", "pirots5", "ep", _context_provider()).success
+        verifier.verified_tap.assert_called()

@@ -5,6 +5,8 @@ from decimal import Decimal
 from typing import Callable, Optional
 
 from orchestrator.core.result import Result
+from orchestrator.modules.provider_profile.autopilot_memory import load_autopilot_flag, save_autopilot_flag
+from orchestrator.modules.slot_autopilot.bet_menu import BetMenuSelector
 from orchestrator.modules.slot_autopilot.config import AutoPilotConfig
 from orchestrator.modules.slot_autopilot.locator import ElementLocator
 from orchestrator.modules.slot_autopilot.verifier import ActionVerifier, Expectation
@@ -14,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 _ELEMENT = "bet_minus"
 _MENU_TOGGLE_ELEMENT = "bet_menu_toggle"
+_BET_VIA_MENU_FLAG = "bet_via_menu"
 
 
 @dataclass
@@ -37,11 +40,14 @@ class BetController:
     base a min_bet_verified."""
 
     def __init__(self, locator: ElementLocator, verifier: ActionVerifier,
-                 step_logger: StepLoggerInterface, config: AutoPilotConfig):
+                 step_logger: StepLoggerInterface, config: AutoPilotConfig,
+                 menu_selector: Optional[BetMenuSelector] = None):
         self.locator = locator
         self.verifier = verifier
         self.step_logger = step_logger
         self.config = config
+        # None = il fallback "menu puntata" e' spento (comportamento storico).
+        self.menu_selector = menu_selector
 
     def set_min_bet(
         self, device_id: str, slot_name: str, episode_id: str,
@@ -73,6 +79,20 @@ class BetController:
                 min_bet_verified=True, attempts=0, strategy_sequence=[],
                 aborted_reason=None, outcome="unchanged_already_min",
             ))
+
+        menu_tried = False
+        if self.menu_selector is not None and load_autopilot_flag(
+            slot_name, _BET_VIA_MENU_FLAG, self.config.slot_memory_dir,
+        ):
+            # Sessione precedente: qui la puntata si cambia dal menu (nessun
+            # tasto meno utilizzabile). Si va dritti li', niente giri a vuoto.
+            logger.info("set_min_bet: la memoria dice che questa slot cambia puntata dal menu: provo li' per primo.")
+            menu_tried = True
+            menu_outcome = self._select_via_menu(
+                device_id, slot_name, episode_id, context, context_provider, starting_bet, [], 1,
+            )
+            if menu_outcome is not None:
+                return menu_outcome
 
         we_opened_the_menu = False
         if (
@@ -250,6 +270,16 @@ class BetController:
                     "plateau, riprovo con la prossima strategia disponibile.",
                     candidate.strategy_name, _ELEMENT,
                 )
+                if self.menu_selector is not None and not menu_tried and not we_opened_the_menu:
+                    # Il tasto meno non funziona (o non esiste): prima di
+                    # scomodare un umano, prova il menu puntata (icona monete).
+                    menu_tried = True
+                    menu_outcome = self._select_via_menu(
+                        device_id, slot_name, episode_id, context, context_provider,
+                        starting_bet, strategy_sequence, attempts + 1,
+                    )
+                    if menu_outcome is not None:
+                        return menu_outcome
                 refreshed = context_provider()
                 if refreshed.success:
                     context = refreshed.data
@@ -285,6 +315,32 @@ class BetController:
             slot_name=slot_name, starting_bet=starting_bet, final_bet=current_bet,
             min_bet_verified=False, attempts=attempts, strategy_sequence=strategy_sequence,
             aborted_reason="MAX_ATTEMPTS", outcome="aborted",
+        ))
+
+    def _select_via_menu(
+        self, device_id, slot_name, episode_id, context, context_provider,
+        starting_bet, strategy_sequence, attempts,
+    ) -> Optional[Result[BetResult]]:
+        """Fallback: puntata piu' bassa dal menu. Ritorna il Result finale se
+        e' riuscito e confermato, None se non ha funzionato (si prosegue con
+        la catena normale, fino all'operatore)."""
+        result = self.menu_selector.select_lowest(device_id, slot_name, context, context_provider)
+        if not result.success:
+            logger.warning("set_min_bet: menu puntata non riuscito (%s): %s", result.error_code, result.error)
+            return None
+        selection = result.data
+        save_autopilot_flag(slot_name, _BET_VIA_MENU_FLAG, True, self.config.slot_memory_dir)
+        logger.info("set_min_bet: puntata minima dal menu: %s EUR (verificata sulla lettura dello schermo)",
+                    selection.final_bet)
+        self._log_step(
+            episode_id, attempts, slot_name, device_id, "menu", None,
+            starting_bet, selection.final_bet, outcome="success", verified=True,
+        )
+        return Result.ok(BetResult(
+            slot_name=slot_name, starting_bet=starting_bet, final_bet=selection.final_bet,
+            min_bet_verified=True, attempts=attempts,
+            strategy_sequence=list(strategy_sequence) + [selection.toggle_strategy, "menu"],
+            aborted_reason=None, outcome="min_bet_confirmed",
         ))
 
     def _close_bet_menu_if_opened(self, device_id: str, context, we_opened_the_menu: bool) -> None:
