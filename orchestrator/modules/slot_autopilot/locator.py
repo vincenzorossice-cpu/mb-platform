@@ -1,4 +1,6 @@
+import dataclasses
 import logging
+import math
 
 from orchestrator.core.result import Result
 from orchestrator.modules.provider_profile.autopilot_memory import save_autopilot_element
@@ -20,6 +22,11 @@ _TRUSTED_STRATEGIES = {"profile", "memory", "hitl"}
 _HITL_OUTCOME_CODES = {"HITL_STOP_REQUESTED", "HITL_SKIPPED", "HITL_HINT_ONLY", "HITL_NO_COORDS"}
 
 
+# Un candidato non fidato piu' vicino di cosi' a un punto scartato e' lo stesso
+# pulsante (un'icona misura ~100 px): non va riprovato.
+REJECT_RADIUS_PX = 120
+
+
 def _within_canvas(x: int, y: int, canvas_bbox: tuple) -> bool:
     x1, y1, x2, y2 = canvas_bbox
     return x1 <= x <= x2 and y1 <= y <= y2
@@ -37,11 +44,19 @@ class ElementLocator:
         self.strategies = strategies
         self.max_consecutive_failures_per_strategy = max_consecutive_failures_per_strategy
         self._failure_counts = {}  # (strategy_name, element_name) -> int consecutivi
+        self._rejected = {}  # element_name -> [(x, y)] tappati con effetto sbagliato
 
-    def locate(self, element_name: str, context: LocateContext) -> Result[LocateCandidate]:
+    def locate(
+        self, element_name: str, context: LocateContext, exclude_strategies: tuple = (),
+    ) -> Result[LocateCandidate]:
         collected = []
         hitl_error_code = None
+        rejected = self._rejected.get(element_name, [])
+        if rejected:
+            context = dataclasses.replace(context, rejected_positions=list(rejected))
         for strategy_name in self._STRATEGY_ORDER:
+            if strategy_name in exclude_strategies:
+                continue
             strategy = self.strategies.get(strategy_name)
             if strategy is None:
                 continue
@@ -63,6 +78,17 @@ class ElementLocator:
                         element_name, strategy_name, candidate.x, candidate.y, context.profile.canvas_bbox,
                     )
                     collected.append(f"{strategy_name}:TARGET_OUTSIDE_CANVAS")
+                    self._failure_counts[key] = self._failure_counts.get(key, 0) + 1
+                    continue
+
+                if strategy_name not in _TRUSTED_STRATEGIES and any(
+                    math.hypot(candidate.x - rx, candidate.y - ry) <= REJECT_RADIUS_PX for rx, ry in rejected
+                ):
+                    logger.warning(
+                        "'%s' via '%s' a (%d,%d) e' vicino a un punto gia' rivelatosi sbagliato: scartato.",
+                        element_name, strategy_name, candidate.x, candidate.y,
+                    )
+                    collected.append(f"{strategy_name}:REJECTED_POSITION")
                     self._failure_counts[key] = self._failure_counts.get(key, 0) + 1
                     continue
 
@@ -95,6 +121,12 @@ class ElementLocator:
     def record_failure(self, strategy_name: str, element_name: str) -> None:
         key = (strategy_name, element_name)
         self._failure_counts[key] = self._failure_counts.get(key, 0) + 1
+
+    def reject_position(self, element_name: str, x: int, y: int) -> None:
+        """Un tap qui ha avuto un effetto sbagliato (es. ha aperto un'altra
+        schermata): per il resto della sessione i candidati non fidati vicini
+        a questo punto non vengono piu' restituiti per questo elemento."""
+        self._rejected.setdefault(element_name, []).append((x, y))
 
     def record_success(self, strategy_name: str, element_name: str) -> None:
         """Da chiamare quando il chiamante ha confermato che il tap sulla

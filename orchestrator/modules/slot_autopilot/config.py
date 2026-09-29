@@ -25,6 +25,12 @@ class AutoPilotConfig:
     # schermo si stabilizza, quindi un tetto piu' alto non rallenta gli spin
     # normali, da' solo piu' pazienza a quelli con un'animazione lunga.
     frame_diff_max_wait_seconds: float = 20.0
+    # Recupero da una schermata aperta per errore: "tornati" = lo schermo e'
+    # uguale a quello prima del tap sbagliato entro questa differenza (piu'
+    # larga della soglia di stabilita': un'animazione di sfondo non deve
+    # impedire di riconoscere lo schermo originale).
+    recovery_return_threshold: float = 0.06
+    max_recovery_attempts: int = 4
     balance_rise_abort_margin: Decimal = Decimal("0.00")
     accounting_tolerance: Decimal = Decimal("0.01")
     enable_gpt_fallback: bool = True
@@ -56,6 +62,10 @@ class AutoPilotConfig:
             return Result.fail("frame_diff_stable_threshold must be >= 0", "CONFIG_INVALID")
         if self.frame_diff_poll_interval <= 0:
             return Result.fail("frame_diff_poll_interval must be > 0", "CONFIG_INVALID")
+        if self.recovery_return_threshold <= 0:
+            return Result.fail("recovery_return_threshold must be > 0", "CONFIG_INVALID")
+        if self.max_recovery_attempts < 1:
+            return Result.fail("max_recovery_attempts must be >= 1", "CONFIG_INVALID")
         if self.frame_diff_max_wait_seconds <= 0:
             return Result.fail("frame_diff_max_wait_seconds must be > 0", "CONFIG_INVALID")
         return Result.ok(self)

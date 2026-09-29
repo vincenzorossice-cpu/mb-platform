@@ -282,3 +282,53 @@ class TestHitlOutcomePropagation:
         result = locator.locate("bet_minus", _context())
         assert not result.success
         assert result.error_code == "ELEMENT_NOT_LOCATABLE"
+
+
+class TestRejectedPositions:
+    def test_untrusted_candidate_near_a_rejected_point_is_discarded_and_counted(self):
+        gpt = _ok_strategy("gpt", x=50, y=2050)
+        locator = ElementLocator({"gpt": gpt})
+        locator.reject_position("bet_minus", 46, 2048)
+
+        result = locator.locate("bet_minus", _context())
+
+        assert not result.success
+        assert locator._failure_counts[("gpt", "bet_minus")] == 1
+
+    def test_far_candidate_is_accepted(self):
+        locator = ElementLocator({"gpt": _ok_strategy("gpt", x=350, y=1765)})
+        locator.reject_position("bet_minus", 46, 2048)
+
+        assert locator.locate("bet_minus", _context()).success
+
+    def test_rejection_is_per_element(self):
+        locator = ElementLocator({"gpt": _ok_strategy("gpt", x=50, y=2050)})
+        locator.reject_position("bet_minus", 46, 2048)
+
+        assert locator.locate("spin", _context()).success
+
+    def test_trusted_sources_are_never_discarded(self):
+        locator = ElementLocator({"memory": _ok_strategy("memory", x=50, y=2050)})
+        locator.reject_position("bet_minus", 46, 2048)
+
+        assert locator.locate("bet_minus", _context()).success
+
+    def test_strategies_receive_the_rejected_points_in_the_context(self):
+        gpt = _ok_strategy("gpt", x=350, y=1765)
+        locator = ElementLocator({"gpt": gpt})
+        locator.reject_position("bet_minus", 46, 2048)
+
+        locator.locate("bet_minus", _context())
+
+        assert gpt.locate.call_args.args[1].rejected_positions == [(46, 2048)]
+
+
+class TestExcludeStrategies:
+    def test_excluded_strategy_is_never_called(self):
+        hitl = _ok_strategy("hitl")
+        locator = ElementLocator({"gpt": _fail_strategy("gpt"), "hitl": hitl})
+
+        result = locator.locate("close_button", _context(), exclude_strategies=("hitl",))
+
+        assert not result.success
+        hitl.locate.assert_not_called()

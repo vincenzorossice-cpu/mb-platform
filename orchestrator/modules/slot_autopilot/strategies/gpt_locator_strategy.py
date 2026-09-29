@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 import tempfile
 
@@ -23,19 +24,43 @@ logger = logging.getLogger(__name__)
 # un cerchietto da ~100 px.
 _COARSE_GRID = (4, 8)
 _FINE_GRID = (6, 6)
+_AVOID_RADIUS_PX = 120  # stesso raggio di ElementLocator.REJECT_RADIUS_PX
 
 # Descrizioni GENERICHE dei nomi elemento del progetto (valide per qualunque
 # slot): senza, GPT riceve solo un identificatore come 'bet_minus'.
 _ELEMENT_DESCRIPTIONS = {
-    "bet_minus": "the minus (-) button that lowers the bet, normally next to the round spin button or the bet amount",
-    "bet_plus": "the plus (+) button that raises the bet, normally next to the round spin button or the bet amount",
+    "bet_minus": (
+        "the minus (-) button that lowers the bet, normally next to the round spin button or the bet amount; "
+        "it may look dimmed when the minimum bet is reached. It is NEVER the 'i' (info) icon, the menu "
+        "(three lines) icon or the stack-of-coins icon"
+    ),
+    "bet_plus": (
+        "the plus (+) button that raises the bet, normally next to the round spin button or the bet amount. "
+        "It is NEVER the 'i' (info) icon or the menu (three lines) icon"
+    ),
     "bet_menu_toggle": "the icon (often a stack of coins) that opens or closes the bet selection menu",
     "spin": "the large round button that starts a spin (usually with circular arrows)",
+    "close_button": (
+        "the X (close) button of a panel or popup that is open on top of the game, usually in a top corner "
+        "of that panel"
+    ),
 }
 
 
 def _describe(element_name: str) -> str:
     return _ELEMENT_DESCRIPTIONS.get(element_name, element_name)
+
+
+def _avoid_note(rejected_positions: list, width: int, height: int) -> str:
+    """Frase per la domanda: punti gia' rivelatisi sbagliati, in frazioni
+    dello schermo (GPT ragiona meglio cosi' che in pixel)."""
+    if not rejected_positions:
+        return ""
+    spots = ", ".join(f"({x / width:.0%} from left, {y / height:.0%} from top)" for x, y in rejected_positions)
+    return (
+        f" IMPORTANT: tapping the icon at {spots} was already tried and it was the WRONG element "
+        "(it opened another screen): do NOT choose it."
+    )
 
 
 class GPTLocatorStrategy(LocatorStrategy):
@@ -52,7 +77,8 @@ class GPTLocatorStrategy(LocatorStrategy):
         candidate_texts = [text for text, _coords, _conf in context.raw_texts]
         questions = {
             "action": choice_question(
-                f"Tap the UI element '{element_name}' ({_describe(element_name)}) if you can see it on screen.",
+                f"Tap the UI element '{element_name}' ({_describe(element_name)}) if you can see it on screen."
+                + _avoid_note(context.rejected_positions, context.screen_width, context.screen_height),
                 {"tap": "Touch the element", "stop": "Element not visible / cannot proceed"},
             ),
             "target": choice_question(
@@ -94,14 +120,14 @@ class GPTLocatorStrategy(LocatorStrategy):
         return Result.ok(LocateCandidate(x=x, y=y, confidence=confidence, strategy_name=self.name))
 
 
-    def _ask_cell(self, element_name: str, image_path: str, labels: list, stage: str):
+    def _ask_cell(self, element_name: str, image_path: str, labels: list, stage: str, note: str = ""):
         """Una domanda Vision con le etichette di griglia come candidati:
         ritorna l'etichetta scelta o None (stop / risposta non valida)."""
         with _PILImage.open(image_path) as img:
             width, height = img.size
         questions = {
             "action": choice_question(
-                f"Tap '{element_name}' ({_describe(element_name)}) if it is visible in this image.",
+                f"Tap '{element_name}' ({_describe(element_name)}) if it is visible in this image." + note,
                 {"tap": "Touch the element", "stop": "Element not visible / cannot proceed"},
             ),
             "target": choice_question(
@@ -131,7 +157,8 @@ class GPTLocatorStrategy(LocatorStrategy):
                 coarse_path = os.path.join(tmp, "coarse.png")
                 coarse = annotate_grid(context.screenshot_path, (0, 0, width, height),
                                        coarse_cols, coarse_rows, coarse_path)
-                label = self._ask_cell(element_name, coarse_path, list(coarse), "coarse")
+                note = _avoid_note(context.rejected_positions, width, height)
+                label = self._ask_cell(element_name, coarse_path, list(coarse), "coarse", note)
                 if label not in coarse:
                     logger.warning("'%s': passo A senza cella valida (%r)", element_name, label)
                     return None
@@ -140,8 +167,18 @@ class GPTLocatorStrategy(LocatorStrategy):
                 box = refinement_box(coarse[label], width / coarse_cols, height / coarse_rows, width, height)
                 fine_path = os.path.join(tmp, "fine.png")
                 fine = annotate_grid(context.screenshot_path, box, fine_cols, fine_rows, fine_path)
-                label_b = self._ask_cell(element_name, fine_path, list(fine), "fine")
-                if label_b not in fine:
+                # Celle fini vicine a un punto gia' rivelatosi sbagliato: non
+                # sono candidati validi.
+                fine_labels = [
+                    name for name, (cx, cy) in fine.items()
+                    if not any(math.hypot(cx - rx, cy - ry) <= _AVOID_RADIUS_PX
+                               for rx, ry in context.rejected_positions)
+                ]
+                if not fine_labels:
+                    logger.warning("'%s': tutte le celle fini sono vicine a punti scartati", element_name)
+                    return None
+                label_b = self._ask_cell(element_name, fine_path, fine_labels, "fine", note)
+                if label_b not in fine_labels:
                     logger.warning("'%s': passo B senza cella valida (%r)", element_name, label_b)
                     return None
                 logger.info("'%s': cella %s -> %s, punto %s", element_name, label, label_b, fine[label_b])

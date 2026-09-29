@@ -21,6 +21,7 @@ from orchestrator.modules.slot_autopilot.strategies.ocr_anchor_strategy import O
 from orchestrator.modules.slot_autopilot.strategies.profile_strategy import ProfileStrategy
 from orchestrator.modules.slot_autopilot.strategies.spatial_heuristic_strategy import SpatialHeuristicStrategy
 from orchestrator.modules.slot_autopilot.strategies.template_strategy import TemplateStrategy
+from orchestrator.modules.slot_autopilot.screen_recovery import ScreenRecovery
 from orchestrator.modules.slot_autopilot.verifier import ActionVerifier
 from orchestrator.modules.slot_ocr.reader import SlotOCRReader
 from orchestrator.modules.step_logger.logger import JSONLStepLogger
@@ -73,6 +74,7 @@ def build_autopilot(args: argparse.Namespace) -> Result[SlotAutoPilot]:
     verifier = ActionVerifier(touch_injector, screen_reader, ocr_reader, config)
     bet_controller = BetController(
         locator, verifier, step_logger, config, menu_selector=BetMenuSelector(locator, verifier),
+        screen_recovery=ScreenRecovery(locator, verifier, config),
     )
     spin_controller = SpinController(locator, verifier, step_logger, config)
 

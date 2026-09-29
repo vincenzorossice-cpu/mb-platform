@@ -7,6 +7,7 @@ from orchestrator.modules.provider_profile.profile import ElementSpec, ProviderP
 from orchestrator.modules.provider_profile.autopilot_memory import load_autopilot_flag, save_autopilot_flag
 from orchestrator.modules.slot_autopilot.bet_controller import BetController
 from orchestrator.modules.slot_autopilot.bet_menu import MenuSelection
+from orchestrator.modules.slot_autopilot.screen_recovery import RecoveryOutcome
 from orchestrator.modules.slot_autopilot.config import AutoPilotConfig
 from orchestrator.modules.slot_autopilot.locator import ElementLocator
 from orchestrator.modules.slot_autopilot.strategies.base import LocateCandidate, LocateContext
@@ -710,3 +711,55 @@ class TestMenuFallback:
 
         assert controller.set_min_bet("dev", "pirots5", "ep", _context_provider()).success
         verifier.verified_tap.assert_called()
+
+
+class TestRecoveryFromUnexpectedScreen:
+    def _run(self, recovery_result, taps):
+        locator = _locator_mock()
+        locator.locate.return_value = _ok_candidate("gpt")
+        verifier = MagicMock()
+        verifier.verified_tap.side_effect = taps
+        recovery = MagicMock()
+        recovery.recover.return_value = recovery_result
+        step_logger = MagicMock()
+        step_logger.log_step.return_value = Result.ok(True)
+        controller = BetController(
+            locator, verifier, step_logger, _config(stable_reads_for_min=1), screen_recovery=recovery,
+        )
+        return controller, locator, recovery
+
+    def test_unexpected_change_rejects_the_point_recovers_and_continues(self):
+        taps = [
+            Result.ok(_tap_outcome(Decimal("0.10"), Decimal("10.0"), False, "unexpected_change")),
+            Result.ok(_tap_outcome(Decimal("0.10"), Decimal("0.05"), True, "success")),
+            Result.ok(_tap_outcome(Decimal("0.05"), Decimal("0.05"), False, "no_effect")),
+        ]
+        controller, locator, recovery = self._run(Result.ok(RecoveryOutcome("ocr_close", 1)), taps)
+
+        result = controller.set_min_bet("dev", "pirots5", "ep", _context_provider(Decimal("0.10")))
+
+        locator.reject_position.assert_called_once_with("bet_minus", 200, 2200)
+        recovery.recover.assert_called_once()
+        assert recovery.recover.call_args.args[1] == "/tmp/a.png"   # screenshot_before del tap sbagliato
+        # la lettura "10.0" della schermata sbagliata NON ha fatto scattare VALUE_ROSE
+        assert result.data.aborted_reason != "VALUE_ROSE"
+        assert result.data.final_bet == Decimal("0.05")
+
+    def test_failed_recovery_stops_without_any_further_tap(self):
+        taps = [Result.ok(_tap_outcome(Decimal("0.10"), Decimal("0.10"), False, "unexpected_change"))]
+        controller, _, _ = self._run(Result.fail("stuck", "RECOVERY_FAILED"), taps)
+
+        result = controller.set_min_bet("dev", "pirots5", "ep", _context_provider(Decimal("0.10")))
+
+        assert result.data.aborted_reason == "STUCK_ON_UNEXPECTED_SCREEN"
+        assert not result.data.min_bet_verified
+        assert controller.verifier.verified_tap.call_count == 1
+
+    def test_no_effect_does_not_trigger_recovery(self):
+        taps = [Result.ok(_tap_outcome(Decimal("0.10"), Decimal("0.10"), False, "no_effect"))] * 5
+        controller, locator, recovery = self._run(Result.ok(RecoveryOutcome("x", 0)), taps)
+
+        controller.set_min_bet("dev", "pirots5", "ep", _context_provider(Decimal("0.10")))
+
+        recovery.recover.assert_not_called()
+        locator.reject_position.assert_not_called()

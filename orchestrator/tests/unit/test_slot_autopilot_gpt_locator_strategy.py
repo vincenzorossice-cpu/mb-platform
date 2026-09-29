@@ -160,3 +160,42 @@ class TestIconRefinement:
 
         assert len(seen) == 2
         assert not any(os.path.exists(path) for path in seen)
+
+
+class TestRejectedPointsAndDescriptions:
+    def test_bet_minus_description_excludes_the_info_icon(self, real_context):
+        gpt_client = MagicMock()
+        gpt_client.ask_with_image.return_value = Result.ok(_answers(action="stop"))
+        GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
+
+        text = gpt_client.ask_with_image.call_args.args[2]["action"]["instructions"]
+        assert "NEVER the 'i'" in text
+
+    def test_close_button_has_a_description(self, real_context):
+        gpt_client = MagicMock()
+        gpt_client.ask_with_image.return_value = Result.ok(_answers(action="stop"))
+        GPTLocatorStrategy(gpt_client).locate("close_button", real_context)
+
+        assert "close" in gpt_client.ask_with_image.call_args.args[2]["action"]["instructions"].lower()
+
+    def test_rejected_points_are_mentioned_in_the_question(self, real_context):
+        real_context.rejected_positions = [(46, 2048)]
+        gpt_client = MagicMock()
+        gpt_client.ask_with_image.return_value = Result.ok(_answers(action="stop"))
+        GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
+
+        text = gpt_client.ask_with_image.call_args.args[2]["action"]["instructions"]
+        assert "WRONG element" in text and "4% from left" in text
+
+    def test_fine_cells_near_a_rejected_point_are_not_offered(self, real_context):
+        # Punto scartato al centro della cella A1 fine: quella cella non e' un candidato.
+        real_context.rejected_positions = [(135, 1350 + 50)]
+        gpt_client = MagicMock()
+        gpt_client.ask_with_image.side_effect = [
+            Result.ok(_answers(target_region="middle-left")), _cell_answer("B6"), _cell_answer("A1"),
+        ]
+        result = GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
+
+        fine_candidates = gpt_client.ask_with_image.call_args_list[2].args[2]["target"]["criteria"]
+        assert "A1" not in fine_candidates and "F6" in fine_candidates
+        assert not result.success   # GPT ha scelto proprio la cella tolta

@@ -9,6 +9,7 @@ from orchestrator.modules.provider_profile.autopilot_memory import load_autopilo
 from orchestrator.modules.slot_autopilot.bet_menu import BetMenuSelector
 from orchestrator.modules.slot_autopilot.config import AutoPilotConfig
 from orchestrator.modules.slot_autopilot.locator import ElementLocator
+from orchestrator.modules.slot_autopilot.screen_recovery import ScreenRecovery
 from orchestrator.modules.slot_autopilot.verifier import ActionVerifier, Expectation
 from orchestrator.modules.step_logger.interface import StepLoggerInterface, StepRecord
 
@@ -41,13 +42,16 @@ class BetController:
 
     def __init__(self, locator: ElementLocator, verifier: ActionVerifier,
                  step_logger: StepLoggerInterface, config: AutoPilotConfig,
-                 menu_selector: Optional[BetMenuSelector] = None):
+                 menu_selector: Optional[BetMenuSelector] = None,
+                 screen_recovery: Optional[ScreenRecovery] = None):
         self.locator = locator
         self.verifier = verifier
         self.step_logger = step_logger
         self.config = config
         # None = il fallback "menu puntata" e' spento (comportamento storico).
         self.menu_selector = menu_selector
+        # None = nessun recupero da schermate aperte per errore (storico).
+        self.screen_recovery = screen_recovery
 
     def set_min_bet(
         self, device_id: str, slot_name: str, episode_id: str,
@@ -171,6 +175,7 @@ class BetController:
             candidate = locate_result.data
             strategy_sequence.append(candidate.strategy_name)
 
+            screenshot_before_tap = None
             if candidate.verified:
                 refreshed_for_hitl = context_provider()
                 new_bet = (
@@ -194,6 +199,7 @@ class BetController:
                         aborted_reason="ELEMENT_NOT_LOCATABLE", outcome="aborted",
                     ))
                 outcome_data = tap_result.data
+                screenshot_before_tap = outcome_data.screenshot_before
                 new_bet = outcome_data.bet_after
                 verified = outcome_data.verified
                 outcome = outcome_data.outcome
@@ -221,6 +227,31 @@ class BetController:
                 (candidate.x, candidate.y), current_bet, new_bet, outcome=outcome,
                 verified=verified,
             )
+
+            if not verified and outcome == "unexpected_change" and screenshot_before_tap is not None:
+                # Il tap ha cambiato lo schermo senza abbassare la puntata:
+                # quasi certamente ha aperto un'altra schermata (info, regole...).
+                # Le letture fatte li' sono spazzatura (es. "10.0" da un testo
+                # della pagina): prima si torna indietro, poi si riprende.
+                self.locator.reject_position(_ELEMENT, candidate.x, candidate.y)
+                if self.screen_recovery is not None:
+                    recovery = self.screen_recovery.recover(
+                        device_id, screenshot_before_tap, (candidate.x, candidate.y), context_provider,
+                    )
+                    if not recovery.success:
+                        logger.error(
+                            "set_min_bet: bloccato su una schermata inattesa, recupero fallito (%s): mi fermo.",
+                            recovery.error_code,
+                        )
+                        return Result.ok(BetResult(
+                            slot_name=slot_name, starting_bet=starting_bet, final_bet=current_bet,
+                            min_bet_verified=False, attempts=attempts, strategy_sequence=strategy_sequence,
+                            aborted_reason="STUCK_ON_UNEXPECTED_SCREEN", outcome="aborted",
+                        ))
+                    refreshed = context_provider()
+                    if refreshed.success:
+                        context = refreshed.data
+                    continue
 
             if new_bet is not None and current_bet is not None and new_bet > current_bet:
                 logger.error("set_min_bet: la puntata e' SALITA (%s -> %s): abort immediato", current_bet, new_bet)

@@ -26,6 +26,9 @@ class LocateContext:
     text_boxes: list = field(default_factory=list)
     slot_ocr_state: dict = field(default_factory=dict)
     profile: Optional[ProviderProfile] = None
+    # Punti (x, y) gia' tappati per questo elemento con un effetto sbagliato
+    # (es. hanno aperto un'altra schermata): riempito dal locator.
+    rejected_positions: list = field(default_factory=list)
 
 
 class LocatorStrategy(ABC):
