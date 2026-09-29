@@ -14,9 +14,9 @@
       "notes": "Confermato da spin rilevato (calo saldo) durante un run reale di test_slot_autonomous.py. Assoluto: (540, 2000) su 1080x2400."
     },
     "bet_menu_toggle": {
-      "norm_x": 0.665741,
-      "norm_y": 0.918718,
-      "notes": "Confermato da GPT-4o-mini Vision: icona che apre/chiude il menu puntata. Assoluto: (719, 2225) su 1080x2400."
+      "norm_x": 0.833333,
+      "norm_y": 0.814212,
+      "notes": "Corretto dopo un run reale: la stima precedente (719,2225), mai verificata con un tap, era una lettura errata di GPT-4o-mini Vision che scambiava l'etichetta non tappabile 'bet_display' (729,2225) per l'icona. Coordinata reale confermata da un tap dell'operatore (HITL) che ha davvero aperto il menu puntata (verificato dal successivo tap riuscito sulla cella 0.20). Assoluto: (900, 2000) su 1080x2400 - stessa riga di 'spin' (barra icone in basso)."
     },
     "exit": {
       "norm_x": 0.872222,
