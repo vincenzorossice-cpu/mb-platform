@@ -324,3 +324,44 @@ class TestValidateScreenConfidence:
         Regression guard per il cambio di fallback richiesto dal fix."""
         elements = [UIElement(text="Qualcos'altro", bounds=[0, 0, 100, 100])]
         assert reader._validate_screen_confidence(elements, "balance_page") == 0.3
+
+
+class TestScreenshotSingleRoundTrip:
+    """Fix velocita': un solo `adb exec-out screencap -p` invece di
+    screencap su /sdcard + pull."""
+
+    def _fake_run(self, payload: bytes):
+        def _run(cmd, stdout=None, **kwargs):
+            if stdout is not None:
+                stdout.write(payload)
+            return MagicMock(returncode=0)
+        return _run
+
+    def test_uses_exec_out_and_returns_the_written_file(self, tmp_path):
+        reader = ScreenReader(adb_timeout=5, screenshot_dir=str(tmp_path))
+        with patch("orchestrator.modules.screen_reader.reader.subprocess.run",
+                   side_effect=self._fake_run(b"\x89PNG-bytes")) as run:
+            result = reader._screenshot("dev1")
+
+        assert result.success
+        with open(result.data, "rb") as f:
+            assert f.read() == b"\x89PNG-bytes"
+        assert run.call_count == 1
+        assert run.call_args[0][0] == ["adb", "-s", "dev1", "exec-out", "screencap", "-p"]
+
+    def test_empty_output_is_a_failure(self, tmp_path):
+        reader = ScreenReader(adb_timeout=5, screenshot_dir=str(tmp_path))
+        with patch("orchestrator.modules.screen_reader.reader.subprocess.run",
+                   side_effect=self._fake_run(b"")):
+            result = reader._screenshot("dev1")
+        assert not result.success
+        assert result.error_code == "ADB_TIMEOUT"
+
+    def test_timeout_is_reported(self, tmp_path):
+        import subprocess
+        reader = ScreenReader(adb_timeout=5, screenshot_dir=str(tmp_path))
+        with patch("orchestrator.modules.screen_reader.reader.subprocess.run",
+                   side_effect=subprocess.TimeoutExpired(cmd="adb", timeout=5)):
+            result = reader._screenshot("dev1")
+        assert not result.success
+        assert result.error_code == "ADB_TIMEOUT"

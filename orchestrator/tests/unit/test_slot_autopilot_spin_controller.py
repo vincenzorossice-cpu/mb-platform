@@ -285,3 +285,35 @@ class TestContextFailureAndRetries:
         assert result.data.outcome == "no_effect"
         assert result.data.attempts == 3
         assert verifier.verified_tap.call_count == 3
+
+
+class TestReuseOfContextForTap:
+    def test_first_tap_reuses_the_context_already_read(self):
+        locator = MagicMock()
+        locator.locate.return_value = _candidate()
+        verifier = MagicMock()
+        verifier.verified_tap.return_value = _tap_outcome(True, balance_after=Decimal("9.90"))
+        controller, _, _, _ = _controller(locator=locator, verifier=verifier)
+        context_result = _context_result(Decimal("10.00"))
+        context_provider = MagicMock(return_value=context_result)
+
+        controller.spin("dev", "pirots5", "ep1", 1, context_provider, True, Decimal("0.10"))
+
+        kwargs = verifier.verified_tap.call_args.kwargs
+        assert kwargs["screenshot_before"] == context_result.data.screenshot_path
+        assert kwargs["state_before"] == context_result.data.slot_ocr_state
+
+    def test_retap_after_a_failed_attempt_rereads_the_screen(self):
+        locator = MagicMock()
+        locator.locate.return_value = _candidate()
+        verifier = MagicMock()
+        verifier.verified_tap.side_effect = [_tap_outcome(False), _tap_outcome(True)]
+        controller, _, _, _ = _controller(locator=locator, verifier=verifier)
+        context_provider = MagicMock(return_value=_context_result(Decimal("10.00")))
+
+        controller.spin("dev", "pirots5", "ep1", 1, context_provider, True, Decimal("0.10"))
+
+        first, second = verifier.verified_tap.call_args_list
+        assert first.kwargs["screenshot_before"] is not None
+        assert second.kwargs["screenshot_before"] is None
+        assert second.kwargs["state_before"] is None

@@ -273,15 +273,14 @@ class ScreenReader(ScreenReaderInterface):
     def _screenshot(self, device_id: str) -> Result[str]:
         try:
             local_path = os.path.join(self.screenshot_dir, f"screen_{device_id}_{int(time.time() * 1000)}.png")  # FIX-BASSA-4
-            subprocess.run(
-                ["adb", "-s", device_id, "shell", "screencap", "-p", "/sdcard/screen.png"],
-                capture_output=True, timeout=self.adb_timeout,
-            )
-            subprocess.run(
-                ["adb", "-s", device_id, "pull", "/sdcard/screen.png", local_path],
-                capture_output=True, timeout=self.adb_timeout,
-            )
-            if not os.path.exists(local_path):
+            # exec-out: un solo round-trip, i byte PNG arrivano direttamente su
+            # stdout (scritto su file binario), senza passare da /sdcard + pull.
+            with open(local_path, "wb") as out:
+                subprocess.run(
+                    ["adb", "-s", device_id, "exec-out", "screencap", "-p"],
+                    stdout=out, stderr=subprocess.PIPE, timeout=self.adb_timeout,
+                )
+            if not os.path.exists(local_path) or os.path.getsize(local_path) == 0:
                 return Result.fail("Screenshot file not created", "ADB_TIMEOUT")
             return Result.ok(local_path)
         except subprocess.TimeoutExpired:

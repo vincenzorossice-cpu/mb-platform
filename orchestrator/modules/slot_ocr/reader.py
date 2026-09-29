@@ -36,6 +36,14 @@ class SlotOCRReader:
         self._ocr = None
         self._last_screenshot_path = None
         self._last_raw_results = None
+        self._region = None
+
+    def set_region(self, region: Optional[tuple]) -> None:
+        """Limita l'OCR a (x1, y1, x2, y2) in pixel assoluti (None = schermo
+        intero). Le coordinate restituite restano assolute."""
+        self._region = tuple(region) if region else None
+        self._last_screenshot_path = None
+        self._last_raw_results = None
 
     def _get_ocr(self):
         if self._ocr is None:
@@ -51,9 +59,29 @@ class SlotOCRReader:
         if screenshot_path == self._last_screenshot_path and self._last_raw_results is not None:
             return self._last_raw_results
         ocr = self._get_ocr()
-        results = ocr.readtext(screenshot_path)
+        if self._region is None:
+            results = ocr.readtext(screenshot_path)
+        else:
+            results = self._readtext_in_region(ocr, screenshot_path)
         self._last_screenshot_path = screenshot_path
         self._last_raw_results = results
+        return results
+
+    def _readtext_in_region(self, ocr, screenshot_path: str):
+        import numpy as np
+        from PIL import Image
+
+        x1, y1, x2, y2 = self._region
+        with Image.open(screenshot_path) as img:
+            width, height = img.size
+            box = (max(0, x1), max(0, y1), min(width, x2), min(height, y2))
+            cropped = np.array(img.convert("RGB").crop(box))
+        offset_x, offset_y = box[0], box[1]
+
+        results = []
+        for bbox, text, conf in ocr.readtext(cropped):
+            shifted = [[int(px) + offset_x, int(py) + offset_y] for px, py in bbox]
+            results.append((shifted, text, conf))
         return results
 
     def read_slot_state(self, screenshot_path: str) -> dict:

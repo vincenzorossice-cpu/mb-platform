@@ -164,6 +164,37 @@ class TestVerifiedTapHappyPaths:
         assert result.data.win_amount is None
 
 
+class TestReuseOfCallerBeforeState:
+    def test_provided_before_state_skips_the_before_screenshot_and_ocr(self, tmp_path):
+        device = FakeSlotDevice(tmp_path, balance=Decimal("10.00"), bet=Decimal("1.00"))
+        device.add_element("spin", 540, 2000, lambda d: setattr(d, "balance", Decimal("9.00")))
+        screen_reader = fake_screen_reader(device)
+        ocr_reader = MagicMock()
+        ocr_reader.read_slot_state.return_value = {"saldo": 9.00, "posta": 1.00, "spin_button_coords": (540, 2000)}
+        verifier = ActionVerifier(fake_touch_injector(device), screen_reader, ocr_reader, _config())
+        before_state = {"saldo": 10.00, "posta": 1.00, "spin_button_coords": (540, 2000)}
+
+        result = verifier.verified_tap(
+            "dev", 540, 2000, Expectation(kind="balance_changed"),
+            screenshot_before=device.screenshot(), state_before=before_state,
+        )
+        assert result.success
+        assert result.data.verified is True
+        assert result.data.balance_before == Decimal("10.0")
+        assert result.data.balance_after == Decimal("9.0")
+        ocr_reader.read_slot_state.assert_called_once()  # solo "after"
+
+    def test_without_before_state_both_reads_still_happen(self, tmp_path):
+        device = FakeSlotDevice(tmp_path, balance=Decimal("10.00"), bet=Decimal("1.00"))
+        screen_reader = fake_screen_reader(device)
+        ocr_reader = MagicMock()
+        ocr_reader.read_slot_state.return_value = {"saldo": 10.00, "posta": 1.00, "spin_button_coords": (540, 2000)}
+        verifier = ActionVerifier(fake_touch_injector(device), screen_reader, ocr_reader, _config())
+
+        verifier.verified_tap("dev", 540, 2000, Expectation(kind="balance_changed"))
+        assert ocr_reader.read_slot_state.call_count == 2
+
+
 class TestVerifiedTapFailurePaths:
     def test_injector_failure_propagates_verbatim_without_second_screenshot(self, tmp_path):
         device = FakeSlotDevice(tmp_path)

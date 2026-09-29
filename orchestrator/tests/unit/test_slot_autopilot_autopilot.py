@@ -75,6 +75,36 @@ class TestPrepare:
         deps["step_logger"].start_episode.assert_called_once()
 
 
+class TestOcrRegionWiring:
+    def _prepare_with(self, profile):
+        deps = _collaborators()
+        deps["profile_loader"].load.return_value = Result.ok(profile)
+        deps["step_logger"].start_episode.return_value = Result.ok("ep-1")
+        SlotAutoPilot(**deps).prepare("dev")
+        return deps["ocr_reader"]
+
+    def test_verified_profile_with_canvas_limits_the_ocr(self):
+        profile = ProviderProfile(
+            slot_name="pirots5", provider="x", screen_width=1080, screen_height=2400,
+            verified=True, canvas_bbox=(0, 247, 1080, 2400),
+        )
+        ocr_reader = self._prepare_with(profile)
+        ocr_reader.set_region.assert_called_once_with((0, 247, 1080, 2400))
+
+    def test_unverified_profile_does_not_limit_the_ocr(self):
+        profile = ProviderProfile(
+            slot_name="pirots5", provider="x", screen_width=1080, screen_height=2400,
+            verified=False, canvas_bbox=(0, 247, 1080, 2400),
+        )
+        self._prepare_with(profile).set_region.assert_not_called()
+
+    def test_profile_without_canvas_does_not_limit_the_ocr(self):
+        profile = ProviderProfile(
+            slot_name="pirots5", provider="x", screen_width=1080, screen_height=2400, verified=True,
+        )
+        self._prepare_with(profile).set_region.assert_not_called()
+
+
 class TestBalanceSummary:
     def _png(self, tmp_path):
         path = str(tmp_path / "shot.png")

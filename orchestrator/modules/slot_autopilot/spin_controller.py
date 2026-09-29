@@ -107,9 +107,15 @@ class SpinController:
                 # richiedere specificamente un calo classificherebbe una
                 # vincita come spin fallito, causando ritap inutili (e
                 # rischiosi) su uno spin gia' riuscito.
+                # Solo al primo tentativo: il context e' fresco (letto in cima a
+                # spin(), locate() non tocca lo schermo). Ai ritap successivi lo
+                # schermo e' cambiato, quindi si rilegge davvero.
+                reuse = attempts == 1
                 tap_result = self.verifier.verified_tap(
                     device_id, candidate.x, candidate.y,
                     Expectation(kind="balance_changed"),
+                    screenshot_before=context.screenshot_path if reuse else None,
+                    state_before=context.slot_ocr_state if reuse else None,
                 )
                 if not tap_result.success:
                     self._log_step(

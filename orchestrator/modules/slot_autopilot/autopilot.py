@@ -65,6 +65,11 @@ class SlotAutoPilot:
             else:
                 self._profile = None
 
+            # La barra del browser non contiene mai testo di gioco: ignorarla
+            # nell'OCR e' un risparmio sicuro (canvas_bbox e' un dato curato).
+            if self._profile is not None and self._profile.verified and self._profile.canvas_bbox is not None:
+                self.ocr_reader.set_region(self._profile.canvas_bbox)
+
             episode_result = self.step_logger.start_episode(self.config.slot_name, device_id)
             if not episode_result.success:
                 return Result.fail(episode_result.error, episode_result.error_code)

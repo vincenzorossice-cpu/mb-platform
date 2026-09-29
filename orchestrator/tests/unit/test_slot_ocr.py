@@ -123,6 +123,55 @@ class TestRawDetectionCache:
         assert boxes_result.data[0].text == "SALDO 114,36"
 
 
+class TestRegion:
+    """Fix velocita': con una regione impostata l'OCR legge solo quella parte,
+    ma le coordinate restano ASSOLUTE (servono ai tap)."""
+
+    def _png(self, tmp_path, size=(400, 600)):
+        from PIL import Image
+        path = tmp_path / "shot.png"
+        Image.new("RGB", size, "white").save(path)
+        return str(path)
+
+    def test_region_crops_the_image_and_shifts_coordinates_back(self, tmp_path):
+        r = _ocr_reader_with([_detection("SALDO 114,36", 10, 20)])
+        r.set_region((0, 100, 400, 600))
+
+        state = r.read_slot_state(self._png(tmp_path))
+
+        passed = r._ocr.readtext.call_args[0][0]
+        assert passed.shape[:2] == (500, 400)  # altezza 600-100, larghezza 400
+        assert state["saldo"] == 114.36
+        assert state["raw_texts"][0][1] == (10, 120)  # y 20 + offset 100
+
+    def test_text_boxes_are_also_absolute(self, tmp_path):
+        r = _ocr_reader_with([_detection("PUNTATA 0.20", 5, 10)])
+        r.set_region((50, 100, 400, 600))
+
+        boxes = r.read_text_boxes(self._png(tmp_path)).data
+        assert boxes[0].bbox == (55, 110, 205, 140)
+
+    def test_no_region_passes_the_path_unchanged(self, tmp_path):
+        r = _ocr_reader_with([_detection("SALDO 114,36", 10, 20)])
+        path = self._png(tmp_path)
+        r.read_slot_state(path)
+        assert r._ocr.readtext.call_args[0][0] == path
+
+    def test_region_larger_than_image_is_clamped(self, tmp_path):
+        r = _ocr_reader_with([])
+        r.set_region((0, 0, 9999, 9999))
+        r.read_slot_state(self._png(tmp_path, size=(100, 200)))
+        assert r._ocr.readtext.call_args[0][0].shape[:2] == (200, 100)
+
+    def test_set_region_invalidates_the_cache(self, tmp_path):
+        r = _ocr_reader_with([_detection("SALDO 1,00", 0, 0)])
+        path = self._png(tmp_path)
+        r.read_slot_state(path)
+        r.set_region((0, 0, 400, 300))
+        r.read_slot_state(path)
+        assert r._ocr.readtext.call_count == 2
+
+
 class TestReExport:
     def test_casino_flow_reexports_same_class(self):
         assert ReExportedSlotOCRReader is SlotOCRReader

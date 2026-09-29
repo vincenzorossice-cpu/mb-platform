@@ -88,22 +88,32 @@ class ActionVerifier:
         self.ocr_reader = ocr_reader
         self.config = config
 
-    def verified_tap(self, device_id: str, x: int, y: int, expectation: Expectation) -> Result[TapOutcome]:
+    def verified_tap(
+        self, device_id: str, x: int, y: int, expectation: Expectation,
+        screenshot_before: Optional[str] = None, state_before: Optional[dict] = None,
+    ) -> Result[TapOutcome]:
         try:
-            return self._verified_tap(device_id, x, y, expectation)
+            return self._verified_tap(device_id, x, y, expectation, screenshot_before, state_before)
         except Exception as exc:
             return Result.fail(f"Unexpected error during verified_tap: {exc}", "VERIFICATION_ERROR")
 
-    def _verified_tap(self, device_id: str, x: int, y: int, expectation: Expectation) -> Result[TapOutcome]:
-        screenshot_before_result = self.screen_reader._screenshot(device_id)
-        if not screenshot_before_result.success:
-            return Result.fail(screenshot_before_result.error, screenshot_before_result.error_code)
-        screenshot_before = screenshot_before_result.data
+    def _verified_tap(
+        self, device_id: str, x: int, y: int, expectation: Expectation,
+        screenshot_before: Optional[str] = None, state_before: Optional[dict] = None,
+    ) -> Result[TapOutcome]:
+        # Se il chiamante ha gia' una lettura fresca dello STESSO schermo (presa
+        # un istante prima, senza nulla in mezzo che lo cambi), riusarla evita
+        # una seconda, costosa passata OCR quasi identica alla prima.
+        if screenshot_before is None or state_before is None:
+            screenshot_before_result = self.screen_reader._screenshot(device_id)
+            if not screenshot_before_result.success:
+                return Result.fail(screenshot_before_result.error, screenshot_before_result.error_code)
+            screenshot_before = screenshot_before_result.data
 
-        try:
-            state_before = self.ocr_reader.read_slot_state(screenshot_before)
-        except Exception as exc:
-            return Result.fail(f"OCR error before tap: {exc}", "VERIFICATION_ERROR")
+            try:
+                state_before = self.ocr_reader.read_slot_state(screenshot_before)
+            except Exception as exc:
+                return Result.fail(f"OCR error before tap: {exc}", "VERIFICATION_ERROR")
 
         logger.info("verified_tap: tap (%d,%d), attesa '%s'", x, y, expectation.kind)
         tap_result = self.touch_injector.tap_coordinates(device_id, x, y)
