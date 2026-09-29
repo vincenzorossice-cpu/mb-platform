@@ -13,6 +13,7 @@ from orchestrator.modules.step_logger.interface import StepLoggerInterface, Step
 logger = logging.getLogger(__name__)
 
 _ELEMENT = "bet_minus"
+_MENU_TOGGLE_ELEMENT = "bet_menu_toggle"
 
 
 @dataclass
@@ -72,6 +73,37 @@ class BetController:
                 min_bet_verified=True, attempts=0, strategy_sequence=[],
                 aborted_reason=None, outcome="unchanged_already_min",
             ))
+
+        we_opened_the_menu = False
+        if (
+            context.profile is not None and context.profile.verified
+            and _ELEMENT not in context.profile.elements
+            and _MENU_TOGGLE_ELEMENT in context.profile.elements
+        ):
+            # Il profilo curato dice che questa slot non ha un pulsante "-"
+            # ma ha un'icona che apre/chiude il menu puntata: apriamolo da
+            # soli, invece di far scoprire la stessa cosa a un umano via
+            # HITL al primo fallimento di locate("bet_minus").
+            logger.info(
+                "set_min_bet: profilo senza '%s' ma con '%s': apro il menu puntata prima di procedere.",
+                _ELEMENT, _MENU_TOGGLE_ELEMENT,
+            )
+            toggle_result = self.locator.locate(_MENU_TOGGLE_ELEMENT, context)
+            if toggle_result.success:
+                toggle_candidate = toggle_result.data
+                toggle_tap = self.verifier.verified_tap(
+                    device_id, toggle_candidate.x, toggle_candidate.y, Expectation(kind="screen_changed"),
+                )
+                we_opened_the_menu = toggle_tap.success and toggle_tap.data.verified
+                logger.info("set_min_bet: apertura menu puntata -> riuscita=%s", we_opened_the_menu)
+                refreshed = context_provider()
+                if refreshed.success:
+                    context = refreshed.data
+            else:
+                logger.warning(
+                    "set_min_bet: '%s' documentato ma non localizzabile (%s): procedo comunque su '%s'.",
+                    _MENU_TOGGLE_ELEMENT, toggle_result.error_code, _ELEMENT,
+                )
 
         lowest_bet_seen = starting_bet
         current_bet = starting_bet
@@ -188,6 +220,22 @@ class BetController:
                 lowest_bet_seen = current_bet
                 any_decrease_seen = True
                 stable_reads = 0
+
+                if trusted_min_bet is not None and current_bet <= trusted_min_bet:
+                    # Il riscontro incrociato col profilo verificato e' gia'
+                    # la prova: chiedere altre stable_reads_for_min letture
+                    # di conferma (spesso via nuovi scambi HITL) sarebbe
+                    # solo spreco, non maggiore sicurezza.
+                    logger.info(
+                        "set_min_bet: puntata scesa al minimo confermato dal profilo (%s <= %s): fermo subito.",
+                        current_bet, trusted_min_bet,
+                    )
+                    self._close_bet_menu_if_opened(device_id, context, we_opened_the_menu)
+                    return Result.ok(BetResult(
+                        slot_name=slot_name, starting_bet=starting_bet, final_bet=current_bet,
+                        min_bet_verified=True, attempts=attempts, strategy_sequence=strategy_sequence,
+                        aborted_reason=None, outcome="min_bet_confirmed",
+                    ))
             elif not verified and not is_trusted and self.locator.is_exhausted(candidate.strategy_name, _ELEMENT):
                 # Questa strategia ha appena esaurito i suoi tentativi: il
                 # prossimo locate() e' garantito saltarla e scendere nella
@@ -219,6 +267,8 @@ class BetController:
                     "set_min_bet: plateau raggiunto (outcome=%s, min_bet_verified=%s, puntata finale=%s)",
                     outcome_label, min_bet_verified, current_bet,
                 )
+                if min_bet_verified:
+                    self._close_bet_menu_if_opened(device_id, context, we_opened_the_menu)
                 return Result.ok(BetResult(
                     slot_name=slot_name, starting_bet=starting_bet, final_bet=current_bet,
                     min_bet_verified=min_bet_verified, attempts=attempts, strategy_sequence=strategy_sequence,
@@ -236,6 +286,23 @@ class BetController:
             min_bet_verified=False, attempts=attempts, strategy_sequence=strategy_sequence,
             aborted_reason="MAX_ATTEMPTS", outcome="aborted",
         ))
+
+    def _close_bet_menu_if_opened(self, device_id: str, context, we_opened_the_menu: bool) -> None:
+        """Richiude il menu puntata solo se e' stato il sistema stesso ad
+        aprirlo: lasciare lo schermo com'era trovato, non bloccante se il
+        tap di richiusura fallisce (solo loggato)."""
+        if not we_opened_the_menu:
+            return
+        toggle_result = self.locator.locate(_MENU_TOGGLE_ELEMENT, context)
+        if not toggle_result.success:
+            logger.warning(
+                "set_min_bet: impossibile richiudere '%s' (%s): lo lascio aperto.",
+                _MENU_TOGGLE_ELEMENT, toggle_result.error_code,
+            )
+            return
+        candidate = toggle_result.data
+        self.verifier.verified_tap(device_id, candidate.x, candidate.y, Expectation(kind="screen_changed"))
+        logger.info("set_min_bet: menu puntata richiuso.")
 
     def _read_bet(self, context) -> Optional[Decimal]:
         value = context.slot_ocr_state.get("posta") if context else None

@@ -393,6 +393,190 @@ class TestSetMinBetWithMockedCollaborators:
         assert result.data.attempts == 3
 
 
+class TestBetMenuToggleFallback:
+    """Quando il profilo curato dice che questa slot non ha un pulsante '-'
+    ma ha un'icona che apre/chiude il menu puntata (es. Pirots5), il sistema
+    deve usarla da solo invece di far scoprire la stessa cosa a un umano via
+    HITL al primo fallimento di locate('bet_minus')."""
+
+    def _profile_without_bet_minus(self, verified=True, known_min_bet=0.20):
+        return ProviderProfile(
+            slot_name="pirots5", provider="hacksaw", screen_width=1080, screen_height=2400,
+            verified=verified, known_min_bet=known_min_bet,
+            elements={"bet_menu_toggle": ElementSpec(name="bet_menu_toggle", norm_x=0.5, norm_y=0.9)},
+        )
+
+    def _context_with_profile(self, profile, bet=Decimal("6.00")):
+        context = LocateContext(
+            device_id="dev", slot_name="pirots5", screenshot_path="/tmp/x.png",
+            screen_width=1080, screen_height=2400, slot_ocr_state={"posta": float(bet)},
+            profile=profile,
+        )
+        return MagicMock(return_value=Result.ok(context))
+
+    def test_opens_menu_proactively_when_profile_has_toggle_but_no_bet_minus(self):
+        profile = self._profile_without_bet_minus()
+        context_provider = self._context_with_profile(profile)
+        locator = _locator_mock()
+        locator.locate.side_effect = [
+            _ok_candidate("profile"),  # bet_menu_toggle
+            _ok_candidate("gpt"),  # bet_minus, riprende normalmente dopo
+        ]
+        verifier = MagicMock()
+        verifier.verified_tap.side_effect = [
+            Result.ok(_tap_outcome(Decimal("6.00"), Decimal("6.00"), True, "success")),  # apertura menu
+            Result.ok(_tap_outcome(Decimal("6.00"), Decimal("6.00"), False, "no_effect")),  # bet_minus
+        ]
+        controller, _ = _controller(locator, verifier, config=_config(max_bet_lower_attempts=1, stable_reads_for_min=100))
+
+        result = controller.set_min_bet("dev", "pirots5", "ep1", context_provider)
+        assert result.success
+        assert locator.locate.call_count == 2
+        assert locator.locate.call_args_list[0].args[0] == "bet_menu_toggle"
+        assert locator.locate.call_args_list[1].args[0] == "bet_minus"
+
+    def test_skips_proactive_open_when_bet_minus_is_documented(self):
+        profile = ProviderProfile(
+            slot_name="pirots5", provider="hacksaw", screen_width=1080, screen_height=2400,
+            verified=True, known_min_bet=0.20,
+            elements={
+                "bet_minus": ElementSpec(name="bet_minus", norm_x=0.1, norm_y=0.9),
+                "bet_menu_toggle": ElementSpec(name="bet_menu_toggle", norm_x=0.5, norm_y=0.9),
+            },
+        )
+        context_provider = self._context_with_profile(profile)
+        locator = _locator_mock()
+        locator.locate.return_value = _ok_candidate("profile")
+        verifier = MagicMock()
+        verifier.verified_tap.return_value = Result.ok(
+            _tap_outcome(Decimal("6.00"), Decimal("6.00"), False, "no_effect")
+        )
+        controller, _ = _controller(locator, verifier, config=_config(max_bet_lower_attempts=1, stable_reads_for_min=100))
+
+        controller.set_min_bet("dev", "pirots5", "ep1", context_provider)
+        assert locator.locate.call_count == 1
+        assert locator.locate.call_args_list[0].args[0] == "bet_minus"
+
+    def test_skips_proactive_open_when_profile_is_not_verified(self):
+        profile = self._profile_without_bet_minus(verified=False)
+        context_provider = self._context_with_profile(profile)
+        locator = _locator_mock()
+        locator.locate.return_value = _ok_candidate("gpt")
+        verifier = MagicMock()
+        verifier.verified_tap.return_value = Result.ok(
+            _tap_outcome(Decimal("6.00"), Decimal("6.00"), False, "no_effect")
+        )
+        controller, _ = _controller(locator, verifier, config=_config(max_bet_lower_attempts=1, stable_reads_for_min=100))
+
+        controller.set_min_bet("dev", "pirots5", "ep1", context_provider)
+        assert locator.locate.call_count == 1
+        assert locator.locate.call_args_list[0].args[0] == "bet_minus"
+
+    def test_proactive_open_failure_does_not_block_the_loop(self):
+        profile = self._profile_without_bet_minus()
+        context_provider = self._context_with_profile(profile)
+        locator = _locator_mock()
+        locator.locate.side_effect = [
+            Result.fail("not found", "ELEMENT_NOT_LOCATABLE"),  # bet_menu_toggle non localizzabile
+            _ok_candidate("gpt"),  # bet_minus prosegue comunque
+        ]
+        verifier = MagicMock()
+        verifier.verified_tap.return_value = Result.ok(
+            _tap_outcome(Decimal("6.00"), Decimal("6.00"), False, "no_effect")
+        )
+        controller, _ = _controller(locator, verifier, config=_config(max_bet_lower_attempts=1, stable_reads_for_min=100))
+
+        result = controller.set_min_bet("dev", "pirots5", "ep1", context_provider)
+        assert result.success
+        assert locator.locate.call_count == 2
+        verifier.verified_tap.assert_called_once()
+
+    def test_stops_immediately_when_a_decrease_lands_exactly_on_the_known_minimum(self):
+        profile = ProviderProfile(
+            slot_name="pirots5", provider="hacksaw", screen_width=1080, screen_height=2400,
+            verified=True, known_min_bet=0.20,
+        )
+        context_provider = self._context_with_profile(profile, bet=Decimal("1.00"))
+        locator = _locator_mock()
+        locator.locate.return_value = _ok_candidate("gpt")
+        verifier = MagicMock()
+        verifier.verified_tap.return_value = Result.ok(
+            _tap_outcome(Decimal("1.00"), Decimal("0.20"), True, "success")
+        )
+        controller, _ = _controller(locator, verifier, config=_config(stable_reads_for_min=3, max_bet_lower_attempts=20))
+
+        result = controller.set_min_bet("dev", "pirots5", "ep1", context_provider)
+        assert result.success
+        assert result.data.outcome == "min_bet_confirmed"
+        assert result.data.min_bet_verified is True
+        assert result.data.attempts == 1
+        assert result.data.final_bet == Decimal("0.20")
+        assert locator.locate.call_count == 1
+
+    def test_does_not_stop_immediately_when_still_above_the_known_minimum(self):
+        profile = ProviderProfile(
+            slot_name="pirots5", provider="hacksaw", screen_width=1080, screen_height=2400,
+            verified=True, known_min_bet=0.20,
+        )
+        context_provider = self._context_with_profile(profile, bet=Decimal("1.00"))
+        locator = _locator_mock()
+        locator.locate.return_value = _ok_candidate("gpt")
+        verifier = MagicMock()
+        verifier.verified_tap.return_value = Result.ok(
+            _tap_outcome(Decimal("1.00"), Decimal("0.50"), True, "success")
+        )
+        controller, _ = _controller(locator, verifier, config=_config(stable_reads_for_min=3, max_bet_lower_attempts=1))
+
+        result = controller.set_min_bet("dev", "pirots5", "ep1", context_provider)
+        assert result.success
+        assert result.data.outcome == "aborted"
+        assert result.data.aborted_reason == "MAX_ATTEMPTS"
+        assert result.data.final_bet == Decimal("0.50")
+
+    def test_closes_the_menu_after_reaching_a_confirmed_minimum_if_it_opened_it(self):
+        profile = self._profile_without_bet_minus()
+        context_provider = self._context_with_profile(profile)
+        locator = _locator_mock()
+        locator.locate.side_effect = [
+            _ok_candidate("profile"),  # apertura
+            _ok_candidate("gpt"),      # bet_minus -> arriva subito al minimo
+            _ok_candidate("profile"),  # richiusura
+        ]
+        verifier = MagicMock()
+        verifier.verified_tap.side_effect = [
+            Result.ok(_tap_outcome(Decimal("6.00"), Decimal("6.00"), True, "success")),
+            Result.ok(_tap_outcome(Decimal("6.00"), Decimal("0.20"), True, "success")),
+            Result.ok(_tap_outcome(Decimal("0.20"), Decimal("0.20"), True, "success")),
+        ]
+        controller, _ = _controller(locator, verifier)
+
+        result = controller.set_min_bet("dev", "pirots5", "ep1", context_provider)
+        assert result.success
+        assert result.data.outcome == "min_bet_confirmed"
+        assert locator.locate.call_count == 3
+        assert locator.locate.call_args_list[2].args[0] == "bet_menu_toggle"
+        assert verifier.verified_tap.call_count == 3
+
+    def test_does_not_attempt_to_close_when_it_never_opened_the_menu(self):
+        profile = ProviderProfile(
+            slot_name="pirots5", provider="hacksaw", screen_width=1080, screen_height=2400,
+            verified=True, known_min_bet=0.20,
+            elements={"bet_minus": ElementSpec(name="bet_minus", norm_x=0.1, norm_y=0.9)},
+        )
+        context_provider = self._context_with_profile(profile, bet=Decimal("1.00"))
+        locator = _locator_mock()
+        locator.locate.return_value = _ok_candidate("profile")
+        verifier = MagicMock()
+        verifier.verified_tap.return_value = Result.ok(
+            _tap_outcome(Decimal("1.00"), Decimal("0.20"), True, "success")
+        )
+        controller, _ = _controller(locator, verifier)
+
+        result = controller.set_min_bet("dev", "pirots5", "ep1", context_provider)
+        assert result.success
+        assert locator.locate.call_count == 1
+
+
 class TestEndToEndWithFakeSlotDevice:
     def test_converges_to_true_minimum(self, tmp_path):
         device = FakeSlotDevice(tmp_path, balance=Decimal("10.00"), bet=Decimal("1.00"))
