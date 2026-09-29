@@ -174,6 +174,42 @@ class TestParseOperatorDescription:
         assert parse_operator_description("le monete impilate col piu' in cima", [], 1080, 2400) is None
         assert parse_operator_description("boh non saprei", [], 1080, 2400) is None
 
+    def test_mentioned_value_present_on_screen_resolves_directly(self):
+        """Bug reale: in un menu puntata a griglia (es. Pirots5, tabella 4x3)
+        l'operatore identifica la cella per il suo VALORE, non per una
+        posizione relativa o una regione - "quella con scritto 0.20" deve
+        tappare esattamente dove l'OCR ha letto quel valore."""
+        raw_texts = [
+            _text("€ 6.00", 375, 875),
+            _text("€ 0.20", 227, 691),
+            _text("€ 2.00", 375, 691),
+        ]
+        assert parse_operator_description(
+            "quella con scritto 0.20", raw_texts, 1080, 2400,
+        ) == (227, 691)
+
+    def test_mentioned_value_with_comma_matches_dot_formatted_ocr_text(self):
+        raw_texts = [_text("€ 0.20", 227, 691)]
+        assert parse_operator_description(
+            "il riquadro da 0,20 euro", raw_texts, 1080, 2400,
+        ) == (227, 691)
+
+    def test_mentioned_value_absent_from_screen_does_not_force_a_match(self):
+        raw_texts = [_text("€ 6.00", 375, 875)]
+        assert parse_operator_description("quella con scritto 0.20", raw_texts, 1080, 2400) is None
+
+    def test_relative_phrase_still_wins_over_mentioned_value(self):
+        """Nessuna regressione sull'ordine: una frase relativa risolvibile
+        resta piu' specifica e vince prima di provare la nuova strategia,
+        anche se la descrizione contiene anche un valore numerico."""
+        raw_texts = [_text("PUNTATA", 500, 600), _text("€ 0.20", 227, 691)]
+        assert parse_operator_description("sopra PUNTATA", raw_texts, 1080, 2400) == (500, 500)
+
+    def test_grid_region_still_works_when_no_value_is_mentioned(self):
+        assert parse_operator_description("in basso a destra", [], 1080, 2400) == region_to_point(
+            "bottom-right", 1080, 2400,
+        )
+
 
 class TestHandleHitlEscalation:
     """handle_hitl_escalation non riceve mai un riferimento al Decision

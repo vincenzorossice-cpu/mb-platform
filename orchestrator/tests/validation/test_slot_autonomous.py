@@ -239,6 +239,43 @@ def _keyword_region(description: str) -> Optional[str]:
     return None
 
 
+def _extract_numeric_value(text: str) -> Optional[float]:
+    """Stessa euristica "ultimo separatore vince" gia' usata altrove nel
+    progetto per importi OCR (es. SlotOCRReader._extract_amount), riprodotta
+    qui senza un nuovo import per confrontare un valore citato dall'operatore
+    con i testi letti dallo schermo."""
+    match = re.search(r'(\d[\d.,]*\d|\d)', text)
+    if not match:
+        return None
+    clean = match.group(1)
+    last_comma = clean.rfind(',')
+    last_dot = clean.rfind('.')
+    if last_comma > last_dot:
+        return float(clean.replace('.', '').replace(',', '.'))
+    elif last_dot > last_comma:
+        return float(clean.replace(',', ''))
+    elif ',' in clean:
+        return float(clean.replace(',', '.'))
+    return float(clean)
+
+
+def _find_coords_by_mentioned_value(description: str, raw_texts: list) -> Optional[tuple]:
+    """Se la descrizione cita un valore numerico (es. "quella con scritto
+    0.20", "il riquadro da 0,20 euro"), cerca tra i testi OCR quello il cui
+    valore estratto corrisponde, e ritorna le sue coordinate esatte.
+    Generico: nessuna etichetta o struttura di slot specifica - funziona per
+    qualunque importo scritto sullo schermo (bottoni puntata, tabelle di
+    selezione, ecc.), non solo per menu gia' noti."""
+    target = _extract_numeric_value(description)
+    if target is None:
+        return None
+    for text, (x, y), _conf in raw_texts:
+        value = _extract_numeric_value(text)
+        if value is not None and abs(value - target) < 0.001:
+            return (x, y)
+    return None
+
+
 def parse_operator_description(
     description: str, raw_texts: list, width: int, height: int,
 ) -> Optional[tuple]:
@@ -250,7 +287,12 @@ def parse_operator_description(
        destra di PUNTATA", "vicino a X"): l'etichetta viene cercata tra i
        testi OCR (stesso fuzzy-match di resolve_target) e si applica uno
        scostamento fisso generico nella direzione indicata.
-    2. Regione grossolana a griglia 3x3 ("in basso a destra", "al centro"):
+    2. Valore numerico citato e realmente presente a schermo ("quella con
+       scritto 0.20"): cerca quel valore tra i testi OCR e tappa li'
+       direttamente — utile per menu di selezione (es. puntata) dove
+       l'operatore identifica la cella per il suo contenuto, non per la sua
+       posizione relativa a qualcos'altro.
+    3. Regione grossolana a griglia 3x3 ("in basso a destra", "al centro"):
        tradotta geometricamente con region_to_point, nessuna coordinata
        hardcoded per slot.
 
@@ -270,6 +312,10 @@ def parse_operator_description(
         x = min(max(x + dx_sign * _RELATIVE_OFFSET_PX, 0), width)
         y = min(max(y + dy_sign * _RELATIVE_OFFSET_PX, 0), height)
         return (x, y)
+
+    value_coords = _find_coords_by_mentioned_value(description, raw_texts)
+    if value_coords is not None:
+        return value_coords
 
     region = _keyword_region(description)
     if region is not None:
