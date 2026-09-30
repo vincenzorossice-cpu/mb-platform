@@ -31,6 +31,11 @@ class AutoPilotConfig:
     # impedire di riconoscere lo schermo originale).
     recovery_return_threshold: float = 0.06
     max_recovery_attempts: int = 4
+    # Discesa della puntata: dopo 2 discese verificate di fila con la stessa
+    # coordinata fidata si tocca a raffica (N-1 tocchi ciechi + 1 verificato).
+    # 1 = nessuna raffica. Il minimo e' un pavimento: non si puo' "passarlo".
+    bet_burst_taps: int = 4
+    bet_burst_interval_seconds: float = 0.6
     balance_rise_abort_margin: Decimal = Decimal("0.00")
     accounting_tolerance: Decimal = Decimal("0.01")
     enable_gpt_fallback: bool = True
@@ -66,6 +71,10 @@ class AutoPilotConfig:
             return Result.fail("recovery_return_threshold must be > 0", "CONFIG_INVALID")
         if self.max_recovery_attempts < 1:
             return Result.fail("max_recovery_attempts must be >= 1", "CONFIG_INVALID")
+        if self.bet_burst_taps < 1:
+            return Result.fail("bet_burst_taps must be >= 1", "CONFIG_INVALID")
+        if self.bet_burst_interval_seconds < 0:
+            return Result.fail("bet_burst_interval_seconds must be >= 0", "CONFIG_INVALID")
         if self.frame_diff_max_wait_seconds <= 0:
             return Result.fail("frame_diff_max_wait_seconds must be > 0", "CONFIG_INVALID")
         return Result.ok(self)

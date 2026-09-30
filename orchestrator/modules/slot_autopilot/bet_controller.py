@@ -1,4 +1,6 @@
+import dataclasses
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -143,9 +145,11 @@ class BetController:
         any_decrease_seen = False
         strategy_sequence = []
         attempts = 0
+        consecutive_decreases = 0  # discese verificate di fila (abilita la raffica)
 
         while attempts < self.config.max_bet_lower_attempts:
             attempts += 1
+            outcome_data = None
             locate_result = self.locator.locate(_ELEMENT, context)
             if not locate_result.success:
                 if locate_result.error_code == "HITL_STOP_REQUESTED":
@@ -192,8 +196,19 @@ class BetController:
                 verified = True
                 outcome = "success"
             else:
+                # Raffica: il "-" ha gia' funzionato 2 volte di fila da una
+                # fonte fidata; il minimo e' un pavimento (non si puo' passarlo),
+                # quindi N-1 tocchi ciechi e UN solo tocco verificato, il cui
+                # "prima" e' lo schermo precedente alla raffica.
+                if (
+                    self.config.bet_burst_taps > 1 and consecutive_decreases >= 2
+                    and current_bet is not None and self.locator.is_trusted_strategy(candidate.strategy_name)
+                ):
+                    self._blind_taps(device_id, candidate.x, candidate.y, self.config.bet_burst_taps - 1)
+                # Il "prima" e' lo schermo gia' letto nel contesto: niente OCR in piu'.
                 tap_result = self.verifier.verified_tap(
                     device_id, candidate.x, candidate.y, Expectation(kind="bet_decrease"),
+                    screenshot_before=context.screenshot_path, state_before=context.slot_ocr_state,
                 )
                 if not tap_result.success:
                     self._log_step(
@@ -261,6 +276,7 @@ class BetController:
                         # Provato: il tocco aveva cambiato lo schermo e abbiamo
                         # dovuto annullarlo: non riproporlo mai piu' su questa slot.
                         self.locator.remember_rejected(slot_name, _ELEMENT, candidate.x, candidate.y)
+                    consecutive_decreases = 0
                     refreshed = context_provider()
                     if refreshed.success:
                         context = refreshed.data
@@ -284,6 +300,7 @@ class BetController:
                 lowest_bet_seen = current_bet
                 any_decrease_seen = True
                 stable_reads = 0
+                consecutive_decreases += 1
 
                 if trusted_min_bet is not None and current_bet <= trusted_min_bet:
                     # Il riscontro incrociato col profilo verificato e' gia'
@@ -301,6 +318,7 @@ class BetController:
                         aborted_reason=None, outcome="min_bet_confirmed",
                     ))
             elif not verified and not is_trusted and self.locator.is_exhausted(candidate.strategy_name, _ELEMENT):
+                consecutive_decreases = 0
                 # Questa strategia ha appena esaurito i suoi tentativi: il
                 # prossimo locate() e' garantito saltarla e scendere nella
                 # catena (es. verso hitl). Un tap a vuoto da una strategia
@@ -339,6 +357,7 @@ class BetController:
                 continue
             else:
                 stable_reads += 1
+                consecutive_decreases = 0
 
             if stable_reads >= self.config.stable_reads_for_min:
                 already_at_known_min = (
@@ -360,9 +379,24 @@ class BetController:
                     outcome=outcome_label,
                 ))
 
-            refreshed = context_provider()
-            if refreshed.success:
-                context = refreshed.data
+            reusable = (
+                outcome_data is not None and outcome_data.state_after is not None
+                and outcome_data.screenshot_after and outcome_data.outcome in ("success", "no_effect")
+                and self.locator.is_trusted_strategy(candidate.strategy_name)
+            )
+            if reusable:
+                # Lo schermo dopo il tocco e' gia' stato letto per verificarlo e
+                # la prossima ricerca e' da fonte fidata (coordinata nota): niente
+                # OCR in piu' (era ~10 s per ogni discesa).
+                context = dataclasses.replace(
+                    context, screenshot_path=outcome_data.screenshot_after,
+                    slot_ocr_state=outcome_data.state_after,
+                    raw_texts=outcome_data.state_after.get("raw_texts", []), text_boxes=[],
+                )
+            else:
+                refreshed = context_provider()
+                if refreshed.success:
+                    context = refreshed.data
 
         logger.warning("set_min_bet: tentativi esauriti (%d) senza plateau", attempts)
         self._close_bet_menu_if_opened(device_id, context, we_opened_the_menu)
@@ -371,6 +405,13 @@ class BetController:
             min_bet_verified=False, attempts=attempts, strategy_sequence=strategy_sequence,
             aborted_reason="MAX_ATTEMPTS", outcome="aborted",
         ))
+
+    def _blind_taps(self, device_id: str, x: int, y: int, count: int) -> None:
+        """Tocchi consecutivi sulla stessa coordinata senza verificare ciascuno."""
+        logger.info("set_min_bet: raffica di %d tocchi a (%d,%d) prima della verifica", count + 1, x, y)
+        for _ in range(count):
+            self.verifier.touch_injector.tap_coordinates(device_id, x, y)
+            time.sleep(self.config.bet_burst_interval_seconds)
 
     def _select_via_menu(
         self, device_id, slot_name, episode_id, context, context_provider,

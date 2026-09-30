@@ -147,6 +147,16 @@ class TestVerifiedTapHappyPaths:
         assert result.success
         assert result.data.win_amount == Decimal("0.45")
 
+    def test_state_after_is_exposed_so_callers_can_skip_a_new_ocr(self, tmp_path):
+        device = FakeSlotDevice(tmp_path, balance=Decimal("10.00"), bet=Decimal("0.20"))
+        device.add_element("spin", 540, 2000, lambda d: setattr(d, "balance", d.balance - Decimal("0.20")))
+        verifier = _verifier_for(device)
+
+        result = verifier.verified_tap("dev", 540, 2000, Expectation(kind="balance_changed"))
+
+        assert result.data.state_after is not None
+        assert result.data.state_after["saldo"] == 9.80
+
     def test_win_amount_none_when_not_detected(self, tmp_path):
         device = FakeSlotDevice(tmp_path)
         screen_reader = fake_screen_reader(device)

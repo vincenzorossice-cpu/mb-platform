@@ -26,6 +26,7 @@ def _config(**overrides) -> AutoPilotConfig:
         device_id="dev", slot_name="pirots5", target_played_amount=Decimal("30.00"),
         stable_reads_for_min=3, max_bet_lower_attempts=20,
         frame_diff_poll_interval=0.01, frame_diff_max_wait_seconds=1.0,
+        bet_burst_taps=1, bet_burst_interval_seconds=0.0,   # raffica spenta di default: ogni test la accende se serve
     )
     defaults.update(overrides)
     return AutoPilotConfig(**defaults)
@@ -893,3 +894,99 @@ class TestSteppersMenuFlow:
 
         assert result.data.min_bet_verified
         selector.select_lowest.assert_called_once()    # prima di qualunque tocco sul "-" esterno
+
+
+def _decrease(before, after, **kw):
+    outcome = _tap_outcome(Decimal(str(before)), Decimal(str(after)), True, "success")
+    outcome.state_after = {"posta": float(after), "saldo": 100.0, "raw_texts": []}
+    outcome.screenshot_after = "/tmp/after.png"
+    return Result.ok(outcome)
+
+
+def _flat(value):
+    outcome = _tap_outcome(Decimal(str(value)), Decimal(str(value)), False, "no_effect")
+    outcome.state_after = {"posta": float(value), "saldo": 100.0, "raw_texts": []}
+    outcome.screenshot_after = "/tmp/after.png"
+    return Result.ok(outcome)
+
+
+class TestFasterDescent:
+    def _controller_for(self, taps, strategy="memory", trusted=True, **config):
+        locator = _locator_mock()
+        locator.locate.return_value = _ok_candidate(strategy)
+        locator.is_trusted_strategy.return_value = trusted
+        verifier = MagicMock()
+        verifier.verified_tap.side_effect = taps
+        controller, step_logger = _controller(locator, verifier, config=_config(**config))
+        return controller, locator, verifier
+
+    def test_the_before_reading_comes_from_the_context_not_from_a_new_ocr(self):
+        controller, _, verifier = self._controller_for([_decrease(2, 1), _flat(1), _flat(1), _flat(1)])
+        provider = _context_provider(Decimal("2.00"))
+
+        controller.set_min_bet("dev", "pirots5", "ep", provider)
+
+        first = verifier.verified_tap.call_args_list[0].kwargs
+        assert first["screenshot_before"] == "/tmp/x.png" and first["state_before"] == {"posta": 2.0}
+
+    def test_a_trusted_tap_outcome_becomes_the_next_context_without_rereading_the_screen(self):
+        controller, _, verifier = self._controller_for([_decrease(2, 1), _flat(1), _flat(1), _flat(1)])
+        provider = _context_provider(Decimal("2.00"))
+
+        controller.set_min_bet("dev", "pirots5", "ep", provider)
+
+        assert provider.call_count == 1      # solo la lettura iniziale: niente OCR tra un tocco e l'altro
+        second = verifier.verified_tap.call_args_list[1].kwargs
+        assert second["screenshot_before"] == "/tmp/after.png" and second["state_before"]["posta"] == 1.0
+
+    def test_an_untrusted_strategy_still_rereads_the_screen(self):
+        controller, _, verifier = self._controller_for(
+            [_decrease(2, 1), _flat(1), _flat(1), _flat(1)], strategy="gpt", trusted=False,
+        )
+        provider = _context_provider(Decimal("2.00"))
+
+        controller.set_min_bet("dev", "pirots5", "ep", provider)
+
+        assert provider.call_count > 1
+
+    def test_burst_after_two_consecutive_decreases_then_one_verified_tap(self, monkeypatch):
+        sleeps = []
+        monkeypatch.setattr("orchestrator.modules.slot_autopilot.bet_controller.time.sleep", sleeps.append)
+        taps = [_decrease(2.0, 1.8), _decrease(1.8, 1.6), _decrease(1.6, 1.0), _flat(1.0), _flat(1.0), _flat(1.0)]
+        controller, _, verifier = self._controller_for(taps, bet_burst_taps=4, bet_burst_interval_seconds=0.5)
+
+        result = controller.set_min_bet("dev", "pirots5", "ep", _context_provider(Decimal("2.00")))
+
+        assert result.data.min_bet_verified and result.data.final_bet == Decimal("1.0")
+        blind = verifier.touch_injector.tap_coordinates.call_args_list
+        # N-1 tocchi ciechi a ogni raffica: una dopo le 2 discese, una ancora perche' la 3a era scesa
+        # (al minimo vero quella raffica non porta a nulla e si torna ai tocchi singoli)
+        assert len(blind) == 6 and sleeps == [0.5] * 6
+        third = verifier.verified_tap.call_args_list[2].kwargs
+        assert third["state_before"]["posta"] == 1.6                  # il "prima" precede la raffica
+        assert verifier.verified_tap.call_count == 6                  # le altre iterazioni restano singole
+
+    def test_no_burst_with_an_untrusted_strategy(self):
+        taps = [_decrease(2.0, 1.8), _decrease(1.8, 1.6), _decrease(1.6, 1.4), _flat(1.4), _flat(1.4), _flat(1.4)]
+        controller, _, verifier = self._controller_for(taps, strategy="gpt", trusted=False, bet_burst_taps=4)
+
+        controller.set_min_bet("dev", "pirots5", "ep", _context_provider(Decimal("2.00")))
+
+        verifier.touch_injector.tap_coordinates.assert_not_called()
+
+    def test_burst_disabled_with_one_tap(self):
+        taps = [_decrease(2.0, 1.8), _decrease(1.8, 1.6), _decrease(1.6, 1.4), _flat(1.4), _flat(1.4), _flat(1.4)]
+        controller, _, verifier = self._controller_for(taps, bet_burst_taps=1)
+
+        controller.set_min_bet("dev", "pirots5", "ep", _context_provider(Decimal("2.00")))
+
+        verifier.touch_injector.tap_coordinates.assert_not_called()
+
+    def test_burst_that_does_not_lower_the_bet_falls_back_to_single_taps(self, monkeypatch):
+        monkeypatch.setattr("orchestrator.modules.slot_autopilot.bet_controller.time.sleep", lambda s: None)
+        taps = [_decrease(2.0, 1.8), _decrease(1.8, 1.6), _flat(1.6), _flat(1.6), _flat(1.6)]
+        controller, _, verifier = self._controller_for(taps, bet_burst_taps=3)
+        controller.set_min_bet("dev", "pirots5", "ep", _context_provider(Decimal("2.00")))
+
+        # dopo la raffica a vuoto i tocchi tornano singoli: 1 sola raffica nonostante i 3 "flat"
+        assert verifier.touch_injector.tap_coordinates.call_count == 2

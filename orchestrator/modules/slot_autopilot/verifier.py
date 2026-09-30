@@ -58,6 +58,9 @@ class TapOutcome:
     # chiamate OCR aggiuntive. Puo' essere None anche dopo una vincita reale
     # se l'OCR non legge l'etichetta "VINCITA" in quel preciso momento.
     win_amount: Optional[Decimal] = None
+    # La lettura OCR completa dopo il tocco (testi inclusi): chi ha bisogno dello
+    # stato dello schermo subito dopo puo' riusarla invece di rifare l'OCR.
+    state_after: Optional[dict] = None
 
 
 def _to_decimal(value) -> Optional[Decimal]:
@@ -171,6 +174,7 @@ class ActionVerifier:
             screen_state_after=classify_screen_state(state_after),
             outcome=outcome,
             win_amount=win_amount,
+            state_after=state_after,
         ))
 
     def _evaluate_expectation(self, expectation: Expectation, diff: float,

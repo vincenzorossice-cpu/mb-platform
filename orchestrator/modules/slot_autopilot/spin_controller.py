@@ -137,6 +137,19 @@ class SpinController:
                 win_amount = tap_result.data.win_amount
                 if tap_result.data.verified:
                     verified = True
+                    self.locator.record_success(candidate.strategy_name, _ELEMENT)
+                    break
+                if not self.locator.is_trusted_strategy(candidate.strategy_name):
+                    # Coordinata indovinata (es. da GPT) che non fa partire lo spin:
+                    # ritoccarla e' inutile e ogni giro costa ~20 s. Si scarta il
+                    # punto (il prossimo giro rilocalizza evitandolo) e si conta il
+                    # fallimento, cosi' dopo qualche errore si scende all'operatore.
+                    self.locator.reject_position(_ELEMENT, candidate.x, candidate.y)
+                    self.locator.record_failure(candidate.strategy_name, _ELEMENT)
+                    logger.warning(
+                        "spin %d: il tocco a (%d,%d) via '%s' non ha effetto: punto scartato.",
+                        spin_index, candidate.x, candidate.y, candidate.strategy_name,
+                    )
                     break
 
         outcome = "success" if verified else "no_effect"

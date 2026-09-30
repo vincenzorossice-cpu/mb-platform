@@ -114,6 +114,45 @@ class TestOpenAIKeyCheck:
         assert real_check_openai_key(MagicMock()).success
 
 
+class TestSpinLoopStopsWithoutEffect:
+    def _autopilot(self, outcomes):
+        from orchestrator.modules.slot_autopilot.bet_controller import BetResult
+        from orchestrator.modules.slot_autopilot.spin_controller import SpinResult
+        from decimal import Decimal
+
+        autopilot = MagicMock()
+        autopilot.prepare.return_value = Result.ok(True)
+        autopilot.set_min_bet.return_value = Result.ok(BetResult(
+            slot_name="s", starting_bet=Decimal("2"), final_bet=Decimal("0.1"), min_bet_verified=True, attempts=1,
+        ))
+        autopilot.get_balance_summary.return_value = (None, None)
+        autopilot.spin.side_effect = [
+            Result.ok(SpinResult(
+                slot_name="s", spin_index=i + 1, bet_amount=Decimal("0.1"), balance_before=None,
+                balance_after=None, win_amount=None, verified=outcome == "success", attempts=1, outcome=outcome,
+            )) for i, outcome in enumerate(outcomes)
+        ]
+        return autopilot
+
+    def test_three_consecutive_no_effect_spins_stop_the_session(self):
+        from orchestrator.scripts.run_autopilot import _run_session
+        autopilot = self._autopilot(["no_effect"] * 10)
+
+        code = _run_session(autopilot, _args(target=30.0, max_steps=50))
+
+        assert code == 1
+        assert autopilot.spin.call_count == 3
+
+    def test_a_successful_spin_resets_the_count(self):
+        from orchestrator.scripts.run_autopilot import _run_session
+        autopilot = self._autopilot(["no_effect", "no_effect", "success", "no_effect", "no_effect", "success"])
+
+        code = _run_session(autopilot, _args(target=0.3, max_steps=6))
+
+        assert code == 0
+        assert autopilot.spin.call_count == 6
+
+
 class TestMain:
     def test_shutdown_called_even_on_keyboard_interrupt(self, monkeypatch):
         autopilot = MagicMock()

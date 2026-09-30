@@ -9,6 +9,7 @@ from PIL import Image
 from orchestrator.core.result import Result
 from orchestrator.modules.slot_autopilot.strategies.base import LocateContext
 from orchestrator.modules.slot_autopilot.strategies.gpt_locator_strategy import GPTLocatorStrategy
+from orchestrator.modules.slot_ocr.reader import OCRBox
 
 
 def _context(raw_texts=None):
@@ -34,17 +35,27 @@ class TestGPTLocatorStrategy:
         raw_texts = [("SPIN", (500, 2000), 0.9)]
         strategy = GPTLocatorStrategy(gpt_client)
 
-        result = strategy.locate("spin", _context(raw_texts))
+        result = strategy.locate("ok_button", _context(raw_texts))
         assert result.success
         assert (result.data.x, result.data.y) == (500, 2000)
         assert result.data.confidence == 0.85
+
+    def test_text_target_is_tapped_at_the_center_of_its_box_not_the_corner(self):
+        gpt_client = MagicMock()
+        gpt_client.ask_with_image.return_value = Result.ok(_answers(target_text="OK"))
+        context = _context([("OK", (500, 2000), 0.9)])
+        context.text_boxes = [OCRBox(text="OK", bbox=(500, 2000, 600, 2040), confidence=0.9)]
+
+        result = GPTLocatorStrategy(gpt_client).locate("ok_button", context)
+
+        assert (result.data.x, result.data.y) == (550, 2020)
 
     def test_stop_action_fails(self):
         gpt_client = MagicMock()
         gpt_client.ask_with_image.return_value = Result.ok(_answers(action="stop"))
         strategy = GPTLocatorStrategy(gpt_client)
 
-        result = strategy.locate("spin", _context())
+        result = strategy.locate("ok_button", _context())
         assert not result.success
         assert result.error_code == "GPT_LOCATOR_NO_TAP"
 
@@ -53,7 +64,7 @@ class TestGPTLocatorStrategy:
         gpt_client.ask_with_image.return_value = Result.fail("API down", "GPT_API_ERROR")
         strategy = GPTLocatorStrategy(gpt_client)
 
-        result = strategy.locate("spin", _context())
+        result = strategy.locate("ok_button", _context())
         assert not result.success
         assert result.error_code == "GPT_API_ERROR"
 
@@ -62,7 +73,7 @@ class TestGPTLocatorStrategy:
         gpt_client.ask_with_image.return_value = Result.ok(_answers(target_text="GHOST"))
         strategy = GPTLocatorStrategy(gpt_client)
 
-        result = strategy.locate("spin", _context(raw_texts=[]))
+        result = strategy.locate("ok_button", _context(raw_texts=[]))
         assert not result.success
         assert result.error_code == "GPT_LOCATOR_UNRESOLVED_TARGET"
 
@@ -122,7 +133,7 @@ class TestIconRefinement:
 
         assert result.success
         assert len(_grid_calls(gpt_client)) == 3
-        assert gpt_client.ask_with_image.call_count == 1
+        gpt_client.ask_with_image.assert_not_called()   # un'icona va diretta alla visione a griglia
         assert (result.data.x, result.data.y) != (180, 1200)   # centro 3x3 "middle-left"
         # A: B6 -> centro (405,1650); riquadro B (135,1350)-(675,1950); B: "C4" (6x6) -> (360,1700);
         # riquadro C (270,1600)-(450,1800) con griglia 4x4 (celle 45x50): "B2" -> (338,1675)
@@ -160,14 +171,27 @@ class TestIconRefinement:
         assert "minus" in _grid_user_text(call).lower()
         assert "A1" in _grid_user_text(call) and "D8" in _grid_user_text(call)
 
-    def test_text_target_resolvable_needs_no_grid_steps(self, real_context):
-        real_context.raw_texts = [("SPIN", (500, 2000), 0.9)]
-        gpt_client = _client(Result.ok(_answers(target_text="SPIN")))
+    def test_non_icon_element_with_a_resolvable_text_needs_no_grid_steps(self, real_context):
+        real_context.raw_texts = [("OK", (500, 2000), 0.9)]
+        gpt_client = _client(Result.ok(_answers(target_text="OK")))
 
-        result = GPTLocatorStrategy(gpt_client).locate("spin", real_context)
+        result = GPTLocatorStrategy(gpt_client).locate("ok_button", real_context)
 
         assert result.success and (result.data.x, result.data.y) == (500, 2000)
         gpt_client.client.chat.completions.create.assert_not_called()
+
+    def test_icon_elements_ignore_ocr_texts_entirely(self, real_context):
+        """Nel log reale GPT aveva scelto il testo 'FAI LE TUE PUNTATE!' come 'spin'."""
+        real_context.raw_texts = [("FAI LE TUE PUNTATE!", (287, 1419), 0.9)]
+        gpt_client = _client(
+            Result.ok(_answers(target_text="FAI LE TUE PUNTATE!")),
+            _cell_answer("B6"), _cell_answer("C4"), _cell_answer("B2"),
+        )
+
+        result = GPTLocatorStrategy(gpt_client).locate("spin", real_context)
+
+        assert (result.data.x, result.data.y) == (338, 1675)
+        gpt_client.ask_with_image.assert_not_called()
 
     @pytest.mark.parametrize("coarse", [
         _cell_answer("ZZ9"), _cell_answer("A1", action="stop"), "not json", json.dumps({"cell": 7}),
@@ -228,25 +252,20 @@ class TestIconRefinement:
 
 
 class TestRejectedPointsAndDescriptions:
-    def test_bet_minus_description_excludes_the_info_icon(self, real_context):
-        gpt_client = _client(Result.ok(_answers(action="stop")))
-        GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
+    def _first_grid_text(self, element, real_context):
+        gpt_client = _client(None, _cell_answer("ZZ9"))
+        GPTLocatorStrategy(gpt_client).locate(element, real_context)
+        return _grid_user_text(_grid_calls(gpt_client)[0])
 
-        text = gpt_client.ask_with_image.call_args.args[2]["action"]["instructions"]
-        assert "NEVER the 'i'" in text
+    def test_bet_minus_description_excludes_the_info_icon(self, real_context):
+        assert "NEVER the 'i'" in self._first_grid_text("bet_minus", real_context)
 
     def test_close_button_has_a_description(self, real_context):
-        gpt_client = _client(Result.ok(_answers(action="stop")))
-        GPTLocatorStrategy(gpt_client).locate("close_button", real_context)
-
-        assert "close" in gpt_client.ask_with_image.call_args.args[2]["action"]["instructions"].lower()
+        assert "close" in self._first_grid_text("close_button", real_context).lower()
 
     def test_rejected_points_are_mentioned_in_the_question(self, real_context):
         real_context.rejected_positions = [(46, 2048)]
-        gpt_client = _client(Result.ok(_answers(action="stop")))
-        GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
-
-        text = gpt_client.ask_with_image.call_args.args[2]["action"]["instructions"]
+        text = self._first_grid_text("bet_minus", real_context)
         assert "WRONG element" in text and "4% from left" in text
 
     def test_rejected_points_are_also_passed_to_the_grid_steps(self, real_context):
@@ -290,30 +309,21 @@ class TestLocateDescribed:
 
 
 class TestCurrentBetHint:
-    def test_bet_minus_question_names_the_current_total_bet_for_multi_row_panels(self, real_context):
+    def _grid_texts(self, element, real_context):
+        gpt_client = _client(None, _cell_answer("B6"), _cell_answer("C4"), _cell_answer("B2"))
+        GPTLocatorStrategy(gpt_client).locate(element, real_context)
+        return [_grid_user_text(call) for call in _grid_calls(gpt_client)]
+
+    def test_bet_minus_names_the_current_total_bet_for_multi_row_panels_in_every_step(self, real_context):
         real_context.slot_ocr_state = {"posta": 2.0}
-        gpt_client = _client(Result.ok(_answers(action="stop")))
-        GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
 
-        text = gpt_client.ask_with_image.call_args.args[2]["action"]["instructions"]
-        assert "2.00" in text and "TOTAL bet" in text
+        texts = self._grid_texts("bet_minus", real_context)
 
-    def test_hint_is_also_given_to_the_grid_steps(self, real_context):
-        real_context.slot_ocr_state = {"posta": 2.0}
-        gpt_client = _client(
-            Result.ok(_answers(target_region="middle-left")), _cell_answer("B6"), _cell_answer("C4"), _cell_answer("B2"),
-        )
-        GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
-
-        assert all("TOTAL bet" in _grid_user_text(call) for call in _grid_calls(gpt_client))
+        assert len(texts) == 3 and all("2.00" in t and "TOTAL bet" in t for t in texts)
 
     def test_no_hint_for_other_elements_or_without_a_bet_reading(self, real_context):
         real_context.slot_ocr_state = {"posta": 2.0}
-        gpt_client = _client(Result.ok(_answers(action="stop")))
-        GPTLocatorStrategy(gpt_client).locate("spin", real_context)
-        assert "TOTAL bet" not in gpt_client.ask_with_image.call_args.args[2]["action"]["instructions"]
+        assert all("TOTAL bet" not in t for t in self._grid_texts("spin", real_context))
 
         real_context.slot_ocr_state = {}
-        gpt_client = _client(Result.ok(_answers(action="stop")))
-        GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
-        assert "TOTAL bet" not in gpt_client.ask_with_image.call_args.args[2]["action"]["instructions"]
+        assert all("TOTAL bet" not in t for t in self._grid_texts("bet_minus", real_context))

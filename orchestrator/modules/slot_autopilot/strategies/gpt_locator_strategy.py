@@ -64,6 +64,16 @@ def _describe(element_name: str) -> str:
     return _ELEMENT_DESCRIPTIONS.get(element_name, element_name)
 
 
+def _text_center(coords: tuple, context: LocateContext) -> tuple:
+    """L'OCR restituisce l'angolo in alto a sinistra del testo: se il riquadro
+    corrispondente e' noto si tocca il suo CENTRO (l'angolo di un testo piccolo
+    e' spesso fuori dal pulsante)."""
+    for box in context.text_boxes:
+        if abs(box.bbox[0] - coords[0]) <= 3 and abs(box.bbox[1] - coords[1]) <= 3:
+            return (round((box.bbox[0] + box.bbox[2]) / 2), round((box.bbox[1] + box.bbox[3]) / 2))
+    return coords
+
+
 def _bet_hint(element_name: str, context: LocateContext) -> str:
     """Per i pulsanti -/+ della puntata: se e' aperto un pannello a piu' righe
     (es. monete per riga, valore moneta, puntata totale) GPT deve scegliere la
@@ -104,6 +114,17 @@ class GPTLocatorStrategy(LocatorStrategy):
         self.gpt_client = gpt_client
 
     def locate(self, element_name: str, context: LocateContext) -> Result[LocateCandidate]:
+        if element_name in _ELEMENT_DESCRIPTIONS:
+            # Elemento "icona" (spin, -, +, menu, chiudi): un testo OCR li' vicino
+            # non e' mai il pulsante (e tappare una scritta, magari sull'angolo,
+            # e' come non fare nulla): si va direttamente alla visione a griglia.
+            coords = self._refine_icon(element_name, context)
+            if coords is None:
+                return Result.fail(
+                    f"GPT could not locate the icon '{element_name}' on the grid", "GPT_LOCATOR_UNRESOLVED_TARGET",
+                )
+            return Result.ok(LocateCandidate(x=coords[0], y=coords[1], confidence=0.8, strategy_name=self.name))
+
         candidate_texts = [text for text, _coords, _conf in context.raw_texts]
         questions = {
             "action": choice_question(
@@ -147,9 +168,8 @@ class GPTLocatorStrategy(LocatorStrategy):
                 f"GPT target could not be resolved for '{element_name}'", "GPT_LOCATOR_UNRESOLVED_TARGET",
             )
 
-        x, y = coords
+        x, y = _text_center(coords, context)
         return Result.ok(LocateCandidate(x=x, y=y, confidence=confidence, strategy_name=self.name))
-
 
     def locate_described(self, description: str, context: LocateContext):
         """(x, y) di un elemento descritto a parole dall'operatore (es. "l'icona

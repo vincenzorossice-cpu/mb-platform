@@ -31,6 +31,9 @@ from orchestrator.modules.touch_injector.injector import TouchInjector
 
 logger = logging.getLogger(__name__)
 
+# Spin senza effetto di fila dopo i quali ci si ferma (invece di consumare --max-steps).
+_MAX_CONSECUTIVE_NO_EFFECT_SPINS = 3
+
 
 def _check_openai_key(gpt_client) -> Result[bool]:
     """Controllo gratuito (elenco modelli, nessun token) che la chiave sia
@@ -138,12 +141,26 @@ def _run_session(autopilot: SlotAutoPilot, args: argparse.Namespace) -> int:
     target = Decimal(str(args.target))
     total_played = Decimal("0.00")
     spin_index = 0
+    consecutive_no_effect = 0
+    stopped_without_effect = False
     while total_played < target and spin_index < args.max_steps:
         spin_index += 1
         spin_result = autopilot.spin(args.device, spin_index)
         if not spin_result.success:
             logger.error("spin() fallito: %s (%s)", spin_result.error, spin_result.error_code)
             return 1
+        if spin_result.data.outcome == "no_effect":
+            consecutive_no_effect += 1
+            if consecutive_no_effect >= _MAX_CONSECUTIVE_NO_EFFECT_SPINS:
+                logger.error(
+                    "%d spin di fila senza effetto: il tasto spin non e' stato trovato. Mi fermo "
+                    "(rilancia: il punto sbagliato viene ricordato solo per la sessione).",
+                    consecutive_no_effect,
+                )
+                stopped_without_effect = True
+                break
+        else:
+            consecutive_no_effect = 0
         if spin_result.data.outcome == "success" and spin_result.data.bet_amount:
             total_played += spin_result.data.bet_amount
             logger.info("Progresso: %s/%s EUR giocati dopo lo spin %d", total_played, target, spin_index)
@@ -159,7 +176,7 @@ def _run_session(autopilot: SlotAutoPilot, args: argparse.Namespace) -> int:
             "Riepilogo: saldo iniziale=%s, saldo finale=%s, netto=%s EUR",
             initial_balance, final_balance, net,
         )
-    return 0
+    return 1 if stopped_without_effect else 0
 
 
 def _parse_args(argv=None) -> argparse.Namespace:

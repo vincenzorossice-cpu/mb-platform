@@ -345,3 +345,45 @@ class TestSpinIsRemembered:
             True, Decimal("0.10"),
         )
         locator.save_verified_candidate.assert_not_called()
+
+
+class TestNoEffectSpinFromGuessedCoordinate:
+    def _run(self, trusted):
+        locator = MagicMock()
+        locator.locate.return_value = _candidate("gpt")
+        locator.is_trusted_strategy.return_value = trusted
+        verifier = MagicMock()
+        verifier.verified_tap.return_value = _tap_outcome(False)
+        controller, _, _, _ = _controller(locator=locator, verifier=verifier)
+        result = controller.spin(
+            "dev", "pirots5", "ep", 1, MagicMock(return_value=_context_result(Decimal("10.00"))),
+            True, Decimal("0.10"),
+        )
+        return result, locator, verifier
+
+    def test_untrusted_point_is_rejected_counted_and_not_retapped(self):
+        result, locator, verifier = self._run(trusted=False)
+
+        assert result.data.outcome == "no_effect" and result.data.attempts == 1
+        assert verifier.verified_tap.call_count == 1
+        locator.reject_position.assert_called_once_with("spin", 540, 2000)
+        locator.record_failure.assert_called_once_with("gpt", "spin")
+
+    def test_trusted_source_keeps_its_retries(self):
+        result, locator, verifier = self._run(trusted=True)
+
+        assert result.data.attempts == 3 and verifier.verified_tap.call_count == 3
+        locator.reject_position.assert_not_called()
+
+    def test_a_verified_spin_resets_the_failure_count(self):
+        locator = MagicMock()
+        locator.locate.return_value = _candidate("gpt")
+        locator.is_trusted_strategy.return_value = False
+        verifier = MagicMock()
+        verifier.verified_tap.return_value = _tap_outcome(True, balance_after=Decimal("9.90"))
+        controller, _, _, _ = _controller(locator=locator, verifier=verifier)
+
+        controller.spin("dev", "pirots5", "ep", 1, MagicMock(return_value=_context_result(Decimal("10.00"))),
+                        True, Decimal("0.10"))
+
+        locator.record_success.assert_called_once_with("gpt", "spin")
