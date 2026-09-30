@@ -82,3 +82,32 @@ class TestAutopilotFlags:
         data = load_autopilot_element_memory("slot_x", str(tmp_path)).data
         assert set(data["elements"]) == {"bet_minus", "spin"}
         assert data["flags"] == {"bet_via_menu": True}
+
+
+class TestRejectedPositionsMemory:
+    def test_roundtrip_and_no_duplicates(self, tmp_path):
+        from orchestrator.modules.provider_profile.autopilot_memory import (
+            load_rejected_positions, save_rejected_position,
+        )
+        save_rejected_position("slot_x", "bet_minus", 46, 2048, str(tmp_path))
+        save_rejected_position("slot_x", "bet_minus", 46, 2048, str(tmp_path))
+        save_rejected_position("slot_x", "bet_menu_toggle", 599, 2115, str(tmp_path))
+
+        assert load_rejected_positions("slot_x", str(tmp_path)) == {
+            "bet_minus": [(46, 2048)], "bet_menu_toggle": [(599, 2115)],
+        }
+        assert load_rejected_positions("slot_y", str(tmp_path)) == {}
+
+    def test_rejected_points_do_not_overwrite_elements_or_flags(self, tmp_path):
+        from orchestrator.modules.provider_profile.autopilot_memory import (
+            load_autopilot_element_memory, save_autopilot_element, save_autopilot_flag, save_rejected_position,
+        )
+        save_autopilot_element("slot_x", "spin", 1, 2, 0.1, 0.2, str(tmp_path))
+        save_autopilot_flag("slot_x", "bet_via_menu", True, str(tmp_path))
+        save_rejected_position("slot_x", "bet_minus", 46, 2048, str(tmp_path))
+        save_autopilot_element("slot_x", "bet_menu_toggle", 3, 4, 0.3, 0.4, str(tmp_path))
+
+        data = load_autopilot_element_memory("slot_x", str(tmp_path)).data
+        assert set(data["elements"]) == {"spin", "bet_menu_toggle"}
+        assert data["flags"] == {"bet_via_menu": True}
+        assert data["rejected"] == {"bet_minus": [[46, 2048]]}

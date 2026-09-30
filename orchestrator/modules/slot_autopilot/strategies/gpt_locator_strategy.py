@@ -21,12 +21,14 @@ from orchestrator.tests.validation.test_slot_autonomous import resolve_target
 logger = logging.getLogger(__name__)
 
 # Griglie di affinamento per le icone senza testo: passo A su tutto lo schermo
-# (celle ~270x300 px), passo B sulla cella scelta (celle ~90x100 px, circa la
-# taglia di un pulsante). Una cella 3x3 (360x800) e' troppo grande per colpire
+# (celle ~270x300 px), passo B sulla cella scelta (celle ~90x100 px), passo C
+# sulla cella B (celle ~34x38 px, sotto la taglia di un pulsante). Una cella 3x3 (360x800) e' troppo grande per colpire
 # un cerchietto da ~100 px.
 _COARSE_GRID = (4, 8)
 _FINE_GRID = (6, 6)
-_AVOID_RADIUS_PX = 120  # stesso raggio di ElementLocator.REJECT_RADIUS_PX
+# Passo C: zoom sulla cella fine scelta, celle ~34x38 px (un tasto "-" misura ~60 px).
+_FINEST_GRID = (4, 4)
+_AVOID_RADIUS_PX = 50  # stesso raggio di ElementLocator.REJECT_RADIUS_PX
 
 # Descrizioni GENERICHE dei nomi elemento del progetto (valide per qualunque
 # slot): senza, GPT riceve solo un identificatore come 'bet_minus'.
@@ -62,6 +64,23 @@ def _describe(element_name: str) -> str:
     return _ELEMENT_DESCRIPTIONS.get(element_name, element_name)
 
 
+def _bet_hint(element_name: str, context: LocateContext) -> str:
+    """Per i pulsanti -/+ della puntata: se e' aperto un pannello a piu' righe
+    (es. monete per riga, valore moneta, puntata totale) GPT deve scegliere la
+    riga della puntata TOTALE, riconoscibile dal fatto che mostra l'importo
+    della puntata corrente letto dallo schermo. Generico, nessun nome di slot."""
+    if element_name not in ("bet_minus", "bet_plus"):
+        return ""
+    posta = context.slot_ocr_state.get("posta") if context.slot_ocr_state else None
+    if posta is None:
+        return ""
+    return (
+        f" The current total bet shown on screen is {float(posta):.2f}. If an open panel has several rows "
+        "with their own -/+ buttons, choose the button of the row whose field shows that TOTAL bet amount, "
+        "not the buttons of the other rows."
+    )
+
+
 def _avoid_note(rejected_positions: list, width: int, height: int) -> str:
     """Frase per la domanda: punti gia' rivelatisi sbagliati, in frazioni
     dello schermo (GPT ragiona meglio cosi' che in pixel)."""
@@ -89,7 +108,8 @@ class GPTLocatorStrategy(LocatorStrategy):
         questions = {
             "action": choice_question(
                 f"Tap the UI element '{element_name}' ({_describe(element_name)}) if you can see it on screen."
-                + _avoid_note(context.rejected_positions, context.screen_width, context.screen_height),
+                + _avoid_note(context.rejected_positions, context.screen_width, context.screen_height)
+                + _bet_hint(element_name, context),
                 {"tap": "Touch the element", "stop": "Element not visible / cannot proceed"},
             ),
             "target": choice_question(
@@ -197,7 +217,7 @@ class GPTLocatorStrategy(LocatorStrategy):
                 coarse_path = os.path.join(tmp, "coarse.png")
                 coarse = annotate_grid(context.screenshot_path, (0, 0, width, height),
                                        coarse_cols, coarse_rows, coarse_path)
-                note = _avoid_note(context.rejected_positions, width, height)
+                note = _avoid_note(context.rejected_positions, width, height) + _bet_hint(element_name, context)
                 label = self._ask_cell(element_name, coarse_path, list(coarse), "coarse", note, description)
                 if label not in coarse:
                     logger.warning("'%s': passo A senza cella valida (%r)", element_name, label)
@@ -221,8 +241,26 @@ class GPTLocatorStrategy(LocatorStrategy):
                 if label_b not in fine_labels:
                     logger.warning("'%s': passo B senza cella valida (%r)", element_name, label_b)
                     return None
-                logger.info("'%s': cella %s -> %s, punto %s", element_name, label, label_b, fine[label_b])
-                return fine[label_b]
+                point = fine[label_b]
+
+                # Passo C: zoom sulla cella B scelta. Se non da' una risposta
+                # valida si tiene il centro della cella B (mai quello della cella grande).
+                finest_cols, finest_rows = _FINEST_GRID
+                fine_cell_w, fine_cell_h = (box[2] - box[0]) / fine_cols, (box[3] - box[1]) / fine_rows
+                box_c = refinement_box(point, fine_cell_w, fine_cell_h, width, height)
+                finest_path = os.path.join(tmp, "finest.png")
+                finest = annotate_grid(context.screenshot_path, box_c, finest_cols, finest_rows, finest_path)
+                label_c = self._ask_cell(element_name, finest_path, list(finest), "finest", note, description)
+                if label_c in finest and not any(
+                    math.hypot(finest[label_c][0] - rx, finest[label_c][1] - ry) <= _AVOID_RADIUS_PX
+                    for rx, ry in context.rejected_positions
+                ):
+                    point = finest[label_c]
+                else:
+                    logger.warning("'%s': passo C senza cella valida (%r), tengo il punto del passo B",
+                                   element_name, label_c)
+                logger.info("'%s': cella %s -> %s -> %s, punto %s", element_name, label, label_b, label_c, point)
+                return point
             except (OSError, ValueError) as exc:
                 logger.warning("'%s': affinamento icona fallito: %s", element_name, exc)
                 return None

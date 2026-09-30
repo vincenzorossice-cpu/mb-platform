@@ -1,5 +1,6 @@
 import logging
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Callable, Optional
 
 from orchestrator.core.result import Result
@@ -16,6 +17,22 @@ _CLOSE_ELEMENT = "close_button"
 # dall'originale (sulla schermata di gioco "Esci" lascerebbe la slot).
 _CLOSE_WORDS = ("X", "×", "✕", "✖", "CHIUDI", "CLOSE")
 _EXIT_WORDS = ("ESCI", "EXIT", "INDIETRO", "BACK")
+
+
+def amounts_match(original_state: Optional[dict], current_state: Optional[dict]) -> bool:
+    """Saldo e puntata letti ora coincidono con quelli di prima? Solo i campi
+    leggibili in entrambi; se nessuno e' confrontabile non si puo' dire che
+    siano diversi. Un cambio di valuta cambia gli importi senza cambiare quasi
+    nessun pixel: il solo diff dell'immagine non lo vede."""
+    if not original_state or not current_state:
+        return True
+    for key in ("posta", "saldo"):
+        before, after = original_state.get(key), current_state.get(key)
+        if before is None or after is None:
+            continue
+        if abs(Decimal(str(before)) - Decimal(str(after))) > Decimal("0.005"):
+            return False
+    return True
 
 
 @dataclass
@@ -39,18 +56,23 @@ class ScreenRecovery:
 
     def recover(
         self, device_id: str, original_screenshot: str, tapped_xy: tuple,
-        context_provider: Callable[[], Result],
+        context_provider: Callable[[], Result], original_state: Optional[dict] = None,
     ) -> Result[RecoveryOutcome]:
+        """`original_state` ({"posta", "saldo"} letti prima del tocco sbagliato),
+        se dato, rende "originale" solo uno schermo con gli stessi importi."""
         try:
-            return self._recover(device_id, original_screenshot, tapped_xy, context_provider)
+            return self._recover(device_id, original_screenshot, tapped_xy, context_provider, original_state)
         except Exception as exc:
             return Result.fail(f"Unexpected error during recovery: {exc}", "RECOVERY_ERROR")
 
-    def _recover(self, device_id, original_screenshot, tapped_xy, context_provider) -> Result[RecoveryOutcome]:
+    def _recover(
+        self, device_id, original_screenshot, tapped_xy, context_provider, original_state=None,
+    ) -> Result[RecoveryOutcome]:
         shot = self.verifier.screen_reader._screenshot(device_id)
         if not shot.success:
             return Result.fail(shot.error, shot.error_code)
-        if self._is_original(original_screenshot, shot.data):
+        pixels_match = self._is_original(original_screenshot, shot.data)
+        if pixels_match and original_state is None:
             logger.info("recovery: lo schermo e' gia' quello originale, nulla da fare.")
             return Result.ok(RecoveryOutcome(method="already_original", attempts=0))
 
@@ -59,9 +81,21 @@ class ScreenRecovery:
             return Result.fail(context_result.error, context_result.error_code)
         context = context_result.data
 
+        soft = False
+        if pixels_match:
+            if amounts_match(original_state, context.slot_ocr_state):
+                logger.info("recovery: schermo e importi gia' quelli originali, nulla da fare.")
+                return Result.ok(RecoveryOutcome(method="already_original", attempts=0))
+            # Pixel quasi uguali ma importi cambiati (es. interruttore di
+            # valuta): ritoccare lo stesso punto e' la prima cosa da provare.
+            soft = True
+            logger.warning("recovery: importi cambiati senza un cambio di schermata (%s -> %s): ritocco il punto.",
+                           {k: original_state.get(k) for k in ("posta", "saldo")},
+                           {k: context.slot_ocr_state.get(k) for k in ("posta", "saldo")})
+
         attempts = 0
         tried = []  # punti gia' tappati in questa recovery
-        for method, point in self._candidates(context, tapped_xy, context_provider):
+        for method, point in self._candidates(context, tapped_xy, context_provider, soft):
             if attempts >= self.config.max_recovery_attempts:
                 break
             if any(abs(point[0] - tx) < 30 and abs(point[1] - ty) < 30 for tx, ty in tried):
@@ -71,8 +105,8 @@ class ScreenRecovery:
             logger.info("recovery: tentativo %d/%d via %s a (%d,%d)", attempts,
                         self.config.max_recovery_attempts, method, point[0], point[1])
             tap = self.verifier.verified_tap(device_id, point[0], point[1], Expectation(kind="screen_changed"))
-            if tap.success and tap.data.screenshot_after and self._is_original(
-                original_screenshot, tap.data.screenshot_after,
+            if tap.success and tap.data.screenshot_after and self._is_restored(
+                original_screenshot, tap.data.screenshot_after, original_state,
             ):
                 logger.info("recovery: schermo originale ripristinato via %s", method)
                 return Result.ok(RecoveryOutcome(method=method, attempts=attempts))
@@ -81,9 +115,11 @@ class ScreenRecovery:
             f"Could not return to the original screen after {attempts} attempts", "RECOVERY_FAILED",
         )
 
-    def _candidates(self, context, tapped_xy, context_provider):
+    def _candidates(self, context, tapped_xy, context_provider, soft=False):
         """Generatore pigro: la ricerca GPT (costosa) parte solo se i tentativi
         precedenti non hanno funzionato."""
+        if soft:
+            yield "retap", tuple(tapped_xy)
         ocr_points = self._ocr_close_points(context)
         for point in ocr_points:
             yield "ocr_close", point
@@ -95,7 +131,8 @@ class ScreenRecovery:
         gpt_point = self._gpt_close_point(context)
         if gpt_point is not None:
             yield "gpt_close", gpt_point
-        yield "retap", tuple(tapped_xy)
+        if not soft:
+            yield "retap", tuple(tapped_xy)
 
     def _ocr_close_points(self, context) -> list:
         def center(box):
@@ -116,3 +153,14 @@ class ScreenRecovery:
     def _is_original(self, original: str, current: str) -> bool:
         diff = diff_score(original, current)
         return diff.success and diff.data < self.config.recovery_return_threshold
+
+    def _is_restored(self, original: str, current: str, original_state: Optional[dict]) -> bool:
+        if not self._is_original(original, current):
+            return False
+        if original_state is None:
+            return True
+        try:
+            state_now = self.verifier.ocr_reader.read_slot_state(current)
+        except Exception:
+            return False
+        return amounts_match(original_state, state_now)

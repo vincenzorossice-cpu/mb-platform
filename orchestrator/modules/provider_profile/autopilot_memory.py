@@ -24,7 +24,7 @@ def load_autopilot_element_memory(slot_name: str, memory_dir: str = "slot_memory
     collisione/perdita di dati con quel file."""
     path = _path(slot_name, memory_dir)
     if not os.path.exists(path):
-        return Result.ok({"elements": {}, "flags": {}})
+        return Result.ok({"elements": {}, "flags": {}, "rejected": {}})
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -32,6 +32,7 @@ def load_autopilot_element_memory(slot_name: str, memory_dir: str = "slot_memory
         return Result.fail(f"Invalid autopilot memory JSON: {exc}", "AUTOPILOT_MEMORY_INVALID_JSON")
     data.setdefault("elements", {})
     data.setdefault("flags", {})
+    data.setdefault("rejected", {})
     return Result.ok(data)
 
 
@@ -79,3 +80,36 @@ def save_autopilot_flag(
 def load_autopilot_flag(slot_name: str, flag_name: str, memory_dir: str = "slot_memory") -> bool:
     result = load_autopilot_element_memory(slot_name, memory_dir)
     return bool(result.success and result.data.get("flags", {}).get(flag_name, False))
+
+
+def save_rejected_position(
+    slot_name: str, element_name: str, x: int, y: int, memory_dir: str = "slot_memory",
+) -> Result[bool]:
+    """Un punto che, toccato per questo elemento, ha provocato un danno (ha
+    aperto un'altra schermata o cambiato modalita') e che non va riproposto in
+    nessuna sessione futura di questa slot."""
+    load_result = load_autopilot_element_memory(slot_name, memory_dir)
+    if not load_result.success:
+        return Result.fail(load_result.error, load_result.error_code)
+    data = load_result.data
+    points = data["rejected"].setdefault(element_name, [])
+    if [x, y] not in points:
+        points.append([x, y])
+    try:
+        os.makedirs(memory_dir, exist_ok=True)
+        with open(_path(slot_name, memory_dir), "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except OSError as exc:
+        return Result.fail(f"Cannot write autopilot memory: {exc}", "AUTOPILOT_MEMORY_WRITE_ERROR")
+    return Result.ok(True)
+
+
+def load_rejected_positions(slot_name: str, memory_dir: str = "slot_memory") -> dict:
+    """{element: [(x, y), ...]} salvati per la slot (vuoto se nessuno/illeggibile)."""
+    result = load_autopilot_element_memory(slot_name, memory_dir)
+    if not result.success:
+        return {}
+    return {
+        element: [(int(x), int(y)) for x, y in points]
+        for element, points in result.data.get("rejected", {}).items()
+    }

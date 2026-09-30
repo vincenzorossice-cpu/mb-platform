@@ -48,6 +48,27 @@ class TestReadSlotStateUnchanged:
         assert state["raw_texts"] == []
 
 
+class TestItalianCreditLabel:
+    """BigBass mostra 'CREDITO', non 'SALDO': senza l'etichetta il saldo non
+    veniva mai letto e ogni spin restava bloccato."""
+
+    def test_credito_label_with_amount_in_the_same_string(self):
+        state = _ocr_reader_with([_detection("CREDITO €99.998,00", 10, 10)]).read_slot_state("/tmp/s.png")
+        assert state["saldo"] == 99998.0
+
+    def test_credito_label_with_amount_in_a_separate_box(self):
+        state = _ocr_reader_with([
+            _detection("CREDITO", 10, 10), _detection("€99.998,00", 200, 12),
+            _detection("PUNTATA", 500, 10), _detection("€0,10", 700, 12),
+        ]).read_slot_state("/tmp/s.png")
+        assert state["saldo"] == 99998.0
+        assert state["posta"] == 0.1
+
+    def test_credit_label(self):
+        state = _ocr_reader_with([_detection("CREDIT 1,250.50", 10, 10)]).read_slot_state("/tmp/s.png")
+        assert state["saldo"] == 1250.5
+
+
 class TestReadTextBoxes:
     def test_bbox_is_true_min_max_of_all_four_points(self):
         """Un quad non assiale: bbox deve essere il min/max reale dei 4 punti,

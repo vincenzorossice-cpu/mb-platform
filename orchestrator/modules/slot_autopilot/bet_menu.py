@@ -22,7 +22,10 @@ _LABEL_WORDS = (
     "VINCITA", "WIN", "DEMO", "TOTALE", "TOTAL",
 )
 _ROW_TOLERANCE_PX = 50
-_MIN_MENU_CELLS = 3
+# Un menu a LISTA di puntate elenca piu' valori selezionabili. Con meno (es. un
+# pannello a righe con pulsanti -/+ che mostra 2-3 importi) non e' una lista:
+# si cambia la puntata con i pulsanti meno/piu'.
+_MIN_MENU_CELLS = 4
 _MAX_PLAUSIBLE_BET = Decimal("100000")
 
 
@@ -60,15 +63,19 @@ def _looks_like_menu(cells: list) -> bool:
 
 
 class BetMenuSelector:
-    """Cambia la puntata dal MENU della slot invece che con un tasto meno:
-    apre il menu (icona tipo monete), legge con l'OCR i valori elencati,
-    tocca il piu' basso, richiude il menu se e' rimasto aperto e conferma che
-    la puntata letta sia quel valore. Il valore piu' basso elencato dal gioco
-    stesso e' per definizione la puntata minima consentita."""
+    """Cambia la puntata dal MENU della slot invece che con un tasto meno
+    sulla schermata principale: apre il menu (icona tipo monete) e, se elenca
+    una LISTA di puntate (4+ importi), legge i valori con l'OCR, tocca il piu'
+    basso, richiude il menu e conferma che la puntata letta sia quel valore (il
+    piu' basso elencato e' per definizione il minimo consentito). Se il menu non
+    e' una lista (es. righe con pulsanti -/+) lo lascia aperto e fallisce con
+    MENU_OPEN_NOT_A_LIST: lo gestisce il chiamante con i pulsanti meno."""
 
-    def __init__(self, locator: ElementLocator, verifier: ActionVerifier):
+    def __init__(self, locator: ElementLocator, verifier: ActionVerifier, screen_recovery=None):
         self.locator = locator
         self.verifier = verifier
+        # Opzionale: senza, un tocco sul bersaglio sbagliato non viene annullato.
+        self.screen_recovery = screen_recovery
 
     def select_lowest(
         self, device_id: str, slot_name: str, context, context_provider: Callable[[], Result],
@@ -83,6 +90,8 @@ class BetMenuSelector:
         if not (toggle_tap.success and toggle_tap.data.verified):
             if not is_trusted:
                 self.locator.record_failure(toggle.strategy_name, _MENU_TOGGLE)
+            if toggle_tap.success and toggle_tap.data.outcome == "unexpected_change":
+                return self._undo_wrong_toggle(device_id, slot_name, toggle, toggle_tap.data, context_provider)
             return Result.fail("Opening the bet menu had no visible effect", "MENU_TOGGLE_NO_EFFECT")
         self.locator.record_success(toggle.strategy_name, _MENU_TOGGLE)
         self.locator.save_verified_candidate(
@@ -94,9 +103,10 @@ class BetMenuSelector:
             return Result.fail("Cannot read the screen after opening the menu", "MENU_CONTEXT_ERROR")
         cells = menu_amounts(opened.text_boxes)
         if not _looks_like_menu(cells):
-            logger.warning("bet menu: aperto ma non leggibile (%d importi isolati): lo richiudo", len(cells))
-            self._close(device_id, toggle)
-            return Result.fail("Bet menu values not readable", "MENU_NOT_READABLE")
+            # Non e' una lista di puntate (es. pannello a righe con -/+): il menu
+            # resta APERTO, il chiamante cambiera' la puntata con i pulsanti meno.
+            logger.info("bet menu: aperto, %d importi isolati: non e' una lista selezionabile, lo lascio aperto", len(cells))
+            return Result.fail("The open menu is not a list of selectable bets", "MENU_OPEN_NOT_A_LIST")
 
         lowest, (cell_x, cell_y) = min(cells, key=lambda item: item[0])
         logger.info("bet menu: valori letti %s, tocco il piu' basso %s a (%d,%d)",
@@ -121,6 +131,27 @@ class BetMenuSelector:
         return Result.ok(MenuSelection(
             final_bet=Decimal(str(bet)), lowest_listed=lowest, toggle_strategy=toggle.strategy_name,
         ))
+
+    def _undo_wrong_toggle(self, device_id, slot_name, toggle, outcome, context_provider) -> Result[MenuSelection]:
+        """Il tocco ha cambiato qualcosa che non e' l'apertura del menu (es. una
+        schermata info o la modalita' di valuta): si scarta il punto e, se
+        possibile, si annulla il cambiamento."""
+        self.locator.reject_position(_MENU_TOGGLE, toggle.x, toggle.y)
+        if self.screen_recovery is None:
+            return Result.fail("The tap changed the screen but did not open the menu", "MENU_TOGGLE_WRONG_TARGET")
+        original_state = {"posta": outcome.bet_before, "saldo": outcome.balance_before}
+        recovery = self.screen_recovery.recover(
+            device_id, outcome.screenshot_before, (toggle.x, toggle.y), context_provider, original_state,
+        )
+        if not recovery.success:
+            return Result.fail(
+                f"The tap hit the wrong element and the screen could not be restored: {recovery.error}",
+                "MENU_STUCK",
+            )
+        if recovery.data.method != "already_original":
+            # Provato: questo tocco aveva cambiato lo schermo e abbiamo dovuto annullarlo.
+            self.locator.remember_rejected(slot_name, _MENU_TOGGLE, toggle.x, toggle.y)
+        return Result.fail("The tap changed the screen but did not open the menu (undone)", "MENU_TOGGLE_WRONG_TARGET")
 
     def _close(self, device_id: str, toggle) -> None:
         self.verifier.verified_tap(device_id, toggle.x, toggle.y, Expectation(kind="screen_changed"))

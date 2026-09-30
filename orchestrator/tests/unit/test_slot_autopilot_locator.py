@@ -332,3 +332,40 @@ class TestExcludeStrategies:
 
         assert not result.success
         hitl.locate.assert_not_called()
+
+
+class TestPersistentRejections:
+    def test_remembered_points_survive_a_new_locator_for_the_same_slot(self, tmp_path):
+        first = ElementLocator({"gpt": _ok_strategy("gpt", x=50, y=2050)}, memory_dir=str(tmp_path))
+        first.remember_rejected("pirots5", "bet_minus", 46, 2048)
+
+        second = ElementLocator({"gpt": _ok_strategy("gpt", x=50, y=2050)}, memory_dir=str(tmp_path))
+        result = second.locate("bet_minus", _context())
+
+        assert not result.success   # il punto era stato scartato in una sessione precedente
+
+    def test_other_slots_are_not_affected(self, tmp_path):
+        ElementLocator({}, memory_dir=str(tmp_path)).remember_rejected("pirots5", "bet_minus", 46, 2048)
+        other = ElementLocator({"gpt": _ok_strategy("gpt", x=50, y=2050)}, memory_dir=str(tmp_path))
+        context = _context()
+        context.slot_name = "bigbass"
+
+        assert other.locate("bet_minus", context).success
+
+    def test_session_rejection_is_not_written_to_disk(self, tmp_path):
+        locator = ElementLocator({}, memory_dir=str(tmp_path))
+        locator.reject_position("bet_minus", 46, 2048)
+
+        assert not list(tmp_path.iterdir())
+
+    def test_without_a_memory_dir_remember_is_session_only(self):
+        locator = ElementLocator({"gpt": _ok_strategy("gpt", x=50, y=2050)})
+        locator.remember_rejected("pirots5", "bet_minus", 46, 2048)
+
+        assert not locator.locate("bet_minus", _context()).success
+
+    def test_a_point_just_outside_the_radius_is_accepted(self):
+        locator = ElementLocator({"gpt": _ok_strategy("gpt", x=46, y=2048 + 60)})
+        locator.reject_position("bet_minus", 46, 2048)
+
+        assert locator.locate("bet_minus", _context()).success

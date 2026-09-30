@@ -42,9 +42,10 @@ def _tap_result(after):
     ))
 
 
-def _recovery(current_shot, tap_afters=(), locator_result=None, config=None):
+def _recovery(current_shot, tap_afters=(), locator_result=None, config=None, states_after=()):
     verifier = MagicMock()
     verifier.screen_reader._screenshot.return_value = Result.ok(current_shot)
+    verifier.ocr_reader.read_slot_state.side_effect = list(states_after)
     verifier.verified_tap.side_effect = [_tap_result(after) for after in tap_afters]
     locator = MagicMock()
     locator.locate.return_value = locator_result or Result.fail("none", "ELEMENT_NOT_LOCATABLE")
@@ -52,8 +53,12 @@ def _recovery(current_shot, tap_afters=(), locator_result=None, config=None):
     return ScreenRecovery(locator, verifier, config), locator, verifier
 
 
-def _provider(boxes=()):
-    return MagicMock(side_effect=lambda: Result.ok(_context(boxes)))
+def _provider(boxes=(), state=None):
+    def make():
+        context = _context(boxes)
+        context.slot_ocr_state = state or {}
+        return Result.ok(context)
+    return MagicMock(side_effect=make)
 
 
 def _taps(verifier):
@@ -134,3 +139,62 @@ class TestRecover:
         recovery.recover("dev", shots["original"], (1000, 300), _provider([_box("X", 1000, 300)]))
 
         assert _taps(verifier) == [(1000, 300)]
+
+
+class TestSoftChangeCurrencySwitch:
+    """Un cambio di valuta cambia gli importi ma quasi nessun pixel."""
+    ORIGINAL = {"posta": Decimal("2.00"), "saldo": Decimal("100000.00")}
+
+    def test_same_pixels_but_different_amounts_is_not_already_original(self, shots):
+        recovery, _, verifier = _recovery(shots["same"], tap_afters=[shots["same"]],
+                                          states_after=[{"posta": 2.0, "saldo": 100000.0}])
+
+        result = recovery.recover(
+            "dev", shots["original"], (599, 2115),
+            _provider(state={"posta": 10.0, "saldo": 500000.0}), self.ORIGINAL,
+        )
+
+        assert result.success and result.data.method == "retap"
+        assert _taps(verifier) == [(599, 2115)]
+
+    def test_retap_comes_first_before_any_close_search(self, shots):
+        recovery, locator, verifier = _recovery(shots["same"], tap_afters=[shots["same"]],
+                                                states_after=[{"posta": 2.0, "saldo": 100000.0}])
+
+        recovery.recover(
+            "dev", shots["original"], (599, 2115),
+            _provider([_box("X", 1000, 300)], state={"posta": 10.0, "saldo": 500000.0}), self.ORIGINAL,
+        )
+
+        assert _taps(verifier)[0] == (599, 2115)
+        locator.locate.assert_not_called()
+
+    def test_retap_that_leaves_the_amounts_changed_does_not_count(self, shots):
+        recovery, _, verifier = _recovery(shots["same"], tap_afters=[shots["same"]],
+                                          states_after=[{"posta": 10.0, "saldo": 500000.0}])
+
+        result = recovery.recover(
+            "dev", shots["original"], (599, 2115),
+            _provider(state={"posta": 10.0, "saldo": 500000.0}), self.ORIGINAL,
+        )
+
+        assert not result.success and result.error_code == "RECOVERY_FAILED"
+
+    def test_same_pixels_and_same_amounts_is_already_original(self, shots):
+        recovery, _, verifier = _recovery(shots["same"])
+
+        result = recovery.recover(
+            "dev", shots["original"], (599, 2115), _provider(state={"posta": 2.0, "saldo": 100000.0}), self.ORIGINAL,
+        )
+
+        assert result.data.method == "already_original"
+        verifier.verified_tap.assert_not_called()
+
+    def test_unreadable_amounts_are_not_compared(self, shots):
+        recovery, _, verifier = _recovery(shots["same"])
+
+        result = recovery.recover(
+            "dev", shots["original"], (1, 1), _provider(state={}), {"posta": None, "saldo": None},
+        )
+
+        assert result.data.method == "already_original"

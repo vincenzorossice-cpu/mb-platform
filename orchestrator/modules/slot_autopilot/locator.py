@@ -3,7 +3,11 @@ import logging
 import math
 
 from orchestrator.core.result import Result
-from orchestrator.modules.provider_profile.autopilot_memory import save_autopilot_element
+from orchestrator.modules.provider_profile.autopilot_memory import (
+    load_rejected_positions,
+    save_autopilot_element,
+    save_rejected_position,
+)
 from orchestrator.modules.slot_autopilot.strategies.base import LocateCandidate, LocateContext
 from orchestrator.modules.slot_autopilot.strategies.memory_strategy import _LEGACY_MEMORY_FIELDS
 from orchestrator.tests.validation.test_slot_autonomous import _persist_slot_memory
@@ -23,8 +27,9 @@ _HITL_OUTCOME_CODES = {"HITL_STOP_REQUESTED", "HITL_SKIPPED", "HITL_HINT_ONLY", 
 
 
 # Un candidato non fidato piu' vicino di cosi' a un punto scartato e' lo stesso
-# pulsante (un'icona misura ~100 px): non va riprovato.
-REJECT_RADIUS_PX = 120
+# pulsante: non va riprovato. Non piu' largo: icone e testi cliccabili stanno
+# a ~60 px l'uno dall'altro, un raggio maggiore scarterebbe anche il bersaglio giusto.
+REJECT_RADIUS_PX = 50
 
 
 def _within_canvas(x: int, y: int, canvas_bbox: tuple) -> bool:
@@ -40,17 +45,23 @@ class ElementLocator:
 
     _STRATEGY_ORDER = ("profile", "memory", "ocr_anchor", "spatial_heuristic", "template", "gpt", "hitl")
 
-    def __init__(self, strategies: dict, max_consecutive_failures_per_strategy: int = 3):
+    def __init__(self, strategies: dict, max_consecutive_failures_per_strategy: int = 3,
+                 memory_dir: str = None):
         self.strategies = strategies
         self.max_consecutive_failures_per_strategy = max_consecutive_failures_per_strategy
         self._failure_counts = {}  # (strategy_name, element_name) -> int consecutivi
         self._rejected = {}  # element_name -> [(x, y)] tappati con effetto sbagliato
+        # Se dato, i punti sbagliati sono ricordati su disco per ogni slot e
+        # ricaricati al primo locate() della slot (vedi remember_rejected).
+        self.memory_dir = memory_dir
+        self._loaded_rejected_slots = set()
 
     def locate(
         self, element_name: str, context: LocateContext, exclude_strategies: tuple = (),
     ) -> Result[LocateCandidate]:
         collected = []
         hitl_error_code = None
+        self._load_persisted_rejections(context.slot_name)
         rejected = self._rejected.get(element_name, [])
         if rejected:
             context = dataclasses.replace(context, rejected_positions=list(rejected))
@@ -127,6 +138,26 @@ class ElementLocator:
         schermata): per il resto della sessione i candidati non fidati vicini
         a questo punto non vengono piu' restituiti per questo elemento."""
         self._rejected.setdefault(element_name, []).append((x, y))
+
+    def remember_rejected(self, slot_name: str, element_name: str, x: int, y: int) -> None:
+        """Come reject_position, ma PER SEMPRE su questa slot (scrive su disco).
+        Da chiamare solo quando e' provato che il tocco era la causa del danno
+        (es. il recupero ha dovuto annullarlo): un'animazione casuale non deve
+        avvelenare la memoria."""
+        self.reject_position(element_name, x, y)
+        if self.memory_dir is None:
+            return
+        result = save_rejected_position(slot_name, element_name, x, y, self.memory_dir)
+        if not result.success:
+            logger.warning("Impossibile salvare il punto scartato: %s", result.error)
+
+    def _load_persisted_rejections(self, slot_name: str) -> None:
+        if self.memory_dir is None or slot_name in self._loaded_rejected_slots:
+            return
+        self._loaded_rejected_slots.add(slot_name)
+        for element_name, points in load_rejected_positions(slot_name, self.memory_dir).items():
+            known = self._rejected.setdefault(element_name, [])
+            known.extend(point for point in points if point not in known)
 
     def record_success(self, strategy_name: str, element_name: str) -> None:
         """Da chiamare quando il chiamante ha confermato che il tap sulla

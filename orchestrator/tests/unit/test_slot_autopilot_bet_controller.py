@@ -424,19 +424,22 @@ class TestBetMenuToggleFallback:
         locator.locate.side_effect = [
             _ok_candidate("profile"),  # bet_menu_toggle
             _ok_candidate("gpt"),  # bet_minus, riprende normalmente dopo
+            _ok_candidate("profile"),  # bet_menu_toggle, per richiudere il menu a fine tentativi
         ]
         verifier = MagicMock()
         verifier.verified_tap.side_effect = [
             Result.ok(_tap_outcome(Decimal("6.00"), Decimal("6.00"), True, "success")),  # apertura menu
             Result.ok(_tap_outcome(Decimal("6.00"), Decimal("6.00"), False, "no_effect")),  # bet_minus
+            Result.ok(_tap_outcome(Decimal("6.00"), Decimal("6.00"), True, "success")),  # chiusura menu
         ]
         controller, _ = _controller(locator, verifier, config=_config(max_bet_lower_attempts=1, stable_reads_for_min=100))
 
         result = controller.set_min_bet("dev", "pirots5", "ep1", context_provider)
         assert result.success
-        assert locator.locate.call_count == 2
+        assert locator.locate.call_count == 3   # toggle, bet_minus, toggle per richiudere il menu
         assert locator.locate.call_args_list[0].args[0] == "bet_menu_toggle"
         assert locator.locate.call_args_list[1].args[0] == "bet_minus"
+        assert locator.locate.call_args_list[2].args[0] == "bet_menu_toggle"
 
     def test_skips_proactive_open_when_bet_minus_is_documented(self):
         profile = ProviderProfile(
@@ -763,3 +766,130 @@ class TestRecoveryFromUnexpectedScreen:
 
         recovery.recover.assert_not_called()
         locator.reject_position.assert_not_called()
+
+
+class TestPermanentRejectionAfterRecovery:
+    def _run(self, method):
+        locator = _locator_mock()
+        locator.locate.return_value = _ok_candidate("gpt")
+        verifier = MagicMock()
+        verifier.verified_tap.side_effect = [
+            Result.ok(_tap_outcome(Decimal("2.00"), Decimal("10.00"), False, "unexpected_change")),
+            Result.ok(_tap_outcome(Decimal("2.00"), Decimal("1.00"), True, "success")),
+            Result.ok(_tap_outcome(Decimal("1.00"), Decimal("1.00"), False, "no_effect")),
+        ]
+        recovery = MagicMock()
+        recovery.recover.return_value = Result.ok(RecoveryOutcome(method, 1))
+        step_logger = MagicMock()
+        step_logger.log_step.return_value = Result.ok(True)
+        controller = BetController(
+            locator, verifier, step_logger, _config(stable_reads_for_min=1), screen_recovery=recovery,
+        )
+        controller.set_min_bet("dev", "pirots5", "ep", _context_provider(Decimal("2.00")))
+        return locator, recovery
+
+    def test_undone_tap_is_remembered_for_good(self):
+        locator, recovery = self._run("retap")
+
+        locator.remember_rejected.assert_called_once_with("pirots5", "bet_minus", 200, 2200)
+        assert recovery.recover.call_args.args[4] == {"posta": Decimal("2.00"), "saldo": Decimal("10.00")}
+
+    def test_nothing_to_undo_is_not_remembered_for_good(self):
+        locator, _ = self._run("already_original")
+
+        locator.remember_rejected.assert_not_called()
+        locator.reject_position.assert_called_once()
+
+
+class TestMenuStuckAborts:
+    def test_a_stuck_menu_attempt_aborts_without_further_taps(self, tmp_path):
+        config = _config(slot_memory_dir=str(tmp_path), max_bet_lower_attempts=6)
+        locator = _locator_mock()
+        locator.locate.return_value = _ok_candidate("gpt")
+        locator.is_exhausted.side_effect = [False, False, True] + [True] * 10
+        verifier = MagicMock()
+        verifier.verified_tap.return_value = Result.ok(_tap_outcome(Decimal("2.00"), Decimal("2.00"), False, "no_effect"))
+        selector = MagicMock()
+        selector.select_lowest.return_value = Result.fail("stuck", "MENU_STUCK")
+        step_logger = MagicMock()
+        step_logger.log_step.return_value = Result.ok(True)
+        controller = BetController(locator, verifier, step_logger, config, menu_selector=selector)
+
+        result = controller.set_min_bet("dev", "pirots5", "ep", _context_provider(Decimal("2.00")))
+
+        assert result.data.aborted_reason == "STUCK_ON_UNEXPECTED_SCREEN"
+        assert verifier.verified_tap.call_count == 3   # nessun tocco dopo il menu
+
+
+class TestSteppersMenuFlow:
+    """Menu a righe con pulsanti -/+ (non una lista): aperto dal selettore, poi
+    il solito ciclo dei pulsanti meno dentro il menu, fino al plateau."""
+
+    def _setup(self, tmp_path):
+        config = _config(slot_memory_dir=str(tmp_path), max_bet_lower_attempts=12, stable_reads_for_min=3)
+        locator = _locator_mock()
+        locator.locate.return_value = _ok_candidate("gpt")
+        locator.is_exhausted.side_effect = [False, False, True] + [False] * 30
+        selector = MagicMock()
+        selector.select_lowest.return_value = Result.fail("not a list", "MENU_OPEN_NOT_A_LIST")
+        step_logger = MagicMock()
+        step_logger.log_step.return_value = Result.ok(True)
+        return locator, selector, step_logger, config
+
+    def test_menu_left_open_continues_with_minus_presses_inside_the_menu(self, tmp_path):
+        locator, selector, step_logger, config = self._setup(tmp_path)
+        verifier = MagicMock()
+        verifier.verified_tap.side_effect = (
+            [Result.ok(_tap_outcome(Decimal("2.00"), Decimal("2.00"), False, "no_effect"))] * 3   # - sulla schermata principale
+            + [Result.ok(_tap_outcome(Decimal("2.00"), Decimal("1.00"), True, "success")),       # - dentro il menu
+               Result.ok(_tap_outcome(Decimal("1.00"), Decimal("0.50"), True, "success")),
+               Result.ok(_tap_outcome(Decimal("0.50"), Decimal("0.50"), False, "no_effect")),
+               Result.ok(_tap_outcome(Decimal("0.50"), Decimal("0.50"), False, "no_effect")),
+               Result.ok(_tap_outcome(Decimal("0.50"), Decimal("0.50"), False, "no_effect")),
+               Result.ok(_tap_outcome(Decimal("0.50"), Decimal("0.50"), True, "success"))]         # chiusura menu
+        )
+        controller = BetController(locator, verifier, step_logger, config, menu_selector=selector)
+
+        result = controller.set_min_bet("dev", "pirots5", "ep", _context_provider(Decimal("2.00")))
+
+        assert result.data.min_bet_verified and result.data.final_bet == Decimal("0.50")
+        selector.select_lowest.assert_called_once()
+        locator.reset_failures.assert_called_with("bet_minus")   # il menu e' un contesto nuovo: GPT riparte da zero
+        assert verifier.verified_tap.call_count == 9   # ...+ richiusura del menu al plateau
+
+    def test_the_menu_route_is_remembered_after_a_verified_minimum(self, tmp_path):
+        locator, selector, step_logger, config = self._setup(tmp_path)
+        verifier = MagicMock()
+        verifier.verified_tap.side_effect = (
+            [Result.ok(_tap_outcome(Decimal("2.00"), Decimal("2.00"), False, "no_effect"))] * 3
+            + [Result.ok(_tap_outcome(Decimal("2.00"), Decimal("1.00"), True, "success")),
+               Result.ok(_tap_outcome(Decimal("1.00"), Decimal("1.00"), False, "no_effect")),
+               Result.ok(_tap_outcome(Decimal("1.00"), Decimal("1.00"), False, "no_effect")),
+               Result.ok(_tap_outcome(Decimal("1.00"), Decimal("1.00"), False, "no_effect")),
+               Result.ok(_tap_outcome(Decimal("1.00"), Decimal("1.00"), True, "success"))]
+        )
+        BetController(locator, verifier, step_logger, config, menu_selector=selector).set_min_bet(
+            "dev", "pirots5", "ep", _context_provider(Decimal("2.00")),
+        )
+
+        assert load_autopilot_flag("pirots5", "bet_via_menu", str(tmp_path))
+
+    def test_a_remembered_menu_route_opens_the_menu_first(self, tmp_path):
+        locator, selector, step_logger, config = self._setup(tmp_path)
+        save_autopilot_flag("pirots5", "bet_via_menu", True, str(tmp_path))
+        locator.is_exhausted.side_effect = None
+        locator.is_exhausted.return_value = False
+        verifier = MagicMock()
+        verifier.verified_tap.side_effect = [
+            Result.ok(_tap_outcome(Decimal("2.00"), Decimal("1.00"), True, "success")),
+            Result.ok(_tap_outcome(Decimal("1.00"), Decimal("1.00"), False, "no_effect")),
+            Result.ok(_tap_outcome(Decimal("1.00"), Decimal("1.00"), False, "no_effect")),
+            Result.ok(_tap_outcome(Decimal("1.00"), Decimal("1.00"), False, "no_effect")),
+            Result.ok(_tap_outcome(Decimal("1.00"), Decimal("1.00"), True, "success")),
+        ]
+        controller = BetController(locator, verifier, step_logger, config, menu_selector=selector)
+
+        result = controller.set_min_bet("dev", "pirots5", "ep", _context_provider(Decimal("2.00")))
+
+        assert result.data.min_bet_verified
+        selector.select_lowest.assert_called_once()    # prima di qualunque tocco sul "-" esterno

@@ -113,20 +113,45 @@ def _grid_user_text(call):
 
 
 class TestIconRefinement:
-    def test_icon_is_located_in_two_grid_steps_never_at_the_3x3_cell_center(self, real_context):
-        gpt_client = _client(Result.ok(_answers(target_region="middle-left")), _cell_answer("B6"), _cell_answer("C4"))
+    def test_icon_is_located_in_three_grid_steps_never_at_the_3x3_cell_center(self, real_context):
+        gpt_client = _client(
+            Result.ok(_answers(target_region="middle-left")), _cell_answer("B6"), _cell_answer("C4"), _cell_answer("B2"),
+        )
 
         result = GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
 
         assert result.success
-        assert len(_grid_calls(gpt_client)) == 2
+        assert len(_grid_calls(gpt_client)) == 3
         assert gpt_client.ask_with_image.call_count == 1
         assert (result.data.x, result.data.y) != (180, 1200)   # centro 3x3 "middle-left"
-        # cella A B6: centro (405,1650); riquadro (135,1350)-(675,1950); cella fine "C4" di una 6x6
-        assert (result.data.x, result.data.y) == (135 + round(2.5 * 540 / 6), 1350 + round(3.5 * 600 / 6))
+        # A: B6 -> centro (405,1650); riquadro B (135,1350)-(675,1950); B: "C4" (6x6) -> (360,1700);
+        # riquadro C (270,1600)-(450,1800) con griglia 4x4 (celle 45x50): "B2" -> (338,1675)
+        assert (result.data.x, result.data.y) == (338, 1675)
+
+    def test_step_c_failure_keeps_the_fine_cell_center(self, real_context):
+        gpt_client = _client(
+            Result.ok(_answers(target_region="middle-left")), _cell_answer("B6"), _cell_answer("C4"), _cell_answer("ZZ9"),
+        )
+
+        result = GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
+
+        assert result.success
+        assert (result.data.x, result.data.y) == (360, 1700)   # centro della cella B, non della 3x3
+
+    def test_step_c_point_near_a_rejected_one_keeps_the_fine_cell_center(self, real_context):
+        real_context.rejected_positions = [(293, 1665)]   # a 46 px dal punto C, a 75 px dal centro della cella B
+        gpt_client = _client(
+            Result.ok(_answers(target_region="middle-left")), _cell_answer("B6"), _cell_answer("C4"), _cell_answer("B2"),
+        )
+
+        result = GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
+
+        assert (result.data.x, result.data.y) == (360, 1700)
 
     def test_grid_steps_use_a_dedicated_prompt_not_the_generic_vision_prompt(self, real_context):
-        gpt_client = _client(Result.ok(_answers(target_region="middle-left")), _cell_answer("A1"), _cell_answer("A1"))
+        gpt_client = _client(
+            Result.ok(_answers(target_region="middle-left")), _cell_answer("A1"), _cell_answer("A1"), _cell_answer("A1"),
+        )
         GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
 
         call = _grid_calls(gpt_client)[0]
@@ -172,13 +197,16 @@ class TestIconRefinement:
         assert not GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context).success
 
     def test_gpt_answers_are_logged_for_debugging(self, real_context, caplog):
-        gpt_client = _client(Result.ok(_answers(target_region="middle-left")), _cell_answer("B6"), _cell_answer("C4"))
+        gpt_client = _client(
+            Result.ok(_answers(target_region="middle-left")), _cell_answer("B6"), _cell_answer("C4"), _cell_answer("B2"),
+        )
         with caplog.at_level("INFO"):
             GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
 
         messages = [record.getMessage() for record in caplog.records]
         assert any("GPT risponde cella='B6'" in m for m in messages)
         assert any("GPT risponde cella='C4'" in m for m in messages)
+        assert any("GPT risponde cella='B2'" in m for m in messages)
 
     def test_temporary_grid_images_are_removed(self, real_context, monkeypatch):
         seen = set()   # PIL (salvataggio) e la lettura base64 aprono lo stesso file
@@ -190,10 +218,12 @@ class TestIconRefinement:
             return original_open(path, *args, **kwargs)
 
         monkeypatch.setattr("builtins.open", spy_open)
-        gpt_client = _client(Result.ok(_answers(target_region="middle-left")), _cell_answer("A1"), _cell_answer("A1"))
+        gpt_client = _client(
+            Result.ok(_answers(target_region="middle-left")), _cell_answer("A1"), _cell_answer("A1"), _cell_answer("A1"),
+        )
         GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
 
-        assert len(seen) == 2
+        assert len(seen) == 3
         assert not any(os.path.exists(path) for path in seen)
 
 
@@ -221,7 +251,9 @@ class TestRejectedPointsAndDescriptions:
 
     def test_rejected_points_are_also_passed_to_the_grid_steps(self, real_context):
         real_context.rejected_positions = [(46, 2048)]
-        gpt_client = _client(Result.ok(_answers(target_region="middle-left")), _cell_answer("B6"), _cell_answer("C4"))
+        gpt_client = _client(
+            Result.ok(_answers(target_region="middle-left")), _cell_answer("B6"), _cell_answer("C4"), _cell_answer("B2"),
+        )
         GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
 
         assert "WRONG element" in _grid_user_text(_grid_calls(gpt_client)[0])
@@ -239,14 +271,14 @@ class TestRejectedPointsAndDescriptions:
 
 
 class TestLocateDescribed:
-    def test_operator_phrase_becomes_the_element_description_in_both_steps(self, real_context):
-        gpt_client = _client(Result.ok(_answers(action="stop")), _cell_answer("B6"), _cell_answer("C4"))
+    def test_operator_phrase_becomes_the_element_description_in_every_step(self, real_context):
+        gpt_client = _client(Result.ok(_answers(action="stop")), _cell_answer("B6"), _cell_answer("C4"), _cell_answer("B2"))
 
         point = GPTLocatorStrategy(gpt_client).locate_described(
             "l'icona delle monete impilate in basso al centro", real_context,
         )
 
-        assert point == (135 + round(2.5 * 540 / 6), 1350 + round(3.5 * 600 / 6))
+        assert point == (338, 1675)
         gpt_client.ask_with_image.assert_not_called()    # nessun passo 0: e' gia' un'icona
         for call in _grid_calls(gpt_client):
             assert "l'icona delle monete impilate in basso al centro" in _grid_user_text(call)
@@ -255,3 +287,33 @@ class TestLocateDescribed:
         gpt_client = _client(Result.ok(_answers(action="stop")), _cell_answer("A1", action="stop"))
 
         assert GPTLocatorStrategy(gpt_client).locate_described("boh", real_context) is None
+
+
+class TestCurrentBetHint:
+    def test_bet_minus_question_names_the_current_total_bet_for_multi_row_panels(self, real_context):
+        real_context.slot_ocr_state = {"posta": 2.0}
+        gpt_client = _client(Result.ok(_answers(action="stop")))
+        GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
+
+        text = gpt_client.ask_with_image.call_args.args[2]["action"]["instructions"]
+        assert "2.00" in text and "TOTAL bet" in text
+
+    def test_hint_is_also_given_to_the_grid_steps(self, real_context):
+        real_context.slot_ocr_state = {"posta": 2.0}
+        gpt_client = _client(
+            Result.ok(_answers(target_region="middle-left")), _cell_answer("B6"), _cell_answer("C4"), _cell_answer("B2"),
+        )
+        GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
+
+        assert all("TOTAL bet" in _grid_user_text(call) for call in _grid_calls(gpt_client))
+
+    def test_no_hint_for_other_elements_or_without_a_bet_reading(self, real_context):
+        real_context.slot_ocr_state = {"posta": 2.0}
+        gpt_client = _client(Result.ok(_answers(action="stop")))
+        GPTLocatorStrategy(gpt_client).locate("spin", real_context)
+        assert "TOTAL bet" not in gpt_client.ask_with_image.call_args.args[2]["action"]["instructions"]
+
+        real_context.slot_ocr_state = {}
+        gpt_client = _client(Result.ok(_answers(action="stop")))
+        GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
+        assert "TOTAL bet" not in gpt_client.ask_with_image.call_args.args[2]["action"]["instructions"]

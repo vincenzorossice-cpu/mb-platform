@@ -97,11 +97,13 @@ def build_autopilot(args: argparse.Namespace) -> Result[SlotAutoPilot]:
             screen_reader, ocr_reader, touch_injector, describer=strategies.get("gpt"),
         )
 
-    locator = ElementLocator(strategies)
+    locator = ElementLocator(strategies, memory_dir=config.slot_memory_dir)
     verifier = ActionVerifier(touch_injector, screen_reader, ocr_reader, config)
+    screen_recovery = ScreenRecovery(locator, verifier, config)
     bet_controller = BetController(
-        locator, verifier, step_logger, config, menu_selector=BetMenuSelector(locator, verifier),
-        screen_recovery=ScreenRecovery(locator, verifier, config),
+        locator, verifier, step_logger, config,
+        menu_selector=BetMenuSelector(locator, verifier, screen_recovery=screen_recovery),
+        screen_recovery=screen_recovery,
     )
     spin_controller = SpinController(locator, verifier, step_logger, config)
 

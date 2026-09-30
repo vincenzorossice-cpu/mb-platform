@@ -22,7 +22,7 @@ class SlotOCRReader:
     illeggibile da uiautomator). Lazy init: il primo readtext e' lento perche'
     carica i pesi del modello, poi il Reader resta cache in self._ocr."""
 
-    _SALDO_LABELS = ("SALDO", "DEMO", "MODALIT", "BALANCE")
+    _SALDO_LABELS = ("SALDO", "DEMO", "MODALIT", "BALANCE", "CREDITO", "CREDIT")
     _POSTA_LABELS = ("POSTA", "PUNTATA", "BET", "STAKE")
     _VINCITA_LABELS = ("VINCITA", "WIN")
     # "XITER" rimosso: e' il nome del bottone feature/bonus-buy di Wazdan

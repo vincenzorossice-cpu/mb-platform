@@ -29,11 +29,12 @@ def _context(boxes, posta=None):
     )
 
 
-def _tap(verified=True):
+def _tap(verified=True, outcome=None):
     return Result.ok(TapOutcome(
         tapped_coords=(0, 0), verified=verified, screenshot_before="a", screenshot_after="b",
         diff_score=0.3, balance_before=None, balance_after=None, bet_before=None, bet_after=None,
-        screen_state_before="idle", screen_state_after="idle", outcome="success" if verified else "no_effect",
+        screen_state_before="idle", screen_state_after="idle",
+        outcome=outcome or ("success" if verified else "no_effect"),
     ))
 
 
@@ -98,13 +99,23 @@ class TestSelectLowest:
         locator.record_failure.assert_called_once_with("gpt", "bet_menu_toggle")
         locator.save_verified_candidate.assert_not_called()
 
-    def test_unreadable_menu_is_closed_again_and_fails(self):
+    def test_menu_that_is_not_a_list_is_left_open_for_the_caller(self):
         selector, _, verifier = _selector()
 
         result = selector.select_lowest("dev", "bigbass", _context(MAIN_BOXES), _provider(_context(MAIN_BOXES)))
 
-        assert result.error_code == "MENU_NOT_READABLE"
-        assert verifier.verified_tap.call_count == 2   # apri + richiudi
+        assert result.error_code == "MENU_OPEN_NOT_A_LIST"
+        assert verifier.verified_tap.call_count == 1   # solo l'apertura: nessuna richiusura
+
+    def test_stepper_panel_with_three_amounts_is_not_treated_as_a_list(self):
+        # pannello a righe: "10" monete per riga, "€0,02" valore moneta, "€2,00" puntata totale
+        stepper = [_box("10", 500, 800), _box("€0,02", 500, 1000), _box("€2,00", 500, 1200)] + MAIN_BOXES
+        selector, _, verifier = _selector()
+
+        result = selector.select_lowest("dev", "bigbass", _context(MAIN_BOXES), _provider(_context(stepper)))
+
+        assert result.error_code == "MENU_OPEN_NOT_A_LIST"
+        assert verifier.verified_tap.call_count == 1   # nessun tocco sui campi dei valori
 
     def test_bet_not_matching_the_selected_value_is_not_confirmed(self):
         selector, _, _ = _selector()
@@ -119,3 +130,55 @@ class TestSelectLowest:
         locator.locate.return_value = Result.fail("nope", "ELEMENT_NOT_LOCATABLE")
 
         assert not selector.select_lowest("dev", "bigbass", _context(MAIN_BOXES), _provider()).success
+
+
+class TestWrongToggleTarget:
+    def _wrong_toggle(self, recovery_result=None, with_recovery=True):
+        selector, locator, verifier = _selector(strategy="gpt", trusted=False)
+        verifier.verified_tap.return_value = Result.ok(TapOutcome(
+            tapped_coords=(599, 2115), verified=False, screenshot_before="/tmp/before.png",
+            screenshot_after="/tmp/after.png", diff_score=0.003, balance_before=Decimal("100000"),
+            balance_after=Decimal("500000"), bet_before=Decimal("2.00"), bet_after=Decimal("10.00"),
+            screen_state_before="idle", screen_state_after="idle", outcome="unexpected_change",
+        ))
+        recovery = MagicMock()
+        recovery.recover.return_value = recovery_result or Result.ok(MagicMock(method="retap"))
+        if with_recovery:
+            selector.screen_recovery = recovery
+        return selector, locator, recovery
+
+    def test_wrong_target_is_rejected_undone_and_remembered(self):
+        selector, locator, recovery = self._wrong_toggle()
+
+        result = selector.select_lowest("dev", "bigbass", _context(MAIN_BOXES, posta=2.0), _provider())
+
+        assert result.error_code == "MENU_TOGGLE_WRONG_TARGET"
+        locator.reject_position.assert_called_once_with("bet_menu_toggle", 540, 2088)
+        args = recovery.recover.call_args.args
+        assert args[1] == "/tmp/before.png" and args[2] == (540, 2088)
+        assert args[4] == {"posta": Decimal("2.00"), "saldo": Decimal("100000")}
+        locator.remember_rejected.assert_called_once_with("bigbass", "bet_menu_toggle", 540, 2088)
+
+    def test_nothing_is_remembered_permanently_when_the_screen_was_already_original(self):
+        selector, locator, _ = self._wrong_toggle(Result.ok(MagicMock(method="already_original")))
+
+        selector.select_lowest("dev", "bigbass", _context(MAIN_BOXES, posta=2.0), _provider())
+
+        locator.remember_rejected.assert_not_called()
+
+    def test_failed_recovery_reports_stuck(self):
+        selector, locator, _ = self._wrong_toggle(Result.fail("no way back", "RECOVERY_FAILED"))
+
+        result = selector.select_lowest("dev", "bigbass", _context(MAIN_BOXES, posta=2.0), _provider())
+
+        assert result.error_code == "MENU_STUCK"
+        locator.remember_rejected.assert_not_called()
+
+    def test_without_a_recovery_the_point_is_only_rejected_for_the_session(self):
+        selector, locator, _ = self._wrong_toggle(with_recovery=False)
+
+        result = selector.select_lowest("dev", "bigbass", _context(MAIN_BOXES, posta=2.0), _provider())
+
+        assert result.error_code == "MENU_TOGGLE_WRONG_TARGET"
+        locator.reject_position.assert_called_once()
+        locator.remember_rejected.assert_not_called()

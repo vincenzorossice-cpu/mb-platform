@@ -85,6 +85,8 @@ class BetController:
             ))
 
         menu_tried = False
+        we_opened_the_menu = False
+        menu_route_used = False
         if self.menu_selector is not None and load_autopilot_flag(
             slot_name, _BET_VIA_MENU_FLAG, self.config.slot_memory_dir,
         ):
@@ -92,15 +94,21 @@ class BetController:
             # tasto meno utilizzabile). Si va dritti li', niente giri a vuoto.
             logger.info("set_min_bet: la memoria dice che questa slot cambia puntata dal menu: provo li' per primo.")
             menu_tried = True
-            menu_outcome = self._select_via_menu(
+            menu_outcome, menu_open = self._select_via_menu(
                 device_id, slot_name, episode_id, context, context_provider, starting_bet, [], 1,
             )
             if menu_outcome is not None:
                 return menu_outcome
+            if menu_open:
+                we_opened_the_menu = menu_route_used = True
+                self.locator.reset_failures(_ELEMENT)
+                refreshed = context_provider()
+                if refreshed.success:
+                    context = refreshed.data
 
-        we_opened_the_menu = False
         if (
-            context.profile is not None and context.profile.verified
+            not we_opened_the_menu
+            and context.profile is not None and context.profile.verified
             and _ELEMENT not in context.profile.elements
             and _MENU_TOGGLE_ELEMENT in context.profile.elements
         ):
@@ -237,6 +245,7 @@ class BetController:
                 if self.screen_recovery is not None:
                     recovery = self.screen_recovery.recover(
                         device_id, screenshot_before_tap, (candidate.x, candidate.y), context_provider,
+                        {"posta": outcome_data.bet_before, "saldo": outcome_data.balance_before},
                     )
                     if not recovery.success:
                         logger.error(
@@ -248,6 +257,10 @@ class BetController:
                             min_bet_verified=False, attempts=attempts, strategy_sequence=strategy_sequence,
                             aborted_reason="STUCK_ON_UNEXPECTED_SCREEN", outcome="aborted",
                         ))
+                    if recovery.data.method != "already_original":
+                        # Provato: il tocco aveva cambiato lo schermo e abbiamo
+                        # dovuto annullarlo: non riproporlo mai piu' su questa slot.
+                        self.locator.remember_rejected(slot_name, _ELEMENT, candidate.x, candidate.y)
                     refreshed = context_provider()
                     if refreshed.success:
                         context = refreshed.data
@@ -305,12 +318,21 @@ class BetController:
                     # Il tasto meno non funziona (o non esiste): prima di
                     # scomodare un umano, prova il menu puntata (icona monete).
                     menu_tried = True
-                    menu_outcome = self._select_via_menu(
+                    menu_outcome, menu_open = self._select_via_menu(
                         device_id, slot_name, episode_id, context, context_provider,
                         starting_bet, strategy_sequence, attempts + 1,
                     )
                     if menu_outcome is not None:
                         return menu_outcome
+                    if menu_open:
+                        # Menu a righe con pulsanti -/+: aperto, si prosegue
+                        # col solito ciclo dei pulsanti meno, stavolta li' dentro.
+                        we_opened_the_menu = menu_route_used = True
+                        self.locator.reset_failures(_ELEMENT)
+                        refreshed = context_provider()
+                        if refreshed.success:
+                            context = refreshed.data
+                        continue
                 refreshed = context_provider()
                 if refreshed.success:
                     context = refreshed.data
@@ -328,8 +350,9 @@ class BetController:
                     "set_min_bet: plateau raggiunto (outcome=%s, min_bet_verified=%s, puntata finale=%s)",
                     outcome_label, min_bet_verified, current_bet,
                 )
-                if min_bet_verified:
-                    self._close_bet_menu_if_opened(device_id, context, we_opened_the_menu)
+                self._close_bet_menu_if_opened(device_id, context, we_opened_the_menu)
+                if min_bet_verified and menu_route_used:
+                    save_autopilot_flag(slot_name, _BET_VIA_MENU_FLAG, True, self.config.slot_memory_dir)
                 return Result.ok(BetResult(
                     slot_name=slot_name, starting_bet=starting_bet, final_bet=current_bet,
                     min_bet_verified=min_bet_verified, attempts=attempts, strategy_sequence=strategy_sequence,
@@ -342,6 +365,7 @@ class BetController:
                 context = refreshed.data
 
         logger.warning("set_min_bet: tentativi esauriti (%d) senza plateau", attempts)
+        self._close_bet_menu_if_opened(device_id, context, we_opened_the_menu)
         return Result.ok(BetResult(
             slot_name=slot_name, starting_bet=starting_bet, final_bet=current_bet,
             min_bet_verified=False, attempts=attempts, strategy_sequence=strategy_sequence,
@@ -351,14 +375,26 @@ class BetController:
     def _select_via_menu(
         self, device_id, slot_name, episode_id, context, context_provider,
         starting_bet, strategy_sequence, attempts,
-    ) -> Optional[Result[BetResult]]:
-        """Fallback: puntata piu' bassa dal menu. Ritorna il Result finale se
-        e' riuscito e confermato, None se non ha funzionato (si prosegue con
-        la catena normale, fino all'operatore)."""
+    ) -> tuple:
+        """Fallback: puntata piu' bassa dal menu. Ritorna (risultato, menu_aperto):
+        (Result finale, _) se e' riuscito e confermato o se bisogna fermarsi;
+        (None, True) se il menu e' aperto ma non e' una lista (si usano i pulsanti
+        meno li' dentro); (None, False) se non ha funzionato (si prosegue con la
+        catena normale, fino all'operatore)."""
         result = self.menu_selector.select_lowest(device_id, slot_name, context, context_provider)
         if not result.success:
             logger.warning("set_min_bet: menu puntata non riuscito (%s): %s", result.error_code, result.error)
-            return None
+            if result.error_code == "MENU_OPEN_NOT_A_LIST":
+                return None, True
+            if result.error_code == "MENU_STUCK":
+                # Un tocco sbagliato ha cambiato lo schermo e non si e' riusciti
+                # a ripristinarlo: niente altri tocchi alla cieca.
+                return Result.ok(BetResult(
+                    slot_name=slot_name, starting_bet=starting_bet, final_bet=starting_bet,
+                    min_bet_verified=False, attempts=attempts, strategy_sequence=list(strategy_sequence),
+                    aborted_reason="STUCK_ON_UNEXPECTED_SCREEN", outcome="aborted",
+                )), False
+            return None, False
         selection = result.data
         save_autopilot_flag(slot_name, _BET_VIA_MENU_FLAG, True, self.config.slot_memory_dir)
         logger.info("set_min_bet: puntata minima dal menu: %s EUR (verificata sulla lettura dello schermo)",
@@ -372,7 +408,7 @@ class BetController:
             min_bet_verified=True, attempts=attempts,
             strategy_sequence=list(strategy_sequence) + [selection.toggle_strategy, "menu"],
             aborted_reason=None, outcome="min_bet_confirmed",
-        ))
+        )), False
 
     def _close_bet_menu_if_opened(self, device_id: str, context, we_opened_the_menu: bool) -> None:
         """Richiude il menu puntata solo se e' stato il sistema stesso ad
