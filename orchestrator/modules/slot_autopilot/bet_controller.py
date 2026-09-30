@@ -18,7 +18,7 @@ from orchestrator.modules.slot_autopilot.bet_menu import BetMenuSelector
 from orchestrator.modules.slot_autopilot.config import AutoPilotConfig
 from orchestrator.modules.slot_autopilot.frame_diff import diff_score
 from orchestrator.modules.slot_autopilot.locator import ElementLocator
-from orchestrator.modules.slot_autopilot.screen_recovery import ScreenRecovery
+from orchestrator.modules.slot_autopilot.screen_recovery import ScreenRecovery, money_moved
 from orchestrator.modules.slot_autopilot.verifier import ActionVerifier, Expectation
 from orchestrator.modules.step_logger.interface import StepLoggerInterface, StepRecord
 
@@ -27,6 +27,9 @@ logger = logging.getLogger(__name__)
 _ELEMENT = "bet_minus"
 _MENU_TOGGLE_ELEMENT = "bet_menu_toggle"
 _PLUS_ELEMENT = "bet_plus"
+_SPIN_ELEMENT = "spin"
+_ZONE_ELEMENTS = ("bet_minus", "bet_plus", "bet_menu_toggle", "close_button")
+_SPIN_ZONE_RADIUS_PX = 90
 _BET_VIA_MENU_FLAG = "bet_via_menu"
 _MIN_BET_VALUE = "min_bet"
 
@@ -101,6 +104,15 @@ class BetController:
             "set_min_bet: puntata iniziale=%s, riscontro fidato=%s, minimo ricordato=%s",
             starting_bet, trusted_min_bet, remembered_min,
         )
+
+        if starting_bet is None:
+            # Senza la puntata leggibile nessun tocco e' verificabile: e' quando un tocco alla cieca
+            # ha gia' giocato uno spin. Meglio fermarsi che tirare a indovinare.
+            logger.error("set_min_bet: non riesco a leggere la puntata (neppure per visione): non tocco nulla.")
+            return Result.ok(BetResult(
+                slot_name=slot_name, starting_bet=None, final_bet=None, min_bet_verified=False,
+                attempts=0, strategy_sequence=[], aborted_reason="BET_UNREADABLE", outcome="aborted",
+            ))
 
         if trusted_min_bet is not None and starting_bet is not None and starting_bet <= trusted_min_bet:
             logger.info(
@@ -177,6 +189,8 @@ class BetController:
         last_step = None  # gradino osservato in un tocco singolo verificato (dimensiona la corsa)
         minus_proven_alive = False  # la prova "+ poi -" ha dimostrato che il "-" funziona davvero
         decreases_seen = 0
+        money_moved_events = 0
+        spin_zone_done = False
 
         while attempts < self.config.max_bet_lower_attempts:
             attempts += 1
@@ -230,6 +244,28 @@ class BetController:
                 verified = True
                 outcome = "success"
             else:
+                if (
+                    self.config.avoid_spin_zone and not spin_zone_done
+                    and not self.locator.is_trusted_strategy(candidate.strategy_name)
+                ):
+                    # Un'ipotesi (GPT): prima di tapparla si localizza lo SPIN (senza tappare) e si
+                    # escludono ~90 px attorno ad esso: un tocco li' gioca e spende.
+                    spin_zone_done = True
+                    spin_located = self.locator.locate(_SPIN_ELEMENT, context, exclude_strategies=("hitl",))
+                    if spin_located.success:
+                        spin = spin_located.data
+                        self.locator.exclude_zone(
+                            _ZONE_ELEMENTS, spin.x, spin.y, _SPIN_ZONE_RADIUS_PX, "big round SPIN button",
+                        )
+                        logger.info("set_min_bet: spin localizzato a (%d,%d): zona da evitare di %d px.",
+                                    spin.x, spin.y, _SPIN_ZONE_RADIUS_PX)
+                        if math.hypot(candidate.x - spin.x, candidate.y - spin.y) <= _SPIN_ZONE_RADIUS_PX:
+                            logger.warning(
+                                "set_min_bet: il candidato (%d,%d) e' sul pulsante di spin: non lo tocco.",
+                                candidate.x, candidate.y,
+                            )
+                            continue
+
                 # Corsa: il "-" ha gia' funzionato una volta da una fonte fidata; il
                 # minimo e' un pavimento (non si puo' "passarlo"), quindi N-1 tocchi
                 # ciechi e UN solo tocco verificato, il cui "prima" e' lo schermo
@@ -296,6 +332,33 @@ class BetController:
                 (candidate.x, candidate.y), current_bet, new_bet, outcome=outcome,
                 verified=verified,
             )
+
+            if (
+                not verified and outcome_data is not None and money_moved(
+                    {"saldo": outcome_data.balance_before, "posta": outcome_data.bet_before},
+                    {"saldo": outcome_data.balance_after, "posta": outcome_data.bet_after},
+                )
+            ):
+                # Il saldo e' cambiato senza scalare con la puntata: il tocco ha GIOCATO UNO SPIN.
+                # Niente ritocco ne' recupero (spenderebbero ancora): il punto e' sbagliato per sempre.
+                money_moved_events += 1
+                self.locator.reject_position(_ELEMENT, candidate.x, candidate.y)
+                self.locator.remember_rejected(slot_name, _ELEMENT, candidate.x, candidate.y)
+                logger.error(
+                    "set_min_bet: il tocco a (%d,%d) ha giocato uno spin (saldo %s -> %s): punto scartato per sempre.",
+                    candidate.x, candidate.y, outcome_data.balance_before, outcome_data.balance_after,
+                )
+                if money_moved_events >= 2:
+                    return Result.ok(BetResult(
+                        slot_name=slot_name, starting_bet=starting_bet, final_bet=current_bet,
+                        min_bet_verified=False, attempts=attempts, strategy_sequence=strategy_sequence,
+                        aborted_reason="MONEY_MOVED", outcome="aborted",
+                    ))
+                consecutive_decreases = 0
+                refreshed = context_provider()
+                if refreshed.success:
+                    context = refreshed.data
+                continue
 
             if not verified and outcome == "unexpected_change" and screenshot_before_tap is not None:
                 # Il tap ha cambiato lo schermo senza abbassare la puntata:

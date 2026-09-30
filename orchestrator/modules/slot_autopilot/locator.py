@@ -51,6 +51,7 @@ class ElementLocator:
         self.max_consecutive_failures_per_strategy = max_consecutive_failures_per_strategy
         self._failure_counts = {}  # (strategy_name, element_name) -> int consecutivi
         self._rejected = {}  # element_name -> [(x, y)] tappati con effetto sbagliato
+        self._zones = {}  # element_name -> [(x, y, raggio, etichetta)] zone da non scegliere
         # Se dato, i punti sbagliati sono ricordati su disco per ogni slot e
         # ricaricati al primo locate() della slot (vedi remember_rejected).
         self.memory_dir = memory_dir
@@ -63,8 +64,9 @@ class ElementLocator:
         hitl_error_code = None
         self._load_persisted_rejections(context.slot_name)
         rejected = self._rejected.get(element_name, [])
-        if rejected:
-            context = dataclasses.replace(context, rejected_positions=list(rejected))
+        zones = self._zones.get(element_name, [])
+        if rejected or zones:
+            context = dataclasses.replace(context, rejected_positions=list(rejected), avoid_zones=list(zones))
         for strategy_name in self._STRATEGY_ORDER:
             if strategy_name in exclude_strategies:
                 continue
@@ -103,6 +105,17 @@ class ElementLocator:
                     self._failure_counts[key] = self._failure_counts.get(key, 0) + 1
                     continue
 
+                if strategy_name not in _TRUSTED_STRATEGIES and any(
+                    math.hypot(candidate.x - zx, candidate.y - zy) <= radius for zx, zy, radius, _label in zones
+                ):
+                    logger.warning(
+                        "'%s' via '%s' a (%d,%d) cade in una zona da evitare (es. lo spin): scartato.",
+                        element_name, strategy_name, candidate.x, candidate.y,
+                    )
+                    collected.append(f"{strategy_name}:IN_AVOID_ZONE")
+                    self._failure_counts[key] = self._failure_counts.get(key, 0) + 1
+                    continue
+
                 # NON azzerare qui il contatore: "localizzato" non vuol dire
                 # "ha funzionato" (passi distinti per design, vedi docstring
                 # della classe). Solo record_success(), chiamato dal chiamante
@@ -138,6 +151,13 @@ class ElementLocator:
         schermata): per il resto della sessione i candidati non fidati vicini
         a questo punto non vengono piu' restituiti per questo elemento."""
         self._rejected.setdefault(element_name, []).append((x, y))
+
+    def exclude_zone(self, element_names, x: int, y: int, radius: int, label: str) -> None:
+        """Per questi elementi i candidati NON fidati dentro il cerchio (x, y, radius) vengono
+        scartati e la zona e' comunicata a GPT. Serve a non tappare, cercando un "-", il
+        pulsante di spin (un tocco sbagliato li' spende)."""
+        for element_name in element_names:
+            self._zones.setdefault(element_name, []).append((x, y, radius, label))
 
     def remember_rejected(self, slot_name: str, element_name: str, x: int, y: int) -> None:
         """Come reject_position, ma PER SEMPRE su questa slot (scrive su disco).

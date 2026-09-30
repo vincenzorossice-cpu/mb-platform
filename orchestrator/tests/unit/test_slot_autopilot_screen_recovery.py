@@ -198,3 +198,63 @@ class TestSoftChangeCurrencySwitch:
         )
 
         assert result.data.method == "already_original"
+
+
+class TestMoneyMovedNeverRetouches:
+    """Nel log reale un tocco aveva giocato uno spin e il recupero lo ritoccava: un altro spin."""
+
+    def test_a_balance_drop_without_the_bet_scaling_is_a_spin_and_nothing_is_tapped(self, shots):
+        recovery, locator, verifier = _recovery(shots["same"], tap_afters=[shots["same"]])
+
+        result = recovery.recover(
+            "dev", shots["original"], (338, 1775),
+            _provider(state={"posta": 1000.0, "saldo": 49000.0}),
+            {"posta": Decimal("1000"), "saldo": Decimal("50000")},
+        )
+
+        assert result.success and result.data.method == "money_moved" and result.data.attempts == 0
+        verifier.verified_tap.assert_not_called()
+        locator.locate.assert_not_called()
+
+    def test_an_unreadable_bet_with_a_changed_balance_is_also_a_spin(self, shots):
+        recovery, _, verifier = _recovery(shots["same"])
+
+        result = recovery.recover(
+            "dev", shots["original"], (338, 1775), _provider(state={"posta": None, "saldo": 49000.0}),
+            {"posta": None, "saldo": Decimal("50000")},
+        )
+
+        assert result.data.method == "money_moved"
+        verifier.verified_tap.assert_not_called()
+
+    def test_money_moved_wins_even_when_the_screen_changed_a_lot(self, shots):
+        recovery, _, verifier = _recovery(shots["other"])      # animazione dei rulli: pixel molto diversi
+
+        result = recovery.recover(
+            "dev", shots["original"], (338, 1775), _provider(state={"posta": 1000.0, "saldo": 49000.0}),
+            {"posta": Decimal("1000"), "saldo": Decimal("50000")},
+        )
+
+        assert result.data.method == "money_moved"
+        verifier.verified_tap.assert_not_called()
+
+    def test_a_win_after_a_spin_counts_as_money_moved_too(self, shots):
+        recovery, _, _ = _recovery(shots["same"])
+
+        result = recovery.recover(
+            "dev", shots["original"], (1, 1), _provider(state={"posta": 1000.0, "saldo": 51000.0}),
+            {"posta": Decimal("1000"), "saldo": Decimal("50000")},
+        )
+
+        assert result.data.method == "money_moved"
+
+    def test_a_currency_switch_still_uses_the_retap(self, shots):
+        recovery, _, verifier = _recovery(shots["same"], tap_afters=[shots["same"]],
+                                          states_after=[{"posta": 2.0, "saldo": 100000.0}])
+
+        result = recovery.recover(
+            "dev", shots["original"], (599, 2115), _provider(state={"posta": 10.0, "saldo": 500000.0}),
+            {"posta": Decimal("2.00"), "saldo": Decimal("100000.00")},
+        )
+
+        assert result.data.method == "retap"

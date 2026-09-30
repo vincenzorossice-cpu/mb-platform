@@ -258,7 +258,9 @@ class TestRejectedPointsAndDescriptions:
         return _grid_user_text(_grid_calls(gpt_client)[0])
 
     def test_bet_minus_description_excludes_the_info_icon(self, real_context):
-        assert "NEVER the 'i'" in self._first_grid_text("bet_minus", real_context)
+        text = self._first_grid_text("bet_minus", real_context)
+        assert "NEVER the spin button itself, the 'i' (info) icon" in text
+        assert "left-pointing arrow" in text          # anche le frecce "<" contano come "-"
 
     def test_close_button_has_a_description(self, real_context):
         assert "close" in self._first_grid_text("close_button", real_context).lower()
@@ -327,3 +329,63 @@ class TestCurrentBetHint:
 
         real_context.slot_ocr_state = {}
         assert all("TOTAL bet" not in t for t in self._grid_texts("bet_minus", real_context))
+
+
+class TestNotVisibleIsNotAGuess:
+    """Nel log reale GPT aveva detto "null" al passo C e il codice aveva tappato lo stesso: era lo spin."""
+
+    def test_an_explicit_null_at_the_zoomed_step_means_no_tap_at_all(self, real_context, caplog):
+        gpt_client = _client(
+            None, _cell_answer("B6"), _cell_answer("C4"), json.dumps({"cell": None, "confidence": 0.9}),
+        )
+
+        with caplog.at_level("WARNING"):
+            result = GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
+
+        assert not result.success and result.error_code == "GPT_LOCATOR_UNRESOLVED_TARGET"
+        assert any("non vede l'elemento" in r.getMessage() for r in caplog.records)
+
+    def test_an_unreadable_answer_at_the_zoomed_step_still_keeps_the_fine_cell(self, real_context):
+        gpt_client = _client(None, _cell_answer("B6"), _cell_answer("C4"), "not json")
+
+        result = GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
+
+        assert result.success and (result.data.x, result.data.y) == (360, 1700)
+
+    def test_an_invalid_label_at_the_zoomed_step_still_keeps_the_fine_cell(self, real_context):
+        gpt_client = _client(None, _cell_answer("B6"), _cell_answer("C4"), _cell_answer("ZZ9"))
+
+        result = GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
+
+        assert result.success and (result.data.x, result.data.y) == (360, 1700)
+
+
+class TestAvoidZones:
+    def test_the_zone_is_named_in_every_grid_question(self, real_context):
+        real_context.avoid_zones = [(540, 1775, 90, "SPIN button")]
+        gpt_client = _client(None, _cell_answer("B6"), _cell_answer("C4"), _cell_answer("B2"))
+
+        GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
+
+        for call in _grid_calls(gpt_client):
+            text = _grid_user_text(call)
+            assert "SPIN button" in text and "50% from left" in text and "74% from top" in text
+
+    def test_fine_cells_inside_the_zone_are_not_offered(self, real_context):
+        real_context.avoid_zones = [(360, 1700, 120, "SPIN button")]
+        gpt_client = _client(None, _cell_answer("B6"), _cell_answer("C4"), _cell_answer("B2"))
+
+        result = GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
+
+        text = _grid_user_text(_grid_calls(gpt_client)[1])
+        labels = text.split("Valid cell labels: ")[1].split(".\n")[0].split(", ")
+        assert "C4" not in labels and "F6" in labels
+        assert not result.success                         # GPT ha scelto proprio una cella esclusa
+
+    def test_a_step_c_point_inside_the_zone_keeps_the_fine_cell_instead(self, real_context):
+        real_context.avoid_zones = [(338, 1675, 20, "SPIN button")]     # solo il punto del passo C
+        gpt_client = _client(None, _cell_answer("B6"), _cell_answer("C4"), _cell_answer("B2"))
+
+        result = GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
+
+        assert (result.data.x, result.data.y) == (360, 1700)

@@ -55,6 +55,23 @@ class TestBuildAutopilot:
         strategies = build_autopilot(_args(no_gpt=True)).data.locator.strategies
         assert strategies["hitl"].describer is None
 
+    def test_with_gpt_the_ocr_reader_gets_the_vision_safety_net(self, tmp_path, monkeypatch):
+        from orchestrator.modules.slot_ocr.vision_reader import ResilientOCRReader
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+        autopilot = build_autopilot(_args()).data
+
+        assert isinstance(autopilot.ocr_reader, ResilientOCRReader) and autopilot.ocr_reader.vision is not None
+
+    def test_without_gpt_the_ocr_reader_is_the_plain_one(self, tmp_path, monkeypatch):
+        from orchestrator.modules.slot_ocr.reader import SlotOCRReader
+        monkeypatch.chdir(tmp_path)
+
+        autopilot = build_autopilot(_args(no_gpt=True)).data
+
+        assert isinstance(autopilot.ocr_reader, SlotOCRReader)
+
     def test_no_gpt_omits_gpt_strategy(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv("OPENAI_API_KEY", "test-key")
@@ -241,6 +258,33 @@ class TestProgressLine:
         line = _progress_line(1, self._result(bet_amount=None, balance_after=None, win_amount=None), Decimal("0"), Decimal("30"), 2)
 
         assert "puntata -" in line and "saldo -" in line and "vincita 0.00" in line
+
+
+class TestBetFailureMessages:
+    @pytest.mark.parametrize("reason,expected", [
+        ("BET_UNREADABLE", "non tocco nulla"),
+        ("MONEY_MOVED", "hanno giocato uno spin"),
+        ("MIN_NOT_PROVEN", "non spinno"),
+        ("NO_DECREASE_OBSERVED", "mi fermo senza spinnare"),
+    ])
+    def test_each_reason_explains_itself(self, reason, expected, caplog):
+        from decimal import Decimal
+        from orchestrator.modules.slot_autopilot.bet_controller import BetResult
+        from orchestrator.scripts.run_autopilot import _run_session
+
+        autopilot = MagicMock()
+        autopilot.prepare.return_value = Result.ok(True)
+        autopilot.set_min_bet.return_value = Result.ok(BetResult(
+            slot_name="s", starting_bet=None, final_bet=None, min_bet_verified=False, attempts=0,
+            aborted_reason=reason, outcome="aborted",
+        ))
+
+        with caplog.at_level("ERROR"):
+            code = _run_session(autopilot, _args(target=30.0, max_steps=50))
+
+        assert code == 1
+        assert any(reason in r.getMessage() and expected in r.getMessage() for r in caplog.records)
+        autopilot.spin.assert_not_called()
 
 
 class TestWaitForBusyScreen:

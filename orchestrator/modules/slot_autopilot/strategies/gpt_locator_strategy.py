@@ -29,18 +29,23 @@ _FINE_GRID = (6, 6)
 # Passo C: zoom sulla cella fine scelta, celle ~34x38 px (un tasto "-" misura ~60 px).
 _FINEST_GRID = (4, 4)
 _AVOID_RADIUS_PX = 50  # stesso raggio di ElementLocator.REJECT_RADIUS_PX
+# Risposta ESPLICITA "l'elemento non e' in questa immagine" (cell: null): diversa da una
+# risposta illeggibile. Al passo C significa che il passo B aveva sbagliato: nessun tocco.
+_NOT_VISIBLE = "__NOT_VISIBLE__"
 
 # Descrizioni GENERICHE dei nomi elemento del progetto (valide per qualunque
 # slot): senza, GPT riceve solo un identificatore come 'bet_minus'.
 _ELEMENT_DESCRIPTIONS = {
     "bet_minus": (
-        "the minus (-) button that lowers the bet, normally next to the round spin button or the bet amount; "
-        "it may look dimmed when the minimum bet is reached. It is NEVER the 'i' (info) icon, the menu "
-        "(three lines) icon or the stack-of-coins icon"
+        "the button that lowers the bet: a minus (-) sign, a left-pointing arrow or chevron, or a 'BET -' button, "
+        "normally next to the spin button or the bet amount; it may look dimmed when the minimum bet is reached. "
+        "It is NEVER the spin button itself, the 'i' (info) icon, the menu (three lines) icon or the "
+        "stack-of-coins icon"
     ),
     "bet_plus": (
-        "the plus (+) button that raises the bet, normally next to the round spin button or the bet amount. "
-        "It is NEVER the 'i' (info) icon or the menu (three lines) icon"
+        "the button that raises the bet: a plus (+) sign, a right-pointing arrow or chevron, or a 'BET +' button, "
+        "normally next to the spin button or the bet amount. It is NEVER the spin button itself, the 'i' (info) "
+        "icon or the menu (three lines) icon"
     ),
     "bet_menu_toggle": "the icon (often a stack of coins) that opens or closes the bet selection menu",
     "spin": "the large round button that starts a spin (usually with circular arrows)",
@@ -91,16 +96,22 @@ def _bet_hint(element_name: str, context: LocateContext) -> str:
     )
 
 
-def _avoid_note(rejected_positions: list, width: int, height: int) -> str:
-    """Frase per la domanda: punti gia' rivelatisi sbagliati, in frazioni
-    dello schermo (GPT ragiona meglio cosi' che in pixel)."""
-    if not rejected_positions:
-        return ""
-    spots = ", ".join(f"({x / width:.0%} from left, {y / height:.0%} from top)" for x, y in rejected_positions)
-    return (
-        f" IMPORTANT: tapping the icon at {spots} was already tried and it was the WRONG element "
-        "(it opened another screen): do NOT choose it."
-    )
+def _avoid_note(rejected_positions: list, width: int, height: int, avoid_zones: list = ()) -> str:
+    """Frase per la domanda: punti gia' rivelatisi sbagliati e zone da non scegliere (es. il
+    pulsante di spin), in frazioni dello schermo (GPT ragiona meglio cosi' che in pixel)."""
+    note = ""
+    if rejected_positions:
+        spots = ", ".join(f"({x / width:.0%} from left, {y / height:.0%} from top)" for x, y in rejected_positions)
+        note += (
+            f" IMPORTANT: tapping the icon at {spots} was already tried and it was the WRONG element "
+            "(it opened another screen): do NOT choose it."
+        )
+    for x, y, _radius, label in avoid_zones:
+        note += (
+            f" IMPORTANT: the {label} is around ({x / width:.0%} from left, {y / height:.0%} from top): "
+            "that is NOT the element to find, do NOT choose it or anything touching it."
+        )
+    return note
 
 
 class GPTLocatorStrategy(LocatorStrategy):
@@ -129,7 +140,7 @@ class GPTLocatorStrategy(LocatorStrategy):
         questions = {
             "action": choice_question(
                 f"Tap the UI element '{element_name}' ({_describe(element_name)}) if you can see it on screen."
-                + _avoid_note(context.rejected_positions, context.screen_width, context.screen_height)
+                + _avoid_note(context.rejected_positions, context.screen_width, context.screen_height, context.avoid_zones)
                 + _bet_hint(element_name, context),
                 {"tap": "Touch the element", "stop": "Element not visible / cannot proceed"},
             ),
@@ -224,6 +235,8 @@ class GPTLocatorStrategy(LocatorStrategy):
         cell = data.get("cell") if isinstance(data, dict) else None
         logger.info("'%s' (%s): GPT risponde cella=%r confidenza=%r", element_name, stage, cell,
                     data.get("confidence") if isinstance(data, dict) else None)
+        if isinstance(data, dict) and "cell" in data and data["cell"] is None:
+            return _NOT_VISIBLE
         if not isinstance(cell, str) or not cell.strip():
             return None
         return cell.strip().upper()
@@ -237,7 +250,9 @@ class GPTLocatorStrategy(LocatorStrategy):
                 coarse_path = os.path.join(tmp, "coarse.png")
                 coarse = annotate_grid(context.screenshot_path, (0, 0, width, height),
                                        coarse_cols, coarse_rows, coarse_path)
-                note = _avoid_note(context.rejected_positions, width, height) + _bet_hint(element_name, context)
+                note = _avoid_note(context.rejected_positions, width, height, context.avoid_zones) + _bet_hint(
+                    element_name, context,
+                )
                 label = self._ask_cell(element_name, coarse_path, list(coarse), "coarse", note, description)
                 if label not in coarse:
                     logger.warning("'%s': passo A senza cella valida (%r)", element_name, label)
@@ -253,6 +268,8 @@ class GPTLocatorStrategy(LocatorStrategy):
                     name for name, (cx, cy) in fine.items()
                     if not any(math.hypot(cx - rx, cy - ry) <= _AVOID_RADIUS_PX
                                for rx, ry in context.rejected_positions)
+                    and not any(math.hypot(cx - zx, cy - zy) <= radius
+                                for zx, zy, radius, _label in context.avoid_zones)
                 ]
                 if not fine_labels:
                     logger.warning("'%s': tutte le celle fini sono vicine a punti scartati", element_name)
@@ -271,9 +288,19 @@ class GPTLocatorStrategy(LocatorStrategy):
                 finest_path = os.path.join(tmp, "finest.png")
                 finest = annotate_grid(context.screenshot_path, box_c, finest_cols, finest_rows, finest_path)
                 label_c = self._ask_cell(element_name, finest_path, list(finest), "finest", note, description)
+                if label_c == _NOT_VISIBLE:
+                    # Nel ritaglio zoomato GPT NON vede l'elemento: il passo B aveva sbagliato.
+                    # Tappare comunque il centro della cella B e' tirare a indovinare (e ha gia'
+                    # colpito uno spin): nessun punto.
+                    logger.warning("'%s': al passo C GPT non vede l'elemento nella cella %s: nessun tocco.",
+                                   element_name, label_b)
+                    return None
                 if label_c in finest and not any(
                     math.hypot(finest[label_c][0] - rx, finest[label_c][1] - ry) <= _AVOID_RADIUS_PX
                     for rx, ry in context.rejected_positions
+                ) and not any(
+                    math.hypot(finest[label_c][0] - zx, finest[label_c][1] - zy) <= radius
+                    for zx, zy, radius, _label in context.avoid_zones
                 ):
                     point = finest[label_c]
                 else:

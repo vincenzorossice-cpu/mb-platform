@@ -389,3 +389,39 @@ class TestExhaustStrategy:
         locator.exhaust_strategy("memory", "bet_minus")
 
         assert locator.locate("spin", _context()).data.strategy_name == "memory"
+
+
+class TestAvoidZones:
+    def test_untrusted_candidate_inside_a_zone_is_discarded_and_counted(self):
+        gpt = _ok_strategy("gpt", x=560, y=1790)
+        locator = ElementLocator({"gpt": gpt})
+        locator.exclude_zone(("bet_minus",), 540, 1775, 90, "SPIN button")
+
+        result = locator.locate("bet_minus", _context())
+
+        assert not result.success
+        assert locator._failure_counts[("gpt", "bet_minus")] == 1
+
+    def test_a_candidate_outside_the_radius_is_accepted(self):
+        locator = ElementLocator({"gpt": _ok_strategy("gpt", x=350, y=1765)})
+        locator.exclude_zone(("bet_minus",), 540, 1775, 90, "SPIN button")
+
+        assert locator.locate("bet_minus", _context()).success
+
+    def test_zones_are_per_element_and_never_apply_to_trusted_sources(self):
+        locator = ElementLocator({"memory": _ok_strategy("memory", x=560, y=1790)})
+        locator.exclude_zone(("bet_minus",), 540, 1775, 90, "SPIN button")
+
+        assert locator.locate("bet_minus", _context()).success      # memoria: fidata
+        gpt_locator = ElementLocator({"gpt": _ok_strategy("gpt", x=560, y=1790)})
+        gpt_locator.exclude_zone(("bet_minus",), 540, 1775, 90, "SPIN button")
+        assert gpt_locator.locate("spin", _context()).success       # altro elemento
+
+    def test_strategies_receive_the_zones_in_the_context(self):
+        gpt = _ok_strategy("gpt", x=350, y=1765)
+        locator = ElementLocator({"gpt": gpt})
+        locator.exclude_zone(("bet_minus", "bet_plus"), 540, 1775, 90, "SPIN button")
+
+        locator.locate("bet_plus", _context())
+
+        assert gpt.locate.call_args.args[1].avoid_zones == [(540, 1775, 90, "SPIN button")]

@@ -40,6 +40,9 @@ class AutoPilotConfig:
     bet_burst_interval_seconds: float = 0.4
     bet_burst_check_every: int = 10
     bet_burst_abort_diff: float = 0.10
+    # Mentre si cerca un controllo della puntata senza coordinate note, si localizza lo spin (senza
+    # tappare) e si escludono ~90 px attorno ad esso: un tocco sbagliato li' spende.
+    avoid_spin_zone: bool = True
     # Puntata gia' al minimo senza un minimo noto: si PROVA che il "-" e' vivo (con un "+"
     # e poi un "-") invece di fermarsi dopo 3 tocchi a vuoto. Spegnibile.
     floor_probe_enabled: bool = True

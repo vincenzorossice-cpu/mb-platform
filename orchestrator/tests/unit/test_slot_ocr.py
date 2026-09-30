@@ -69,6 +69,20 @@ class TestItalianCreditLabel:
         assert state["saldo"] == 1250.5
 
 
+class TestThousandsSeparatorsInTheOcr:
+    @pytest.mark.parametrize("text,expected", [
+        ("CREDITO €50.000", 50000.0), ("SALDO 1.250", 1250.0), ("SALDO 1.000.000", 1000000.0),
+        ("CREDITO 50000.00", 50000.0), ("CREDITO €99.998,00", 99998.0), ("POSTA 0,10", 0.1),
+        ("SALDO 5,000.00", 5000.0), ("SALDO 114,36", 114.36), ("POSTA 0.125", 0.125),
+    ])
+    def test_amounts(self, text, expected):
+        assert SlotOCRReader()._extract_amount(text) == expected
+
+    def test_a_lone_three_digit_group_in_the_credit_line_is_read_as_thousands(self):
+        state = _ocr_reader_with([_detection("CREDITO 50.000", 10, 10)]).read_slot_state("/tmp/s.png")
+        assert state["saldo"] == 50000.0
+
+
 class TestReadTextBoxes:
     def test_bbox_is_true_min_max_of_all_four_points(self):
         """Un quad non assiale: bbox deve essere il min/max reale dei 4 punti,

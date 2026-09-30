@@ -35,9 +35,33 @@ def amounts_match(original_state: Optional[dict], current_state: Optional[dict])
     return True
 
 
+def _ratio(before, after) -> Optional[Decimal]:
+    if before is None or after is None:
+        return None
+    before = Decimal(str(before))
+    return None if before == 0 else Decimal(str(after)) / before
+
+
+def money_moved(original_state: Optional[dict], current_state: Optional[dict]) -> bool:
+    """Il saldo e' cambiato e NON come un cambio di valuta (saldo e puntata scalati insieme
+    dello stesso fattore)? Allora il tocco ha giocato uno spin (o mosso denaro): ritoccarlo
+    spenderebbe di nuovo. Saldo illeggibile prima o dopo: non si puo' dire."""
+    if not original_state or not current_state:
+        return False
+    before, after = original_state.get("saldo"), current_state.get("saldo")
+    if before is None or after is None or abs(Decimal(str(before)) - Decimal(str(after))) <= Decimal("0.005"):
+        return False
+    balance_ratio = _ratio(before, after)
+    bet_ratio = _ratio(original_state.get("posta"), current_state.get("posta"))
+    if balance_ratio is not None and bet_ratio is not None and abs(balance_ratio - 1) > Decimal("0.05"):
+        if abs(balance_ratio - bet_ratio) <= Decimal("0.05") * max(balance_ratio, bet_ratio):
+            return False   # saldo e puntata scalati insieme: e' un interruttore di valuta
+    return True
+
+
 @dataclass
 class RecoveryOutcome:
-    method: str  # "already_original" | "ocr_close" | "gpt_close" | "retap"
+    method: str  # "already_original" | "ocr_close" | "gpt_close" | "retap" | "money_moved"
     attempts: int
 
 
@@ -80,6 +104,16 @@ class ScreenRecovery:
         if not context_result.success:
             return Result.fail(context_result.error, context_result.error_code)
         context = context_result.data
+
+        if money_moved(original_state, context.slot_ocr_state):
+            # NESSUN tocco di recupero: un ritocco giocherebbe un altro spin. Chi chiama scarta
+            # il punto e decide se proseguire.
+            logger.error(
+                "recovery: il saldo e' cambiato (%s -> %s) senza scalare con la puntata: il tocco ha giocato uno "
+                "spin. Non ritocco nulla.",
+                original_state.get("saldo"), context.slot_ocr_state.get("saldo"),
+            )
+            return Result.ok(RecoveryOutcome(method="money_moved", attempts=0))
 
         soft = False
         if pixels_match:

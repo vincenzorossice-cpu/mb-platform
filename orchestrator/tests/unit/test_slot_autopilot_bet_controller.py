@@ -42,6 +42,7 @@ def _config(**overrides) -> AutoPilotConfig:
         frame_diff_poll_interval=0.01, frame_diff_max_wait_seconds=1.0,
         bet_burst_taps=1, bet_burst_interval_seconds=0.0,   # raffica spenta di default: ogni test la accende se serve
         floor_probe_enabled=False,                          # idem per la prova del pavimento
+        avoid_spin_zone=False,                              # idem per la zona di esclusione dello spin
     )
     defaults.update(overrides)
     return AutoPilotConfig(**defaults)
@@ -1356,3 +1357,113 @@ class TestMinimumMustBeProven:
         data, _, _ = self._run(taps, floor_probe_enabled=False)
 
         assert data.min_bet_verified
+
+
+def _money_tap(balance_before, balance_after, bet_before=None, bet_after=None):
+    outcome = TapOutcome(
+        tapped_coords=(200, 2200), verified=False, screenshot_before="/tmp/a.png", screenshot_after="/tmp/b.png",
+        diff_score=0.001, balance_before=balance_before, balance_after=balance_after,
+        bet_before=bet_before, bet_after=bet_after, screen_state_before="idle", screen_state_after="idle",
+        outcome="unexpected_change",
+    )
+    return Result.ok(outcome)
+
+
+class TestNeverTouchBlindly:
+    def _controller_for(self, taps, **config):
+        locator = _locator_mock()
+        locator.locate.return_value = _ok_candidate("gpt")
+        verifier = MagicMock()
+        verifier.verified_tap.side_effect = taps
+        recovery = MagicMock()
+        controller, _ = _controller(locator, verifier, config=_config(**config))
+        controller.screen_recovery = recovery
+        return controller, locator, verifier, recovery
+
+    def test_an_unreadable_bet_stops_before_any_tap(self):
+        controller, locator, verifier, _ = self._controller_for([])
+        context = LocateContext(
+            device_id="dev", slot_name="pirots5", screenshot_path="/tmp/x.png", screen_width=1080,
+            screen_height=2400, slot_ocr_state={"saldo": 50000.0},
+        )
+
+        result = controller.set_min_bet("dev", "pirots5", "ep", MagicMock(return_value=Result.ok(context)))
+
+        assert result.data.aborted_reason == "BET_UNREADABLE" and not result.data.min_bet_verified
+        verifier.verified_tap.assert_not_called()
+        locator.locate.assert_not_called()
+
+    def test_a_tap_that_moved_money_is_rejected_forever_and_never_retouched(self):
+        taps = [_money_tap(Decimal("50000"), Decimal("49000")), _decrease(2.0, 1.0)] + [_flat(1.0)] * 4
+        controller, locator, verifier, recovery = self._controller_for(taps)
+
+        controller.set_min_bet("dev", "pirots5", "ep", _context_provider(Decimal("2.00")))
+
+        locator.reject_position.assert_any_call("bet_minus", 200, 2200)
+        locator.remember_rejected.assert_called_once_with("pirots5", "bet_minus", 200, 2200)
+        recovery.recover.assert_not_called()                 # nessun ritocco/recupero
+
+    def test_a_second_spin_during_the_setup_stops_the_session(self):
+        taps = [_money_tap(Decimal("50000"), Decimal("49000")), _money_tap(Decimal("49000"), Decimal("48000"))]
+        controller, _, verifier, recovery = self._controller_for(taps)
+
+        result = controller.set_min_bet("dev", "pirots5", "ep", _context_provider(Decimal("2.00")))
+
+        assert result.data.aborted_reason == "MONEY_MOVED" and not result.data.min_bet_verified
+        assert verifier.verified_tap.call_count == 2
+
+    def test_a_currency_switch_is_not_a_spin_and_goes_to_the_recovery(self):
+        taps = [_money_tap(Decimal("100000"), Decimal("500000"), Decimal("2"), Decimal("10"))]
+        controller, locator, verifier, recovery = self._controller_for(taps, max_bet_lower_attempts=1)
+        recovery.recover.return_value = Result.ok(RecoveryOutcome("retap", 1))
+
+        controller.set_min_bet("dev", "pirots5", "ep", _context_provider(Decimal("2.00")))
+
+        recovery.recover.assert_called_once()
+
+
+class TestSpinZoneWhileSettingTheBet:
+    def _run(self, bet_minus_points, spin_point=(540, 1775), trusted=False, **config):
+        locator = _locator_mock()
+        points = iter(bet_minus_points)
+
+        def locate(element, context, exclude_strategies=()):
+            if element == "spin":
+                return Result.ok(LocateCandidate(x=spin_point[0], y=spin_point[1], confidence=0.9, strategy_name="gpt"))
+            x, y = next(points)
+            return Result.ok(LocateCandidate(x=x, y=y, confidence=0.8, strategy_name="memory" if trusted else "gpt"))
+
+        locator.locate.side_effect = locate
+        locator.is_trusted_strategy.side_effect = lambda name: name == "memory"
+        verifier = MagicMock()
+        verifier.verified_tap.side_effect = [_decrease(2.0, 1.0)] + [_flat(1.0)] * 6
+        config.setdefault("avoid_spin_zone", True)
+        controller, _ = _controller(locator, verifier, config=_config(**config))
+        controller.set_min_bet("dev", "pirots5", "ep", _context_provider(Decimal("2.00")))
+        return locator, verifier
+
+    def test_the_spin_is_located_once_and_its_zone_excluded_for_the_bet_controls(self):
+        locator, _ = self._run([(350, 1765)] * 6)
+
+        zone_calls = locator.exclude_zone.call_args_list
+        assert len(zone_calls) == 1
+        assert zone_calls[0].args == (("bet_minus", "bet_plus", "bet_menu_toggle", "close_button"), 540, 1775, 90,
+                                      "big round SPIN button")
+        assert [c.args[0] for c in locator.locate.call_args_list].count("spin") == 1
+
+    def test_a_candidate_on_the_spin_button_is_not_tapped(self):
+        locator, verifier = self._run([(520, 1780), (350, 1765), (350, 1765), (350, 1765), (350, 1765)])
+
+        tapped = [call.args[1:3] for call in verifier.verified_tap.call_args_list]
+        assert (520, 1780) not in tapped and tapped[0] == (350, 1765)
+
+    def test_a_trusted_coordinate_does_not_trigger_the_zone_search(self):
+        locator, _ = self._run([(350, 1765)] * 6, trusted=True)
+
+        locator.exclude_zone.assert_not_called()
+        assert [c.args[0] for c in locator.locate.call_args_list].count("spin") == 0
+
+    def test_the_zone_search_can_be_switched_off(self):
+        locator, _ = self._run([(350, 1765)] * 6, avoid_spin_zone=False)
+
+        locator.exclude_zone.assert_not_called()

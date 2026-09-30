@@ -29,6 +29,9 @@ class LocateContext:
     # Punti (x, y) gia' tappati per questo elemento con un effetto sbagliato
     # (es. hanno aperto un'altra schermata): riempito dal locator.
     rejected_positions: list = field(default_factory=list)
+    # Zone da non scegliere per questo elemento: (x, y, raggio, etichetta), es. il pulsante di spin
+    # mentre si cerca un "-": riempito dal locator.
+    avoid_zones: list = field(default_factory=list)
     # Fascia (x1, y1, x2, y2) dove si leggono saldo e puntata, appresa dallo schermo:
     # permette letture OCR rapide quando servono solo quei due importi.
     amounts_band: Optional[tuple] = None

@@ -1,3 +1,4 @@
+import pytest
 from decimal import Decimal
 
 from orchestrator.modules.slot_autopilot.value_parser import parse_amount
@@ -67,3 +68,22 @@ def test_garbage_fails_gracefully():
     result = parse_amount("???")
     assert not result.success
     assert result.error_code == "AMOUNT_NOT_FOUND"
+
+
+class TestThousandsSeparators:
+    """Gli importi hanno due decimali: un solo separatore + 3 cifre sono le migliaia."""
+
+    @pytest.mark.parametrize("text,expected", [
+        ("50.000", "50000"), ("€50.000", "50000"), ("1.250", "1250"), ("999,000", "999000"),
+        ("1.000.000", "1000000"), ("1,000,000", "1000000"), ("49.000", "49000"),
+    ])
+    def test_single_separator_with_three_digits_is_thousands(self, text, expected):
+        assert parse_amount(text).data == Decimal(expected)
+
+    @pytest.mark.parametrize("text,expected", [
+        ("0.10", "0.10"), ("0,10", "0.10"), ("114,36", "114.36"), ("1.234,56", "1234.56"),
+        ("5,000.00", "5000.00"), ("99.998,00", "99998.00"), ("50000.00", "50000.00"), ("0.125", "0.125"),
+        ("0,125", "0.125"), ("10.5", "10.5"), ("12.345.67", "12345.67"),
+    ])
+    def test_everything_else_is_unchanged(self, text, expected):
+        assert parse_amount(text).data == Decimal(expected)

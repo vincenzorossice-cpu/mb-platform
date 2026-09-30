@@ -30,6 +30,7 @@ from orchestrator.modules.slot_autopilot.strategies.template_strategy import Tem
 from orchestrator.modules.slot_autopilot.screen_recovery import ScreenRecovery
 from orchestrator.modules.slot_autopilot.verifier import ActionVerifier
 from orchestrator.modules.slot_ocr.reader import SlotOCRReader
+from orchestrator.modules.slot_ocr.vision_reader import ResilientOCRReader, VisionAmountReader
 from orchestrator.modules.step_logger.logger import JSONLStepLogger
 from orchestrator.modules.touch_injector.injector import TouchInjector
 
@@ -79,6 +80,14 @@ def _configure_logging(log_dir: str, slot_name: str) -> str:
         warnings.filterwarnings("ignore", message=pattern)
     logging.getLogger("easyocr").setLevel(logging.ERROR)  # "Using CPU": informativo, una volta
     return path
+
+
+_BET_FAILURE_MESSAGES = {
+    "BET_UNREADABLE": "Non riesco a leggere la puntata: non tocco nulla (e non spinno).",
+    "MONEY_MOVED": "Due tocchi durante la messa a punto della puntata hanno giocato uno spin: mi fermo.",
+    "MIN_NOT_PROVEN": "Non riesco a dimostrare che questa sia la puntata minima: per sicurezza non spinno.",
+    "STUCK_ON_UNEXPECTED_SCREEN": "Sono rimasto su una schermata inattesa e non riesco a tornare indietro: mi fermo.",
+}
 
 
 def _progress_line(spin_index: int, spin_result, total_played: Decimal, target: Decimal, seconds: float) -> str:
@@ -150,6 +159,9 @@ def build_autopilot(args: argparse.Namespace) -> Result[SlotAutoPilot]:
             if not key_check.success:
                 return Result.fail(key_check.error, key_check.error_code)
             strategies["gpt"] = GPTLocatorStrategy(gpt_client)
+            # Rete di sicurezza per saldo e puntata: se l'OCR non li legge o li legge male (es. "50000.00"
+            # letto 50.0) si usa la visione; dove l'OCR basta non costa nulla.
+            ocr_reader = ResilientOCRReader(ocr_reader, VisionAmountReader(gpt_client))
 
     if config.enable_hitl_fallback:
         strategies["hitl"] = HITLStrategy(
@@ -187,7 +199,10 @@ def _run_session(autopilot: SlotAutoPilot, args: argparse.Namespace) -> int:
     bet_result = autopilot.set_min_bet(args.device)
     if not bet_result.success or not bet_result.data.min_bet_verified:
         reason = bet_result.data.aborted_reason if bet_result.success else bet_result.error_code
-        logger.error("Impossibile verificare la puntata minima (%s): mi fermo senza spinnare.", reason)
+        logger.error(
+            "Impossibile verificare la puntata minima (%s): %s", reason,
+            _BET_FAILURE_MESSAGES.get(reason, "mi fermo senza spinnare."),
+        )
         return 1
     logger.info(
         "Puntata minima verificata: %s EUR (outcome=%s, tentativi=%d)",

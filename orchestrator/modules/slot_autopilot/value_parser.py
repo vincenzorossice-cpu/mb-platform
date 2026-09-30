@@ -1,6 +1,7 @@
 import re
 from decimal import Decimal, InvalidOperation
 
+from orchestrator.core.amount_format import normalize_number_run
 from orchestrator.core.result import Result
 
 _CURRENCY_TOKENS = re.compile(r"(€|\$|EUR|USD)", re.IGNORECASE)
@@ -26,16 +27,7 @@ def parse_amount(text: str) -> Result[Decimal]:
     run = run.translate(_OCR_DIGIT_FIXES)
     run = run.lstrip("-")
 
-    last_comma = run.rfind(",")
-    last_dot = run.rfind(".")
-    if last_comma > last_dot:
-        normalized = run.replace(".", "").replace(",", ".")
-    elif last_dot > last_comma:
-        normalized = run.replace(",", "")
-    elif "," in run:
-        normalized = run.replace(",", ".")
-    else:
-        normalized = run
+    normalized = normalize_number_run(run)
 
     if negative:
         normalized = f"-{normalized}"

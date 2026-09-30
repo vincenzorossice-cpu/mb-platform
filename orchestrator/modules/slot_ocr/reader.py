@@ -3,6 +3,7 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
+from orchestrator.core.amount_format import normalize_number_run
 from orchestrator.core.result import Result
 
 logger = logging.getLogger(__name__)
@@ -209,24 +210,9 @@ class SlotOCRReader:
         return Result.ok(boxes)
 
     def _extract_amount(self, text: str) -> Optional[float]:
-        """Estrae un importo numerico da un testo OCR (es. '114,36 €', '5,000.00')."""
+        """Estrae un importo numerico da un testo OCR (es. '114,36 €', '5,000.00',
+        '50.000' = cinquantamila). Le regole dei separatori stanno in
+        normalize_number_run."""
         match = re.search(r'(\d[\d.,]*\d)', text)
         if not match: return None
-        clean = match.group(1)
-
-        # Determina formato in base all'ultimo separatore
-        last_comma = clean.rfind(',')
-        last_dot = clean.rfind('.')
-
-        if last_comma > last_dot:
-            # Formato europeo: 1.234,56 o 114,36
-            return float(clean.replace('.', '').replace(',', '.'))
-        elif last_dot > last_comma:
-            # Formato americano: 5,000.00 o 1.50
-            return float(clean.replace(',', ''))
-        elif ',' in clean:
-            # Solo virgola: europeo 114,36
-            return float(clean.replace(',', '.'))
-
-        # Solo punto o nessuno: intero o americano 1.50
-        return float(clean)
+        return float(normalize_number_run(match.group(1)))
