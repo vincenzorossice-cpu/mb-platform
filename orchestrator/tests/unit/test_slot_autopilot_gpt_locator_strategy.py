@@ -1,4 +1,6 @@
+import json
 import os
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -82,80 +84,113 @@ def real_context(tmp_path):
 
 
 def _cell_answer(label, action="tap"):
-    return Result.ok({"answers": {
-        "action": {"choice": action, "confidence": 0.8},
-        "target": {"choice": {"text": label, "region": None}, "confidence": 0.8},
-    }})
+    """Risposta del canale dedicato alla griglia (gpt_client.client)."""
+    cell = label if action == "tap" else None
+    return json.dumps({"cell": cell, "confidence": 0.8})
+
+
+def _client(first, *cells):
+    """gpt_client finto: il primo passo passa da ask_with_image, i passi
+    A/B della griglia dal client OpenAI diretto (un JSON per chiamata)."""
+    gpt_client = MagicMock()
+    gpt_client.ask_with_image.return_value = first
+    responses = []
+    for cell in cells:
+        if isinstance(cell, Exception):
+            responses.append(cell)
+        else:
+            responses.append(SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=cell))]))
+    gpt_client.client.chat.completions.create.side_effect = responses
+    return gpt_client
+
+
+def _grid_calls(gpt_client):
+    return gpt_client.client.chat.completions.create.call_args_list
+
+
+def _grid_user_text(call):
+    return call.kwargs["messages"][1]["content"][0]["text"]
 
 
 class TestIconRefinement:
     def test_icon_is_located_in_two_grid_steps_never_at_the_3x3_cell_center(self, real_context):
-        gpt_client = MagicMock()
-        gpt_client.ask_with_image.side_effect = [
-            Result.ok(_answers(target_region="middle-left")),
-            _cell_answer("B6"),   # passo A: colonna B (270-540), riga 6 (1500-1800)
-            _cell_answer("C4"),   # passo B
-        ]
+        gpt_client = _client(Result.ok(_answers(target_region="middle-left")), _cell_answer("B6"), _cell_answer("C4"))
+
         result = GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
 
         assert result.success
-        assert gpt_client.ask_with_image.call_count == 3
+        assert len(_grid_calls(gpt_client)) == 2
+        assert gpt_client.ask_with_image.call_count == 1
         assert (result.data.x, result.data.y) != (180, 1200)   # centro 3x3 "middle-left"
-        # cella A: centro (405,1650); riquadro (135,1350)-(675,1950); cella B "C4" di una 6x6:
+        # cella A B6: centro (405,1650); riquadro (135,1350)-(675,1950); cella fine "C4" di una 6x6
         assert (result.data.x, result.data.y) == (135 + round(2.5 * 540 / 6), 1350 + round(3.5 * 600 / 6))
 
-    def test_stage_calls_use_labeled_grid_candidates_and_the_element_description(self, real_context):
-        gpt_client = MagicMock()
-        gpt_client.ask_with_image.side_effect = [
-            Result.ok(_answers(target_region="middle-left")), _cell_answer("A1"), _cell_answer("A1"),
-        ]
+    def test_grid_steps_use_a_dedicated_prompt_not_the_generic_vision_prompt(self, real_context):
+        gpt_client = _client(Result.ok(_answers(target_region="middle-left")), _cell_answer("A1"), _cell_answer("A1"))
         GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
 
-        first_questions = gpt_client.ask_with_image.call_args_list[0].args[2]
-        assert "minus" in first_questions["action"]["instructions"].lower()
-        coarse_questions = gpt_client.ask_with_image.call_args_list[1].args[2]
-        assert "A1" in coarse_questions["target"]["criteria"] and "D8" in coarse_questions["target"]["criteria"]
+        call = _grid_calls(gpt_client)[0]
+        assert "labeled grid" in call.kwargs["messages"][0]["content"]
+        assert call.kwargs["response_format"] == {"type": "json_object"}
+        assert "minus" in _grid_user_text(call).lower()
+        assert "A1" in _grid_user_text(call) and "D8" in _grid_user_text(call)
 
     def test_text_target_resolvable_needs_no_grid_steps(self, real_context):
         real_context.raw_texts = [("SPIN", (500, 2000), 0.9)]
-        gpt_client = MagicMock()
-        gpt_client.ask_with_image.return_value = Result.ok(_answers(target_text="SPIN"))
+        gpt_client = _client(Result.ok(_answers(target_text="SPIN")))
 
         result = GPTLocatorStrategy(gpt_client).locate("spin", real_context)
 
         assert result.success and (result.data.x, result.data.y) == (500, 2000)
-        gpt_client.ask_with_image.assert_called_once()
+        gpt_client.client.chat.completions.create.assert_not_called()
 
-    @pytest.mark.parametrize("second_answer", [_cell_answer("ZZ9"), _cell_answer("A1", action="stop"),
-                                               Result.fail("api", "GPT_API_ERROR")])
-    def test_invalid_first_grid_step_fails_without_falling_back_to_the_coarse_cell(self, real_context, second_answer):
-        gpt_client = MagicMock()
-        gpt_client.ask_with_image.side_effect = [Result.ok(_answers(target_region="middle-left")), second_answer]
+    @pytest.mark.parametrize("coarse", [
+        _cell_answer("ZZ9"), _cell_answer("A1", action="stop"), "not json", json.dumps({"cell": 7}),
+        json.dumps(["A1"]),
+    ])
+    def test_invalid_first_grid_step_fails_without_falling_back_to_the_coarse_cell(self, real_context, coarse):
+        gpt_client = _client(Result.ok(_answers(target_region="middle-left")), coarse)
 
         result = GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
 
         assert not result.success
         assert result.error_code == "GPT_LOCATOR_UNRESOLVED_TARGET"
 
+    def test_openai_error_is_logged_and_fails(self, real_context, caplog):
+        import openai
+        error = openai.APIConnectionError(request=MagicMock())
+        gpt_client = _client(Result.ok(_answers(target_region="middle-left")), error)
+
+        with caplog.at_level("WARNING"):
+            result = GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
+
+        assert not result.success
+        assert any("errore OpenAI" in record.getMessage() for record in caplog.records)
+
     def test_invalid_second_step_fails(self, real_context):
-        gpt_client = MagicMock()
-        gpt_client.ask_with_image.side_effect = [
-            Result.ok(_answers(target_region="middle-left")), _cell_answer("B2"), _cell_answer("Z9"),
-        ]
+        gpt_client = _client(Result.ok(_answers(target_region="middle-left")), _cell_answer("B2"), _cell_answer("Z9"))
         assert not GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context).success
 
-    def test_temporary_grid_images_are_removed(self, real_context):
-        seen = []
-        gpt_client = MagicMock()
+    def test_gpt_answers_are_logged_for_debugging(self, real_context, caplog):
+        gpt_client = _client(Result.ok(_answers(target_region="middle-left")), _cell_answer("B6"), _cell_answer("C4"))
+        with caplog.at_level("INFO"):
+            GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
 
-        def ask(image_path, *args, **kwargs):
-            if "autopilot_grid_" in image_path:
-                seen.append(image_path)
-                assert os.path.exists(image_path)
-                return _cell_answer("A1")
-            return Result.ok(_answers(target_region="middle-left"))
+        messages = [record.getMessage() for record in caplog.records]
+        assert any("GPT risponde cella='B6'" in m for m in messages)
+        assert any("GPT risponde cella='C4'" in m for m in messages)
 
-        gpt_client.ask_with_image.side_effect = ask
+    def test_temporary_grid_images_are_removed(self, real_context, monkeypatch):
+        seen = set()   # PIL (salvataggio) e la lettura base64 aprono lo stesso file
+        original_open = open
+
+        def spy_open(path, *args, **kwargs):
+            if "autopilot_grid_" in str(path):
+                seen.add(str(path))
+            return original_open(path, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", spy_open)
+        gpt_client = _client(Result.ok(_answers(target_region="middle-left")), _cell_answer("A1"), _cell_answer("A1"))
         GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
 
         assert len(seen) == 2
@@ -164,38 +199,40 @@ class TestIconRefinement:
 
 class TestRejectedPointsAndDescriptions:
     def test_bet_minus_description_excludes_the_info_icon(self, real_context):
-        gpt_client = MagicMock()
-        gpt_client.ask_with_image.return_value = Result.ok(_answers(action="stop"))
+        gpt_client = _client(Result.ok(_answers(action="stop")))
         GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
 
         text = gpt_client.ask_with_image.call_args.args[2]["action"]["instructions"]
         assert "NEVER the 'i'" in text
 
     def test_close_button_has_a_description(self, real_context):
-        gpt_client = MagicMock()
-        gpt_client.ask_with_image.return_value = Result.ok(_answers(action="stop"))
+        gpt_client = _client(Result.ok(_answers(action="stop")))
         GPTLocatorStrategy(gpt_client).locate("close_button", real_context)
 
         assert "close" in gpt_client.ask_with_image.call_args.args[2]["action"]["instructions"].lower()
 
     def test_rejected_points_are_mentioned_in_the_question(self, real_context):
         real_context.rejected_positions = [(46, 2048)]
-        gpt_client = MagicMock()
-        gpt_client.ask_with_image.return_value = Result.ok(_answers(action="stop"))
+        gpt_client = _client(Result.ok(_answers(action="stop")))
         GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
 
         text = gpt_client.ask_with_image.call_args.args[2]["action"]["instructions"]
         assert "WRONG element" in text and "4% from left" in text
 
+    def test_rejected_points_are_also_passed_to_the_grid_steps(self, real_context):
+        real_context.rejected_positions = [(46, 2048)]
+        gpt_client = _client(Result.ok(_answers(target_region="middle-left")), _cell_answer("B6"), _cell_answer("C4"))
+        GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
+
+        assert "WRONG element" in _grid_user_text(_grid_calls(gpt_client)[0])
+
     def test_fine_cells_near_a_rejected_point_are_not_offered(self, real_context):
         # Punto scartato al centro della cella A1 fine: quella cella non e' un candidato.
         real_context.rejected_positions = [(135, 1350 + 50)]
-        gpt_client = MagicMock()
-        gpt_client.ask_with_image.side_effect = [
-            Result.ok(_answers(target_region="middle-left")), _cell_answer("B6"), _cell_answer("A1"),
-        ]
+        gpt_client = _client(Result.ok(_answers(target_region="middle-left")), _cell_answer("B6"), _cell_answer("A1"))
         result = GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
 
-        fine_candidates = gpt_client.ask_with_image.call_args_list[2].args[2]["target"]["criteria"]
-        assert "A1" not in fine_candidates and "F6" in fine_candidates
+        fine_text = _grid_user_text(_grid_calls(gpt_client)[1])
+        labels_line = fine_text.split("Valid cell labels: ")[1].split(".\n")[0].split(", ")
+        assert "A1" not in labels_line and "F6" in labels_line
         assert not result.success   # GPT ha scelto proprio la cella tolta

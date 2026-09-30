@@ -1,9 +1,12 @@
 import argparse
 from unittest.mock import MagicMock, patch
 
+import httpx
+import openai
 import pytest
 
 from orchestrator.core.result import Result
+from orchestrator.scripts.run_autopilot import _check_openai_key as real_check_openai_key
 from orchestrator.scripts.run_autopilot import build_autopilot, main
 
 
@@ -14,6 +17,13 @@ def _args(**overrides) -> argparse.Namespace:
     )
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
+
+
+@pytest.fixture(autouse=True)
+def _no_network_key_check(monkeypatch):
+    """Nessun test deve chiamare OpenAI: il controllo della chiave e' finto
+    (i suoi casi reali sono in TestOpenAIKeyCheck)."""
+    monkeypatch.setattr("orchestrator.scripts.run_autopilot._check_openai_key", lambda client: Result.ok(True))
 
 
 class TestBuildAutopilot:
@@ -46,6 +56,51 @@ class TestBuildAutopilot:
         result = build_autopilot(_args())
         assert result.success
         assert "gpt" not in result.data.locator.strategies
+
+
+class TestOpenAIKeyCheck:
+    def test_rejected_key_blocks_the_start_with_a_clear_message(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("OPENAI_API_KEY", "bad-key")
+        monkeypatch.setattr(
+            "orchestrator.scripts.run_autopilot._check_openai_key",
+            lambda client: Result.fail("chiave rifiutata", "OPENAI_KEY_REJECTED"),
+        )
+        result = build_autopilot(_args())
+
+        assert not result.success
+        assert result.error_code == "OPENAI_KEY_REJECTED"
+
+    def test_no_gpt_skips_the_check_entirely(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("OPENAI_API_KEY", "bad-key")
+        check = MagicMock(return_value=Result.fail("x", "OPENAI_KEY_REJECTED"))
+        monkeypatch.setattr("orchestrator.scripts.run_autopilot._check_openai_key", check)
+
+        assert build_autopilot(_args(no_gpt=True)).success
+        check.assert_not_called()
+
+    def test_401_is_reported_as_rejected_key(self):
+        client = MagicMock()
+        response = httpx.Response(401, request=httpx.Request("GET", "https://api.openai.com/v1/models"))
+        client.client.models.list.side_effect = openai.AuthenticationError(
+            "Incorrect API key", response=response, body=None,
+        )
+
+        result = real_check_openai_key(client)
+
+        assert not result.success
+        assert result.error_code == "OPENAI_KEY_REJECTED"
+        assert "--no-gpt" in result.error and "OPENAI_API_KEY" in result.error
+
+    def test_network_problem_does_not_block_the_start(self):
+        client = MagicMock()
+        client.client.models.list.side_effect = openai.APIConnectionError(request=MagicMock())
+
+        assert real_check_openai_key(client).success
+
+    def test_valid_key_passes(self):
+        assert real_check_openai_key(MagicMock()).success
 
 
 class TestMain:

@@ -1,9 +1,11 @@
+import base64
+import json
 import logging
 import math
 import os
 import tempfile
 
-from PIL import Image as _PILImage
+import openai
 
 from orchestrator.core.result import Result
 from orchestrator.modules.decision_engine.interface import choice_question
@@ -45,6 +47,15 @@ _ELEMENT_DESCRIPTIONS = {
         "of that panel"
     ),
 }
+
+
+_GRID_SYSTEM_PROMPT = (
+    "You look at a screenshot of a mobile slot-machine game with a labeled grid drawn on top: each cell "
+    "has a yellow label (like A1, B3) at its top-left corner. Your only job is to say which ONE cell "
+    "contains the CENTER of the requested element. Use only labels from the list you are given; never "
+    "invent labels. If the element is not visible in the image, answer null. Respond ONLY with JSON: "
+    '{"cell": "<label or null>", "confidence": <0.0-1.0>}'
+)
 
 
 def _describe(element_name: str) -> str:
@@ -121,32 +132,49 @@ class GPTLocatorStrategy(LocatorStrategy):
 
 
     def _ask_cell(self, element_name: str, image_path: str, labels: list, stage: str, note: str = ""):
-        """Una domanda Vision con le etichette di griglia come candidati:
-        ritorna l'etichetta scelta o None (stop / risposta non valida)."""
-        with _PILImage.open(image_path) as img:
-            width, height = img.size
-        questions = {
-            "action": choice_question(
-                f"Tap '{element_name}' ({_describe(element_name)}) if it is visible in this image." + note,
-                {"tap": "Touch the element", "stop": "Element not visible / cannot proceed"},
-            ),
-            "target": choice_question(
-                "The image has a labeled grid. Answer with the label of the ONE cell that contains "
-                "the CENTER of the element.",
-                {label: label for label in labels},
-            ),
-        }
-        result = self.gpt_client.ask_with_image(
-            image_path, f"Locate the element ({stage} grid): {element_name}", questions, width, height,
+        """Domanda Vision con un prompt DEDICATO alla griglia etichettata:
+        ritorna l'etichetta scelta o None. Non passa da ask_with_image, il cui
+        prompt di sistema impone a GPT di rispondere con testo OCR o regione
+        3x3 (mai con una cella della mia griglia)."""
+        try:
+            with open(image_path, "rb") as img_file:
+                encoded = base64.b64encode(img_file.read()).decode("utf-8")
+        except OSError as exc:
+            logger.warning("'%s' (%s): immagine illeggibile: %s", element_name, stage, exc)
+            return None
+
+        user_text = (
+            f"Element to find: '{element_name}' - {_describe(element_name)}.{note}\n"
+            f"Valid cell labels: {', '.join(labels)}.\n"
+            "Reply with the label of the ONE cell that contains the CENTER of the element, or null if it "
+            "is not visible in this image."
         )
-        if not result.success:
+        messages = [
+            {"role": "system", "content": _GRID_SYSTEM_PROMPT},
+            {"role": "user", "content": [
+                {"type": "text", "text": user_text},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}},
+            ]},
+        ]
+        try:
+            response = self.gpt_client.client.chat.completions.create(
+                model=self.gpt_client.model, messages=messages,
+                response_format={"type": "json_object"}, temperature=0.1, max_tokens=100,
+            )
+            data = json.loads(response.choices[0].message.content)
+        except openai.OpenAIError as exc:
+            logger.warning("'%s' (%s): errore OpenAI: %s", element_name, stage, exc)
             return None
-        answers = result.data.get("answers", {})
-        if answers.get("action", {}).get("choice") != "tap":
+        except (json.JSONDecodeError, IndexError, AttributeError, TypeError) as exc:
+            logger.warning("'%s' (%s): risposta GPT non valida: %s", element_name, stage, exc)
             return None
-        target = answers.get("target", {}).get("choice")
-        label = target.get("text") if isinstance(target, dict) else None
-        return label.strip().upper() if label else None
+
+        cell = data.get("cell") if isinstance(data, dict) else None
+        logger.info("'%s' (%s): GPT risponde cella=%r confidenza=%r", element_name, stage, cell,
+                    data.get("confidence") if isinstance(data, dict) else None)
+        if not isinstance(cell, str) or not cell.strip():
+            return None
+        return cell.strip().upper()
 
     def _refine_icon(self, element_name: str, context: LocateContext):
         """(x, y) assoluti del centro della cella fine scelta, o None."""

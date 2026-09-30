@@ -3,6 +3,8 @@ import logging
 import sys
 from decimal import Decimal
 
+import openai
+
 from orchestrator.core.result import Result
 from orchestrator.modules.decision_engine.gpt_client import GPTDecisionClient
 from orchestrator.modules.provider_profile.loader import ProviderProfileLoader
@@ -28,6 +30,25 @@ from orchestrator.modules.step_logger.logger import JSONLStepLogger
 from orchestrator.modules.touch_injector.injector import TouchInjector
 
 logger = logging.getLogger(__name__)
+
+
+def _check_openai_key(gpt_client) -> Result[bool]:
+    """Controllo gratuito (elenco modelli, nessun token) che la chiave sia
+    accettata: una chiave rifiutata fa fallire in silenzio ogni chiamata GPT e
+    lascia solo l'operatore. Solo un rifiuto esplicito (401) e' bloccante: rete
+    o server momentaneamente giu' non devono impedire di partire."""
+    try:
+        gpt_client.client.models.list()
+    except openai.AuthenticationError as exc:
+        return Result.fail(
+            "La chiave OpenAI e' stata rifiutata (401 Unauthorized). Imposta una chiave valida "
+            "(PowerShell: $env:OPENAI_API_KEY=\"sk-...\"; verificala su platform.openai.com/api-keys) "
+            f"oppure rilancia con --no-gpt. Dettaglio: {exc}",
+            "OPENAI_KEY_REJECTED",
+        )
+    except openai.OpenAIError as exc:
+        logger.warning("Controllo chiave OpenAI non riuscito (%s): proseguo comunque.", exc)
+    return Result.ok(True)
 
 
 def build_autopilot(args: argparse.Namespace) -> Result[SlotAutoPilot]:
@@ -63,9 +84,13 @@ def build_autopilot(args: argparse.Namespace) -> Result[SlotAutoPilot]:
     if config.enable_gpt_fallback:
         try:
             gpt_client = GPTDecisionClient()
-            strategies["gpt"] = GPTLocatorStrategy(gpt_client)
         except ValueError as exc:
             logger.warning("GPT fallback disabilitato (OPENAI_API_KEY mancante?): %s", exc)
+        else:
+            key_check = _check_openai_key(gpt_client)
+            if not key_check.success:
+                return Result.fail(key_check.error, key_check.error_code)
+            strategies["gpt"] = GPTLocatorStrategy(gpt_client)
 
     if config.enable_hitl_fallback:
         strategies["hitl"] = HITLStrategy(screen_reader, ocr_reader, touch_injector)
