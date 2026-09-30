@@ -453,3 +453,40 @@ class TestTimingBreakdownInTheLog:
 
         by_level = {r.levelname for r in caplog.records if "bloccato" in r.getMessage()}
         assert by_level == {"INFO", "WARNING"}
+
+
+class TestBetUnderstated:
+    def _spin(self, balance_after, bet="0.10", balance_before="100.00", win=None):
+        locator = MagicMock()
+        locator.locate.return_value = _candidate()
+        verifier = MagicMock()
+        verifier.verified_tap.return_value = _tap_outcome(True, balance_after=Decimal(balance_after), win_amount=win)
+        controller, _, _, _ = _controller(locator=locator, verifier=verifier)
+        return controller.spin(
+            "dev", "pirots5", "ep", 1, MagicMock(return_value=_context_result(Decimal(balance_before))),
+            True, Decimal(bet),
+        ).data
+
+    def test_a_balance_drop_far_above_the_believed_bet_is_flagged(self):
+        assert self._spin("90.00").bet_understated          # calo 10.00 con puntata creduta 0.10
+
+    def test_a_normal_drop_or_a_win_is_not_flagged(self):
+        assert not self._spin("99.90").bet_understated
+        assert not self._spin("100.40").bet_understated
+        assert not self._spin("99.85", win=Decimal("0.05")).bet_understated
+
+    def test_two_bets_worth_of_drop_is_the_limit(self):
+        assert not self._spin("99.80").bet_understated       # esattamente 2 x 0.10
+        assert self._spin("99.70").bet_understated           # 3 x 0.10
+
+    def test_unreadable_balance_is_not_flagged(self):
+        locator = MagicMock()
+        locator.locate.return_value = _candidate()
+        verifier = MagicMock()
+        verifier.verified_tap.return_value = _tap_outcome(True, balance_after=None)
+        controller, _, _, _ = _controller(locator=locator, verifier=verifier)
+
+        result = controller.spin("dev", "pirots5", "ep", 1,
+                                 MagicMock(return_value=_context_result(Decimal("100.00"))), True, Decimal("0.10"))
+
+        assert not result.data.bet_understated

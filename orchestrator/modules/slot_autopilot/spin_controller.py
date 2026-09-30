@@ -35,6 +35,8 @@ class SpinResult:
     # iniziare lo spin successivo puo' riusarli invece di rifare la lettura.
     screenshot_after: Optional[str] = None
     state_after: Optional[dict] = None
+    # Il saldo e' sceso di molto piu' della puntata creduta: la puntata reale e' piu' alta.
+    bet_understated: bool = False
 
 
 class SpinController:
@@ -176,6 +178,12 @@ class SpinController:
             )
         if outcome == "success" and win_amount is None:
             win_amount = self._infer_win(balance_before, balance_after, expected_bet)
+        bet_understated = outcome == "success" and self._bet_understated(balance_before, balance_after, expected_bet)
+        if bet_understated:
+            logger.error(
+                "spin %d: il saldo e' sceso di %s con una puntata creduta di %s: la puntata reale e' piu' alta.",
+                spin_index, balance_before - balance_after, expected_bet,
+            )
         accounting_anomaly = None
         if outcome == "success":
             accounting_anomaly = self._check_accounting(balance_before, expected_bet, win_amount, balance_after)
@@ -199,8 +207,15 @@ class SpinController:
             balance_before=balance_before, balance_after=balance_after, win_amount=win_amount,
             verified=verified, attempts=attempts, outcome=outcome,
             accounting_anomaly=accounting_anomaly, strategy_name=candidate.strategy_name,
-            screenshot_after=screenshot_after, state_after=state_after,
+            screenshot_after=screenshot_after, state_after=state_after, bet_understated=bet_understated,
         ))
+
+    def _bet_understated(self, balance_before, balance_after, bet) -> bool:
+        """Una vincita puo' solo RIDURRE il calo di saldo: se il saldo scende di piu' del doppio
+        della puntata creduta (piu' la tolleranza), quella puntata non puo' essere giusta."""
+        if balance_before is None or balance_after is None or bet is None or bet <= 0:
+            return False
+        return (balance_before - balance_after) > 2 * bet + self.config.accounting_tolerance
 
     def _infer_win(self, balance_before, balance_after, bet) -> Optional[Decimal]:
         """La vincita non letta dall'OCR si deduce dal saldo: dopo - prima + puntata.

@@ -175,6 +175,8 @@ class BetController:
         consecutive_decreases = 0  # discese verificate di fila (abilita la raffica)
         probe_done = False
         last_step = None  # gradino osservato in un tocco singolo verificato (dimensiona la corsa)
+        minus_proven_alive = False  # la prova "+ poi -" ha dimostrato che il "-" funziona davvero
+        decreases_seen = 0
 
         while attempts < self.config.max_bet_lower_attempts:
             attempts += 1
@@ -359,6 +361,7 @@ class BetController:
                     # falso VALUE_ROSE), col "-" vivo o da sostituire.
                     current_bet = lowest_bet_seen = probe.bet
                     any_decrease_seen = probe.minus_alive
+                    minus_proven_alive = minus_proven_alive or probe.minus_alive
                     consecutive_decreases = 1 if probe.minus_alive else 0
                     stable_reads = 0
                     if probe.minus_dead:
@@ -389,6 +392,7 @@ class BetController:
                 any_decrease_seen = True
                 stable_reads = 0
                 consecutive_decreases += 1
+                decreases_seen += 1
                 if not burst_done and bet_before_update is not None:
                     last_step = bet_before_update - current_bet  # un solo tocco: e' il gradino vero
                 if burst_done and remembered_min is not None and current_bet <= remembered_min:
@@ -466,8 +470,62 @@ class BetController:
                 already_at_known_min = (
                     trusted_min_bet is not None and current_bet is not None and current_bet <= trusted_min_bet
                 ) or remembered_floor
-                min_bet_verified = any_decrease_seen or already_at_known_min
+                operator_involved = "hitl" in strategy_sequence
+                if not self.config.floor_probe_enabled:
+                    # Comportamento storico: una discesa letta basta.
+                    min_bet_verified = any_decrease_seen or already_at_known_min
+                    proof = "discesa letta (prova del pavimento spenta)"
+                else:
+                    # Il minimo di una slot va DIMOSTRATO: una discesa letta dall'OCR non basta (una
+                    # cifra persa o un controllo che cicla i valori ne fabbricano una finta). Serve un
+                    # riscontro indipendente: minimo curato/ricordato, operatore, oppure la prova
+                    # "+ poi -" che il "-" funziona davvero.
+                    proven = already_at_known_min or minus_proven_alive or operator_involved
+                    if (
+                        not proven and not probe_done and outcome_data is not None
+                        and current_bet is not None
+                    ):
+                        probe_done = True
+                        probe = self._probe_floor(
+                            device_id, slot_name, context, candidate, outcome_data, current_bet, context_provider,
+                        )
+                        if probe.status == "floor":
+                            proven = True
+                        elif probe.status == "stuck":
+                            return Result.ok(BetResult(
+                                slot_name=slot_name, starting_bet=starting_bet, final_bet=current_bet,
+                                min_bet_verified=False, attempts=attempts, strategy_sequence=strategy_sequence,
+                                aborted_reason="STUCK_ON_UNEXPECTED_SCREEN", outcome="aborted",
+                            ))
+                        elif probe.status == "continue":
+                            current_bet = lowest_bet_seen = probe.bet
+                            any_decrease_seen = probe.minus_alive
+                            minus_proven_alive = minus_proven_alive or probe.minus_alive
+                            consecutive_decreases = 1 if probe.minus_alive else 0
+                            stable_reads = 0
+                            if probe.minus_dead:
+                                self.locator.exhaust_strategy(candidate.strategy_name, _ELEMENT)
+                                self.locator.reject_position(_ELEMENT, candidate.x, candidate.y)
+                            refreshed = context_provider()
+                            if refreshed.success:
+                                context = refreshed.data
+                            continue
+                    min_bet_verified = proven
+                    proof = (
+                        "minimo curato/ricordato" if already_at_known_min
+                        else "prova del pavimento (+ poi -)" if minus_proven_alive or proven and not operator_involved
+                        else "operatore" if operator_involved else "NESSUNA"
+                    )
+                logger.info(
+                    "set_min_bet: evidenza del minimo: discese verificate=%d, profilo curato=%s, ricordato=%s, "
+                    "operatore=%s, riscontro=%s -> verificato=%s",
+                    decreases_seen, trusted_min_bet, remembered_min, operator_involved, proof, min_bet_verified,
+                )
                 outcome_label = "min_bet_confirmed" if any_decrease_seen else "unchanged_already_min"
+                if not min_bet_verified and any_decrease_seen and self.config.floor_probe_enabled:
+                    logger.error(
+                        "Non riesco a dimostrare che %s e' la puntata minima: per sicurezza non spinno.", current_bet,
+                    )
                 logger.info(
                     "set_min_bet: plateau raggiunto (outcome=%s, min_bet_verified=%s, puntata finale=%s)",
                     outcome_label, min_bet_verified, current_bet,
@@ -480,7 +538,11 @@ class BetController:
                 return Result.ok(BetResult(
                     slot_name=slot_name, starting_bet=starting_bet, final_bet=current_bet,
                     min_bet_verified=min_bet_verified, attempts=attempts, strategy_sequence=strategy_sequence,
-                    aborted_reason=None if min_bet_verified else "NO_DECREASE_OBSERVED",
+                    aborted_reason=(
+                        None if min_bet_verified
+                        else "MIN_NOT_PROVEN" if any_decrease_seen and self.config.floor_probe_enabled
+                        else "NO_DECREASE_OBSERVED"
+                    ),
                     outcome=outcome_label,
                 ))
 

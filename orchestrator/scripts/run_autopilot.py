@@ -208,6 +208,13 @@ def _run_session(autopilot: SlotAutoPilot, args: argparse.Namespace) -> int:
         if not spin_result.success:
             logger.error("spin() fallito: %s (%s)", spin_result.error, spin_result.error_code)
             return 1
+        if spin_result.data.bet_understated:
+            logger.error(
+                "La puntata reale sembra piu' alta di %s (il saldo e' sceso molto piu' del previsto): mi fermo.",
+                spin_result.data.bet_amount,
+            )
+            stopped_without_effect = True
+            break
         if spin_result.data.outcome != "blocked":
             busy_since = None
         if spin_result.data.outcome == "no_effect":

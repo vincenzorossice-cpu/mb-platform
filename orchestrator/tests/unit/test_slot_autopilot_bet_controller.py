@@ -1168,11 +1168,14 @@ class TestFloorProbe:
         assert not data.min_bet_verified and data.aborted_reason == "NO_DECREASE_OBSERVED"
         assert verifier.verified_tap.call_count == 3
 
-    def test_no_probe_with_an_untrusted_minus(self):
-        data, verifier, _ = self._run([_flat(0.1)] * 3, trusted_for=())
+    def test_an_untrusted_minus_is_not_probed_after_the_first_idle_tap_only_at_the_plateau(self):
+        data, verifier, _ = self._run(
+            [_flat(0.1)] * 3 + [_raise(0.1, 0.2), _decrease(0.2, 0.1)], trusted_for=(),
+        )
 
-        assert verifier.verified_tap.call_count == 3
-        assert all(call.args[3].kind == "bet_decrease" for call in verifier.verified_tap.call_args_list)
+        kinds = [call.args[3].kind for call in verifier.verified_tap.call_args_list]
+        assert kinds == ["bet_decrease"] * 3 + ["bet_increase", "bet_decrease"]
+        assert data.min_bet_verified
 
     def test_no_probe_when_switched_off_or_when_the_minimum_is_remembered(self):
         _, verifier, _ = self._run([_flat(0.1)] * 3, floor_probe_enabled=False)
@@ -1265,3 +1268,91 @@ class TestRunSizing:
 
         # 1a discesa da 0.2 (2.0 -> 1.8): corsa da 19 tocchi = 18 ciechi (+1 verificato)
         assert verifier.touch_injector.tap_coordinates.call_count == 18
+
+
+class TestMinimumMustBeProven:
+    """Una discesa letta dall'OCR non basta: serve un riscontro indipendente."""
+
+    def _run(self, taps, plus=None, provider=None, strategy="gpt", trusted_for=(), **config):
+        config.setdefault("floor_probe_enabled", True)
+        locator = _locator_mock()
+
+        def locate(element, context, exclude_strategies=()):
+            if element == "bet_plus":
+                return plus if plus is not None else Result.ok(LocateCandidate(
+                    x=500, y=1775, confidence=0.8, strategy_name="gpt"))
+            return _ok_candidate(strategy)
+
+        locator.locate.side_effect = locate
+        locator.is_trusted_strategy.side_effect = lambda name: name in trusted_for
+        verifier = MagicMock()
+        verifier.verified_tap.side_effect = taps
+        controller, _ = _controller(locator, verifier, config=_config(**config))
+        result = controller.set_min_bet("dev", "pirots5", "ep", provider or _context_provider(Decimal("2.00")))
+        return result.data, verifier, locator
+
+    def test_a_single_fake_decrease_followed_by_a_dead_minus_does_not_prove_the_minimum(self):
+        taps = [_decrease(2.0, 1.0), _flat(1.0), _flat(1.0), _flat(1.0), _raise(1.0, 1.1)] + [_flat(1.1)] * 8
+
+        data, _, _ = self._run(taps)
+
+        assert not data.min_bet_verified
+        assert data.aborted_reason in ("MIN_NOT_PROVEN", "NO_DECREASE_OBSERVED")
+        assert load_autopilot_value("pirots5", "min_bet", "slot_memory") is None
+
+    def test_the_floor_probe_proves_the_minimum_after_a_descent(self, caplog):
+        taps = [_decrease(2.0, 1.0), _flat(1.0), _flat(1.0), _flat(1.0), _raise(1.0, 1.1), _decrease(1.1, 1.0)]
+
+        with caplog.at_level("INFO"):
+            data, verifier, _ = self._run(taps)
+
+        assert data.min_bet_verified and data.final_bet == Decimal("1.0") and data.aborted_reason is None
+        assert load_autopilot_value("pirots5", "min_bet", "slot_memory") == "1.0"
+        line = next(r.getMessage() for r in caplog.records if "evidenza del minimo" in r.getMessage())
+        assert "prova del pavimento" in line and "verificato=True" in line
+
+    def test_without_a_plus_the_descent_alone_is_not_enough(self, caplog):
+        taps = [_decrease(2.0, 1.0), _flat(1.0), _flat(1.0), _flat(1.0)]
+
+        with caplog.at_level("INFO"):
+            data, _, _ = self._run(taps, plus=Result.fail("no plus", "ELEMENT_NOT_LOCATABLE"))
+
+        assert not data.min_bet_verified and data.aborted_reason == "MIN_NOT_PROVEN"
+        assert any("non spinno" in r.getMessage() for r in caplog.records)
+
+    def test_a_remembered_minimum_needs_no_probe(self):
+        save_autopilot_value("pirots5", "min_bet", "1.0", "slot_memory")
+        taps = [_decrease(2.0, 1.0), _flat(1.0)]
+
+        data, verifier, _ = self._run(taps, strategy="memory", trusted_for=("memory",))
+
+        assert data.min_bet_verified
+        assert all(call.args[3].kind == "bet_decrease" for call in verifier.verified_tap.call_args_list)
+
+    def test_an_operator_supervised_descent_is_accepted_without_a_probe(self):
+        bets = iter([2.0, 1.0])
+
+        def provider():
+            bet = next(bets, 1.0)       # dopo l'intervento dell'operatore la puntata resta a 1.0
+            return Result.ok(LocateContext(
+                device_id="dev", slot_name="pirots5", screenshot_path="/tmp/x.png", screen_width=1080,
+                screen_height=2400, slot_ocr_state={"posta": bet},
+            ))
+        locator = _locator_mock()
+        locator.locate.return_value = Result.ok(LocateCandidate(
+            x=10, y=10, confidence=1.0, strategy_name="hitl", verified=True))
+        locator.is_trusted_strategy.side_effect = lambda name: name == "hitl"
+        verifier = MagicMock()
+        controller, _ = _controller(locator, verifier, config=_config(floor_probe_enabled=True))
+
+        result = controller.set_min_bet("dev", "pirots5", "ep", provider)
+
+        assert result.data.min_bet_verified
+        verifier.verified_tap.assert_not_called()
+
+    def test_with_the_probe_switched_off_the_historic_rule_applies(self):
+        taps = [_decrease(2.0, 1.0), _flat(1.0), _flat(1.0), _flat(1.0)]
+
+        data, _, _ = self._run(taps, floor_probe_enabled=False)
+
+        assert data.min_bet_verified
