@@ -232,6 +232,88 @@ class TestProgressLine:
         assert "puntata -" in line and "saldo -" in line and "vincita 0.00" in line
 
 
+class TestWaitForBusyScreen:
+    @pytest.fixture
+    def clock(self, monkeypatch):
+        """Orologio finto: ogni sleep lo fa avanzare, nessuna attesa reale."""
+        now = [1000.0]
+        sleeps = []
+        monkeypatch.setattr("orchestrator.scripts.run_autopilot.time.monotonic", lambda: now[0])
+
+        def fake_sleep(seconds):
+            sleeps.append(seconds)
+            now[0] += seconds
+        monkeypatch.setattr("orchestrator.scripts.run_autopilot.time.sleep", fake_sleep)
+        return sleeps
+
+    def _autopilot(self, outcomes):
+        from decimal import Decimal
+        from orchestrator.modules.slot_autopilot.bet_controller import BetResult
+        from orchestrator.modules.slot_autopilot.spin_controller import SpinResult
+
+        autopilot = MagicMock()
+        autopilot.prepare.return_value = Result.ok(True)
+        autopilot.set_min_bet.return_value = Result.ok(BetResult(
+            slot_name="s", starting_bet=Decimal("2"), final_bet=Decimal("0.1"), min_bet_verified=True, attempts=1,
+        ))
+        autopilot.get_balance_summary.return_value = (None, None)
+        results = []
+        for i, outcome in enumerate(outcomes):
+            violated = None
+            if outcome.startswith("blocked:"):
+                outcome, violated = "blocked", outcome.split(":")[1]
+            results.append(Result.ok(SpinResult(
+                slot_name="s", spin_index=i + 1, bet_amount=Decimal("0.1"), balance_before=None,
+                balance_after=None, win_amount=None, verified=outcome == "success", attempts=1,
+                outcome=outcome, violated_invariant=violated,
+            )))
+        autopilot.spin.side_effect = results
+        return autopilot
+
+    def test_a_busy_screen_is_waited_out_and_the_session_continues(self, clock):
+        from orchestrator.scripts.run_autopilot import _run_session
+        autopilot = self._autopilot(["blocked:UNSAFE_SCREEN_STATE"] * 2 + ["success", "success"])
+
+        code = _run_session(autopilot, _args(target=0.2, max_steps=4))
+
+        assert code == 0
+        assert autopilot.spin.call_count == 4 and clock == [5, 5]
+
+    def test_waiting_does_not_consume_max_steps(self, clock):
+        from orchestrator.scripts.run_autopilot import _run_session
+        autopilot = self._autopilot(["blocked:UNSAFE_SCREEN_STATE"] * 3 + ["success"])
+
+        code = _run_session(autopilot, _args(target=0.1, max_steps=1))
+
+        assert code == 0 and autopilot.spin.call_count == 4
+
+    def test_a_screen_busy_for_too_long_stops_the_session_with_a_failure_code(self, clock):
+        from orchestrator.scripts.run_autopilot import _run_session
+        autopilot = self._autopilot(["blocked:UNSAFE_SCREEN_STATE"] * 40)
+
+        code = _run_session(autopilot, _args(target=30.0, max_steps=200))
+
+        assert code == 1
+        assert sum(clock) >= 120 and autopilot.spin.call_count < 40
+
+    def test_other_blocks_stop_immediately(self, clock):
+        from orchestrator.scripts.run_autopilot import _run_session
+        autopilot = self._autopilot(["blocked:INSUFFICIENT_BALANCE", "success"])
+
+        _run_session(autopilot, _args(target=30.0, max_steps=200))
+
+        assert autopilot.spin.call_count == 1 and clock == []
+
+    def test_the_busy_clock_restarts_after_a_successful_spin(self, clock):
+        from orchestrator.scripts.run_autopilot import _run_session
+        busy = ["blocked:UNSAFE_SCREEN_STATE"] * 20
+        autopilot = self._autopilot(busy + ["success"] + busy + ["success"])
+
+        code = _run_session(autopilot, _args(target=0.2, max_steps=50))
+
+        assert code == 0 and autopilot.spin.call_count == 42
+
+
 class TestMain:
     def test_shutdown_called_even_on_keyboard_interrupt(self, monkeypatch):
         autopilot = MagicMock()

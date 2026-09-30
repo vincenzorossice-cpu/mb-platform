@@ -37,6 +37,10 @@ logger = logging.getLogger(__name__)
 
 # Spin senza effetto di fila dopo i quali ci si ferma (invece di consumare --max-steps).
 _MAX_CONSECUTIVE_NO_EFFECT_SPINS = 3
+# Schermo non libero dopo uno spin (vincita/bonus/animazione lunga): si aspetta invece di
+# chiudere la sessione, fino a questo tempo.
+_MAX_BUSY_WAIT_SECONDS = 120
+_BUSY_POLL_SECONDS = 5
 
 
 # Loggers i cui messaggi INFO restano anche sulla console (progresso e eventi chiave);
@@ -195,6 +199,7 @@ def _run_session(autopilot: SlotAutoPilot, args: argparse.Namespace) -> int:
     spin_index = 0
     consecutive_no_effect = 0
     stopped_without_effect = False
+    busy_since = None
     while total_played < target and spin_index < args.max_steps:
         spin_index += 1
         started = time.monotonic()
@@ -203,6 +208,8 @@ def _run_session(autopilot: SlotAutoPilot, args: argparse.Namespace) -> int:
         if not spin_result.success:
             logger.error("spin() fallito: %s (%s)", spin_result.error, spin_result.error_code)
             return 1
+        if spin_result.data.outcome != "blocked":
+            busy_since = None
         if spin_result.data.outcome == "no_effect":
             consecutive_no_effect += 1
             if consecutive_no_effect >= _MAX_CONSECUTIVE_NO_EFFECT_SPINS:
@@ -219,7 +226,21 @@ def _run_session(autopilot: SlotAutoPilot, args: argparse.Namespace) -> int:
             total_played += spin_result.data.bet_amount
             logger.info("%s", _progress_line(spin_index, spin_result.data, total_played, target, seconds))
         elif spin_result.data.outcome == "blocked":
-            logger.warning("Spin bloccato da un'invariante di sicurezza: %s", spin_result.data.violated_invariant)
+            if spin_result.data.violated_invariant == "UNSAFE_SCREEN_STATE":
+                if busy_since is None:
+                    busy_since = time.monotonic()
+                    logger.info(
+                        "Schermo occupato (vincita/bonus in corso?): aspetto che finisca (al massimo %d s)...",
+                        _MAX_BUSY_WAIT_SECONDS,
+                    )
+                if time.monotonic() - busy_since < _MAX_BUSY_WAIT_SECONDS:
+                    time.sleep(_BUSY_POLL_SECONDS)
+                    spin_index -= 1   # l'attesa non consuma --max-steps
+                    continue
+                logger.warning("Lo schermo e' rimasto occupato per oltre %d s: mi fermo.", _MAX_BUSY_WAIT_SECONDS)
+                stopped_without_effect = True
+            else:
+                logger.warning("Spin bloccato da un'invariante di sicurezza: %s", spin_result.data.violated_invariant)
             break
     logger.info("Sessione conclusa: %s/%s EUR giocati in %d spin.", total_played, target, spin_index)
 

@@ -7,9 +7,15 @@ from decimal import Decimal
 from typing import Callable, Optional
 
 from orchestrator.core.result import Result
-from orchestrator.modules.provider_profile.autopilot_memory import load_autopilot_flag, save_autopilot_flag
+from orchestrator.modules.provider_profile.autopilot_memory import (
+    load_autopilot_flag,
+    load_autopilot_value,
+    save_autopilot_flag,
+    save_autopilot_value,
+)
 from orchestrator.modules.slot_autopilot.bet_menu import BetMenuSelector
 from orchestrator.modules.slot_autopilot.config import AutoPilotConfig
+from orchestrator.modules.slot_autopilot.frame_diff import diff_score
 from orchestrator.modules.slot_autopilot.locator import ElementLocator
 from orchestrator.modules.slot_autopilot.screen_recovery import ScreenRecovery
 from orchestrator.modules.slot_autopilot.verifier import ActionVerifier, Expectation
@@ -20,6 +26,7 @@ logger = logging.getLogger(__name__)
 _ELEMENT = "bet_minus"
 _MENU_TOGGLE_ELEMENT = "bet_menu_toggle"
 _BET_VIA_MENU_FLAG = "bet_via_menu"
+_MIN_BET_VALUE = "min_bet"
 
 
 @dataclass
@@ -73,7 +80,14 @@ class BetController:
             trusted_min_bet = Decimal(str(context.profile.known_min_bet))
 
         starting_bet = self._read_bet(context)
-        logger.info("set_min_bet: puntata iniziale=%s, riscontro fidato=%s", starting_bet, trusted_min_bet)
+        # Minimo verificato in una sessione precedente (auto-appreso): un indizio che,
+        # insieme a un tocco sul "-" che non scende, verifica il minimo. NON e' il
+        # riscontro fidato di un profilo curato e non salta mai i tocchi da solo.
+        remembered_min = self._remembered_min(slot_name)
+        logger.info(
+            "set_min_bet: puntata iniziale=%s, riscontro fidato=%s, minimo ricordato=%s",
+            starting_bet, trusted_min_bet, remembered_min,
+        )
 
         if trusted_min_bet is not None and starting_bet is not None and starting_bet <= trusted_min_bet:
             logger.info(
@@ -188,6 +202,7 @@ class BetController:
             strategy_sequence.append(candidate.strategy_name)
 
             screenshot_before_tap = None
+            burst_done = False
             if candidate.verified:
                 refreshed_for_hitl = context_provider()
                 new_bet = (
@@ -196,15 +211,20 @@ class BetController:
                 verified = True
                 outcome = "success"
             else:
-                # Raffica: il "-" ha gia' funzionato 2 volte di fila da una
-                # fonte fidata; il minimo e' un pavimento (non si puo' passarlo),
-                # quindi N-1 tocchi ciechi e UN solo tocco verificato, il cui
-                # "prima" e' lo schermo precedente alla raffica.
+                # Corsa: il "-" ha gia' funzionato una volta da una fonte fidata; il
+                # minimo e' un pavimento (non si puo' "passarlo"), quindi N-1 tocchi
+                # ciechi e UN solo tocco verificato, il cui "prima" e' lo schermo
+                # precedente alla corsa.
+                burst_done = False
                 if (
-                    self.config.bet_burst_taps > 1 and consecutive_decreases >= 2
+                    self.config.bet_burst_taps > 1 and consecutive_decreases >= 1
                     and current_bet is not None and self.locator.is_trusted_strategy(candidate.strategy_name)
                 ):
-                    self._blind_taps(device_id, candidate.x, candidate.y, self.config.bet_burst_taps - 1)
+                    self._blind_taps(
+                        device_id, candidate.x, candidate.y, self.config.bet_burst_taps - 1,
+                        context.screenshot_path,
+                    )
+                    burst_done = True
                 # Il "prima" e' lo schermo gia' letto nel contesto: niente OCR in piu'.
                 tap_result = self.verifier.verified_tap(
                     device_id, candidate.x, candidate.y, Expectation(kind="bet_decrease"),
@@ -301,6 +321,10 @@ class BetController:
                 any_decrease_seen = True
                 stable_reads = 0
                 consecutive_decreases += 1
+                if burst_done and remembered_min is not None and current_bet <= remembered_min:
+                    # Dopo una corsa la puntata e' scesa fino al minimo gia' verificato
+                    # in passato: pavimento confermato, non serve un'altra corsa.
+                    stable_reads = self.config.stable_reads_for_min
 
                 if trusted_min_bet is not None and current_bet <= trusted_min_bet:
                     # Il riscontro incrociato col profilo verificato e' gia'
@@ -312,6 +336,7 @@ class BetController:
                         current_bet, trusted_min_bet,
                     )
                     self._close_bet_menu_if_opened(device_id, context, we_opened_the_menu)
+                    self._remember_min(slot_name, current_bet)
                     return Result.ok(BetResult(
                         slot_name=slot_name, starting_bet=starting_bet, final_bet=current_bet,
                         min_bet_verified=True, attempts=attempts, strategy_sequence=strategy_sequence,
@@ -358,11 +383,19 @@ class BetController:
             else:
                 stable_reads += 1
                 consecutive_decreases = 0
+                if burst_done and outcome == "no_effect":
+                    # Una corsa intera di tocchi senza nessuna discesa vale piu' delle
+                    # letture di stabilita': il pavimento e' confermato.
+                    stable_reads = max(stable_reads, self.config.stable_reads_for_min)
 
-            if stable_reads >= self.config.stable_reads_for_min:
+            remembered_floor = (
+                remembered_min is not None and current_bet is not None and current_bet <= remembered_min
+                and self.locator.is_trusted_strategy(candidate.strategy_name)
+            )
+            if stable_reads >= (1 if remembered_floor else self.config.stable_reads_for_min):
                 already_at_known_min = (
                     trusted_min_bet is not None and current_bet is not None and current_bet <= trusted_min_bet
-                )
+                ) or remembered_floor
                 min_bet_verified = any_decrease_seen or already_at_known_min
                 outcome_label = "min_bet_confirmed" if any_decrease_seen else "unchanged_already_min"
                 logger.info(
@@ -372,6 +405,8 @@ class BetController:
                 self._close_bet_menu_if_opened(device_id, context, we_opened_the_menu)
                 if min_bet_verified and menu_route_used:
                     save_autopilot_flag(slot_name, _BET_VIA_MENU_FLAG, True, self.config.slot_memory_dir)
+                if min_bet_verified:
+                    self._remember_min(slot_name, current_bet)
                 return Result.ok(BetResult(
                     slot_name=slot_name, starting_bet=starting_bet, final_bet=current_bet,
                     min_bet_verified=min_bet_verified, attempts=attempts, strategy_sequence=strategy_sequence,
@@ -406,12 +441,48 @@ class BetController:
             aborted_reason="MAX_ATTEMPTS", outcome="aborted",
         ))
 
-    def _blind_taps(self, device_id: str, x: int, y: int, count: int) -> None:
-        """Tocchi consecutivi sulla stessa coordinata senza verificare ciascuno."""
-        logger.info("set_min_bet: raffica di %d tocchi a (%d,%d) prima della verifica", count + 1, x, y)
-        for _ in range(count):
+    def _blind_taps(self, device_id: str, x: int, y: int, count: int, reference_screenshot=None) -> int:
+        """Tocchi consecutivi sulla stessa coordinata senza verificare ciascuno. Ogni
+        `bet_burst_check_every` tocchi uno screenshot (nessuna OCR) confrontato con lo
+        schermo precedente alla corsa: se e' cambiato molto (popup, altra schermata)
+        la corsa si ferma. Ritorna i tocchi eseguiti."""
+        logger.info("set_min_bet: corsa di %d tocchi a (%d,%d) prima della verifica", count + 1, x, y)
+        done = 0
+        for index in range(count):
             self.verifier.touch_injector.tap_coordinates(device_id, x, y)
+            done += 1
             time.sleep(self.config.bet_burst_interval_seconds)
+            if reference_screenshot and done % self.config.bet_burst_check_every == 0 and done < count:
+                if self._screen_changed_a_lot(device_id, reference_screenshot):
+                    logger.warning("set_min_bet: lo schermo e' cambiato durante la corsa (dopo %d tocchi): mi fermo.", done)
+                    break
+        return done
+
+    def _screen_changed_a_lot(self, device_id: str, reference_screenshot: str) -> bool:
+        try:
+            shot = self.verifier.screen_reader._screenshot(device_id)
+            if not shot.success:
+                return False
+            diff = diff_score(reference_screenshot, shot.data)
+            return bool(diff.success and diff.data >= self.config.bet_burst_abort_diff)
+        except Exception:
+            return False
+
+    def _remembered_min(self, slot_name: str) -> Optional[Decimal]:
+        raw = load_autopilot_value(slot_name, _MIN_BET_VALUE, self.config.slot_memory_dir)
+        if raw is None:
+            return None
+        try:
+            return Decimal(str(raw))
+        except Exception:
+            return None
+
+    def _remember_min(self, slot_name: str, bet: Optional[Decimal]) -> None:
+        if bet is None:
+            return
+        result = save_autopilot_value(slot_name, _MIN_BET_VALUE, str(bet), self.config.slot_memory_dir)
+        if not result.success:
+            logger.warning("Impossibile salvare il minimo appreso: %s", result.error)
 
     def _select_via_menu(
         self, device_id, slot_name, episode_id, context, context_provider,

@@ -1,4 +1,5 @@
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -54,7 +55,9 @@ class SpinController:
         context_provider: Callable[[], Result], min_bet_verified: bool,
         expected_bet: Optional[Decimal],
     ) -> Result[SpinResult]:
+        started = time.monotonic()
         context_result = context_provider()
+        context_seconds = time.monotonic() - started
         if not context_result.success:
             self._log_step(
                 episode_id, spin_index, slot_name, device_id, None, None, None, None,
@@ -66,7 +69,10 @@ class SpinController:
 
         violated = self._check_invariants(min_bet_verified, balance_before, expected_bet, context)
         if violated is not None:
-            logger.warning("spin %d bloccato da invariante di sicurezza: %s", spin_index, violated)
+            # Schermo occupato (vincita/bonus in corso): chi chiama aspetta e riprova, non e'
+            # un avviso da mostrare a ogni tentativo. Le altre invarianti restano avvisi.
+            level = logging.INFO if violated == "UNSAFE_SCREEN_STATE" else logging.WARNING
+            logger.log(level, "spin %d bloccato da invariante di sicurezza: %s", spin_index, violated)
             self._log_step(
                 episode_id, spin_index, slot_name, device_id, None, None,
                 balance_before, balance_before, outcome="blocked", notes=violated,
@@ -176,9 +182,11 @@ class SpinController:
 
         if accounting_anomaly:
             logger.warning("spin %d: anomalia contabile: %s", spin_index, accounting_anomaly)
+        total_seconds = time.monotonic() - started
         logger.info(
-            "spin %d: outcome=%s verified=%s saldo %s->%s vincita=%s",
+            "spin %d: outcome=%s verified=%s saldo %s->%s vincita=%s (contesto %.1f s, tocco+attesa+lettura %.1f s)",
             spin_index, outcome, verified, balance_before, balance_after, win_amount,
+            context_seconds, total_seconds - context_seconds,
         )
         self._log_step(
             episode_id, spin_index, slot_name, device_id, candidate.strategy_name,

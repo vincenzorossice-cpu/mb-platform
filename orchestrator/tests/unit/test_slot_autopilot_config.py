@@ -48,7 +48,7 @@ def test_zero_max_spin_attempts_per_step_fails():
 
 def test_burst_defaults_are_on_and_valid():
     config = _config()
-    assert config.bet_burst_taps == 6 and config.bet_burst_interval_seconds == 0.6
+    assert config.bet_burst_taps == 30 and config.bet_burst_interval_seconds == 0.4
     assert config.validate().success
 
 
@@ -69,3 +69,10 @@ def test_negative_burst_interval_fails():
 def test_full_read_every_spins_default_and_validation():
     assert _config().full_read_every_spins == 10
     assert not _config(full_read_every_spins=0).validate().success
+
+
+def test_burst_safety_check_defaults_and_validation():
+    config = _config()
+    assert config.bet_burst_check_every == 10 and config.bet_burst_abort_diff == 0.10
+    assert not _config(bet_burst_check_every=0).validate().success
+    assert not _config(bet_burst_abort_diff=0).validate().success

@@ -31,11 +31,15 @@ class AutoPilotConfig:
     # impedire di riconoscere lo schermo originale).
     recovery_return_threshold: float = 0.06
     max_recovery_attempts: int = 4
-    # Discesa della puntata: dopo 2 discese verificate di fila con la stessa
-    # coordinata fidata si tocca a raffica (N-1 tocchi ciechi + 1 verificato).
-    # 1 = nessuna raffica. Il minimo e' un pavimento: non si puo' "passarlo".
-    bet_burst_taps: int = 6
-    bet_burst_interval_seconds: float = 0.6
+    # Discesa della puntata: dopo UNA discesa verificata con una coordinata fidata si
+    # tocca "in corsa" (N-1 tocchi ciechi + 1 verificato). 1 = nessuna corsa. Il
+    # minimo e' un pavimento: tocchi in piu' sono innocui. Ogni `check_every` tocchi
+    # uno screenshot (senza OCR) protegge da popup/cambi di schermata: se cambia piu'
+    # di `abort_diff` la corsa si ferma.
+    bet_burst_taps: int = 30
+    bet_burst_interval_seconds: float = 0.4
+    bet_burst_check_every: int = 10
+    bet_burst_abort_diff: float = 0.10
     # Spin: ogni N spin una lettura OCR completa (lo schermo intero) anche se di
     # norma si legge solo la fascia di saldo/puntata.
     full_read_every_spins: int = 10
@@ -76,6 +80,10 @@ class AutoPilotConfig:
             return Result.fail("max_recovery_attempts must be >= 1", "CONFIG_INVALID")
         if self.full_read_every_spins < 1:
             return Result.fail("full_read_every_spins must be >= 1", "CONFIG_INVALID")
+        if self.bet_burst_check_every < 1:
+            return Result.fail("bet_burst_check_every must be >= 1", "CONFIG_INVALID")
+        if self.bet_burst_abort_diff <= 0:
+            return Result.fail("bet_burst_abort_diff must be > 0", "CONFIG_INVALID")
         if self.bet_burst_taps < 1:
             return Result.fail("bet_burst_taps must be >= 1", "CONFIG_INVALID")
         if self.bet_burst_interval_seconds < 0:

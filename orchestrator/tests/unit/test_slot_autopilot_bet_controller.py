@@ -1,10 +1,18 @@
 from decimal import Decimal
 from unittest.mock import MagicMock
 
+import pytest
+from PIL import Image
+
 from orchestrator.core.result import Result
 from orchestrator.modules.provider_profile.loader import ProviderProfileLoader
 from orchestrator.modules.provider_profile.profile import ElementSpec, ProviderProfile
-from orchestrator.modules.provider_profile.autopilot_memory import load_autopilot_flag, save_autopilot_flag
+from orchestrator.modules.provider_profile.autopilot_memory import (
+    load_autopilot_flag,
+    load_autopilot_value,
+    save_autopilot_flag,
+    save_autopilot_value,
+)
 from orchestrator.modules.slot_autopilot.bet_controller import BetController
 from orchestrator.modules.slot_autopilot.bet_menu import MenuSelection
 from orchestrator.modules.slot_autopilot.screen_recovery import RecoveryOutcome
@@ -19,6 +27,12 @@ from orchestrator.tests.unit._fake_slot_device import (
     fake_screen_reader,
     fake_touch_injector,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolated_slot_memory(tmp_path, monkeypatch):
+    """set_min_bet ora ricorda il minimo verificato in slot_memory/: mai nel repo."""
+    monkeypatch.chdir(tmp_path)
 
 
 def _config(**overrides) -> AutoPilotConfig:
@@ -949,22 +963,17 @@ class TestFasterDescent:
 
         assert provider.call_count > 1
 
-    def test_burst_after_two_consecutive_decreases_then_one_verified_tap(self, monkeypatch):
-        sleeps = []
-        monkeypatch.setattr("orchestrator.modules.slot_autopilot.bet_controller.time.sleep", sleeps.append)
-        taps = [_decrease(2.0, 1.8), _decrease(1.8, 1.6), _decrease(1.6, 1.0), _flat(1.0), _flat(1.0), _flat(1.0)]
-        controller, _, verifier = self._controller_for(taps, bet_burst_taps=4, bet_burst_interval_seconds=0.5)
+    def test_run_after_the_first_verified_decrease_then_a_run_without_decrease_confirms_the_floor(self):
+        taps = [_decrease(2.0, 1.8), _decrease(1.8, 0.6), _flat(0.6)]
+        controller, _, verifier = self._controller_for(taps, bet_burst_taps=5)
 
         result = controller.set_min_bet("dev", "pirots5", "ep", _context_provider(Decimal("2.00")))
 
-        assert result.data.min_bet_verified and result.data.final_bet == Decimal("1.0")
-        blind = verifier.touch_injector.tap_coordinates.call_args_list
-        # N-1 tocchi ciechi a ogni raffica: una dopo le 2 discese, una ancora perche' la 3a era scesa
-        # (al minimo vero quella raffica non porta a nulla e si torna ai tocchi singoli)
-        assert len(blind) == 6 and sleeps == [0.5] * 6
-        third = verifier.verified_tap.call_args_list[2].kwargs
-        assert third["state_before"]["posta"] == 1.6                  # il "prima" precede la raffica
-        assert verifier.verified_tap.call_count == 6                  # le altre iterazioni restano singole
+        assert result.data.min_bet_verified and result.data.final_bet == Decimal("0.6")
+        assert verifier.verified_tap.call_count == 3                  # niente letture di stabilita' a vuoto
+        assert verifier.touch_injector.tap_coordinates.call_count == 8   # 2 corse da 4 tocchi ciechi
+        second = verifier.verified_tap.call_args_list[1].kwargs
+        assert second["state_before"]["posta"] == 1.8                  # il "prima" precede la corsa
 
     def test_no_burst_with_an_untrusted_strategy(self):
         taps = [_decrease(2.0, 1.8), _decrease(1.8, 1.6), _decrease(1.6, 1.4), _flat(1.4), _flat(1.4), _flat(1.4)]
@@ -982,11 +991,101 @@ class TestFasterDescent:
 
         verifier.touch_injector.tap_coordinates.assert_not_called()
 
-    def test_burst_that_does_not_lower_the_bet_falls_back_to_single_taps(self, monkeypatch):
-        monkeypatch.setattr("orchestrator.modules.slot_autopilot.bet_controller.time.sleep", lambda s: None)
-        taps = [_decrease(2.0, 1.8), _decrease(1.8, 1.6), _flat(1.6), _flat(1.6), _flat(1.6)]
-        controller, _, verifier = self._controller_for(taps, bet_burst_taps=3)
-        controller.set_min_bet("dev", "pirots5", "ep", _context_provider(Decimal("2.00")))
 
-        # dopo la raffica a vuoto i tocchi tornano singoli: 1 sola raffica nonostante i 3 "flat"
-        assert verifier.touch_injector.tap_coordinates.call_count == 2
+class TestRememberedMinimum:
+    def _run(self, taps, start="2.00", strategy="memory", trusted=True, remembered=None, **config):
+        if remembered is not None:
+            save_autopilot_value("pirots5", "min_bet", remembered, "slot_memory")
+        locator = _locator_mock()
+        locator.locate.return_value = _ok_candidate(strategy)
+        locator.is_trusted_strategy.return_value = trusted
+        verifier = MagicMock()
+        verifier.verified_tap.side_effect = taps
+        controller, _ = _controller(locator, verifier, config=_config(**config))
+        result = controller.set_min_bet("dev", "pirots5", "ep", _context_provider(Decimal(start)))
+        return result.data, verifier
+
+    def test_already_at_the_remembered_minimum_one_idle_tap_verifies_it(self):
+        data, verifier = self._run([_flat(0.1)], start="0.10", remembered="0.1")
+
+        assert data.min_bet_verified and data.outcome == "unchanged_already_min"
+        assert verifier.verified_tap.call_count == 1
+
+    def test_the_remembered_minimum_needs_a_trusted_coordinate(self):
+        data, verifier = self._run([_flat(0.1)] * 3, start="0.10", strategy="gpt", trusted=False, remembered="0.1")
+
+        assert not data.min_bet_verified and data.aborted_reason == "NO_DECREASE_OBSERVED"
+        assert verifier.verified_tap.call_count == 3
+
+    def test_without_a_remembered_minimum_three_idle_taps_do_not_verify_it(self):
+        data, _ = self._run([_flat(0.1)] * 3, start="0.10")
+
+        assert not data.min_bet_verified and data.aborted_reason == "NO_DECREASE_OBSERVED"
+
+    def test_a_bet_above_the_remembered_minimum_is_lowered_normally(self):
+        data, verifier = self._run(
+            [_decrease(2.0, 1.0), _flat(1.0), _flat(1.0), _flat(1.0)], remembered="0.1",
+        )
+
+        assert data.min_bet_verified and data.final_bet == Decimal("1.0")
+        assert verifier.verified_tap.call_count == 4       # nessuna scorciatoia sopra il minimo
+
+    def test_a_run_that_reaches_the_remembered_minimum_confirms_the_floor_at_once(self):
+        data, verifier = self._run(
+            [_decrease(2.0, 1.8), _decrease(1.8, 0.1)], remembered="0.1", bet_burst_taps=5,
+        )
+
+        assert data.min_bet_verified and data.final_bet == Decimal("0.1")
+        assert verifier.verified_tap.call_count == 2       # niente corsa di conferma
+
+    def test_the_verified_minimum_is_remembered_for_the_next_session(self):
+        data, _ = self._run([_decrease(2.0, 1.0), _flat(1.0), _flat(1.0), _flat(1.0)])
+
+        assert data.min_bet_verified
+        assert load_autopilot_value("pirots5", "min_bet", "slot_memory") == "1.0"
+
+    def test_an_unverified_minimum_is_not_remembered(self):
+        data, _ = self._run([_flat(0.1)] * 3, start="0.10")
+
+        assert not data.min_bet_verified
+        assert load_autopilot_value("pirots5", "min_bet", "slot_memory") is None
+
+
+class TestRunSafetyCheck:
+    @pytest.fixture
+    def screens(self, tmp_path):
+        paths = {}
+        for name, color in (("reference", (10, 20, 30)), ("same", (11, 20, 30)), ("popup", (250, 250, 250))):
+            path = tmp_path / f"{name}.png"
+            Image.new("RGB", (100, 200), color).save(path)
+            paths[name] = str(path)
+        return paths
+
+    def _controller(self, screens, screenshot_name):
+        locator = _locator_mock()
+        locator.locate.return_value = _ok_candidate("memory")
+        locator.is_trusted_strategy.return_value = True
+        verifier = MagicMock()
+        verifier.screen_reader._screenshot.return_value = Result.ok(screens[screenshot_name])
+        controller, _ = _controller(
+            locator, verifier, config=_config(bet_burst_taps=25, bet_burst_check_every=10, bet_burst_abort_diff=0.1),
+        )
+        return controller, verifier
+
+    def test_a_popup_during_the_run_stops_the_remaining_taps(self, screens):
+        controller, verifier = self._controller(screens, "popup")
+
+        done = controller._blind_taps("dev", 338, 1775, 24, screens["reference"])
+
+        assert done == 10 and verifier.touch_injector.tap_coordinates.call_count == 10
+
+    def test_a_changed_digit_does_not_stop_the_run(self, screens):
+        controller, verifier = self._controller(screens, "same")
+
+        assert controller._blind_taps("dev", 338, 1775, 24, screens["reference"]) == 24
+
+    def test_a_failing_check_never_blocks_the_run(self, screens):
+        controller, verifier = self._controller(screens, "same")
+        verifier.screen_reader._screenshot.side_effect = RuntimeError("adb")
+
+        assert controller._blind_taps("dev", 338, 1775, 24, screens["reference"]) == 24

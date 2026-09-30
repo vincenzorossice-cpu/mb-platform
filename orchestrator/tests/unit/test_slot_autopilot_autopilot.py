@@ -1,6 +1,7 @@
 from decimal import Decimal
 from unittest.mock import MagicMock
 
+import pytest
 from PIL import Image
 
 from orchestrator.core.result import Result
@@ -21,6 +22,12 @@ from orchestrator.tests.unit._fake_slot_device import (
     fake_screen_reader,
     fake_touch_injector,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolated_slot_memory(tmp_path, monkeypatch):
+    """set_min_bet ricorda il minimo verificato in slot_memory/: mai nel repo."""
+    monkeypatch.chdir(tmp_path)
 
 
 def _config(**overrides) -> AutoPilotConfig:

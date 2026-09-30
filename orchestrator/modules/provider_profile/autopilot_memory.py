@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from typing import Optional
 from datetime import datetime, timezone
 
 from orchestrator.core.result import Result
@@ -24,7 +25,7 @@ def load_autopilot_element_memory(slot_name: str, memory_dir: str = "slot_memory
     collisione/perdita di dati con quel file."""
     path = _path(slot_name, memory_dir)
     if not os.path.exists(path):
-        return Result.ok({"elements": {}, "flags": {}, "rejected": {}})
+        return Result.ok({"elements": {}, "flags": {}, "rejected": {}, "values": {}})
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -33,6 +34,7 @@ def load_autopilot_element_memory(slot_name: str, memory_dir: str = "slot_memory
     data.setdefault("elements", {})
     data.setdefault("flags", {})
     data.setdefault("rejected", {})
+    data.setdefault("values", {})
     return Result.ok(data)
 
 
@@ -113,3 +115,28 @@ def load_rejected_positions(slot_name: str, memory_dir: str = "slot_memory") -> 
         element: [(int(x), int(y)) for x, y in points]
         for element, points in result.data.get("rejected", {}).items()
     }
+
+
+def save_autopilot_value(
+    slot_name: str, key: str, value: str, memory_dir: str = "slot_memory",
+) -> Result[bool]:
+    """Un valore appreso sulla slot (es. 'min_bet': la puntata minima verificata)."""
+    load_result = load_autopilot_element_memory(slot_name, memory_dir)
+    if not load_result.success:
+        return Result.fail(load_result.error, load_result.error_code)
+    data = load_result.data
+    data["values"][key] = str(value)
+    try:
+        os.makedirs(memory_dir, exist_ok=True)
+        with open(_path(slot_name, memory_dir), "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except OSError as exc:
+        return Result.fail(f"Cannot write autopilot memory: {exc}", "AUTOPILOT_MEMORY_WRITE_ERROR")
+    return Result.ok(True)
+
+
+def load_autopilot_value(slot_name: str, key: str, memory_dir: str = "slot_memory") -> Optional[str]:
+    result = load_autopilot_element_memory(slot_name, memory_dir)
+    if not result.success:
+        return None
+    return result.data.get("values", {}).get(key)

@@ -426,3 +426,30 @@ class TestInferredWin:
         result = self._spin("9.90")
 
         assert result.screenshot_after == "/tmp/b.png"
+
+
+class TestTimingBreakdownInTheLog:
+    def test_each_spin_logs_how_long_the_context_and_the_tap_took(self, caplog):
+        locator = MagicMock()
+        locator.locate.return_value = _candidate()
+        verifier = MagicMock()
+        verifier.verified_tap.return_value = _tap_outcome(True, balance_after=Decimal("9.90"))
+        controller, _, _, _ = _controller(locator=locator, verifier=verifier)
+
+        with caplog.at_level("INFO"):
+            controller.spin("dev", "pirots5", "ep", 1, MagicMock(return_value=_context_result(Decimal("10.00"))),
+                            True, Decimal("0.10"))
+
+        line = next(r.getMessage() for r in caplog.records if "outcome=success" in r.getMessage())
+        assert "contesto" in line and "tocco+attesa+lettura" in line
+
+    def test_a_busy_screen_block_is_logged_quietly_other_blocks_as_warnings(self, caplog):
+        controller, _, _, _ = _controller()
+        with caplog.at_level("INFO"):
+            controller.spin("dev", "pirots5", "ep", 1, MagicMock(return_value=_context_result(Decimal("10.00"), idle=False)),
+                            True, Decimal("0.10"))
+            controller.spin("dev", "pirots5", "ep", 2, MagicMock(return_value=_context_result(Decimal("0.01"))),
+                            True, Decimal("0.10"))
+
+        by_level = {r.levelname for r in caplog.records if "bloccato" in r.getMessage()}
+        assert by_level == {"INFO", "WARNING"}
