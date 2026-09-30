@@ -369,3 +369,23 @@ class TestPersistentRejections:
         locator.reject_position("bet_minus", 46, 2048)
 
         assert locator.locate("bet_minus", _context()).success
+
+
+class TestExhaustStrategy:
+    def test_an_exhausted_trusted_strategy_is_skipped_by_the_next_locate(self):
+        memory = _ok_strategy("memory", x=338, y=1775)
+        gpt = _ok_strategy("gpt", x=350, y=1765)
+        locator = ElementLocator({"memory": memory, "gpt": gpt})
+
+        locator.exhaust_strategy("memory", "bet_minus")
+        result = locator.locate("bet_minus", _context())
+
+        assert result.data.strategy_name == "gpt"
+        memory.locate.assert_not_called()
+        assert locator.is_exhausted("memory", "bet_minus")
+
+    def test_other_elements_are_untouched(self):
+        locator = ElementLocator({"memory": _ok_strategy("memory")})
+        locator.exhaust_strategy("memory", "bet_minus")
+
+        assert locator.locate("spin", _context()).data.strategy_name == "memory"

@@ -34,7 +34,7 @@ def classify_screen_state(ocr_state: dict) -> str:
 
 @dataclass
 class Expectation:
-    kind: str  # "balance_decrease" | "balance_changed" | "bet_decrease" | "bet_unchanged_confirms_min" | "screen_changed"
+    kind: str  # "balance_decrease" | "balance_changed" | "bet_decrease" | "bet_increase" | "bet_unchanged_confirms_min" | "screen_changed"
     min_decrease: Decimal = Decimal("0.00")
     region: Optional[tuple] = None
 
@@ -196,6 +196,10 @@ class ActionVerifier:
             if bet_before is None or bet_after is None:
                 return False
             return bet_after < bet_before
+        if expectation.kind == "bet_increase":
+            if bet_before is None or bet_after is None:
+                return False
+            return bet_after > bet_before
         if expectation.kind == "bet_unchanged_confirms_min":
             if bet_before is None or bet_after is None:
                 return False

@@ -41,6 +41,7 @@ def _config(**overrides) -> AutoPilotConfig:
         stable_reads_for_min=3, max_bet_lower_attempts=20,
         frame_diff_poll_interval=0.01, frame_diff_max_wait_seconds=1.0,
         bet_burst_taps=1, bet_burst_interval_seconds=0.0,   # raffica spenta di default: ogni test la accende se serve
+        floor_probe_enabled=False,                          # idem per la prova del pavimento
     )
     defaults.update(overrides)
     return AutoPilotConfig(**defaults)
@@ -1089,3 +1090,100 @@ class TestRunSafetyCheck:
         verifier.screen_reader._screenshot.side_effect = RuntimeError("adb")
 
         assert controller._blind_taps("dev", 338, 1775, 24, screens["reference"]) == 24
+
+
+def _raise(before, after):
+    outcome = _tap_outcome(Decimal(str(before)), Decimal(str(after)), True, "success")
+    outcome.state_after = {"posta": float(after), "saldo": 100.0, "raw_texts": []}
+    outcome.screenshot_after = "/tmp/after.png"
+    return Result.ok(outcome)
+
+
+class TestFloorProbe:
+    """Puntata gia' al minimo e nessun minimo noto: "+" poi "-" provano che il "-" e' vivo."""
+
+    def _run(self, taps, plus=None, trusted_for=("memory",), start="0.10", **config):
+        config.setdefault("floor_probe_enabled", True)
+        locator = _locator_mock()
+
+        def locate(element, context, exclude_strategies=()):
+            if element == "bet_plus":
+                return plus if plus is not None else Result.ok(LocateCandidate(
+                    x=500, y=1775, confidence=0.8, strategy_name="gpt"))
+            return _ok_candidate("memory")
+
+        locator.locate.side_effect = locate
+        locator.is_trusted_strategy.side_effect = lambda name: name in trusted_for
+        verifier = MagicMock()
+        verifier.verified_tap.side_effect = taps
+        controller, _ = _controller(locator, verifier, config=_config(**config))
+        result = controller.set_min_bet("dev", "pirots5", "ep", _context_provider(Decimal(start)))
+        return result.data, verifier, locator
+
+    def test_plus_raises_minus_brings_it_back_so_the_floor_is_proven(self):
+        data, verifier, locator = self._run([_flat(0.1), _raise(0.1, 0.2), _decrease(0.2, 0.1)])
+
+        assert data.min_bet_verified and data.outcome == "unchanged_already_min" and data.final_bet == Decimal("0.1")
+        assert verifier.verified_tap.call_count == 3        # nessun 2o e 3o tocco a vuoto
+        expectations = [call.args[3].kind for call in verifier.verified_tap.call_args_list]
+        assert expectations == ["bet_decrease", "bet_increase", "bet_decrease"]
+        locator.save_verified_candidate.assert_any_call("bet_plus", locator.locate.side_effect("bet_plus", None).data,
+                                                        "pirots5", 1080, 2400)
+        assert load_autopilot_value("pirots5", "min_bet", "slot_memory") == "0.1"
+
+    def test_the_probe_reuses_the_screen_already_read_as_the_before_state(self):
+        data, verifier, _ = self._run([_flat(0.1), _raise(0.1, 0.2), _decrease(0.2, 0.1)])
+
+        plus_call, minus_call = verifier.verified_tap.call_args_list[1], verifier.verified_tap.call_args_list[2]
+        assert plus_call.kwargs["state_before"]["posta"] == 0.1
+        assert minus_call.kwargs["state_before"]["posta"] == 0.2
+
+    def test_minus_going_below_the_start_resumes_the_normal_descent(self):
+        data, verifier, _ = self._run(
+            [_flat(0.5), _raise(0.5, 0.6), _decrease(0.6, 0.4), _decrease(0.4, 0.2), _flat(0.2), _flat(0.2), _flat(0.2)],
+            start="0.50",
+        )
+
+        assert data.min_bet_verified and data.final_bet == Decimal("0.2")
+
+    def test_minus_that_stays_dead_after_the_plus_replaces_the_coordinate_without_a_false_rise(self):
+        data, verifier, locator = self._run(
+            [_flat(0.1), _raise(0.1, 0.2), _flat(0.2)] + [_flat(0.2)] * 10, max_bet_lower_attempts=4,
+        )
+
+        locator.exhaust_strategy.assert_called_once_with("memory", "bet_minus")
+        locator.reject_position.assert_called_with("bet_minus", 200, 2200)
+        assert data.aborted_reason != "VALUE_ROSE"
+
+    def test_a_plus_that_does_not_raise_the_bet_falls_back_to_the_historic_behaviour(self):
+        data, verifier, _ = self._run([_flat(0.1), _flat(0.1)] + [_flat(0.1)] * 3, stable_reads_for_min=3)
+
+        assert not data.min_bet_verified and data.aborted_reason == "NO_DECREASE_OBSERVED"
+
+    def test_plus_not_locatable_falls_back_to_the_historic_behaviour(self):
+        data, verifier, _ = self._run(
+            [_flat(0.1)] * 3, plus=Result.fail("no plus", "ELEMENT_NOT_LOCATABLE"),
+        )
+
+        assert not data.min_bet_verified and data.aborted_reason == "NO_DECREASE_OBSERVED"
+        assert verifier.verified_tap.call_count == 3
+
+    def test_no_probe_with_an_untrusted_minus(self):
+        data, verifier, _ = self._run([_flat(0.1)] * 3, trusted_for=())
+
+        assert verifier.verified_tap.call_count == 3
+        assert all(call.args[3].kind == "bet_decrease" for call in verifier.verified_tap.call_args_list)
+
+    def test_no_probe_when_switched_off_or_when_the_minimum_is_remembered(self):
+        _, verifier, _ = self._run([_flat(0.1)] * 3, floor_probe_enabled=False)
+        assert verifier.verified_tap.call_count == 3
+
+        save_autopilot_value("pirots5", "min_bet", "0.1", "slot_memory")
+        data, verifier, _ = self._run([_flat(0.1)])
+        assert data.min_bet_verified and verifier.verified_tap.call_count == 1
+
+    def test_the_probe_runs_at_most_once(self):
+        data, verifier, _ = self._run([_flat(0.1), _flat(0.1)] + [_flat(0.1)] * 5)
+
+        kinds = [call.args[3].kind for call in verifier.verified_tap.call_args_list]
+        assert kinds.count("bet_increase") == 1

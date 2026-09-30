@@ -25,8 +25,20 @@ logger = logging.getLogger(__name__)
 
 _ELEMENT = "bet_minus"
 _MENU_TOGGLE_ELEMENT = "bet_menu_toggle"
+_PLUS_ELEMENT = "bet_plus"
 _BET_VIA_MENU_FLAG = "bet_via_menu"
 _MIN_BET_VALUE = "min_bet"
+
+
+@dataclass
+class _ProbeOutcome:
+    """Esito della prova del pavimento. status: 'floor' (pavimento provato) |
+    'continue' (la puntata e' stata alzata: riprendere la discesa da `bet`) |
+    'inconclusive' (nulla e' cambiato) | 'stuck' (schermata sbagliata non ripristinata)."""
+    status: str
+    bet: Optional[Decimal] = None
+    minus_alive: bool = False
+    minus_dead: bool = False
 
 
 @dataclass
@@ -160,6 +172,7 @@ class BetController:
         strategy_sequence = []
         attempts = 0
         consecutive_decreases = 0  # discese verificate di fila (abilita la raffica)
+        probe_done = False
 
         while attempts < self.config.max_bet_lower_attempts:
             attempts += 1
@@ -297,6 +310,49 @@ class BetController:
                         # dovuto annullarlo: non riproporlo mai piu' su questa slot.
                         self.locator.remember_rejected(slot_name, _ELEMENT, candidate.x, candidate.y)
                     consecutive_decreases = 0
+                    refreshed = context_provider()
+                    if refreshed.success:
+                        context = refreshed.data
+                    continue
+
+            if (
+                not verified and outcome == "no_effect" and outcome_data is not None
+                and self.config.floor_probe_enabled and not probe_done and not any_decrease_seen
+                and trusted_min_bet is None and remembered_min is None and current_bet is not None
+                and self.locator.is_trusted_strategy(candidate.strategy_name)
+            ):
+                # Puntata che non scende da una coordinata gia' provata e nessun minimo noto:
+                # prima di ripetere tocchi alla cieca si PROVA che il "-" e' vivo (+ poi -).
+                probe_done = True
+                probe = self._probe_floor(
+                    device_id, slot_name, context, candidate, outcome_data, current_bet, context_provider,
+                )
+                if probe.status == "floor":
+                    self._close_bet_menu_if_opened(device_id, context, we_opened_the_menu)
+                    if menu_route_used:
+                        save_autopilot_flag(slot_name, _BET_VIA_MENU_FLAG, True, self.config.slot_memory_dir)
+                    self._remember_min(slot_name, current_bet)
+                    return Result.ok(BetResult(
+                        slot_name=slot_name, starting_bet=starting_bet, final_bet=current_bet,
+                        min_bet_verified=True, attempts=attempts, strategy_sequence=strategy_sequence,
+                        aborted_reason=None, outcome="unchanged_already_min",
+                    ))
+                if probe.status == "stuck":
+                    return Result.ok(BetResult(
+                        slot_name=slot_name, starting_bet=starting_bet, final_bet=current_bet,
+                        min_bet_verified=False, attempts=attempts, strategy_sequence=strategy_sequence,
+                        aborted_reason="STUCK_ON_UNEXPECTED_SCREEN", outcome="aborted",
+                    ))
+                if probe.status == "continue":
+                    # La puntata e' stata alzata di un gradino: si riparte da li' (nessun
+                    # falso VALUE_ROSE), col "-" vivo o da sostituire.
+                    current_bet = lowest_bet_seen = probe.bet
+                    any_decrease_seen = probe.minus_alive
+                    consecutive_decreases = 1 if probe.minus_alive else 0
+                    stable_reads = 0
+                    if probe.minus_dead:
+                        self.locator.exhaust_strategy(candidate.strategy_name, _ELEMENT)
+                        self.locator.reject_position(_ELEMENT, candidate.x, candidate.y)
                     refreshed = context_provider()
                     if refreshed.success:
                         context = refreshed.data
@@ -440,6 +496,63 @@ class BetController:
             min_bet_verified=False, attempts=attempts, strategy_sequence=strategy_sequence,
             aborted_reason="MAX_ATTEMPTS", outcome="aborted",
         ))
+
+    def _probe_floor(
+        self, device_id, slot_name, context, minus, minus_outcome, start_bet, context_provider,
+    ) -> "_ProbeOutcome":
+        """Prova che il "-" e' vivo quando la puntata non scende: "+" (deve salire) e poi
+        "-" (deve tornare esattamente alla puntata di partenza). Se torna li', il "-"
+        funziona e a quel valore non scendeva oltre: pavimento provato."""
+        plus_result = self.locator.locate(_PLUS_ELEMENT, context, exclude_strategies=("hitl",))
+        if not plus_result.success:
+            logger.info("set_min_bet: prova del pavimento non possibile ('%s' non localizzabile).", _PLUS_ELEMENT)
+            return _ProbeOutcome("inconclusive")
+        plus = plus_result.data
+        plus_trusted = self.locator.is_trusted_strategy(plus.strategy_name)
+
+        plus_tap = self.verifier.verified_tap(
+            device_id, plus.x, plus.y, Expectation(kind="bet_increase"),
+            screenshot_before=minus_outcome.screenshot_after, state_before=minus_outcome.state_after,
+        )
+        if not plus_tap.success or not plus_tap.data.verified:
+            if not plus_trusted:
+                self.locator.record_failure(plus.strategy_name, _PLUS_ELEMENT)
+            if plus_tap.success and plus_tap.data.outcome == "unexpected_change":
+                self.locator.reject_position(_PLUS_ELEMENT, plus.x, plus.y)
+                if self.screen_recovery is not None:
+                    recovery = self.screen_recovery.recover(
+                        device_id, plus_tap.data.screenshot_before, (plus.x, plus.y), context_provider,
+                        {"posta": plus_tap.data.bet_before, "saldo": plus_tap.data.balance_before},
+                    )
+                    if not recovery.success:
+                        return _ProbeOutcome("stuck")
+                    if recovery.data.method != "already_original":
+                        self.locator.remember_rejected(slot_name, _PLUS_ELEMENT, plus.x, plus.y)
+            logger.info("set_min_bet: prova del pavimento inconclusiva: il '+' non ha alzato la puntata.")
+            return _ProbeOutcome("inconclusive")
+
+        raised_bet = plus_tap.data.bet_after
+        logger.info("set_min_bet: prova del pavimento: '+' ha alzato la puntata %s -> %s", start_bet, raised_bet)
+        minus_tap = self.verifier.verified_tap(
+            device_id, minus.x, minus.y, Expectation(kind="bet_decrease"),
+            screenshot_before=plus_tap.data.screenshot_after, state_before=plus_tap.data.state_after,
+        )
+        if not minus_tap.success or not minus_tap.data.verified:
+            logger.warning("set_min_bet: dopo il '+' il '-' non abbassa la puntata: la coordinata e' da sostituire.")
+            return _ProbeOutcome("continue", bet=raised_bet, minus_dead=True)
+
+        back_bet = minus_tap.data.bet_after
+        if back_bet == start_bet:
+            logger.info(
+                "set_min_bet: prova del pavimento riuscita: il '-' riporta la puntata a %s e prima non scendeva "
+                "oltre: %s e' il minimo.", back_bet, start_bet,
+            )
+            self.locator.save_verified_candidate(
+                _PLUS_ELEMENT, plus, slot_name, context.screen_width, context.screen_height,
+            )
+            return _ProbeOutcome("floor", bet=start_bet, minus_alive=True)
+        logger.info("set_min_bet: dopo il '+' il '-' porta la puntata a %s (non a %s): riprendo la discesa.", back_bet, start_bet)
+        return _ProbeOutcome("continue", bet=back_bet, minus_alive=True)
 
     def _blind_taps(self, device_id: str, x: int, y: int, count: int, reference_screenshot=None) -> int:
         """Tocchi consecutivi sulla stessa coordinata senza verificare ciascuno. Ogni

@@ -165,6 +165,11 @@ class ElementLocator:
         voluto - azzera esplicitamente lo storico di fallimenti."""
         self._failure_counts[(strategy_name, element_name)] = 0
 
+    def exhaust_strategy(self, strategy_name: str, element_name: str) -> None:
+        """Esaurisce subito questa coppia: il prossimo locate() la salta. Serve per una
+        coordinata gia' 'fidata' (profile/memory) che si e' appena rivelata morta."""
+        self._failure_counts[(strategy_name, element_name)] = self.max_consecutive_failures_per_strategy
+
     def is_exhausted(self, strategy_name: str, element_name: str) -> bool:
         """True se questa coppia ha gia' raggiunto la soglia di fallimenti
         consecutivi: il prossimo locate() e' garantito saltarla."""

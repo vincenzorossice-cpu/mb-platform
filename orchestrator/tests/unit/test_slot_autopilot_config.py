@@ -76,3 +76,7 @@ def test_burst_safety_check_defaults_and_validation():
     assert config.bet_burst_check_every == 10 and config.bet_burst_abort_diff == 0.10
     assert not _config(bet_burst_check_every=0).validate().success
     assert not _config(bet_burst_abort_diff=0).validate().success
+
+
+def test_floor_probe_is_on_by_default():
+    assert _config().floor_probe_enabled is True and _config().validate().success

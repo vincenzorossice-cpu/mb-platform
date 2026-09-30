@@ -40,6 +40,9 @@ class AutoPilotConfig:
     bet_burst_interval_seconds: float = 0.4
     bet_burst_check_every: int = 10
     bet_burst_abort_diff: float = 0.10
+    # Puntata gia' al minimo senza un minimo noto: si PROVA che il "-" e' vivo (con un "+"
+    # e poi un "-") invece di fermarsi dopo 3 tocchi a vuoto. Spegnibile.
+    floor_probe_enabled: bool = True
     # Spin: ogni N spin una lettura OCR completa (lo schermo intero) anche se di
     # norma si legge solo la fascia di saldo/puntata.
     full_read_every_spins: int = 10

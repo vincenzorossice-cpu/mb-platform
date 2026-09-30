@@ -50,6 +50,37 @@ class TestVerifiedTapHappyPaths:
         assert outcome.bet_after == Decimal("0.5")
         assert outcome.tapped_coords == (100, 100)
 
+    def test_bet_increase_verified_when_the_bet_goes_up(self, tmp_path):
+        device = FakeSlotDevice(tmp_path, balance=Decimal("10.00"), bet=Decimal("0.10"))
+        device.add_element("bet_plus", 200, 200, lambda d: setattr(d, "bet", Decimal("0.20")))
+        verifier = _verifier_for(device)
+
+        result = verifier.verified_tap("dev", 200, 200, Expectation(kind="bet_increase"))
+
+        assert result.data.verified is True and result.data.bet_after == Decimal("0.2")
+
+    def test_bet_increase_not_verified_when_the_bet_does_not_move_or_goes_down(self, tmp_path):
+        device = FakeSlotDevice(tmp_path, balance=Decimal("10.00"), bet=Decimal("1.00"))
+        device.add_element("bet_minus", 100, 100, lambda d: setattr(d, "bet", Decimal("0.50")))
+        verifier = _verifier_for(device)
+
+        down = verifier.verified_tap("dev", 100, 100, Expectation(kind="bet_increase"))
+        nothing = verifier.verified_tap("dev", 900, 900, Expectation(kind="bet_increase"))
+
+        assert down.data.verified is False and nothing.data.verified is False
+
+    def test_bet_increase_not_verified_when_the_bet_is_unreadable(self, tmp_path):
+        device = FakeSlotDevice(tmp_path)
+        ocr_reader = MagicMock()
+        ocr_reader.read_slot_state.side_effect = [
+            {"saldo": 10.0, "posta": None}, {"saldo": 10.0, "posta": None},
+        ]
+        verifier = ActionVerifier(fake_touch_injector(device), fake_screen_reader(device), ocr_reader, _config())
+
+        result = verifier.verified_tap("dev", 10, 10, Expectation(kind="bet_increase"))
+
+        assert result.data.verified is False
+
     def test_tap_on_dead_zone_is_no_effect(self, tmp_path):
         device = FakeSlotDevice(tmp_path, balance=Decimal("10.00"), bet=Decimal("1.00"))
         device.add_element("bet_minus", 100, 100, lambda d: setattr(d, "bet", Decimal("0.50")))
