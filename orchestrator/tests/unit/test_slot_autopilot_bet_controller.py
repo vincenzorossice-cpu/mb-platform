@@ -80,6 +80,8 @@ def _locator_mock():
     locator = MagicMock()
     locator.is_exhausted.return_value = False
     locator.is_trusted_strategy.return_value = False
+    locator.is_chain_exhausted.return_value = False   # idem: lo stop immediato lo esercitano solo i test dedicati
+    locator.last_hitl_tap.return_value = None
     return locator
 
 
@@ -1467,3 +1469,150 @@ class TestSpinZoneWhileSettingTheBet:
         locator, _ = self._run([(350, 1765)] * 6, avoid_spin_zone=False)
 
         locator.exclude_zone.assert_not_called()
+
+
+class TestMenuFirstAndOperatorHelp:
+    """Slot senza tasto "-" ma con un menu puntata a lista: prima il menu da soli, poi l'operatore,
+    e dopo ogni aiuto dell'operatore si guarda cosa e' successo."""
+
+    @staticmethod
+    def _boxes():
+        from orchestrator.modules.slot_ocr.reader import OCRBox
+
+        def box(text, x, y):
+            return OCRBox(text=text, bbox=(x - 30, y - 15, x + 30, y + 15), confidence=0.9)
+        return [box("0,10", 200, 1000), box("0,20", 400, 1000), box("0,50", 600, 1000), box("1,00", 200, 1200)]
+
+    @staticmethod
+    def _context(posta, boxes=()):
+        return LocateContext(
+            device_id="dev", slot_name="pirots5", screenshot_path="/tmp/x.png", screen_width=1080,
+            screen_height=2400, slot_ocr_state={"posta": posta}, text_boxes=list(boxes),
+        )
+
+    def _controller(self, locator, selector, tmp_path, **config):
+        step_logger = MagicMock()
+        step_logger.log_step.return_value = Result.ok(True)
+        return BetController(
+            locator, MagicMock(), step_logger, _config(slot_memory_dir=str(tmp_path), **config), menu_selector=selector,
+        )
+
+    def _selection(self):
+        return Result.ok(MenuSelection(final_bet=Decimal("0.10"), lowest_listed=Decimal("0.10"), toggle_strategy="gpt"))
+
+    def test_menu_is_tried_before_asking_the_operator(self, tmp_path):
+        locator = _locator_mock()
+        locator.locate.return_value = Result.fail("not visible", "ELEMENT_NOT_LOCATABLE")
+        selector = MagicMock()
+        selector.select_lowest.return_value = self._selection()
+        controller = self._controller(locator, selector, tmp_path)
+
+        result = controller.set_min_bet("dev", "pirots5", "ep", MagicMock(return_value=Result.ok(self._context(0.3))))
+
+        assert result.data.min_bet_verified and result.data.final_bet == Decimal("0.10")
+        assert selector.select_lowest.call_args.kwargs["allow_operator"] is False
+        locator.locate.assert_called_once_with("bet_minus", locator.locate.call_args.args[1], exclude_strategies=("hitl",))
+        assert load_autopilot_flag("pirots5", "bet_via_menu", str(tmp_path))
+        assert load_autopilot_value("pirots5", "min_bet", str(tmp_path)) == "0.10"
+
+    def test_failed_menu_resets_counters_and_goes_on_to_the_full_chain(self, tmp_path):
+        locator = _locator_mock()
+        locator.locate.side_effect = [
+            Result.fail("not visible", "ELEMENT_NOT_LOCATABLE"),
+            Result.fail("stop", "HITL_STOP_REQUESTED"),
+        ]
+        selector = MagicMock()
+        selector.select_lowest.return_value = Result.fail("no icon", "ELEMENT_NOT_LOCATABLE")
+        controller = self._controller(locator, selector, tmp_path)
+
+        result = controller.set_min_bet("dev", "pirots5", "ep", MagicMock(return_value=Result.ok(self._context(0.3))))
+
+        assert result.data.aborted_reason == "HITL_STOP"
+        locator.reset_failures.assert_called_with("bet_minus")
+        assert locator.locate.call_args_list[1].kwargs == {}    # la catena completa, operatore compreso
+        selector.select_lowest.assert_called_once()
+
+    def test_a_bet_list_opened_by_the_operator_is_used_by_the_controller(self, tmp_path):
+        state = {"menu": False}
+
+        def locate(element, context, exclude_strategies=()):
+            if "hitl" in exclude_strategies:
+                return Result.fail("not visible", "ELEMENT_NOT_LOCATABLE")
+            state["menu"] = True
+            return Result.fail("hint", "HITL_HINT_ONLY")
+
+        locator = _locator_mock()
+        locator.locate.side_effect = locate
+        locator.last_hitl_tap.return_value = (788, 1775)
+        selector = MagicMock()
+        selector.select_lowest.return_value = Result.fail("no icon", "ELEMENT_NOT_LOCATABLE")
+        selector.select_from_open_menu.return_value = self._selection()
+        controller = self._controller(locator, selector, tmp_path)
+
+        def provider():
+            return Result.ok(self._context(None if state["menu"] else 0.3, self._boxes() if state["menu"] else ()))
+
+        result = controller.set_min_bet("dev", "pirots5", "ep", provider)
+
+        assert result.data.min_bet_verified and result.data.final_bet == Decimal("0.10")
+        assert result.data.strategy_sequence == ["hitl", "menu"]
+        assert selector.select_from_open_menu.call_args.args[-1] == (788, 1775)
+        assert load_autopilot_flag("pirots5", "bet_via_menu", str(tmp_path))
+
+    def test_a_screen_with_few_amounts_is_not_treated_as_a_menu(self, tmp_path):
+        state = {"hint": False}
+
+        def locate(element, context, exclude_strategies=()):
+            if "hitl" in exclude_strategies:
+                return Result.fail("not visible", "ELEMENT_NOT_LOCATABLE")
+            if not state["hint"]:
+                state["hint"] = True
+                return Result.fail("hint", "HITL_HINT_ONLY")
+            return Result.fail("stop", "HITL_STOP_REQUESTED")
+
+        locator = _locator_mock()
+        locator.locate.side_effect = locate
+        selector = MagicMock()
+        selector.select_lowest.return_value = Result.fail("no icon", "ELEMENT_NOT_LOCATABLE")
+        controller = self._controller(locator, selector, tmp_path)
+        few = self._boxes()[:2]
+
+        result = controller.set_min_bet(
+            "dev", "pirots5", "ep", MagicMock(return_value=Result.ok(self._context(0.3, few))),
+        )
+
+        selector.select_from_open_menu.assert_not_called()
+        assert result.data.aborted_reason == "HITL_STOP"
+
+    def test_bet_lowered_by_the_operator_is_noticed(self, tmp_path):
+        state = {"hint": False}
+
+        def locate(element, context, exclude_strategies=()):
+            if not state["hint"]:
+                state["hint"] = True
+                return Result.fail("hint", "HITL_HINT_ONLY")
+            return Result.fail("stop", "HITL_STOP_REQUESTED")
+
+        locator = _locator_mock()
+        locator.locate.side_effect = locate
+        controller = self._controller(locator, None, tmp_path)
+        bets = iter([0.3, 0.10, 0.10, 0.10])
+
+        result = controller.set_min_bet(
+            "dev", "pirots5", "ep", lambda: Result.ok(self._context(next(bets))),
+        )
+
+        assert result.data.aborted_reason == "HITL_STOP"
+        assert result.data.final_bet == Decimal("0.1")     # non piu' 0.3: la discesa e' stata vista
+        assert "hitl" in result.data.strategy_sequence
+
+    def test_exhausted_chain_stops_at_once_instead_of_looping(self, tmp_path):
+        locator = _locator_mock()
+        locator.locate.return_value = Result.fail("nothing", "ELEMENT_NOT_LOCATABLE")
+        locator.is_chain_exhausted.return_value = True
+        controller = self._controller(locator, None, tmp_path, max_bet_lower_attempts=20)
+
+        result = controller.set_min_bet("dev", "pirots5", "ep", MagicMock(return_value=Result.ok(self._context(0.3))))
+
+        assert result.data.aborted_reason == "ELEMENT_NOT_LOCATABLE"
+        assert result.data.attempts == 1

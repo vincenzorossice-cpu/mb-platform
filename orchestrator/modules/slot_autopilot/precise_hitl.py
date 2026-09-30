@@ -1,3 +1,4 @@
+import re
 import time
 from typing import Callable, Optional
 
@@ -14,6 +15,14 @@ from orchestrator.tests.validation.test_slot_autonomous import (
 )
 
 _TAP_SETTLE_SECONDS = 3
+# Una frase che indica la cella da un VALORE ("il piu' basso", "quella da 0.10", "il minimo"): se la
+# vista non la trova, il vecchio interprete a parole chiave leggerebbe "basso" come "in basso" e
+# toccherebbe un punto a caso. Meglio ammettere di non aver capito e richiedere aiuto.
+_VALUE_DESCRIPTION = re.compile(
+    r"\d+[.,]\d+|\b(pi[uù]'?\s+(basso|bassa|alto|alta|piccolo|piccola|grande)|minim\w*|massim\w*|"
+    r"lowest|highest|smallest|largest)\b",
+    re.IGNORECASE,
+)
 
 
 def handle_precise_hitl_escalation(
@@ -66,6 +75,12 @@ def handle_precise_hitl_escalation(
             ))
             if point is not None:
                 print(f"Ho trovato '{description}' a ({point[0]},{point[1]}): tocco li'.")
+            elif _VALUE_DESCRIPTION.search(description):
+                print(
+                    "Non ho trovato con la vista la cella indicata dal valore: non tocco a caso. "
+                    "Riprova indicando l'importo scritto (es. 'la cella 0.10') o le coordinate (es. '540,600')."
+                )
+                continue
             else:
                 point = parse_operator_description(description, pre_tap_state.get("raw_texts", []), width, height)
                 if point is None:

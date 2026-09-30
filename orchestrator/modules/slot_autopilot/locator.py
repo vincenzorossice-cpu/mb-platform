@@ -195,6 +195,18 @@ class ElementLocator:
         consecutivi: il prossimo locate() e' garantito saltarla."""
         return self._failure_counts.get((strategy_name, element_name), 0) >= self.max_consecutive_failures_per_strategy
 
+    def is_chain_exhausted(self, element_name: str) -> bool:
+        """True se OGNI strategia registrata ha raggiunto la soglia di fallimenti per questo
+        elemento: il prossimo locate() non proverebbe nulla ("nessuna strategia: []")."""
+        names = [name for name in self._STRATEGY_ORDER if name in self.strategies]
+        return bool(names) and all(self.is_exhausted(name, element_name) for name in names)
+
+    def last_hitl_tap(self):
+        """(x, y) dell'ultimo tocco fatto fare dall'operatore, o None."""
+        hitl = self.strategies.get("hitl")
+        tap = getattr(hitl, "last_tap", None)
+        return tap if isinstance(tap, tuple) else None
+
     def is_trusted_strategy(self, strategy_name: str) -> bool:
         """Una fonte gia' curata/verificata a monte (profile/memory/hitl) che
         smette di far progredire un valore e' proprio la firma di un plateau

@@ -60,8 +60,11 @@ _GRID_SYSTEM_PROMPT = (
     "You look at a screenshot of a mobile slot-machine game with a labeled grid drawn on top: each cell "
     "has a yellow label (like A1, B3) at its top-left corner. Your only job is to say which ONE cell "
     "contains the CENTER of the requested element. Use only labels from the list you are given; never "
-    "invent labels. If the element is not visible in the image, answer null. Respond ONLY with JSON: "
-    '{"cell": "<label or null>", "confidence": <0.0-1.0>}'
+    "invent labels. If the element is not visible in the image, answer null. If the element is defined by "
+    "an amount (for example 'the cell with the lowest amount' or 'the cell showing 0.10'), FIRST read the "
+    "amounts you can see and list them in \"values_seen\", THEN choose the cell that matches. Respond ONLY "
+    'with JSON: {"values_seen": [<amounts you read, may be empty>], "cell": "<label or null>", '
+    '"confidence": <0.0-1.0>}'
 )
 
 
@@ -222,7 +225,7 @@ class GPTLocatorStrategy(LocatorStrategy):
         try:
             response = self.gpt_client.client.chat.completions.create(
                 model=self.gpt_client.model, messages=messages,
-                response_format={"type": "json_object"}, temperature=0.1, max_tokens=100,
+                response_format={"type": "json_object"}, temperature=0.1, max_tokens=250,
             )
             data = json.loads(response.choices[0].message.content)
         except openai.OpenAIError as exc:
@@ -233,8 +236,9 @@ class GPTLocatorStrategy(LocatorStrategy):
             return None
 
         cell = data.get("cell") if isinstance(data, dict) else None
-        logger.info("'%s' (%s): GPT risponde cella=%r confidenza=%r", element_name, stage, cell,
-                    data.get("confidence") if isinstance(data, dict) else None)
+        logger.info("'%s' (%s): GPT risponde cella=%r confidenza=%r importi letti=%r", element_name, stage, cell,
+                    data.get("confidence") if isinstance(data, dict) else None,
+                    data.get("values_seen") if isinstance(data, dict) else None)
         if isinstance(data, dict) and "cell" in data and data["cell"] is None:
             return _NOT_VISIBLE
         if not isinstance(cell, str) or not cell.strip():

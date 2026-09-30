@@ -74,3 +74,17 @@ class TestPreciseFlowSelection:
 
         assert result.error_code == "HITL_STOP_REQUESTED"
         precise.assert_not_called()
+
+
+class TestLastTap:
+    def test_the_tap_that_changed_the_screen_is_remembered(self):
+        strategy = _strategy()
+        with patch(_PATCH_TARGET, return_value=("hint", "look", None, (788, 1775))):
+            strategy.locate("bet_minus", _context())
+        assert strategy.last_tap == (788, 1775)
+
+    def test_no_tap_after_a_stop(self):
+        strategy = _strategy()
+        with patch(_PATCH_TARGET, return_value=("stop", None, None, None)):
+            strategy.locate("bet_minus", _context())
+        assert strategy.last_tap is None

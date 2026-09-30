@@ -6,6 +6,7 @@ from typing import Callable, Optional
 
 from orchestrator.core.result import Result
 from orchestrator.modules.slot_autopilot.locator import ElementLocator
+from orchestrator.modules.slot_autopilot.strategies.base import LocateCandidate
 from orchestrator.modules.slot_autopilot.value_parser import parse_amount
 from orchestrator.modules.slot_autopilot.verifier import ActionVerifier, Expectation
 
@@ -79,8 +80,13 @@ class BetMenuSelector:
 
     def select_lowest(
         self, device_id: str, slot_name: str, context, context_provider: Callable[[], Result],
+        allow_operator: bool = True,
     ) -> Result[MenuSelection]:
-        toggle_result = self.locator.locate(_MENU_TOGGLE, context)
+        # allow_operator=False: se l'icona non si trova da sola NON si chiama l'operatore (il
+        # chiamante lo fara' dopo, con la sua domanda e non una sull'icona del menu).
+        toggle_result = self.locator.locate(
+            _MENU_TOGGLE, context, exclude_strategies=() if allow_operator else ("hitl",),
+        )
         if not toggle_result.success:
             return Result.fail(toggle_result.error, toggle_result.error_code)
         toggle = toggle_result.data
@@ -101,6 +107,30 @@ class BetMenuSelector:
         opened = self._fresh(context_provider)
         if opened is None:
             return Result.fail("Cannot read the screen after opening the menu", "MENU_CONTEXT_ERROR")
+        return self._select_from_open(device_id, opened, context_provider, toggle)
+
+    def select_from_open_menu(
+        self, device_id: str, slot_name: str, context, context_provider: Callable[[], Result],
+        toggle_xy: Optional[tuple] = None,
+    ) -> Result[MenuSelection]:
+        """Il menu e' GIA' aperto (l'ha aperto l'operatore): sceglie la puntata piu' bassa della lista.
+        `toggle_xy` e' il punto che l'operatore ha fatto tappare per aprirlo: se la selezione riesce
+        viene ricordato come icona del menu, cosi' la volta dopo non serve nessun aiuto."""
+        toggle = None
+        if toggle_xy is not None:
+            toggle = LocateCandidate(
+                x=int(toggle_xy[0]), y=int(toggle_xy[1]), confidence=1.0, strategy_name="hitl", verified=True,
+            )
+        result = self._select_from_open(device_id, context, context_provider, toggle)
+        if result.success and toggle is not None:
+            self.locator.save_verified_candidate(
+                _MENU_TOGGLE, toggle, slot_name, context.screen_width, context.screen_height,
+            )
+        return result
+
+    def _select_from_open(
+        self, device_id: str, opened, context_provider: Callable[[], Result], toggle: Optional[LocateCandidate],
+    ) -> Result[MenuSelection]:
         cells = menu_amounts(opened.text_boxes)
         if not _looks_like_menu(cells):
             # Non e' una lista di puntate (es. pannello a righe con -/+): il menu
@@ -118,6 +148,11 @@ class BetMenuSelector:
             return Result.fail("Cannot read the screen after selecting the bet", "MENU_CONTEXT_ERROR")
         if _looks_like_menu(menu_amounts(after.text_boxes)):
             logger.info("bet menu: ancora aperto dopo la selezione, lo richiudo")
+            if toggle is None:
+                located = self.locator.locate(_MENU_TOGGLE, after, exclude_strategies=("hitl",))
+                toggle = located.data if located.success else None
+            if toggle is None:
+                return Result.fail("The menu is still open and its icon is unknown", "MENU_CLOSE_UNKNOWN")
             self._close(device_id, toggle)
             after = self._fresh(context_provider)
             if after is None:
@@ -129,7 +164,8 @@ class BetMenuSelector:
                 f"Bet after menu selection is {bet}, expected {lowest}", "MENU_SELECTION_NOT_CONFIRMED",
             )
         return Result.ok(MenuSelection(
-            final_bet=Decimal(str(bet)), lowest_listed=lowest, toggle_strategy=toggle.strategy_name,
+            final_bet=Decimal(str(bet)), lowest_listed=lowest,
+            toggle_strategy=toggle.strategy_name if toggle is not None else "hitl",
         ))
 
     def _undo_wrong_toggle(self, device_id, slot_name, toggle, outcome, context_provider) -> Result[MenuSelection]:

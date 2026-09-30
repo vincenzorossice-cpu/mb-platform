@@ -389,3 +389,10 @@ class TestAvoidZones:
         result = GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
 
         assert (result.data.x, result.data.y) == (360, 1700)
+
+
+def test_grid_prompt_asks_gpt_to_read_the_amounts_first():
+    from orchestrator.modules.slot_autopilot.strategies import gpt_locator_strategy
+
+    assert "values_seen" in gpt_locator_strategy._GRID_SYSTEM_PROMPT
+    assert "lowest" in gpt_locator_strategy._GRID_SYSTEM_PROMPT

@@ -23,6 +23,9 @@ class HITLStrategy(LocatorStrategy):
         # Opzionale: un oggetto con locate_described(frase, contesto) -> (x, y)
         # (GPTLocatorStrategy). Senza, vale il vecchio interprete a parole chiave.
         self.describer = describer
+        # Ultimo punto tappato su indicazione dell'operatore (anche quando l'esito e' solo un
+        # "hint": e' il punto che ha cambiato lo schermo, es. l'icona che apre un menu).
+        self.last_tap = None
 
     def locate(self, element_name: str, context: LocateContext) -> Result[LocateCandidate]:
         current_bet = context.slot_ocr_state.get("posta")
@@ -38,6 +41,8 @@ class HITLStrategy(LocatorStrategy):
                 self.screen_reader, self.ocr_reader, self.touch_injector,
                 context.device_id, current_bet, known_min_bet,
             )
+
+        self.last_tap = tuple(tapped_coords) if tapped_coords is not None else None
 
         if action == "stop":
             return Result.fail("Operator requested stop", "HITL_STOP_REQUESTED")

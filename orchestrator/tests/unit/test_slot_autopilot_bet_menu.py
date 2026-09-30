@@ -182,3 +182,66 @@ class TestWrongToggleTarget:
         assert result.error_code == "MENU_TOGGLE_WRONG_TARGET"
         locator.reject_position.assert_called_once()
         locator.remember_rejected.assert_not_called()
+
+
+class TestSelectFromOpenMenu:
+    def test_taps_the_lowest_without_reopening_and_remembers_the_operator_toggle(self):
+        selector, locator, verifier = _selector()
+        provider = _provider(_context(MAIN_BOXES, posta=0.10))
+
+        result = selector.select_from_open_menu(
+            "dev", "shining", _context(MENU_BOXES, posta=None), provider, toggle_xy=(788, 1775),
+        )
+
+        assert result.success and result.data.final_bet == Decimal("0.10")
+        assert [call.args[1:3] for call in verifier.verified_tap.call_args_list] == [(200, 1000)]
+        saved = locator.save_verified_candidate.call_args
+        assert saved.args[0] == "bet_menu_toggle"
+        assert (saved.args[1].x, saved.args[1].y, saved.args[1].strategy_name) == (788, 1775, "hitl")
+
+    def test_nothing_is_remembered_when_the_selection_is_not_confirmed(self):
+        selector, locator, _ = _selector()
+
+        result = selector.select_from_open_menu(
+            "dev", "shining", _context(MENU_BOXES), _provider(_context(MAIN_BOXES, posta=0.50)), (788, 1775),
+        )
+
+        assert result.error_code == "MENU_SELECTION_NOT_CONFIRMED"
+        locator.save_verified_candidate.assert_not_called()
+
+    def test_not_a_list_is_reported_without_tapping(self):
+        selector, _, verifier = _selector()
+
+        result = selector.select_from_open_menu("dev", "shining", _context(MAIN_BOXES), _provider(), None)
+
+        assert result.error_code == "MENU_OPEN_NOT_A_LIST"
+        verifier.verified_tap.assert_not_called()
+
+    def test_menu_still_open_is_closed_with_the_operator_toggle(self):
+        selector, _, verifier = _selector()
+        provider = _provider(_context(MENU_BOXES), _context(MAIN_BOXES, posta=0.10))
+
+        result = selector.select_from_open_menu("dev", "shining", _context(MENU_BOXES), provider, (788, 1775))
+
+        assert result.success
+        assert [call.args[1:3] for call in verifier.verified_tap.call_args_list] == [(200, 1000), (788, 1775)]
+
+    def test_still_open_with_an_unknown_toggle_fails_instead_of_guessing(self):
+        selector, locator, _ = _selector()
+        locator.locate.return_value = Result.fail("no", "ELEMENT_NOT_LOCATABLE")
+
+        result = selector.select_from_open_menu(
+            "dev", "shining", _context(MENU_BOXES), _provider(_context(MENU_BOXES)), None,
+        )
+
+        assert result.error_code == "MENU_CLOSE_UNKNOWN"
+
+
+class TestSelectLowestWithoutOperator:
+    def test_the_operator_is_excluded_when_asked(self):
+        selector, locator, _ = _selector()
+        provider = _provider(_context(MENU_BOXES), _context(MAIN_BOXES, posta=0.10))
+
+        selector.select_lowest("dev", "bigbass", _context(MAIN_BOXES, posta=2.0), provider, allow_operator=False)
+
+        assert locator.locate.call_args.kwargs["exclude_strategies"] == ("hitl",)

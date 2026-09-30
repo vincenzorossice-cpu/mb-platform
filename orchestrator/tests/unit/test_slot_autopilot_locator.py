@@ -425,3 +425,25 @@ class TestAvoidZones:
         locator.locate("bet_plus", _context())
 
         assert gpt.locate.call_args.args[1].avoid_zones == [(540, 1775, 90, "SPIN button")]
+
+
+class TestChainExhaustionAndOperatorTap:
+    def test_chain_is_exhausted_only_when_every_strategy_reached_the_threshold(self):
+        locator = ElementLocator(
+            {"gpt": _fail_strategy("gpt"), "hitl": _fail_strategy("hitl")}, max_consecutive_failures_per_strategy=2,
+        )
+        assert not locator.is_chain_exhausted("bet_minus")
+        for _ in range(2):
+            locator.locate("bet_minus", _context())
+        assert locator.is_chain_exhausted("bet_minus")
+        assert not locator.is_chain_exhausted("spin")
+        locator.reset_failures("bet_minus")
+        assert not locator.is_chain_exhausted("bet_minus")
+
+    def test_last_hitl_tap_is_exposed_only_when_known(self):
+        hitl = _fail_strategy("hitl")
+        hitl.last_tap = (788, 1775)
+        assert ElementLocator({"hitl": hitl}).last_hitl_tap() == (788, 1775)
+        assert ElementLocator({"gpt": _fail_strategy("gpt")}).last_hitl_tap() is None
+        hitl.last_tap = None
+        assert ElementLocator({"hitl": hitl}).last_hitl_tap() is None

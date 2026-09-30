@@ -74,6 +74,34 @@ class TestDescriptionIsUnderstood:
         touch.tap_coordinates.assert_not_called()
 
 
+class TestValueDescriptionsAreNeverGuessed:
+    def test_lowest_value_phrase_not_found_by_sight_does_not_tap_a_keyword_guess(self, monkeypatch, shot):
+        result, touch = _run(
+            monkeypatch, shot,
+            [("text", "devi premere la cella contenente il valore piu basso"), ("stop",)],
+            [], MagicMock(return_value=None),
+        )
+
+        assert result[0] == "stop"
+        touch.tap_coordinates.assert_not_called()
+
+    def test_amount_phrase_not_found_by_sight_does_not_tap_a_keyword_guess(self, monkeypatch, shot):
+        result, touch = _run(
+            monkeypatch, shot, [("text", "la cella 0.10 in basso"), ("stop",)], [], MagicMock(return_value=None),
+        )
+
+        assert result[0] == "stop"
+        touch.tap_coordinates.assert_not_called()
+
+    def test_a_plain_position_phrase_still_uses_the_keyword_fallback(self, monkeypatch, shot):
+        result, touch = _run(
+            monkeypatch, shot, [("text", "in basso a destra")],
+            [{"saldo": 100.0, "posta": 1.0, "raw_texts": []}], MagicMock(return_value=None),
+        )
+
+        assert touch.tap_coordinates.called
+
+
 class TestExplicitCoordinatesAndExits:
     def test_explicit_coordinates_are_tapped_exactly(self, monkeypatch, shot):
         describe = MagicMock()
