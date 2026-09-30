@@ -34,8 +34,11 @@ class AutoPilotConfig:
     # Discesa della puntata: dopo 2 discese verificate di fila con la stessa
     # coordinata fidata si tocca a raffica (N-1 tocchi ciechi + 1 verificato).
     # 1 = nessuna raffica. Il minimo e' un pavimento: non si puo' "passarlo".
-    bet_burst_taps: int = 4
+    bet_burst_taps: int = 6
     bet_burst_interval_seconds: float = 0.6
+    # Spin: ogni N spin una lettura OCR completa (lo schermo intero) anche se di
+    # norma si legge solo la fascia di saldo/puntata.
+    full_read_every_spins: int = 10
     balance_rise_abort_margin: Decimal = Decimal("0.00")
     accounting_tolerance: Decimal = Decimal("0.01")
     enable_gpt_fallback: bool = True
@@ -71,6 +74,8 @@ class AutoPilotConfig:
             return Result.fail("recovery_return_threshold must be > 0", "CONFIG_INVALID")
         if self.max_recovery_attempts < 1:
             return Result.fail("max_recovery_attempts must be >= 1", "CONFIG_INVALID")
+        if self.full_read_every_spins < 1:
+            return Result.fail("full_read_every_spins must be >= 1", "CONFIG_INVALID")
         if self.bet_burst_taps < 1:
             return Result.fail("bet_burst_taps must be >= 1", "CONFIG_INVALID")
         if self.bet_burst_interval_seconds < 0:

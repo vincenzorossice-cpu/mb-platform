@@ -30,6 +30,10 @@ class SpinResult:
     violated_invariant: Optional[str] = None  # "MIN_BET_NOT_VERIFIED" | "INSUFFICIENT_BALANCE" | "UNSAFE_SCREEN_STATE"
     accounting_anomaly: Optional[str] = None
     strategy_name: Optional[str] = None  # strategia che ha localizzato lo spin (None se non tappato)
+    # Schermo stabile dopo lo spin e relativa lettura OCR (da TapOutcome): chi deve
+    # iniziare lo spin successivo puo' riusarli invece di rifare la lettura.
+    screenshot_after: Optional[str] = None
+    state_after: Optional[dict] = None
 
 
 class SpinController:
@@ -87,6 +91,8 @@ class SpinController:
         candidate = locate_result.data
 
         attempts = 0
+        screenshot_after = None
+        state_after = None
         if candidate.verified:
             # Ramo HITL: nessun verified_tap di mezzo (l'operatore ha gia'
             # tappato e verificato), quindi nessun TapOutcome da cui leggere
@@ -135,6 +141,8 @@ class SpinController:
                 if tap_result.data.balance_after is not None:
                     balance_after = tap_result.data.balance_after
                 win_amount = tap_result.data.win_amount
+                screenshot_after = tap_result.data.screenshot_after
+                state_after = tap_result.data.state_after
                 if tap_result.data.verified:
                     verified = True
                     self.locator.record_success(candidate.strategy_name, _ELEMENT)
@@ -160,6 +168,8 @@ class SpinController:
             self.locator.save_verified_candidate(
                 _ELEMENT, candidate, slot_name, context.screen_width, context.screen_height,
             )
+        if outcome == "success" and win_amount is None:
+            win_amount = self._infer_win(balance_before, balance_after, expected_bet)
         accounting_anomaly = None
         if outcome == "success":
             accounting_anomaly = self._check_accounting(balance_before, expected_bet, win_amount, balance_after)
@@ -181,7 +191,16 @@ class SpinController:
             balance_before=balance_before, balance_after=balance_after, win_amount=win_amount,
             verified=verified, attempts=attempts, outcome=outcome,
             accounting_anomaly=accounting_anomaly, strategy_name=candidate.strategy_name,
+            screenshot_after=screenshot_after, state_after=state_after,
         ))
+
+    def _infer_win(self, balance_before, balance_after, bet) -> Optional[Decimal]:
+        """La vincita non letta dall'OCR si deduce dal saldo: dopo - prima + puntata.
+        Sotto un centesimo e' rumore di lettura, non una vincita."""
+        if balance_before is None or balance_after is None or bet is None:
+            return None
+        inferred = balance_after - balance_before + bet
+        return inferred if inferred >= Decimal("0.01") else None
 
     def _check_invariants(self, min_bet_verified, balance_before, expected_bet, context) -> Optional[str]:
         if not min_bet_verified:

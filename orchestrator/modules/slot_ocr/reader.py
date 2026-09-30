@@ -38,6 +38,11 @@ class SlotOCRReader:
         self._last_raw_results = None
         self._region = None
 
+    @property
+    def region(self) -> Optional[tuple]:
+        """La regione corrente (x1, y1, x2, y2) o None = schermo intero."""
+        return self._region
+
     def set_region(self, region: Optional[tuple]) -> None:
         """Limita l'OCR a (x1, y1, x2, y2) in pixel assoluti (None = schermo
         intero). Le coordinate restituite restano assolute."""

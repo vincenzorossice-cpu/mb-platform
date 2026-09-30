@@ -17,3 +17,6 @@ riconciliazione.py
 verify_*.py
 debug_*.py
 write_live_*.py
+
+# Log completi delle sessioni dell'autopilot (run_autopilot --log-dir)
+logs/

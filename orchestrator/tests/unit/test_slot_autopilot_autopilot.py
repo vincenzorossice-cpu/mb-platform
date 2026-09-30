@@ -6,7 +6,8 @@ from PIL import Image
 from orchestrator.core.result import Result
 from orchestrator.modules.provider_profile.loader import ProviderProfileLoader
 from orchestrator.modules.provider_profile.profile import ElementSpec, ProviderProfile
-from orchestrator.modules.slot_autopilot.autopilot import SlotAutoPilot
+from orchestrator.modules.slot_autopilot.autopilot import SlotAutoPilot, learn_amounts_band
+from orchestrator.modules.slot_ocr.reader import OCRBox
 from orchestrator.modules.slot_autopilot.bet_controller import BetController, BetResult
 from orchestrator.modules.slot_autopilot.config import AutoPilotConfig
 from orchestrator.modules.slot_autopilot.locator import ElementLocator
@@ -413,3 +414,177 @@ class TestProfileEvidence:
         builder = MagicMock()
         builder.record_session.side_effect = RuntimeError("disk full")
         assert self._autopilot(None, builder).shutdown("dev").success
+
+
+def _box(text, x, y):
+    return OCRBox(text=text, bbox=(x - 40, y - 15, x + 40, y + 15), confidence=0.9)
+
+
+BAR = [_box("CREDITO", 150, 2200), _box("€99.998,00", 350, 2200), _box("PUNTATA", 600, 2200), _box("€0,10", 800, 2200)]
+STATE = {"saldo": 99998.0, "posta": 0.1, "raw_texts": []}
+CANVAS = (0, 247, 1080, 2400)
+
+
+class TestLearnAmountsBand:
+    def test_band_covers_labels_and_values_on_their_rows_with_margin(self):
+        assert learn_amounts_band(BAR, STATE, CANVAS, (1080, 2400)) == (0, 2145, 1080, 2255)
+
+    def test_band_is_clamped_to_the_canvas(self):
+        low = [_box("SALDO", 100, 260), _box("POSTA", 500, 262), _box("10,00", 300, 260)]
+        band = learn_amounts_band(low, STATE, CANVAS, (1080, 2400))
+        assert band[1] == 247
+
+    def test_no_band_without_readable_amounts_or_labels(self):
+        assert learn_amounts_band(BAR, {"saldo": None, "posta": 0.1}, CANVAS, (1080, 2400)) is None
+        assert learn_amounts_band([_box("SPIN", 500, 2000)], STATE, CANVAS, (1080, 2400)) is None
+
+    def test_scattered_labels_give_no_band(self):
+        scattered = BAR + [_box("DEMO", 500, 400)]
+        assert learn_amounts_band(scattered, STATE, CANVAS, (1080, 2400)) is None
+
+    def test_without_a_canvas_the_whole_screen_is_the_limit(self):
+        assert learn_amounts_band(BAR, STATE, None, (1080, 2400)) == (0, 2145, 1080, 2255)
+
+
+class _Screens:
+    """Schermo finto: un PNG reale per ogni screenshot, OCR che dipende dalla regione."""
+
+    def __init__(self, tmp_path):
+        self.tmp_path = tmp_path
+        self.shots = 0
+        self.regions_used = []
+        self.region = None
+        self.band_state = dict(STATE)
+        self.full_state = dict(STATE)
+
+    def screenshot(self, device_id):
+        self.shots += 1
+        path = str(self.tmp_path / f"s{self.shots}.png")
+        Image.new("RGB", (1080, 2400)).save(path)
+        return Result.ok(path)
+
+    def set_region(self, region):
+        self.region = region
+
+    def read_slot_state(self, path):
+        self.regions_used.append(self.region)
+        return dict(self.full_state if self.region in (None, CANVAS) else self.band_state)
+
+    def read_text_boxes(self, path):
+        return Result.ok(list(BAR))
+
+
+def _pilot(tmp_path, spin_outcomes, config=None, profile=None):
+    screens = _Screens(tmp_path)
+    deps = _collaborators(config=config or _config(require_profile=False))
+    deps["profile_loader"].load.return_value = (
+        Result.ok(profile) if profile is not None else Result.fail("nf", "PROFILE_NOT_FOUND")
+    )
+    deps["step_logger"].start_episode.return_value = Result.ok("ep")
+    deps["screen_reader"]._screenshot.side_effect = screens.screenshot
+    ocr = deps["ocr_reader"]
+    type(ocr).region = property(lambda self: screens.region)
+    ocr.set_region.side_effect = screens.set_region
+    ocr.read_slot_state.side_effect = screens.read_slot_state
+    ocr.read_text_boxes.side_effect = screens.read_text_boxes
+    contexts = []
+
+    def fake_spin(device_id, slot, episode, index, provider, min_ok, bet):
+        contexts.append(provider())
+        outcome, strategy = spin_outcomes[index - 1]
+        return Result.ok(SpinResult(
+            slot_name=slot, spin_index=index, bet_amount=Decimal("0.10"), balance_before=None,
+            balance_after=Decimal("99997.9"), win_amount=None, verified=outcome == "success", attempts=1,
+            outcome=outcome, strategy_name=strategy, screenshot_after="/tmp/after.png" if outcome == "success" else None,
+            state_after=dict(STATE) if outcome == "success" else None,
+        ))
+
+    deps["spin_controller"].spin.side_effect = fake_spin
+    autopilot = SlotAutoPilot(**deps)
+    autopilot.prepare("dev")
+    autopilot._min_bet_verified, autopilot._current_bet = True, Decimal("0.10")
+    return autopilot, screens, contexts
+
+
+class TestFastSpinCycle:
+    def test_prepare_learns_the_band(self, tmp_path):
+        autopilot, _, _ = _pilot(tmp_path, [])
+        assert autopilot._amounts_band == (0, 2145, 1080, 2255)
+
+    def test_the_ocr_works_on_the_band_during_a_spin_and_the_region_is_restored(self, tmp_path):
+        autopilot, screens, _ = _pilot(tmp_path, [("no_effect", "memory")])
+        screens.region = CANVAS
+        seen = []
+        original = autopilot.spin_controller.spin.side_effect
+
+        def peek(*args):
+            seen.append(screens.region)
+            return original(*args)
+
+        autopilot.spin_controller.spin.side_effect = peek
+        autopilot.spin("dev", 1)
+
+        assert seen == [(0, 2145, 1080, 2255)] and screens.region == CANVAS
+
+    def test_the_region_is_restored_even_when_the_spin_raises(self, tmp_path):
+        autopilot, screens, _ = _pilot(tmp_path, [])
+        screens.region = CANVAS
+        autopilot.spin_controller.spin.side_effect = RuntimeError("boom")
+
+        result = autopilot.spin("dev", 1)
+
+        assert not result.success and screens.region == CANVAS
+
+    def test_a_verified_trusted_spin_provides_the_next_context_without_a_new_reading(self, tmp_path):
+        autopilot, screens, contexts = _pilot(tmp_path, [("success", "memory"), ("success", "memory")])
+        autopilot.spin("dev", 1)
+        shots_before = screens.shots
+
+        autopilot.spin("dev", 2)
+
+        assert screens.shots == shots_before                 # nessuno screenshot/OCR a inizio spin
+        assert contexts[1].data.screenshot_path == "/tmp/after.png"
+        assert contexts[1].data.slot_ocr_state["saldo"] == 99998.0
+
+    def test_no_reuse_after_no_effect_or_an_untrusted_strategy(self, tmp_path):
+        for outcome, strategy in (("no_effect", "memory"), ("success", "gpt")):
+            autopilot, screens, contexts = _pilot(tmp_path, [(outcome, strategy), ("success", "memory")])
+            autopilot.spin("dev", 1)
+            shots_before = screens.shots
+
+            autopilot.spin("dev", 2)
+
+            assert screens.shots > shots_before
+            assert contexts[1].data.screenshot_path != "/tmp/after.png"
+
+    def test_a_full_reading_is_forced_every_n_spins(self, tmp_path):
+        outcomes = [("success", "memory")] * 4
+        autopilot, screens, contexts = _pilot(
+            tmp_path, outcomes, config=_config(require_profile=False, full_read_every_spins=2),
+        )
+        screens.region = CANVAS
+        for index in (1, 2, 3):
+            autopilot.spin("dev", index)
+
+        # il terzo spin parte da una lettura completa (regione = canvas), non dal contesto riusato
+        assert CANVAS in screens.regions_used[-1:]
+        assert contexts[2].data.screenshot_path != "/tmp/after.png"
+
+    def test_band_reading_without_amounts_falls_back_to_one_full_reading(self, tmp_path):
+        autopilot, screens, contexts = _pilot(tmp_path, [("no_effect", "gpt"), ("success", "memory")])
+        screens.region = CANVAS
+        screens.band_state = {"saldo": None, "posta": None, "raw_texts": []}
+        autopilot.spin("dev", 1)
+
+        autopilot.spin("dev", 2)
+
+        assert contexts[1].data.slot_ocr_state["saldo"] == 99998.0     # dalla lettura completa
+        assert screens.region == CANVAS
+
+    def test_without_a_band_nothing_changes(self, tmp_path):
+        autopilot, screens, contexts = _pilot(tmp_path, [("no_effect", "memory")])
+        autopilot._amounts_band = None
+        screens.region = CANVAS
+        autopilot.spin("dev", 1)
+
+        assert screens.region == CANVAS and contexts[0].success

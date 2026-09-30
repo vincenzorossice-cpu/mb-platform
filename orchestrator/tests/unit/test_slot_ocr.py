@@ -193,6 +193,16 @@ class TestRegion:
         assert r._ocr.readtext.call_count == 2
 
 
+class TestRegionProperty:
+    def test_region_is_readable_and_follows_set_region(self):
+        reader = SlotOCRReader()
+        assert reader.region is None
+        reader.set_region((0, 247, 1080, 2400))
+        assert reader.region == (0, 247, 1080, 2400)
+        reader.set_region(None)
+        assert reader.region is None
+
+
 class TestReExport:
     def test_casino_flow_reexports_same_class(self):
         assert ReExportedSlotOCRReader is SlotOCRReader

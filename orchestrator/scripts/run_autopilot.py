@@ -1,6 +1,10 @@
 import argparse
 import logging
+import os
 import sys
+import time
+import warnings
+from datetime import datetime
 from decimal import Decimal
 
 import openai
@@ -33,6 +37,54 @@ logger = logging.getLogger(__name__)
 
 # Spin senza effetto di fila dopo i quali ci si ferma (invece di consumare --max-steps).
 _MAX_CONSECUTIVE_NO_EFFECT_SPINS = 3
+
+
+# Loggers i cui messaggi INFO restano anche sulla console (progresso e eventi chiave);
+# tutto il resto va solo su file (a meno che non sia un avviso/errore).
+_CONSOLE_INFO_LOGGERS = ("__main__", "orchestrator.scripts.run_autopilot")
+_HARMLESS_WARNING_PATTERNS = (".*pin_memory.*", ".*quantize_per_tensor.*")
+
+
+class _ConsoleFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno >= logging.WARNING or record.name in _CONSOLE_INFO_LOGGERS
+
+
+def _configure_logging(log_dir: str, slot_name: str) -> str:
+    """Dettaglio completo (httpx, risposte GPT, ogni tocco) su file; sulla console solo
+    la riga di progresso, gli eventi chiave e gli avvisi/errori. Ritorna il percorso del
+    file. Le UserWarning innocue di torch (CPU senza acceleratore) non si mostrano."""
+    os.makedirs(log_dir, exist_ok=True)
+    slug = "".join(c if c.isalnum() or c in "-_" else "_" for c in slot_name.strip().lower()) or "slot"
+    path = os.path.join(log_dir, f"autopilot_{slug}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+
+    file_handler = logging.FileHandler(path, encoding="utf-8")
+    file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    console = logging.StreamHandler()
+    console.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%H:%M:%S"))
+    console.addFilter(_ConsoleFilter())
+    root.addHandler(file_handler)
+    root.addHandler(console)
+
+    for pattern in _HARMLESS_WARNING_PATTERNS:
+        warnings.filterwarnings("ignore", message=pattern)
+    logging.getLogger("easyocr").setLevel(logging.ERROR)  # "Using CPU": informativo, una volta
+    return path
+
+
+def _progress_line(spin_index: int, spin_result, total_played: Decimal, target: Decimal, seconds: float) -> str:
+    bet = f"{spin_result.bet_amount:.2f}" if spin_result.bet_amount is not None else "-"
+    balance = f"{spin_result.balance_after}" if spin_result.balance_after is not None else "-"
+    win = f"{spin_result.win_amount:.2f}" if spin_result.win_amount else "0.00"
+    return (
+        f"Spin {spin_index} | puntata {bet} | saldo {balance} | vincita {win} | "
+        f"giocato {total_played:.2f}/{target:.2f} | {seconds:.0f} s"
+    )
 
 
 def _check_openai_key(gpt_client) -> Result[bool]:
@@ -145,7 +197,9 @@ def _run_session(autopilot: SlotAutoPilot, args: argparse.Namespace) -> int:
     stopped_without_effect = False
     while total_played < target and spin_index < args.max_steps:
         spin_index += 1
+        started = time.monotonic()
         spin_result = autopilot.spin(args.device, spin_index)
+        seconds = time.monotonic() - started
         if not spin_result.success:
             logger.error("spin() fallito: %s (%s)", spin_result.error, spin_result.error_code)
             return 1
@@ -163,7 +217,7 @@ def _run_session(autopilot: SlotAutoPilot, args: argparse.Namespace) -> int:
             consecutive_no_effect = 0
         if spin_result.data.outcome == "success" and spin_result.data.bet_amount:
             total_played += spin_result.data.bet_amount
-            logger.info("Progresso: %s/%s EUR giocati dopo lo spin %d", total_played, target, spin_index)
+            logger.info("%s", _progress_line(spin_index, spin_result.data, total_played, target, seconds))
         elif spin_result.data.outcome == "blocked":
             logger.warning("Spin bloccato da un'invariante di sicurezza: %s", spin_result.data.violated_invariant)
             break
@@ -191,13 +245,15 @@ def _parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--live", action="store_true", help="Disattiva il dry-run: esegue tap reali.")
     parser.add_argument("--no-gpt", action="store_true", help="Disabilita il fallback GPT-4o-mini Vision.")
     parser.add_argument("--require-profile", action="store_true", help="Rifiuta le slot senza profilo in provider_profiles/.")
+    parser.add_argument("--log-dir", default="logs", help="Cartella del file di log completo (default: logs).")
     parser.add_argument("--no-hitl", action="store_true", help="Disabilita il fallback HITL da terminale.")
     return parser.parse_args(argv)
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     args = _parse_args()
+    log_path = _configure_logging(getattr(args, "log_dir", "logs"), args.slot)
+    logger.info("Dettaglio completo su file: %s", log_path)
 
     build_result = build_autopilot(args)
     if not build_result.success:

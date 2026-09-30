@@ -1,3 +1,4 @@
+import dataclasses
 import logging
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -21,6 +22,45 @@ logger = logging.getLogger(__name__)
 
 # Strategie che non implicano alcun aiuto esterno: dati gia' curati/verificati.
 _UNASSISTED_STRATEGIES = {"profile", "memory", "menu"}
+# Solo coordinate gia' curate/verificate: il loro spin puo' riusare lo schermo letto
+# dopo il tocco come contesto dello spin successivo.
+_REUSE_CONTEXT_STRATEGIES = {"profile", "memory"}
+
+_AMOUNT_LABELS = SlotOCRReader._SALDO_LABELS + SlotOCRReader._POSTA_LABELS
+_BAND_MARGIN_PX = 40
+_BAND_ROW_TOLERANCE_PX = 50
+_BAND_MAX_CANVAS_FRACTION = 0.35
+
+
+def learn_amounts_band(text_boxes: list, state: dict, canvas_bbox: Optional[tuple], screen_size: tuple) -> Optional[tuple]:
+    """La fascia orizzontale dello schermo dove si leggono saldo e puntata (etichette
+    e importi sulle stesse righe), +-margine, larghezza piena, dentro la canvas.
+    Calcolata dallo schermo, nessun dato per slot. None se saldo/puntata non si
+    leggono, se non ci sono etichette o se la fascia sarebbe troppo alta (etichette
+    sparse: meglio leggere tutto)."""
+    if state.get("saldo") is None or state.get("posta") is None:
+        return None
+    label_boxes = [b for b in text_boxes if any(word in b.text.upper() for word in _AMOUNT_LABELS)]
+    if not label_boxes:
+        return None
+    rows = [(b.bbox[1] + b.bbox[3]) / 2 for b in label_boxes]
+    value_boxes = [
+        b for b in text_boxes
+        if any(ch.isdigit() for ch in b.text)
+        and any(abs((b.bbox[1] + b.bbox[3]) / 2 - row) < _BAND_ROW_TOLERANCE_PX for row in rows)
+    ]
+    boxes = label_boxes + value_boxes
+    width, height = screen_size
+    cx1, cy1, cx2, cy2 = canvas_bbox or (0, 0, width, height)
+    y1 = max(cy1, min(b.bbox[1] for b in boxes) - _BAND_MARGIN_PX)
+    y2 = min(cy2, max(b.bbox[3] for b in boxes) + _BAND_MARGIN_PX)
+    if y2 <= y1 or (y2 - y1) > _BAND_MAX_CANVAS_FRACTION * (cy2 - cy1):
+        return None
+    return (cx1, int(y1), cx2, int(y2))
+
+
+def _has_amounts(state: Optional[dict]) -> bool:
+    return bool(state) and state.get("saldo") is not None and state.get("posta") is not None
 
 
 def _now() -> str:
@@ -66,6 +106,11 @@ class SlotAutoPilot:
         # SpinResult.balance_after, nessuna lettura extra.
         self._initial_balance: Optional[Decimal] = None
         self._last_known_balance: Optional[Decimal] = None
+        # Velocita' del ciclo di spin: fascia di saldo/puntata appresa dallo schermo
+        # e contesto riusabile (schermo stabile dopo l'ultimo spin verificato).
+        self._amounts_band: Optional[tuple] = None
+        self._cached_spin_context: Optional[LocateContext] = None
+        self._spins_since_full_read = 0
 
     def prepare(self, device_id: str) -> Result[bool]:
         try:
@@ -92,6 +137,7 @@ class SlotAutoPilot:
                 value = context_result.data.slot_ocr_state.get("saldo")
                 self._initial_balance = Decimal(str(value)) if value is not None else None
                 self._last_known_balance = self._initial_balance
+                self._learn_band(context_result.data)
 
             return Result.ok(True)
         except Exception as exc:
@@ -114,11 +160,19 @@ class SlotAutoPilot:
             return Result.fail(f"Unexpected error in set_min_bet: {exc}", "UNEXPECTED_ERROR")
 
     def spin(self, device_id: str, spin_index: int) -> Result[SpinResult]:
+        full_region = self.ocr_reader.region
+        band = self._amounts_band
         try:
+            if band is not None:
+                # Lettura rapida: EasyOCR su una striscia di saldo/puntata invece
+                # che su tutto lo schermo (~1 s invece di ~9 s).
+                self.ocr_reader.set_region(band)
             result = self.spin_controller.spin(
                 device_id, self.config.slot_name, self._episode_id, spin_index,
-                lambda: self._build_context(device_id), self._min_bet_verified, self._current_bet,
+                lambda: self._spin_context(device_id, full_region), self._min_bet_verified, self._current_bet,
             )
+            self._spins_since_full_read += 1
+            self._cached_spin_context = None
             if result.success:
                 self._total_steps += 1
                 if result.data.strategy_name is not None and result.data.strategy_name not in _UNASSISTED_STRATEGIES:
@@ -131,9 +185,66 @@ class SlotAutoPilot:
                         self._total_played += result.data.bet_amount
                     if result.data.balance_after is not None:
                         self._last_known_balance = result.data.balance_after
+                    self._cached_spin_context = self._context_from_spin(result.data)
             return result
         except Exception as exc:
             return Result.fail(f"Unexpected error in spin: {exc}", "UNEXPECTED_ERROR")
+        finally:
+            if band is not None:
+                self.ocr_reader.set_region(full_region)
+
+    def _learn_band(self, context: LocateContext) -> None:
+        try:
+            canvas = self._profile.canvas_bbox if self._profile is not None and self._profile.verified else None
+            self._amounts_band = learn_amounts_band(
+                context.text_boxes, context.slot_ocr_state, canvas, (context.screen_width, context.screen_height),
+            )
+        except Exception as exc:
+            logger.warning("Fascia di saldo/puntata non appresa: %s", exc)
+            self._amounts_band = None
+        if self._amounts_band is not None:
+            logger.info("Fascia di saldo/puntata appresa: %s (lettura rapida durante gli spin)", self._amounts_band)
+
+    def _context_from_spin(self, spin_result: SpinResult) -> Optional[LocateContext]:
+        """Lo schermo stabile dopo uno spin verificato da una coordinata fidata e'
+        gia' stato letto per verificarlo: e' il contesto dello spin successivo."""
+        if (
+            spin_result.strategy_name not in _REUSE_CONTEXT_STRATEGIES or spin_result.state_after is None
+            or not spin_result.screenshot_after or self._screen_size is None
+        ):
+            return None
+        return LocateContext(
+            device_id="", slot_name=self.config.slot_name, screenshot_path=spin_result.screenshot_after,
+            screen_width=self._screen_size[0], screen_height=self._screen_size[1],
+            raw_texts=spin_result.state_after.get("raw_texts", []), text_boxes=[],
+            slot_ocr_state=spin_result.state_after, profile=self._profile,
+        )
+
+    def _spin_context(self, device_id: str, full_region) -> Result[LocateContext]:
+        """Contesto di inizio spin: quello gia' letto dopo lo spin precedente se c'e' (e
+        mostra saldo e puntata); ogni N spin, o se la lettura rapida non trova saldo e
+        puntata, UNA lettura completa prima di giudicare lo schermo."""
+        cached, self._cached_spin_context = self._cached_spin_context, None
+        force_full = self._amounts_band is not None and self._spins_since_full_read >= self.config.full_read_every_spins
+        if cached is not None and not force_full and _has_amounts(cached.slot_ocr_state):
+            return Result.ok(dataclasses.replace(cached, device_id=device_id))
+        if self._amounts_band is None:
+            return self._build_context(device_id)
+        if force_full:
+            return self._full_context(device_id, full_region)
+        result = self._build_context(device_id)
+        if result.success and not _has_amounts(result.data.slot_ocr_state):
+            return self._full_context(device_id, full_region)
+        return result
+
+    def _full_context(self, device_id: str, full_region) -> Result[LocateContext]:
+        self._spins_since_full_read = 0
+        band = self.ocr_reader.region
+        self.ocr_reader.set_region(full_region)
+        try:
+            return self._build_context(device_id)
+        finally:
+            self.ocr_reader.set_region(band)
 
     def get_balance_summary(self) -> tuple:
         """(saldo_iniziale, ultimo_saldo_osservato) - per un riepilogo netto

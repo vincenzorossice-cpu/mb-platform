@@ -155,9 +155,11 @@ class TestCleanSpins:
         locator = MagicMock()
         locator.locate.return_value = _candidate()
         verifier = MagicMock()
-        # Atteso 9.90 (10.00 - 0.10 + 0), osservato 10.40: scarto enorme, ma il
-        # tap era verificato -> successo comunque, anomalia solo annotata.
-        verifier.verified_tap.return_value = _tap_outcome(True, balance_after=Decimal("10.40"))
+        # Vincita letta 0.05 -> atteso 9.95 (10.00 - 0.10 + 0.05), osservato 10.40: scarto
+        # enorme, ma il tap era verificato -> successo comunque, anomalia solo annotata.
+        verifier.verified_tap.return_value = _tap_outcome(
+            True, balance_after=Decimal("10.40"), win_amount=Decimal("0.05"),
+        )
         controller, _, _, _ = _controller(locator=locator, verifier=verifier)
         context_provider = MagicMock(return_value=_context_result(Decimal("10.00")))
 
@@ -387,3 +389,40 @@ class TestNoEffectSpinFromGuessedCoordinate:
                         True, Decimal("0.10"))
 
         locator.record_success.assert_called_once_with("gpt", "spin")
+
+
+class TestInferredWin:
+    def _spin(self, balance_after, win_amount=None, bet="0.10", balance_before="10.00"):
+        locator = MagicMock()
+        locator.locate.return_value = _candidate()
+        verifier = MagicMock()
+        verifier.verified_tap.return_value = _tap_outcome(
+            True, balance_after=Decimal(balance_after), win_amount=win_amount,
+        )
+        controller, _, _, _ = _controller(locator=locator, verifier=verifier)
+        return controller.spin(
+            "dev", "pirots5", "ep", 1, MagicMock(return_value=_context_result(Decimal(balance_before))),
+            True, Decimal(bet),
+        ).data
+
+    def test_unread_win_is_inferred_from_the_balance(self):
+        result = self._spin("10.40")          # 10.00 -0.10 +0.50
+
+        assert result.win_amount == Decimal("0.50")
+        assert result.accounting_anomaly is None
+
+    def test_no_win_when_the_balance_only_drops_by_the_bet(self):
+        assert self._spin("9.90").win_amount is None
+
+    def test_a_win_read_by_the_ocr_is_kept_and_still_cross_checked(self):
+        result = self._spin("9.95", win_amount=Decimal("0.05"))
+
+        assert result.win_amount == Decimal("0.05") and result.accounting_anomaly is None
+
+    def test_sub_cent_noise_is_not_a_win(self):
+        assert self._spin("9.905").win_amount is None
+
+    def test_result_exposes_the_screen_after_the_spin_for_reuse(self):
+        result = self._spin("9.90")
+
+        assert result.screenshot_after == "/tmp/b.png"

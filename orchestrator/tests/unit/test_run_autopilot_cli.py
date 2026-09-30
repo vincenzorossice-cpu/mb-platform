@@ -7,6 +7,8 @@ import pytest
 
 from orchestrator.core.result import Result
 from orchestrator.scripts.run_autopilot import _check_openai_key as real_check_openai_key
+from orchestrator.scripts.run_autopilot import _configure_logging as real_configure_logging
+from orchestrator.scripts.run_autopilot import _progress_line
 from orchestrator.scripts.run_autopilot import build_autopilot, main
 
 
@@ -17,6 +19,12 @@ def _args(**overrides) -> argparse.Namespace:
     )
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
+
+
+@pytest.fixture(autouse=True)
+def _no_log_files(monkeypatch):
+    """main() non deve creare cartelle di log nel repo durante i test."""
+    monkeypatch.setattr("orchestrator.scripts.run_autopilot._configure_logging", lambda log_dir, slot: "test.log")
 
 
 @pytest.fixture(autouse=True)
@@ -151,6 +159,77 @@ class TestSpinLoopStopsWithoutEffect:
 
         assert code == 0
         assert autopilot.spin.call_count == 6
+
+
+class TestLogging:
+    @pytest.fixture(autouse=True)
+    def _restore_logging(self):
+        import logging
+        root = logging.getLogger()
+        handlers, level = list(root.handlers), root.level
+        yield
+        for handler in list(root.handlers):
+            root.removeHandler(handler)
+            handler.close()
+        for handler in handlers:
+            root.addHandler(handler)
+        root.setLevel(level)
+
+    def test_full_detail_goes_to_the_file_and_only_progress_and_warnings_to_the_console(self, tmp_path, capsys):
+        import logging
+        path = real_configure_logging(str(tmp_path / "logs"), "Big Bass Bonanza")
+
+        logging.getLogger("orchestrator.scripts.run_autopilot").info("Spin 1 | puntata 0.10")
+        logging.getLogger("httpx2").info("HTTP Request: POST https://api.openai.com/...")
+        logging.getLogger("orchestrator.modules.slot_autopilot.verifier").info("verified_tap: tap (1,2)")
+        logging.getLogger("orchestrator.modules.slot_autopilot.locator").warning("attenzione: punto scartato")
+        for handler in logging.getLogger().handlers:
+            handler.flush()
+
+        console = capsys.readouterr().err
+        assert "Spin 1 | puntata 0.10" in console and "attenzione: punto scartato" in console
+        assert "HTTP Request" not in console and "verified_tap" not in console
+        detail = open(path, encoding="utf-8").read()
+        assert "Spin 1" in detail and "HTTP Request" in detail and "verified_tap" in detail
+
+    def test_log_file_name_carries_the_slot_and_the_folder_is_created(self, tmp_path):
+        path = real_configure_logging(str(tmp_path / "nuova" / "cartella"), "Big Bass Bonanza")
+
+        assert "autopilot_big_bass_bonanza_" in path and path.endswith(".log")
+        assert (tmp_path / "nuova" / "cartella").is_dir()
+
+    def test_harmless_torch_warnings_are_ignored(self, tmp_path):
+        import warnings
+        real_configure_logging(str(tmp_path), "s")
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.warn("'pin_memory' argument is set as true but no accelerator is found", UserWarning)
+            warnings.warn("torch.quantize_per_tensor is deprecated", UserWarning)
+        assert caught == []
+
+
+class TestProgressLine:
+    def _result(self, **overrides):
+        from decimal import Decimal
+        from orchestrator.modules.slot_autopilot.spin_controller import SpinResult
+        data = dict(
+            slot_name="s", spin_index=9, bet_amount=Decimal("0.1"), balance_before=None,
+            balance_after=Decimal("99999.15"), win_amount=Decimal("0.05"), verified=True, attempts=1, outcome="success",
+        )
+        data.update(overrides)
+        return SpinResult(**data)
+
+    def test_simple_one_line_summary(self):
+        from decimal import Decimal
+        line = _progress_line(9, self._result(), Decimal("0.90"), Decimal("30"), 13.6)
+
+        assert line == "Spin 9 | puntata 0.10 | saldo 99999.15 | vincita 0.05 | giocato 0.90/30.00 | 14 s"
+
+    def test_missing_values_are_shown_plainly(self):
+        from decimal import Decimal
+        line = _progress_line(1, self._result(bet_amount=None, balance_after=None, win_amount=None), Decimal("0"), Decimal("30"), 2)
+
+        assert "puntata -" in line and "saldo -" in line and "vincita 0.00" in line
 
 
 class TestMain:
