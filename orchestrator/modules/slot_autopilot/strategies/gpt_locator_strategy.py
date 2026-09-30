@@ -131,7 +131,15 @@ class GPTLocatorStrategy(LocatorStrategy):
         return Result.ok(LocateCandidate(x=x, y=y, confidence=confidence, strategy_name=self.name))
 
 
-    def _ask_cell(self, element_name: str, image_path: str, labels: list, stage: str, note: str = ""):
+    def locate_described(self, description: str, context: LocateContext):
+        """(x, y) di un elemento descritto a parole dall'operatore (es. "l'icona
+        delle monete impilate in basso al centro"), con lo stesso affinamento a
+        griglia delle icone: la frase diventa la descrizione dell'elemento. None
+        se GPT non lo trova."""
+        return self._refine_icon("operator_target", context, description=description)
+
+    def _ask_cell(self, element_name: str, image_path: str, labels: list, stage: str, note: str = "",
+                  description: str = None):
         """Domanda Vision con un prompt DEDICATO alla griglia etichettata:
         ritorna l'etichetta scelta o None. Non passa da ask_with_image, il cui
         prompt di sistema impone a GPT di rispondere con testo OCR o regione
@@ -143,8 +151,12 @@ class GPTLocatorStrategy(LocatorStrategy):
             logger.warning("'%s' (%s): immagine illeggibile: %s", element_name, stage, exc)
             return None
 
+        if description:
+            what = f"The operator describes the element to find as: \"{description}\"."
+        else:
+            what = f"Element to find: '{element_name}' - {_describe(element_name)}."
         user_text = (
-            f"Element to find: '{element_name}' - {_describe(element_name)}.{note}\n"
+            f"{what}{note}\n"
             f"Valid cell labels: {', '.join(labels)}.\n"
             "Reply with the label of the ONE cell that contains the CENTER of the element, or null if it "
             "is not visible in this image."
@@ -176,7 +188,7 @@ class GPTLocatorStrategy(LocatorStrategy):
             return None
         return cell.strip().upper()
 
-    def _refine_icon(self, element_name: str, context: LocateContext):
+    def _refine_icon(self, element_name: str, context: LocateContext, description: str = None):
         """(x, y) assoluti del centro della cella fine scelta, o None."""
         width, height = context.screen_width, context.screen_height
         with tempfile.TemporaryDirectory(prefix="autopilot_grid_") as tmp:
@@ -186,7 +198,7 @@ class GPTLocatorStrategy(LocatorStrategy):
                 coarse = annotate_grid(context.screenshot_path, (0, 0, width, height),
                                        coarse_cols, coarse_rows, coarse_path)
                 note = _avoid_note(context.rejected_positions, width, height)
-                label = self._ask_cell(element_name, coarse_path, list(coarse), "coarse", note)
+                label = self._ask_cell(element_name, coarse_path, list(coarse), "coarse", note, description)
                 if label not in coarse:
                     logger.warning("'%s': passo A senza cella valida (%r)", element_name, label)
                     return None
@@ -205,7 +217,7 @@ class GPTLocatorStrategy(LocatorStrategy):
                 if not fine_labels:
                     logger.warning("'%s': tutte le celle fini sono vicine a punti scartati", element_name)
                     return None
-                label_b = self._ask_cell(element_name, fine_path, fine_labels, "fine", note)
+                label_b = self._ask_cell(element_name, fine_path, fine_labels, "fine", note, description)
                 if label_b not in fine_labels:
                     logger.warning("'%s': passo B senza cella valida (%r)", element_name, label_b)
                     return None

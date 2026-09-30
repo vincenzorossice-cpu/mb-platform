@@ -93,7 +93,9 @@ def build_autopilot(args: argparse.Namespace) -> Result[SlotAutoPilot]:
             strategies["gpt"] = GPTLocatorStrategy(gpt_client)
 
     if config.enable_hitl_fallback:
-        strategies["hitl"] = HITLStrategy(screen_reader, ocr_reader, touch_injector)
+        strategies["hitl"] = HITLStrategy(
+            screen_reader, ocr_reader, touch_injector, describer=strategies.get("gpt"),
+        )
 
     locator = ElementLocator(strategies)
     verifier = ActionVerifier(touch_injector, screen_reader, ocr_reader, config)

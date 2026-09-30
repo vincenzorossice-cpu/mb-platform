@@ -36,6 +36,17 @@ class TestBuildAutopilot:
         for name in ("profile", "memory", "ocr_anchor", "spatial_heuristic", "template", "gpt", "hitl"):
             assert name in strategies
 
+    def test_hitl_gets_the_gpt_strategy_as_describer(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+        strategies = build_autopilot(_args()).data.locator.strategies
+        assert strategies["hitl"].describer is strategies["gpt"]
+
+    def test_hitl_without_gpt_has_no_describer(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        strategies = build_autopilot(_args(no_gpt=True)).data.locator.strategies
+        assert strategies["hitl"].describer is None
+
     def test_no_gpt_omits_gpt_strategy(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv("OPENAI_API_KEY", "test-key")

@@ -4,6 +4,7 @@ from orchestrator.modules.slot_autopilot.strategies.base import (
     LocateContext,
     LocatorStrategy,
 )
+from orchestrator.modules.slot_autopilot.precise_hitl import handle_precise_hitl_escalation
 from orchestrator.tests.validation.test_slot_autonomous import handle_hitl_escalation
 
 
@@ -15,19 +16,28 @@ class HITLStrategy(LocatorStrategy):
     ActionVerifier su un candidato HITL."""
     name = "hitl"
 
-    def __init__(self, screen_reader, ocr_reader, touch_injector):
+    def __init__(self, screen_reader, ocr_reader, touch_injector, describer=None):
         self.screen_reader = screen_reader
         self.ocr_reader = ocr_reader
         self.touch_injector = touch_injector
+        # Opzionale: un oggetto con locate_described(frase, contesto) -> (x, y)
+        # (GPTLocatorStrategy). Senza, vale il vecchio interprete a parole chiave.
+        self.describer = describer
 
     def locate(self, element_name: str, context: LocateContext) -> Result[LocateCandidate]:
         current_bet = context.slot_ocr_state.get("posta")
         known_min_bet = context.profile.known_min_bet if context.profile else None
 
-        action, _data, _confirmed_min_bet, tapped_coords = handle_hitl_escalation(
-            self.screen_reader, self.ocr_reader, self.touch_injector,
-            context.device_id, current_bet, known_min_bet,
-        )
+        if self.describer is not None:
+            action, _data, _confirmed_min_bet, tapped_coords = handle_precise_hitl_escalation(
+                self.screen_reader, self.ocr_reader, self.touch_injector,
+                context.device_id, current_bet, known_min_bet, self.describer.locate_described,
+            )
+        else:
+            action, _data, _confirmed_min_bet, tapped_coords = handle_hitl_escalation(
+                self.screen_reader, self.ocr_reader, self.touch_injector,
+                context.device_id, current_bet, known_min_bet,
+            )
 
         if action == "stop":
             return Result.fail("Operator requested stop", "HITL_STOP_REQUESTED")

@@ -50,3 +50,27 @@ class TestHITLStrategy:
             result = _strategy().locate("bet_minus", _context())
         assert not result.success
         assert result.error_code == "HITL_NO_COORDS"
+
+
+_PRECISE_TARGET = "orchestrator.modules.slot_autopilot.strategies.hitl_strategy.handle_precise_hitl_escalation"
+
+
+class TestPreciseFlowSelection:
+    def test_with_a_describer_the_precise_flow_is_used(self):
+        describer = MagicMock()
+        strategy = HITLStrategy(MagicMock(), MagicMock(), MagicMock(), describer=describer)
+        with patch(_PRECISE_TARGET, return_value=("resolved", {}, None, (544, 2090))) as precise, \
+                patch(_PATCH_TARGET) as legacy:
+            result = strategy.locate("bet_menu_toggle", _context())
+
+        assert result.success and (result.data.x, result.data.y) == (544, 2090)
+        legacy.assert_not_called()
+        assert precise.call_args.args[-1] is describer.locate_described
+
+    def test_without_a_describer_the_legacy_flow_is_used(self):
+        with patch(_PRECISE_TARGET) as precise, \
+                patch(_PATCH_TARGET, return_value=("stop", None, None, None)):
+            result = _strategy().locate("bet_minus", _context())
+
+        assert result.error_code == "HITL_STOP_REQUESTED"
+        precise.assert_not_called()

@@ -236,3 +236,22 @@ class TestRejectedPointsAndDescriptions:
         labels_line = fine_text.split("Valid cell labels: ")[1].split(".\n")[0].split(", ")
         assert "A1" not in labels_line and "F6" in labels_line
         assert not result.success   # GPT ha scelto proprio la cella tolta
+
+
+class TestLocateDescribed:
+    def test_operator_phrase_becomes_the_element_description_in_both_steps(self, real_context):
+        gpt_client = _client(Result.ok(_answers(action="stop")), _cell_answer("B6"), _cell_answer("C4"))
+
+        point = GPTLocatorStrategy(gpt_client).locate_described(
+            "l'icona delle monete impilate in basso al centro", real_context,
+        )
+
+        assert point == (135 + round(2.5 * 540 / 6), 1350 + round(3.5 * 600 / 6))
+        gpt_client.ask_with_image.assert_not_called()    # nessun passo 0: e' gia' un'icona
+        for call in _grid_calls(gpt_client):
+            assert "l'icona delle monete impilate in basso al centro" in _grid_user_text(call)
+
+    def test_returns_none_when_gpt_cannot_find_it(self, real_context):
+        gpt_client = _client(Result.ok(_answers(action="stop")), _cell_answer("A1", action="stop"))
+
+        assert GPTLocatorStrategy(gpt_client).locate_described("boh", real_context) is None
