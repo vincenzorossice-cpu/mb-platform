@@ -191,6 +191,7 @@ class BetController:
         decreases_seen = 0
         money_moved_events = 0
         spin_zone_done = False
+        unavailable_streak = 0
 
         while attempts < self.config.max_bet_lower_attempts:
             attempts += 1
@@ -201,7 +202,7 @@ class BetController:
                 # Prima di chiamare l'operatore: se il "-" non si trova da soli, su molte slot la
                 # puntata si cambia dal menu (icona monete): lo provo io, una volta sola.
                 locate_result = self.locator.locate(_ELEMENT, context, exclude_strategies=("hitl",))
-                if not locate_result.success:
+                if not locate_result.success and locate_result.error_code != "GPT_LOCATOR_UNAVAILABLE":
                     menu_tried = True
                     logger.info("set_min_bet: '%s' non trovato (%s): provo il menu puntata prima di chiedere aiuto.",
                                 _ELEMENT, locate_result.error_code)
@@ -234,6 +235,21 @@ class BetController:
                         min_bet_verified=False, attempts=attempts, strategy_sequence=strategy_sequence,
                         aborted_reason="HITL_STOP", outcome="aborted",
                     ))
+
+                if locate_result.error_code == "GPT_LOCATOR_UNAVAILABLE":
+                    # Non e' "l'elemento non c'e'": GPT non risponde (limite di richieste, rete).
+                    unavailable_streak += 1
+                    if unavailable_streak >= 3:
+                        logger.error("set_min_bet: GPT non raggiungibile per %d tentativi di fila: mi fermo.",
+                                     unavailable_streak)
+                        self._close_bet_menu_if_opened(device_id, context, we_opened_the_menu)
+                        return Result.ok(BetResult(
+                            slot_name=slot_name, starting_bet=starting_bet, final_bet=current_bet,
+                            min_bet_verified=False, attempts=attempts, strategy_sequence=strategy_sequence,
+                            aborted_reason="GPT_UNAVAILABLE", outcome="aborted",
+                        ))
+                else:
+                    unavailable_streak = 0
 
                 # Fallimento "morbido": non abortisce. Copre sia il caso
                 # generico (nessuna strategia ha funzionato QUESTO giro, ma

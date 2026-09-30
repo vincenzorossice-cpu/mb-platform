@@ -7,6 +7,9 @@ import tempfile
 
 import openai
 
+from PIL import Image
+
+from orchestrator.core.openai_retry import call_with_rate_limit_retry
 from orchestrator.core.result import Result
 from orchestrator.modules.decision_engine.interface import choice_question
 from orchestrator.modules.slot_autopilot.grid_locator import annotate_grid, refinement_box
@@ -47,7 +50,12 @@ _ELEMENT_DESCRIPTIONS = {
         "normally next to the spin button or the bet amount. It is NEVER the spin button itself, the 'i' (info) "
         "icon or the menu (three lines) icon"
     ),
-    "bet_menu_toggle": "the icon (often a stack of coins) that opens or closes the bet selection menu",
+    "bet_menu_toggle": (
+        "the icon (often a stack of coins or chips) next to the bet/spin controls that opens or closes the bet "
+        "selection menu, usually in the bottom part of the game. It is NOT the general game menu icon (three "
+        "horizontal lines / hamburger, often in a top corner), NOT the 'i' (info) icon, NOT an arrow and NOT the "
+        "spin button"
+    ),
     "spin": "the large round button that starts a spin (usually with circular arrows)",
     "close_button": (
         "the X (close) button of a panel or popup that is open on top of the game, usually in a top corner "
@@ -66,6 +74,31 @@ _GRID_SYSTEM_PROMPT = (
     'with JSON: {"values_seen": [<amounts you read, may be empty>], "cell": "<label or null>", '
     '"confidence": <0.0-1.0>}'
 )
+
+
+# Cosa deve essere davvero il punto scelto (verifica su un ritaglio isolato, prima del primo tocco).
+_EXPECTED_KIND = {
+    "bet_minus": "minus_button",
+    "bet_plus": "plus_button",
+    "bet_menu_toggle": "coin_stack_icon",
+    "spin": "spin_button",
+    "close_button": "close_button",
+}
+_KIND_CHOICES = (
+    "minus_button (a minus sign or a left arrow/chevron that lowers a value), "
+    "plus_button (a plus sign or a right arrow/chevron that raises a value), "
+    "spin_button (the large round button that starts a spin), "
+    "coin_stack_icon (a stack of coins/chips, or a BET button that opens the bet selector), "
+    "menu_icon (general menu: three horizontal lines / hamburger / gear), "
+    "info_icon (an 'i' or question mark), close_button (an X), "
+    "reels_or_symbols (slot reels, game symbols or artwork), other"
+)
+_KIND_SYSTEM_PROMPT = (
+    "You see a small crop of a screenshot of a mobile slot-machine game. Say what kind of element sits at the "
+    f"CENTER of the crop. Choose exactly one of: {_KIND_CHOICES}. "
+    'Respond ONLY with JSON: {"kind": "<one of the names above>", "confidence": <0.0-1.0>}'
+)
+_VERIFY_CROP_PX = 240
 
 
 def _describe(element_name: str) -> str:
@@ -124,8 +157,12 @@ class GPTLocatorStrategy(LocatorStrategy):
     nessun flag interno da controllare qui)."""
     name = "gpt"
 
-    def __init__(self, gpt_client):
+    def __init__(self, gpt_client, verify_icons: bool = False):
         self.gpt_client = gpt_client
+        # True: prima di proporre un'icona la si classifica su un ritaglio isolato (una chiamata in piu').
+        self.verify_icons = verify_icons
+        # Impostato quando GPT non e' stato raggiungibile (limite di richieste, rete): "non so", non "non c'e'".
+        self._api_unavailable = False
 
     def locate(self, element_name: str, context: LocateContext) -> Result[LocateCandidate]:
         if element_name in _ELEMENT_DESCRIPTIONS:
@@ -134,6 +171,10 @@ class GPTLocatorStrategy(LocatorStrategy):
             # e' come non fare nulla): si va direttamente alla visione a griglia.
             coords = self._refine_icon(element_name, context)
             if coords is None:
+                if self._api_unavailable:
+                    return Result.fail(
+                        f"GPT unreachable while locating '{element_name}'", "GPT_LOCATOR_UNAVAILABLE",
+                    )
                 return Result.fail(
                     f"GPT could not locate the icon '{element_name}' on the grid", "GPT_LOCATOR_UNRESOLVED_TARGET",
                 )
@@ -223,13 +264,14 @@ class GPTLocatorStrategy(LocatorStrategy):
             ]},
         ]
         try:
-            response = self.gpt_client.client.chat.completions.create(
+            response = call_with_rate_limit_retry(lambda: self.gpt_client.client.chat.completions.create(
                 model=self.gpt_client.model, messages=messages,
                 response_format={"type": "json_object"}, temperature=0.1, max_tokens=250,
-            )
+            ))
             data = json.loads(response.choices[0].message.content)
         except openai.OpenAIError as exc:
             logger.warning("'%s' (%s): errore OpenAI: %s", element_name, stage, exc)
+            self._api_unavailable = True
             return None
         except (json.JSONDecodeError, IndexError, AttributeError, TypeError) as exc:
             logger.warning("'%s' (%s): risposta GPT non valida: %s", element_name, stage, exc)
@@ -248,6 +290,7 @@ class GPTLocatorStrategy(LocatorStrategy):
     def _refine_icon(self, element_name: str, context: LocateContext, description: str = None):
         """(x, y) assoluti del centro della cella fine scelta, o None."""
         width, height = context.screen_width, context.screen_height
+        self._api_unavailable = False
         with tempfile.TemporaryDirectory(prefix="autopilot_grid_") as tmp:
             try:
                 coarse_cols, coarse_rows = _COARSE_GRID
@@ -311,7 +354,54 @@ class GPTLocatorStrategy(LocatorStrategy):
                     logger.warning("'%s': passo C senza cella valida (%r), tengo il punto del passo B",
                                    element_name, label_c)
                 logger.info("'%s': cella %s -> %s -> %s, punto %s", element_name, label, label_b, label_c, point)
+                if description is None and self.verify_icons and not self._looks_like_expected(
+                    element_name, context, point, tmp,
+                ):
+                    return None
                 return point
             except (OSError, ValueError) as exc:
                 logger.warning("'%s': affinamento icona fallito: %s", element_name, exc)
                 return None
+
+    def _looks_like_expected(self, element_name: str, context: LocateContext, point: tuple, tmp: str) -> bool:
+        """Classifica un ritaglio ~240 px centrato sul punto scelto: se non e' il tipo di elemento cercato,
+        il punto non viene proposto (un tocco sbagliato puo' giocare uno spin o aprire un altro menu)."""
+        expected = _EXPECTED_KIND.get(element_name)
+        if expected is None:
+            return True
+        half = _VERIFY_CROP_PX // 2
+        try:
+            with Image.open(context.screenshot_path) as image:
+                left = max(0, min(int(point[0]) - half, image.width - _VERIFY_CROP_PX))
+                top = max(0, min(int(point[1]) - half, image.height - _VERIFY_CROP_PX))
+                crop_path = os.path.join(tmp, "verify.png")
+                image.crop((left, top, left + _VERIFY_CROP_PX, top + _VERIFY_CROP_PX)).save(crop_path)
+            with open(crop_path, "rb") as img_file:
+                encoded = base64.b64encode(img_file.read()).decode("utf-8")
+            messages = [
+                {"role": "system", "content": _KIND_SYSTEM_PROMPT},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "What is at the center of this crop?"},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}},
+                ]},
+            ]
+            response = call_with_rate_limit_retry(lambda: self.gpt_client.client.chat.completions.create(
+                model=self.gpt_client.model, messages=messages,
+                response_format={"type": "json_object"}, temperature=0, max_tokens=60,
+            ))
+            data = json.loads(response.choices[0].message.content)
+        except openai.OpenAIError as exc:
+            logger.warning("'%s': verifica dell'icona non riuscita (errore OpenAI): %s", element_name, exc)
+            self._api_unavailable = True
+            return False
+        except (OSError, ValueError, IndexError, AttributeError, TypeError) as exc:
+            logger.warning("'%s': verifica dell'icona non riuscita: %s", element_name, exc)
+            return False
+        kind = str(data.get("kind", "")).strip().lower() if isinstance(data, dict) else ""
+        if kind == expected:
+            return True
+        logger.warning(
+            "'%s': il punto (%d,%d) sembra un '%s', non un '%s': non lo propongo.",
+            element_name, point[0], point[1], kind or "?", expected,
+        )
+        return False

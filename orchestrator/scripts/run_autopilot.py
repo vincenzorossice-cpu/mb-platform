@@ -86,6 +86,7 @@ _BET_FAILURE_MESSAGES = {
     "BET_UNREADABLE": "Non riesco a leggere la puntata: non tocco nulla (e non spinno).",
     "MONEY_MOVED": "Due tocchi durante la messa a punto della puntata hanno giocato uno spin: mi fermo.",
     "MIN_NOT_PROVEN": "Non riesco a dimostrare che questa sia la puntata minima: per sicurezza non spinno.",
+    "GPT_UNAVAILABLE": "GPT non risponde (limite di richieste o rete): riprova tra un minuto. Non ho toccato altro.",
     "ELEMENT_NOT_LOCATABLE": "Non trovo nessun modo di abbassare la puntata (ne' il tasto meno ne' il menu): mi fermo.",
     "STUCK_ON_UNEXPECTED_SCREEN": "Sono rimasto su una schermata inattesa e non riesco a tornare indietro: mi fermo.",
 }
@@ -159,7 +160,7 @@ def build_autopilot(args: argparse.Namespace) -> Result[SlotAutoPilot]:
             key_check = _check_openai_key(gpt_client)
             if not key_check.success:
                 return Result.fail(key_check.error, key_check.error_code)
-            strategies["gpt"] = GPTLocatorStrategy(gpt_client)
+            strategies["gpt"] = GPTLocatorStrategy(gpt_client, verify_icons=True)
             # Rete di sicurezza per saldo e puntata: se l'OCR non li legge o li legge male (es. "50000.00"
             # letto 50.0) si usa la visione; dove l'OCR basta non costa nulla.
             ocr_reader = ResilientOCRReader(ocr_reader, VisionAmountReader(gpt_client))

@@ -143,3 +143,25 @@ class TestResilientOCRReader:
         reader.set_region((1, 2, 3, 4))
         ocr.set_region.assert_called_once_with((1, 2, 3, 4))
         assert reader._SALDO_LABELS == ("SALDO",)
+
+
+class TestRateLimit:
+    def _limit(self):
+        import httpx
+        response = httpx.Response(429, request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions"))
+        return openai.RateLimitError("Please try again in 100ms.", response=response, body=None)
+
+    def test_a_temporary_limit_is_waited_out(self, shot, monkeypatch):
+        monkeypatch.setattr("orchestrator.core.openai_retry.time.sleep", lambda seconds: None)
+        ok = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({"credit": 50000, "bet": 0.3})))])
+        client = MagicMock()
+        client.client.chat.completions.create.side_effect = [self._limit(), ok]
+
+        assert VisionAmountReader(client).read(shot) == {"saldo": 50000.0, "posta": 0.3}
+
+    def test_a_persistent_limit_reads_nothing_without_raising(self, shot, monkeypatch):
+        monkeypatch.setattr("orchestrator.core.openai_retry.time.sleep", lambda seconds: None)
+        client = MagicMock()
+        client.client.chat.completions.create.side_effect = self._limit()
+
+        assert VisionAmountReader(client).read(shot) == {"saldo": None, "posta": None}

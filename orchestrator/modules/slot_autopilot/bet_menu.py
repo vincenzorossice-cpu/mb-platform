@@ -5,6 +5,7 @@ from decimal import Decimal
 from typing import Callable, Optional
 
 from orchestrator.core.result import Result
+from orchestrator.modules.provider_profile.autopilot_memory import forget_autopilot_element, load_autopilot_flag
 from orchestrator.modules.slot_autopilot.locator import ElementLocator
 from orchestrator.modules.slot_autopilot.strategies.base import LocateCandidate
 from orchestrator.modules.slot_autopilot.value_parser import parse_amount
@@ -28,6 +29,10 @@ _ROW_TOLERANCE_PX = 50
 # si cambia la puntata con i pulsanti meno/piu'.
 _MIN_MENU_CELLS = 4
 _MAX_PLAUSIBLE_BET = Decimal("100000")
+# Un menu puntata mostra almeno 2 importi isolati (un pannello a righe 2-3, una lista 4+). Con meno, l'icona
+# toccata ha aperto un'altra cosa (menu generale del gioco, regole...).
+_MIN_BET_MENU_AMOUNTS = 2
+_BET_VIA_MENU_FLAG = "bet_via_menu"
 
 
 @dataclass
@@ -99,15 +104,41 @@ class BetMenuSelector:
             if toggle_tap.success and toggle_tap.data.outcome == "unexpected_change":
                 return self._undo_wrong_toggle(device_id, slot_name, toggle, toggle_tap.data, context_provider)
             return Result.fail("Opening the bet menu had no visible effect", "MENU_TOGGLE_NO_EFFECT")
+        opened = self._fresh(context_provider)
+        if opened is None:
+            return Result.fail("Cannot read the screen after opening the menu", "MENU_CONTEXT_ERROR")
+        if self._is_not_a_bet_menu(slot_name, toggle, opened):
+            # Lo schermo e' cambiato ma non c'e' nessuna puntata da scegliere: quell'icona non e' il menu
+            # puntata. Niente memoria, si annulla (come un tocco sbagliato) e non si riprova.
+            logger.warning(
+                "bet menu: l'icona (%d,%d) ha aperto qualcosa che non e' un menu puntata: la annullo.",
+                toggle.x, toggle.y,
+            )
+            if toggle.strategy_name == "memory":
+                forget_autopilot_element(slot_name, _MENU_TOGGLE, self._memory_dir())
+            if not is_trusted:
+                self.locator.record_failure(toggle.strategy_name, _MENU_TOGGLE)
+            return self._undo_wrong_toggle(device_id, slot_name, toggle, toggle_tap.data, context_provider)
         self.locator.record_success(toggle.strategy_name, _MENU_TOGGLE)
         self.locator.save_verified_candidate(
             _MENU_TOGGLE, toggle, slot_name, context.screen_width, context.screen_height,
         )
-
-        opened = self._fresh(context_provider)
-        if opened is None:
-            return Result.fail("Cannot read the screen after opening the menu", "MENU_CONTEXT_ERROR")
         return self._select_from_open(device_id, opened, context_provider, toggle)
+
+    def _memory_dir(self) -> str:
+        directory = getattr(self.locator, "memory_dir", None)
+        return directory if isinstance(directory, str) and directory else "slot_memory"
+
+    def _is_not_a_bet_menu(self, slot_name: str, toggle: LocateCandidate, opened) -> bool:
+        if len({value for value, _ in menu_amounts(opened.text_boxes)}) >= _MIN_BET_MENU_AMOUNTS:
+            return False
+        if toggle.strategy_name == "profile":
+            return False        # coordinata curata a mano: mai messa in dubbio da una lettura
+        if toggle.strategy_name == "memory" and load_autopilot_flag(
+            slot_name, _BET_VIA_MENU_FLAG, self._memory_dir(),
+        ):
+            return False        # gia' usata con successo in una sessione precedente
+        return True
 
     def select_from_open_menu(
         self, device_id: str, slot_name: str, context, context_provider: Callable[[], Result],

@@ -127,6 +127,12 @@ class ElementLocator:
                 )
                 return result
 
+            if result.error_code == "GPT_LOCATOR_UNAVAILABLE":
+                # GPT non e' raggiungibile (limite di richieste, rete): e' un "non so", non un "non c'e'".
+                # Niente fallimento contato e niente salto all'operatore: chi chiama aspetta e riprova.
+                logger.warning("'%s' via '%s': servizio non raggiungibile, riprovo piu' tardi.", element_name, strategy_name)
+                return Result.fail(result.error, "GPT_LOCATOR_UNAVAILABLE")
+
             if strategy_name == "hitl":
                 hitl_error_code = result.error_code
             collected.append(f"{strategy_name}:{result.error_code}")

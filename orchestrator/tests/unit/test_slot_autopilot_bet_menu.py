@@ -3,6 +3,7 @@ from unittest.mock import MagicMock
 
 from orchestrator.core.result import Result
 from orchestrator.modules.slot_autopilot.bet_menu import BetMenuSelector, menu_amounts
+from orchestrator.modules.slot_autopilot.screen_recovery import RecoveryOutcome
 from orchestrator.modules.slot_autopilot.strategies.base import LocateCandidate, LocateContext
 from orchestrator.modules.slot_autopilot.verifier import TapOutcome
 from orchestrator.modules.slot_ocr.reader import OCRBox
@@ -100,9 +101,10 @@ class TestSelectLowest:
         locator.save_verified_candidate.assert_not_called()
 
     def test_menu_that_is_not_a_list_is_left_open_for_the_caller(self):
+        stepper = [_box("10", 500, 800), _box("€2,00", 500, 1200)] + MAIN_BOXES
         selector, _, verifier = _selector()
 
-        result = selector.select_lowest("dev", "bigbass", _context(MAIN_BOXES), _provider(_context(MAIN_BOXES)))
+        result = selector.select_lowest("dev", "bigbass", _context(MAIN_BOXES), _provider(_context(stepper)))
 
         assert result.error_code == "MENU_OPEN_NOT_A_LIST"
         assert verifier.verified_tap.call_count == 1   # solo l'apertura: nessuna richiusura
@@ -245,3 +247,65 @@ class TestSelectLowestWithoutOperator:
         selector.select_lowest("dev", "bigbass", _context(MAIN_BOXES, posta=2.0), provider, allow_operator=False)
 
         assert locator.locate.call_args.kwargs["exclude_strategies"] == ("hitl",)
+
+
+class TestIconThatIsNotTheBetMenu:
+    """Un'icona che cambia lo schermo senza mostrare nessuna puntata (menu generale del gioco...)."""
+
+    def _selector(self, strategy="gpt", recovery=None):
+        selector, locator, verifier = _selector(strategy=strategy, trusted=strategy in ("memory", "profile"))
+        locator.memory_dir = None
+        selector.screen_recovery = recovery
+        return selector, locator, verifier
+
+    def _recovery(self):
+        recovery = MagicMock()
+        recovery.recover.return_value = Result.ok(RecoveryOutcome(method="x_button", attempts=1))
+        return recovery
+
+    def test_nothing_is_saved_and_the_tap_is_undone_and_rejected(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        selector, locator, _ = self._selector(recovery=self._recovery())
+        general_menu = [_box("SUONO", 300, 500), _box("REGOLE", 300, 700), _box("3", 300, 900)]
+
+        result = selector.select_lowest("dev", "shining", _context(MAIN_BOXES), _provider(_context(general_menu)))
+
+        assert result.error_code == "MENU_TOGGLE_WRONG_TARGET"
+        locator.save_verified_candidate.assert_not_called()
+        locator.reject_position.assert_called_once()
+        locator.remember_rejected.assert_called_once()
+        selector.screen_recovery.recover.assert_called_once()
+
+    def test_a_remembered_toggle_that_led_there_is_forgotten(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        from orchestrator.modules.provider_profile.autopilot_memory import (
+            load_autopilot_element_memory, save_autopilot_element,
+        )
+        save_autopilot_element("shining", "bet_menu_toggle", 46, 120, 0.04, 0.05)
+        save_autopilot_element("shining", "spin", 540, 1775, 0.5, 0.7)
+        selector, _, _ = self._selector(strategy="memory", recovery=self._recovery())
+
+        selector.select_lowest("dev", "shining", _context(MAIN_BOXES), _provider(_context([_box("SUONO", 300, 500)])))
+
+        elements = load_autopilot_element_memory("shining").data["elements"]
+        assert "bet_menu_toggle" not in elements and "spin" in elements
+
+    def test_a_remembered_toggle_already_used_with_success_is_trusted(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        from orchestrator.modules.provider_profile.autopilot_memory import save_autopilot_flag
+        save_autopilot_flag("shining", "bet_via_menu", True)
+        selector, locator, _ = self._selector(strategy="memory")
+        panel = [_box("10", 500, 800)]
+
+        result = selector.select_lowest("dev", "shining", _context(MAIN_BOXES), _provider(_context(panel)))
+
+        assert result.error_code == "MENU_OPEN_NOT_A_LIST"     # come prima: il chiamante usa i pulsanti -/+
+        locator.save_verified_candidate.assert_called_once()
+
+    def test_a_curated_profile_toggle_is_never_second_guessed(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        selector, _, _ = self._selector(strategy="profile")
+
+        result = selector.select_lowest("dev", "shining", _context(MAIN_BOXES), _provider(_context([])))
+
+        assert result.error_code == "MENU_OPEN_NOT_A_LIST"

@@ -7,6 +7,7 @@ from typing import Optional
 import openai
 
 from orchestrator.core.amount_format import normalize_number_run
+from orchestrator.core.openai_retry import call_with_rate_limit_retry
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +52,7 @@ class VisionAmountReader:
         try:
             with open(screenshot_path, "rb") as img_file:
                 encoded = base64.b64encode(img_file.read()).decode("utf-8")
-            response = self.gpt_client.client.chat.completions.create(
+            response = call_with_rate_limit_retry(lambda: self.gpt_client.client.chat.completions.create(
                 model=self.gpt_client.model, response_format={"type": "json_object"},
                 temperature=0, max_tokens=80,
                 messages=[
@@ -61,7 +62,7 @@ class VisionAmountReader:
                         {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}},
                     ]},
                 ],
-            )
+            ))
             data = json.loads(response.choices[0].message.content)
         except OSError as exc:
             logger.warning("lettura per visione: screenshot illeggibile: %s", exc)

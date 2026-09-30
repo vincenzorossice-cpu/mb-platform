@@ -1616,3 +1616,21 @@ class TestMenuFirstAndOperatorHelp:
 
         assert result.data.aborted_reason == "ELEMENT_NOT_LOCATABLE"
         assert result.data.attempts == 1
+
+
+class TestGptUnavailable:
+    def test_unreachable_gpt_is_not_a_missing_element_and_stops_after_three_rounds(self, tmp_path):
+        locator = _locator_mock()
+        locator.locate.return_value = Result.fail("unreachable", "GPT_LOCATOR_UNAVAILABLE")
+        selector = MagicMock()
+        step_logger = MagicMock()
+        step_logger.log_step.return_value = Result.ok(True)
+        controller = BetController(
+            locator, MagicMock(), step_logger, _config(slot_memory_dir=str(tmp_path)), menu_selector=selector,
+        )
+
+        result = controller.set_min_bet("dev", "pirots5", "ep", _context_provider(Decimal("0.30")))
+
+        assert result.data.aborted_reason == "GPT_UNAVAILABLE"
+        assert result.data.attempts == 3
+        selector.select_lowest.assert_not_called()      # il menu ha bisogno di GPT: non si tenta

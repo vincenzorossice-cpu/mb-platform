@@ -396,3 +396,84 @@ def test_grid_prompt_asks_gpt_to_read_the_amounts_first():
 
     assert "values_seen" in gpt_locator_strategy._GRID_SYSTEM_PROMPT
     assert "lowest" in gpt_locator_strategy._GRID_SYSTEM_PROMPT
+
+
+def _kind_answer(kind):
+    return json.dumps({"kind": kind, "confidence": 0.9})
+
+
+def _rate_limit():
+    import httpx
+    import openai
+    response = httpx.Response(429, request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions"))
+    return openai.RateLimitError("Please try again in 100ms.", response=response, body=None)
+
+
+@pytest.fixture
+def no_sleep(monkeypatch):
+    monkeypatch.setattr("orchestrator.core.openai_retry.time.sleep", lambda seconds: None)
+
+
+class TestIconIsVerifiedBeforeTheFirstTap:
+    def test_a_point_that_is_the_expected_kind_is_proposed(self, real_context):
+        gpt_client = _client(None, _cell_answer("B6"), _cell_answer("C4"), _cell_answer("B2"), _kind_answer("minus_button"))
+
+        result = GPTLocatorStrategy(gpt_client, verify_icons=True).locate("bet_minus", real_context)
+
+        assert result.success
+
+    def test_a_point_that_is_something_else_is_not_proposed(self, real_context):
+        gpt_client = _client(None, _cell_answer("B6"), _cell_answer("C4"), _cell_answer("B2"), _kind_answer("reels_or_symbols"))
+
+        result = GPTLocatorStrategy(gpt_client, verify_icons=True).locate("bet_minus", real_context)
+
+        assert not result.success and result.error_code == "GPT_LOCATOR_UNRESOLVED_TARGET"
+
+    def test_the_menu_icon_is_not_accepted_for_the_bet_menu_toggle(self, real_context):
+        gpt_client = _client(None, _cell_answer("A1"), _cell_answer("A1"), _cell_answer("A1"), _kind_answer("menu_icon"))
+
+        result = GPTLocatorStrategy(gpt_client, verify_icons=True).locate("bet_menu_toggle", real_context)
+
+        assert not result.success
+
+    def test_the_crop_sent_for_verification_is_small(self, real_context):
+        gpt_client = _client(None, _cell_answer("B6"), _cell_answer("C4"), _cell_answer("B2"), _kind_answer("minus_button"))
+
+        GPTLocatorStrategy(gpt_client, verify_icons=True).locate("bet_minus", real_context)
+
+        last = _grid_calls(gpt_client)[-1]
+        assert "center of this crop" in last.kwargs["messages"][1]["content"][0]["text"]
+
+    def test_operator_phrases_are_not_second_guessed(self, real_context):
+        gpt_client = _client(None, _cell_answer("B6"), _cell_answer("C4"), _cell_answer("B2"))
+
+        point = GPTLocatorStrategy(gpt_client, verify_icons=True).locate_described("le monete", real_context)
+
+        assert point is not None and len(_grid_calls(gpt_client)) == 3
+
+    def test_verification_is_off_unless_asked_for(self, real_context):
+        gpt_client = _client(None, _cell_answer("B6"), _cell_answer("C4"), _cell_answer("B2"))
+
+        assert GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context).success
+        assert len(_grid_calls(gpt_client)) == 3
+
+
+class TestRateLimit:
+    def test_a_temporary_limit_is_waited_out_and_the_grid_goes_on(self, real_context, no_sleep):
+        gpt_client = _client(None, _rate_limit(), _cell_answer("B6"), _cell_answer("C4"), _cell_answer("B2"))
+
+        assert GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context).success
+
+    def test_a_persistent_limit_is_unavailable_not_not_visible(self, real_context, no_sleep):
+        gpt_client = _client(None, *[_rate_limit() for _ in range(5)])
+
+        result = GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
+
+        assert not result.success and result.error_code == "GPT_LOCATOR_UNAVAILABLE"
+
+    def test_a_clear_not_visible_answer_is_still_unresolved(self, real_context):
+        gpt_client = _client(None, _cell_answer("B6", action="none"))
+
+        result = GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
+
+        assert result.error_code == "GPT_LOCATOR_UNRESOLVED_TARGET"

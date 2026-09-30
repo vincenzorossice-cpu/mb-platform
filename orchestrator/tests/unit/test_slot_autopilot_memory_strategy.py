@@ -137,3 +137,33 @@ class TestAutopilotValues:
         assert data["flags"] == {"bet_via_menu": True}
         assert data["rejected"] == {"bet_minus": [[46, 2048]]}
         assert data["values"] == {"min_bet": "0.1"}
+
+
+class TestForgetAutopilotElement:
+    def test_only_the_named_element_is_removed(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        from orchestrator.modules.provider_profile.autopilot_memory import (
+            forget_autopilot_element, load_autopilot_element_memory, save_autopilot_element,
+        )
+        save_autopilot_element("shining", "bet_minus", 100, 200, 0.1, 0.1)
+        save_autopilot_element("shining", "close_button", 900, 100, 0.9, 0.04)
+
+        assert forget_autopilot_element("shining", "bet_minus").data is True
+
+        elements = load_autopilot_element_memory("shining").data["elements"]
+        assert list(elements) == ["close_button"]
+        assert forget_autopilot_element("shining", "bet_minus").data is False
+
+    def test_legacy_elements_are_cleared_from_the_fixed_schema_too(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        from orchestrator.modules.provider_profile.autopilot_memory import forget_autopilot_element
+        from orchestrator.tests.validation.test_slot_autonomous import load_slot_memory, save_slot_memory
+        save_slot_memory("shining", {
+            "known_spin_coords": (540, 1775), "learned_hints": [], "known_min_bet": None,
+            "known_bet_menu_toggle": (46, 120),
+        })
+
+        assert forget_autopilot_element("shining", "bet_menu_toggle").data is True
+
+        memory = load_slot_memory("shining")
+        assert memory["known_bet_menu_toggle"] is None and memory["known_spin_coords"] == (540, 1775)

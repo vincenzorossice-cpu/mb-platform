@@ -140,3 +140,31 @@ def load_autopilot_value(slot_name: str, key: str, memory_dir: str = "slot_memor
     if not result.success:
         return None
     return result.data.get("values", {}).get(key)
+
+
+def forget_autopilot_element(slot_name: str, element_name: str, memory_dir: str = "slot_memory") -> Result[bool]:
+    """Toglie dalla memoria una coordinata che si e' rivelata sbagliata (per esempio un'icona che apriva un
+    altro menu). Ritorna True se c'era qualcosa da togliere. Non tocca gli altri elementi."""
+    removed = False
+    load_result = load_autopilot_element_memory(slot_name, memory_dir)
+    if load_result.success and element_name in load_result.data.get("elements", {}):
+        data = load_result.data
+        del data["elements"][element_name]
+        try:
+            with open(_path(slot_name, memory_dir), "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except OSError as exc:
+            return Result.fail(f"Cannot write autopilot memory: {exc}", "AUTOPILOT_MEMORY_WRITE_ERROR")
+        removed = True
+
+    # Gli elementi "legacy" (spin, menu puntata) vivono anche nello schema fisso di slot_memory/<slot>.json.
+    from orchestrator.modules.slot_autopilot.strategies.memory_strategy import _LEGACY_MEMORY_FIELDS
+    legacy_field = _LEGACY_MEMORY_FIELDS.get(element_name)
+    if legacy_field is not None:
+        from orchestrator.tests.validation.test_slot_autonomous import load_slot_memory, save_slot_memory
+        legacy = load_slot_memory(slot_name)
+        if legacy.get(legacy_field):
+            legacy.pop(legacy_field)
+            save_slot_memory(slot_name, legacy)
+            removed = True
+    return Result.ok(removed)

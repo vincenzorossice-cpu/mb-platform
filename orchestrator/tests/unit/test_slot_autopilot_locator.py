@@ -447,3 +447,18 @@ class TestChainExhaustionAndOperatorTap:
         assert ElementLocator({"gpt": _fail_strategy("gpt")}).last_hitl_tap() is None
         hitl.last_tap = None
         assert ElementLocator({"hitl": hitl}).last_hitl_tap() is None
+
+
+class TestUnavailableStrategy:
+    def test_unreachable_gpt_stops_the_chain_without_counting_a_failure_or_calling_the_operator(self):
+        hitl = _ok_strategy("hitl")
+        locator = ElementLocator({
+            "gpt": _fail_strategy("gpt", "GPT_LOCATOR_UNAVAILABLE"), "hitl": hitl,
+        })
+
+        for _ in range(5):
+            result = locator.locate("bet_minus", _context())
+
+        assert result.error_code == "GPT_LOCATOR_UNAVAILABLE"
+        hitl.locate.assert_not_called()
+        assert not locator.is_exhausted("gpt", "bet_minus")
