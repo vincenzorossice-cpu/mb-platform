@@ -94,15 +94,36 @@ class ActionVerifier:
     def verified_tap(
         self, device_id: str, x: int, y: int, expectation: Expectation,
         screenshot_before: Optional[str] = None, state_before: Optional[dict] = None,
+        region_hint: Optional[tuple] = None,
     ) -> Result[TapOutcome]:
+        """`region_hint` (x1,y1,x2,y2): lettura OCR rapida "dopo" solo su quella fascia
+        (saldo/puntata); se li' mancano saldo o puntata si rilegge lo stesso screenshot
+        a schermo intero, cosi' una fascia sbagliata non genera falsi "nessun effetto"."""
         try:
-            return self._verified_tap(device_id, x, y, expectation, screenshot_before, state_before)
+            return self._verified_tap(
+                device_id, x, y, expectation, screenshot_before, state_before, region_hint,
+            )
         except Exception as exc:
             return Result.fail(f"Unexpected error during verified_tap: {exc}", "VERIFICATION_ERROR")
+
+    def _read_state_after(self, screenshot_path: str, region_hint: Optional[tuple]) -> dict:
+        if region_hint is None or not hasattr(self.ocr_reader, "set_region"):
+            return self.ocr_reader.read_slot_state(screenshot_path)
+        original = getattr(self.ocr_reader, "region", None)
+        self.ocr_reader.set_region(region_hint)
+        try:
+            state = self.ocr_reader.read_slot_state(screenshot_path)
+            if state.get("saldo") is None or state.get("posta") is None:
+                self.ocr_reader.set_region(original)
+                state = self.ocr_reader.read_slot_state(screenshot_path)
+            return state
+        finally:
+            self.ocr_reader.set_region(original)
 
     def _verified_tap(
         self, device_id: str, x: int, y: int, expectation: Expectation,
         screenshot_before: Optional[str] = None, state_before: Optional[dict] = None,
+        region_hint: Optional[tuple] = None,
     ) -> Result[TapOutcome]:
         # Se il chiamante ha gia' una lettura fresca dello STESSO schermo (presa
         # un istante prima, senza nulla in mezzo che lo cambi), riusarla evita
@@ -136,7 +157,7 @@ class ActionVerifier:
         screenshot_after = wait_result.data.screenshot_path
 
         try:
-            state_after = self.ocr_reader.read_slot_state(screenshot_after)
+            state_after = self._read_state_after(screenshot_after, region_hint)
         except Exception as exc:
             return Result.fail(f"OCR error after tap: {exc}", "VERIFICATION_ERROR")
 

@@ -1187,3 +1187,81 @@ class TestFloorProbe:
 
         kinds = [call.args[3].kind for call in verifier.verified_tap.call_args_list]
         assert kinds.count("bet_increase") == 1
+
+
+class TestFasterBetPhase:
+    BAND = (0, 2145, 1080, 2255)
+
+    def _context(self, bet="2.00", band=None):
+        context = LocateContext(
+            device_id="dev", slot_name="pirots5", screenshot_path="/tmp/x.png", screen_width=1080,
+            screen_height=2400, slot_ocr_state={"posta": float(bet)}, amounts_band=band,
+        )
+        return MagicMock(return_value=Result.ok(context))
+
+    def _run(self, taps, trusted=True, band=None, **config):
+        locator = _locator_mock()
+        locator.locate.return_value = _ok_candidate("memory" if trusted else "gpt")
+        locator.is_trusted_strategy.return_value = trusted
+        verifier = MagicMock()
+        verifier.verified_tap.side_effect = taps
+        controller, _ = _controller(locator, verifier, config=_config(**config))
+        controller.set_min_bet("dev", "pirots5", "ep", self._context(band=band))
+        return verifier
+
+    def test_a_trusted_coordinate_reads_only_the_band_after_the_tap(self):
+        verifier = self._run([_decrease(2.0, 1.0), _flat(1.0), _flat(1.0), _flat(1.0)], band=self.BAND)
+
+        assert all(call.kwargs["region_hint"] == self.BAND for call in verifier.verified_tap.call_args_list)
+
+    def test_an_untrusted_coordinate_keeps_the_full_reading(self):
+        verifier = self._run([_decrease(2.0, 1.0), _flat(1.0), _flat(1.0), _flat(1.0)], trusted=False, band=self.BAND)
+
+        assert all(call.kwargs["region_hint"] is None for call in verifier.verified_tap.call_args_list)
+
+    def test_without_a_learned_band_nothing_changes(self):
+        verifier = self._run([_decrease(2.0, 1.0), _flat(1.0), _flat(1.0), _flat(1.0)], band=None)
+
+        assert all(call.kwargs["region_hint"] is None for call in verifier.verified_tap.call_args_list)
+
+    def test_the_log_reports_how_long_each_iteration_took(self, caplog):
+        with caplog.at_level("INFO"):
+            self._run([_decrease(2.0, 1.0), _flat(1.0), _flat(1.0), _flat(1.0)])
+
+        assert any("di cui corsa di tocchi" in r.getMessage() for r in caplog.records)
+
+
+class TestRunSizing:
+    def _controller(self, taps=30):
+        controller, _ = _controller(_locator_mock(), MagicMock(), config=_config(bet_burst_taps=taps))
+        return controller
+
+    def test_without_a_known_minimum_or_step_the_default_run_is_used(self):
+        controller = self._controller()
+        assert controller._run_size(Decimal("1.8"), None, Decimal("0.2")) == 30
+        assert controller._run_size(Decimal("1.8"), Decimal("0.1"), None) == 30
+
+    def test_known_minimum_and_step_size_the_run_with_margin(self):
+        controller = self._controller()
+        # (1.8 - 0.1) / (0.2 / 2) = 17 tocchi + 2 di margine
+        assert controller._run_size(Decimal("1.8"), Decimal("0.1"), Decimal("0.2")) == 19
+
+    def test_never_less_than_eight_nor_more_than_the_configured_run(self):
+        controller = self._controller()
+        assert controller._run_size(Decimal("0.3"), Decimal("0.1"), Decimal("0.2")) == 8
+        assert controller._run_size(Decimal("100"), Decimal("0.1"), Decimal("0.1")) == 30
+        assert self._controller(taps=5)._run_size(Decimal("1.8"), Decimal("0.1"), Decimal("0.2")) == 5
+
+    def test_the_run_uses_the_single_tap_step_and_the_remembered_minimum(self):
+        save_autopilot_value("pirots5", "min_bet", "0.1", "slot_memory")
+        locator = _locator_mock()
+        locator.locate.return_value = _ok_candidate("memory")
+        locator.is_trusted_strategy.return_value = True
+        verifier = MagicMock()
+        verifier.verified_tap.side_effect = [_decrease(2.0, 1.8), _decrease(1.8, 0.1)]
+        controller, _ = _controller(locator, verifier, config=_config(bet_burst_taps=30))
+
+        controller.set_min_bet("dev", "pirots5", "ep", _context_provider(Decimal("2.00")))
+
+        # 1a discesa da 0.2 (2.0 -> 1.8): corsa da 19 tocchi = 18 ciechi (+1 verificato)
+        assert verifier.touch_injector.tap_coordinates.call_count == 18

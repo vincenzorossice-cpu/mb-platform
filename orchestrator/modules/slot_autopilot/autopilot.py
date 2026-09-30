@@ -1,5 +1,6 @@
 import dataclasses
 import logging
+import time
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional
@@ -27,6 +28,9 @@ _UNASSISTED_STRATEGIES = {"profile", "memory", "menu"}
 _REUSE_CONTEXT_STRATEGIES = {"profile", "memory"}
 
 _AMOUNT_LABELS = SlotOCRReader._SALDO_LABELS + SlotOCRReader._POSTA_LABELS
+# Il contesto letto da prepare() vale come lettura iniziale di set_min_bet se e' piu'
+# recente di cosi' (stesso schermo, nessun tocco in mezzo).
+_PREPARED_CONTEXT_MAX_AGE_SECONDS = 30
 _BAND_MARGIN_PX = 40
 _BAND_ROW_TOLERANCE_PX = 50
 _BAND_MAX_CANVAS_FRACTION = 0.35
@@ -111,6 +115,8 @@ class SlotAutoPilot:
         self._amounts_band: Optional[tuple] = None
         self._cached_spin_context: Optional[LocateContext] = None
         self._spins_since_full_read = 0
+        self._prepared_context: Optional[LocateContext] = None
+        self._prepared_at = 0.0
 
     def prepare(self, device_id: str) -> Result[bool]:
         try:
@@ -138,6 +144,9 @@ class SlotAutoPilot:
                 self._initial_balance = Decimal(str(value)) if value is not None else None
                 self._last_known_balance = self._initial_balance
                 self._learn_band(context_result.data)
+                context_result.data.amounts_band = self._amounts_band
+                self._prepared_context = context_result.data
+                self._prepared_at = time.monotonic()
 
             return Result.ok(True)
         except Exception as exc:
@@ -147,7 +156,7 @@ class SlotAutoPilot:
         try:
             result = self.bet_controller.set_min_bet(
                 device_id, self.config.slot_name, self._episode_id,
-                lambda: self._build_context(device_id),
+                lambda: self._bet_context(device_id),
             )
             if result.success:
                 self._total_steps += result.data.attempts
@@ -193,6 +202,14 @@ class SlotAutoPilot:
             if band is not None:
                 self.ocr_reader.set_region(full_region)
 
+    def _bet_context(self, device_id: str) -> Result[LocateContext]:
+        """La prima lettura di set_min_bet e' quella appena fatta da prepare() (stesso
+        schermo, pochi secondi fa): si riusa una volta sola invece di rifare ~9 s di OCR."""
+        prepared, self._prepared_context = self._prepared_context, None
+        if prepared is not None and time.monotonic() - self._prepared_at < _PREPARED_CONTEXT_MAX_AGE_SECONDS:
+            return Result.ok(dataclasses.replace(prepared, device_id=device_id))
+        return self._build_context(device_id)
+
     def _learn_band(self, context: LocateContext) -> None:
         try:
             canvas = self._profile.canvas_bbox if self._profile is not None and self._profile.verified else None
@@ -217,7 +234,7 @@ class SlotAutoPilot:
             device_id="", slot_name=self.config.slot_name, screenshot_path=spin_result.screenshot_after,
             screen_width=self._screen_size[0], screen_height=self._screen_size[1],
             raw_texts=spin_result.state_after.get("raw_texts", []), text_boxes=[],
-            slot_ocr_state=spin_result.state_after, profile=self._profile,
+            slot_ocr_state=spin_result.state_after, profile=self._profile, amounts_band=self._amounts_band,
         )
 
     def _spin_context(self, device_id: str, full_region) -> Result[LocateContext]:
@@ -317,5 +334,5 @@ class SlotAutoPilot:
             device_id=device_id, slot_name=self.config.slot_name, screenshot_path=screenshot_path,
             screen_width=width, screen_height=height,
             raw_texts=slot_ocr_state.get("raw_texts", []), text_boxes=text_boxes,
-            slot_ocr_state=slot_ocr_state, profile=self._profile,
+            slot_ocr_state=slot_ocr_state, profile=self._profile, amounts_band=self._amounts_band,
         ))

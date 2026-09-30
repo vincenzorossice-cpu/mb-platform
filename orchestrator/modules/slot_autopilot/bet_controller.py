@@ -1,5 +1,6 @@
 import dataclasses
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -173,10 +174,13 @@ class BetController:
         attempts = 0
         consecutive_decreases = 0  # discese verificate di fila (abilita la raffica)
         probe_done = False
+        last_step = None  # gradino osservato in un tocco singolo verificato (dimensiona la corsa)
 
         while attempts < self.config.max_bet_lower_attempts:
             attempts += 1
             outcome_data = None
+            iteration_started = time.monotonic()
+            run_seconds = 0.0
             locate_result = self.locator.locate(_ELEMENT, context)
             if not locate_result.success:
                 if locate_result.error_code == "HITL_STOP_REQUESTED":
@@ -233,15 +237,20 @@ class BetController:
                     self.config.bet_burst_taps > 1 and consecutive_decreases >= 1
                     and current_bet is not None and self.locator.is_trusted_strategy(candidate.strategy_name)
                 ):
+                    run_taps = self._run_size(current_bet, trusted_min_bet or remembered_min, last_step)
+                    run_started = time.monotonic()
                     self._blind_taps(
-                        device_id, candidate.x, candidate.y, self.config.bet_burst_taps - 1,
-                        context.screenshot_path,
+                        device_id, candidate.x, candidate.y, run_taps - 1, context.screenshot_path,
                     )
+                    run_seconds = time.monotonic() - run_started
                     burst_done = True
                 # Il "prima" e' lo schermo gia' letto nel contesto: niente OCR in piu'.
                 tap_result = self.verifier.verified_tap(
                     device_id, candidate.x, candidate.y, Expectation(kind="bet_decrease"),
                     screenshot_before=context.screenshot_path, state_before=context.slot_ocr_state,
+                    # Coordinata fidata: basta leggere la fascia di saldo/puntata (~1,5 s
+                    # invece di ~9 s); con GPT/operatore si legge tutto come prima.
+                    region_hint=context.amounts_band if self.locator.is_trusted_strategy(candidate.strategy_name) else None,
                 )
                 if not tap_result.success:
                     self._log_step(
@@ -273,10 +282,12 @@ class BetController:
             elif not is_trusted:
                 self.locator.record_failure(candidate.strategy_name, _ELEMENT)
 
+            iteration_seconds = time.monotonic() - iteration_started
             logger.info(
-                "set_min_bet: tentativo %d/%d: %s -> %s (outcome=%s, strategia=%s, coords=(%d,%d))",
+                "set_min_bet: tentativo %d/%d: %s -> %s (outcome=%s, strategia=%s, coords=(%d,%d)) "
+                "[%.1f s, di cui corsa di tocchi %.1f s]",
                 attempts, self.config.max_bet_lower_attempts, current_bet, new_bet, outcome,
-                candidate.strategy_name, candidate.x, candidate.y,
+                candidate.strategy_name, candidate.x, candidate.y, iteration_seconds, run_seconds,
             )
             self._log_step(
                 episode_id, attempts, slot_name, device_id, candidate.strategy_name,
@@ -366,6 +377,7 @@ class BetController:
                     aborted_reason="VALUE_ROSE", outcome="aborted",
                 ))
 
+            bet_before_update = current_bet
             if new_bet is not None:
                 current_bet = new_bet
 
@@ -377,6 +389,8 @@ class BetController:
                 any_decrease_seen = True
                 stable_reads = 0
                 consecutive_decreases += 1
+                if not burst_done and bet_before_update is not None:
+                    last_step = bet_before_update - current_bet  # un solo tocco: e' il gradino vero
                 if burst_done and remembered_min is not None and current_bet <= remembered_min:
                     # Dopo una corsa la puntata e' scesa fino al minimo gia' verificato
                     # in passato: pavimento confermato, non serve un'altra corsa.
@@ -513,6 +527,7 @@ class BetController:
         plus_tap = self.verifier.verified_tap(
             device_id, plus.x, plus.y, Expectation(kind="bet_increase"),
             screenshot_before=minus_outcome.screenshot_after, state_before=minus_outcome.state_after,
+            region_hint=context.amounts_band,
         )
         if not plus_tap.success or not plus_tap.data.verified:
             if not plus_trusted:
@@ -536,6 +551,7 @@ class BetController:
         minus_tap = self.verifier.verified_tap(
             device_id, minus.x, minus.y, Expectation(kind="bet_decrease"),
             screenshot_before=plus_tap.data.screenshot_after, state_before=plus_tap.data.state_after,
+            region_hint=context.amounts_band,
         )
         if not minus_tap.success or not minus_tap.data.verified:
             logger.warning("set_min_bet: dopo il '+' il '-' non abbassa la puntata: la coordinata e' da sostituire.")
@@ -553,6 +569,15 @@ class BetController:
             return _ProbeOutcome("floor", bet=start_bet, minus_alive=True)
         logger.info("set_min_bet: dopo il '+' il '-' porta la puntata a %s (non a %s): riprendo la discesa.", back_bet, start_bet)
         return _ProbeOutcome("continue", bet=back_bet, minus_alive=True)
+
+    def _run_size(self, current_bet, known_min, last_step) -> int:
+        """Tocchi della corsa: con un minimo noto e un gradino osservato bastano quelli che
+        servono (gradino dimezzato per prudenza, +2 di margine, mai meno di 8 ne' piu' di
+        bet_burst_taps). Se e' sottostimata, la corsa dopo continua: solo un giro in piu'."""
+        if known_min is None or last_step is None or last_step <= 0 or current_bet is None:
+            return self.config.bet_burst_taps
+        needed = math.ceil((current_bet - known_min) / (last_step / 2)) + 2
+        return min(self.config.bet_burst_taps, max(8, needed))
 
     def _blind_taps(self, device_id: str, x: int, y: int, count: int, reference_screenshot=None) -> int:
         """Tocchi consecutivi sulla stessa coordinata senza verificare ciascuno. Ogni

@@ -595,3 +595,50 @@ class TestFastSpinCycle:
         autopilot.spin("dev", 1)
 
         assert screens.region == CANVAS and contexts[0].success
+
+
+class TestPreparedContextReuse:
+    def _ready(self, tmp_path):
+        autopilot, screens, _ = _pilot(tmp_path, [])
+        autopilot.bet_controller.set_min_bet.side_effect = lambda device, slot, episode, provider: Result.ok(
+            BetResult(slot_name=slot, starting_bet=None, final_bet=Decimal("0.1"), min_bet_verified=True, attempts=1,
+                      strategy_sequence=[]))
+        return autopilot, screens
+
+    def test_set_min_bet_starts_from_the_context_prepare_just_read(self, tmp_path):
+        autopilot, screens = self._ready(tmp_path)
+        shots_after_prepare = screens.shots
+        provided = []
+        autopilot.bet_controller.set_min_bet.side_effect = lambda device, slot, episode, provider: (
+            provided.append(provider()) or Result.ok(BetResult(
+                slot_name=slot, starting_bet=None, final_bet=Decimal("0.1"), min_bet_verified=True, attempts=1)))
+
+        autopilot.set_min_bet("dev")
+
+        assert screens.shots == shots_after_prepare          # nessuno screenshot/OCR in piu'
+        assert provided[0].data.amounts_band == (0, 2145, 1080, 2255)
+        assert provided[0].data.device_id == "dev"
+
+    def test_the_prepared_context_is_used_only_once(self, tmp_path):
+        autopilot, screens = self._ready(tmp_path)
+        shots = screens.shots
+        autopilot._bet_context("dev")
+        assert screens.shots == shots
+        autopilot._bet_context("dev")
+        assert screens.shots > shots
+
+    def test_a_stale_prepared_context_is_not_reused(self, tmp_path, monkeypatch):
+        autopilot, screens = self._ready(tmp_path)
+        shots = screens.shots
+        monkeypatch.setattr("orchestrator.modules.slot_autopilot.autopilot.time.monotonic",
+                            lambda: autopilot._prepared_at + 31)
+
+        autopilot._bet_context("dev")
+
+        assert screens.shots > shots
+
+    def test_every_new_context_carries_the_learned_band(self, tmp_path):
+        autopilot, _ = self._ready(tmp_path)
+        autopilot._prepared_context = None
+
+        assert autopilot._bet_context("dev").data.amounts_band == (0, 2145, 1080, 2255)

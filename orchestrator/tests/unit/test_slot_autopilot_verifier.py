@@ -296,3 +296,88 @@ class TestClassifyScreenState:
     def test_unsafe_when_spin_button_absent_and_posta_missing(self):
         ocr_state = {"spin_button_coords": None, "saldo": 5000.0, "posta": None}
         assert classify_screen_state(ocr_state) == "unsafe"
+
+
+class _RegionAwareOcr:
+    """OCR finto con regione: nella fascia legge solo cio' che la fascia contiene."""
+
+    def __init__(self, band_state, full_state):
+        self.region = (0, 247, 1080, 2400)
+        self.band_state, self.full_state = band_state, full_state
+        self.regions_seen = []
+        self.fail_inside_band = False
+
+    def set_region(self, region):
+        self.region = region
+
+    def read_slot_state(self, path):
+        self.regions_seen.append(self.region)
+        if self.region == BAND and self.fail_inside_band:
+            raise RuntimeError("ocr")
+        return dict(self.band_state if self.region == BAND else self.full_state)
+
+
+BAND = (0, 2145, 1080, 2255)
+FULL = {"saldo": 10.0, "posta": 0.5, "raw_texts": ["full"]}
+
+
+class TestRegionHint:
+    def _verifier(self, tmp_path, ocr):
+        device = FakeSlotDevice(tmp_path, balance=Decimal("10.00"), bet=Decimal("1.00"))
+        device.add_element("bet_minus", 100, 100, lambda d: setattr(d, "bet", Decimal("0.50")))
+        return ActionVerifier(fake_touch_injector(device), fake_screen_reader(device), ocr, _config())
+
+    def test_the_after_reading_uses_the_band_and_the_region_is_restored(self, tmp_path):
+        ocr = _RegionAwareOcr({"saldo": 10.0, "posta": 0.5}, FULL)
+        verifier = self._verifier(tmp_path, ocr)
+        before_path = verifier.screen_reader._screenshot("dev").data
+
+        result = verifier.verified_tap(
+            "dev", 100, 100, Expectation(kind="bet_decrease"),
+            screenshot_before=before_path, state_before={"saldo": 10.0, "posta": 1.0}, region_hint=BAND,
+        )
+
+        assert result.data.verified and result.data.bet_after == Decimal("0.5")
+        assert ocr.regions_seen == [BAND]                       # una sola lettura, rapida
+        assert ocr.region == (0, 247, 1080, 2400)               # regione originale ripristinata
+        assert result.data.state_after == {"saldo": 10.0, "posta": 0.5}
+
+    def test_a_band_without_the_amounts_is_reread_on_the_full_screen(self, tmp_path):
+        ocr = _RegionAwareOcr({"saldo": None, "posta": None}, FULL)
+        verifier = self._verifier(tmp_path, ocr)
+
+        result = verifier.verified_tap(
+            "dev", 100, 100, Expectation(kind="bet_decrease"),
+            screenshot_before=verifier.screen_reader._screenshot("dev").data,
+            state_before={"saldo": 10.0, "posta": 1.0}, region_hint=BAND,
+        )
+
+        assert result.data.bet_after == Decimal("0.5")          # dalla lettura completa, non un falso "nessun effetto"
+        assert ocr.regions_seen == [BAND, (0, 247, 1080, 2400)]
+        assert ocr.region == (0, 247, 1080, 2400)
+
+    def test_the_region_is_restored_even_when_the_reading_fails(self, tmp_path):
+        ocr = _RegionAwareOcr({"saldo": 10.0, "posta": 0.5}, FULL)
+        ocr.fail_inside_band = True
+        verifier = self._verifier(tmp_path, ocr)
+
+        result = verifier.verified_tap(
+            "dev", 100, 100, Expectation(kind="bet_decrease"),
+            screenshot_before=verifier.screen_reader._screenshot("dev").data,
+            state_before={"saldo": 10.0, "posta": 1.0}, region_hint=BAND,
+        )
+
+        assert not result.success and result.error_code == "VERIFICATION_ERROR"
+        assert ocr.region == (0, 247, 1080, 2400)
+
+    def test_without_a_hint_the_reading_is_unchanged(self, tmp_path):
+        ocr = _RegionAwareOcr({"saldo": 10.0, "posta": 0.5}, FULL)
+        verifier = self._verifier(tmp_path, ocr)
+
+        result = verifier.verified_tap(
+            "dev", 100, 100, Expectation(kind="bet_decrease"),
+            screenshot_before=verifier.screen_reader._screenshot("dev").data,
+            state_before={"saldo": 10.0, "posta": 1.0},
+        )
+
+        assert ocr.regions_seen == [(0, 247, 1080, 2400)] and result.data.state_after == FULL
