@@ -853,6 +853,14 @@ class BetController:
             logger.warning("set_min_bet: menu puntata non riuscito (%s): %s", result.error_code, result.error)
             if result.error_code == "MENU_OPEN_NOT_A_LIST":
                 return None, True
+            if result.error_code == "MENU_SELECTION_UNREADABLE":
+                # La cella e' stata scelta ma la puntata non si legge: nessun altro tocco e nessuna ricerca
+                # costosa del "-": senza leggere la puntata non si puo' dimostrare nulla.
+                return Result.ok(BetResult(
+                    slot_name=slot_name, starting_bet=starting_bet, final_bet=None,
+                    min_bet_verified=False, attempts=attempts, strategy_sequence=list(strategy_sequence),
+                    aborted_reason="MENU_BET_UNREADABLE", outcome="aborted",
+                )), False
             if result.error_code == "MENU_STUCK":
                 # Un tocco sbagliato ha cambiato lo schermo e non si e' riusciti
                 # a ripristinarlo: niente altri tocchi alla cieca.

@@ -14,6 +14,8 @@ _SUGGESTED_WAIT = re.compile(r"try again in (?:(\d+(?:\.\d+)?)m(?!s))?\s*(\d+(?:
 _DEFAULT_WAIT_SECONDS = 2.0
 _MARGIN_SECONDS = 0.5
 _MAX_WAIT_SECONDS = 20.0
+# Con la finestra al minuto piena un'attesa di frazioni di secondo non basta: almeno 5 s per tentativo.
+_MIN_WAIT_PER_ATTEMPT_SECONDS = 5.0
 
 
 def suggested_wait_seconds(message: str) -> float:
@@ -51,7 +53,7 @@ def call_with_rate_limit_retry(
             if attempt >= max_retries:
                 raise
             attempt += 1
-            wait = suggested_wait_seconds(str(exc))
+            wait = min(max(suggested_wait_seconds(str(exc)), _MIN_WAIT_PER_ATTEMPT_SECONDS * attempt), _MAX_WAIT_SECONDS)
             logger.warning(
                 "Limite di richieste OpenAI raggiunto: aspetto %.1f s e riprovo (%d/%d).",
                 wait, attempt, max_retries,

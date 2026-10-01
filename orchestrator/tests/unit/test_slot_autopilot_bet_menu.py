@@ -1,5 +1,9 @@
+import dataclasses
 from decimal import Decimal
 from unittest.mock import MagicMock
+
+import pytest
+from PIL import Image
 
 from orchestrator.core.result import Result
 from orchestrator.modules.slot_autopilot.bet_menu import BetMenuSelector, menu_amounts
@@ -7,6 +11,11 @@ from orchestrator.modules.slot_autopilot.screen_recovery import RecoveryOutcome
 from orchestrator.modules.slot_autopilot.strategies.base import LocateCandidate, LocateContext
 from orchestrator.modules.slot_autopilot.verifier import TapOutcome
 from orchestrator.modules.slot_ocr.reader import OCRBox
+
+
+@pytest.fixture(autouse=True)
+def _no_settle_pause(monkeypatch):
+    monkeypatch.setattr("orchestrator.modules.slot_autopilot.bet_menu.time.sleep", lambda seconds: None)
 
 
 def _box(text, x, y):
@@ -309,3 +318,57 @@ class TestIconThatIsNotTheBetMenu:
         result = selector.select_lowest("dev", "shining", _context(MAIN_BOXES), _provider(_context([])))
 
         assert result.error_code == "MENU_OPEN_NOT_A_LIST"
+
+
+class TestMenuClosedOrStillOpen:
+    """La schermata di gioco puo' mostrare anch'essa una riga di puntate: 4+ importi non bastano a dire "aperto"."""
+
+    @staticmethod
+    def _shot(tmp_path, name, color):
+        path = tmp_path / name
+        Image.new("RGB", (200, 400), color).save(path)
+        return str(path)
+
+    def test_a_closed_menu_is_not_reopened_even_if_the_game_screen_lists_bets(self, tmp_path):
+        selector, _, verifier = _selector()
+        menu = dataclasses.replace(_context(MENU_BOXES), screenshot_path=self._shot(tmp_path, "menu.png", "white"))
+        game = dataclasses.replace(
+            _context(MENU_BOXES, posta=0.10), screenshot_path=self._shot(tmp_path, "game.png", "black"),
+        )
+
+        result = selector.select_from_open_menu("dev", "shining", menu, _provider(game), (788, 1775))
+
+        assert result.success and result.data.final_bet == Decimal("0.10")
+        assert [call.args[1:3] for call in verifier.verified_tap.call_args_list] == [(200, 1000)]   # nessun tocco sull'icona
+
+    def test_a_menu_that_barely_changed_is_closed_with_the_icon(self, tmp_path):
+        selector, _, verifier = _selector()
+        shot = self._shot(tmp_path, "same.png", "white")
+        menu = dataclasses.replace(_context(MENU_BOXES), screenshot_path=shot)
+        still_open = dataclasses.replace(_context(MENU_BOXES), screenshot_path=shot)
+        closed = dataclasses.replace(
+            _context(MAIN_BOXES, posta=0.10), screenshot_path=self._shot(tmp_path, "closed.png", "black"),
+        )
+
+        result = selector.select_from_open_menu("dev", "shining", menu, _provider(still_open, closed), (788, 1775))
+
+        assert result.success
+        assert [call.args[1:3] for call in verifier.verified_tap.call_args_list] == [(200, 1000), (788, 1775)]
+
+
+class TestUnreadableBetAfterSelection:
+    def test_a_bet_that_cannot_be_read_at_first_is_read_again(self):
+        selector, _, _ = _selector()
+        provider = _provider(_context(MAIN_BOXES, posta=None), _context(MAIN_BOXES, posta=0.10))
+
+        result = selector.select_from_open_menu("dev", "shining", _context(MENU_BOXES), provider, (788, 1775))
+
+        assert result.success and result.data.final_bet == Decimal("0.10")
+
+    def test_a_bet_that_stays_unreadable_is_reported_as_such(self):
+        selector, _, _ = _selector()
+        provider = _provider(_context(MAIN_BOXES, posta=None), _context(MAIN_BOXES, posta=None))
+
+        result = selector.select_from_open_menu("dev", "shining", _context(MENU_BOXES), provider, (788, 1775))
+
+        assert result.error_code == "MENU_SELECTION_UNREADABLE"

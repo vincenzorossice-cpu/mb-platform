@@ -1634,3 +1634,21 @@ class TestGptUnavailable:
         assert result.data.aborted_reason == "GPT_UNAVAILABLE"
         assert result.data.attempts == 3
         selector.select_lowest.assert_not_called()      # il menu ha bisogno di GPT: non si tenta
+
+
+class TestMenuSelectionUnreadable:
+    def test_chosen_cell_but_unreadable_bet_stops_without_searching_for_the_minus(self, tmp_path):
+        locator = _locator_mock()
+        locator.locate.return_value = Result.fail("not visible", "ELEMENT_NOT_LOCATABLE")
+        selector = MagicMock()
+        selector.select_lowest.return_value = Result.fail("unreadable", "MENU_SELECTION_UNREADABLE")
+        step_logger = MagicMock()
+        step_logger.log_step.return_value = Result.ok(True)
+        controller = BetController(
+            locator, MagicMock(), step_logger, _config(slot_memory_dir=str(tmp_path)), menu_selector=selector,
+        )
+
+        result = controller.set_min_bet("dev", "pirots5", "ep", _context_provider(Decimal("0.30")))
+
+        assert result.data.aborted_reason == "MENU_BET_UNREADABLE" and not result.data.min_bet_verified
+        locator.locate.assert_called_once()     # nessuna catena completa (e nessuna chiamata GPT) dopo il tocco

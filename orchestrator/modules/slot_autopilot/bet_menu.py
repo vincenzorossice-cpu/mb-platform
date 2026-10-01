@@ -1,11 +1,13 @@
 import logging
 import re
+import time
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Callable, Optional
 
 from orchestrator.core.result import Result
 from orchestrator.modules.provider_profile.autopilot_memory import forget_autopilot_element, load_autopilot_flag
+from orchestrator.modules.slot_autopilot.frame_diff import diff_score
 from orchestrator.modules.slot_autopilot.locator import ElementLocator
 from orchestrator.modules.slot_autopilot.strategies.base import LocateCandidate
 from orchestrator.modules.slot_autopilot.value_parser import parse_amount
@@ -33,6 +35,11 @@ _MAX_PLAUSIBLE_BET = Decimal("100000")
 # toccata ha aperto un'altra cosa (menu generale del gioco, regole...).
 _MIN_BET_MENU_AMOUNTS = 2
 _BET_VIA_MENU_FLAG = "bet_via_menu"
+# Dopo la scelta di una cella: un menu che si chiude cambia molto lo schermo (diff sopra questa soglia),
+# una cella che si evidenzia cambia poco. Serve a non scambiare per "menu aperto" una schermata di gioco
+# che mostra anch'essa una riga di puntate.
+_MENU_STILL_OPEN_DIFF = 0.08
+_SETTLE_SECONDS = 1.5   # pausa prima di rileggere una puntata non leggibile (animazione di chiusura)
 
 
 @dataclass
@@ -177,7 +184,7 @@ class BetMenuSelector:
         after = self._fresh(context_provider)
         if after is None:
             return Result.fail("Cannot read the screen after selecting the bet", "MENU_CONTEXT_ERROR")
-        if _looks_like_menu(menu_amounts(after.text_boxes)):
+        if self._menu_still_open(opened, after):
             logger.info("bet menu: ancora aperto dopo la selezione, lo richiudo")
             if toggle is None:
                 located = self.locator.locate(_MENU_TOGGLE, after, exclude_strategies=("hitl",))
@@ -190,7 +197,18 @@ class BetMenuSelector:
                 return Result.fail("Cannot read the screen after closing the menu", "MENU_CONTEXT_ERROR")
 
         bet = after.slot_ocr_state.get("posta")
-        if bet is None or Decimal(str(bet)) != lowest:
+        if bet is None:
+            # Non letta non vuol dire sbagliata: un'animazione di chiusura puo' coprirla. Una seconda lettura.
+            time.sleep(_SETTLE_SECONDS)
+            again = self._fresh(context_provider)
+            if again is not None:
+                after = again
+                bet = after.slot_ocr_state.get("posta")
+        if bet is None:
+            return Result.fail(
+                f"Bet after menu selection cannot be read (expected {lowest})", "MENU_SELECTION_UNREADABLE",
+            )
+        if Decimal(str(bet)) != lowest:
             return Result.fail(
                 f"Bet after menu selection is {bet}, expected {lowest}", "MENU_SELECTION_NOT_CONFIRMED",
             )
@@ -198,6 +216,15 @@ class BetMenuSelector:
             final_bet=Decimal(str(bet)), lowest_listed=lowest,
             toggle_strategy=toggle.strategy_name if toggle is not None else "hitl",
         ))
+
+    @staticmethod
+    def _menu_still_open(opened, after) -> bool:
+        """Dopo la scelta: 4+ importi isolati E lo schermo quasi uguale a quello col menu aperto. Se la
+        differenza e' grande il menu si e' chiuso (e gli importi visti sono la riga di puntate del gioco)."""
+        if not _looks_like_menu(menu_amounts(after.text_boxes)):
+            return False
+        diff = diff_score(opened.screenshot_path, after.screenshot_path)
+        return not (diff.success and diff.data >= _MENU_STILL_OPEN_DIFF)
 
     def _undo_wrong_toggle(self, device_id, slot_name, toggle, outcome, context_provider) -> Result[MenuSelection]:
         """Il tocco ha cambiato qualcosa che non e' l'apertura del menu (es. una

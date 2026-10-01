@@ -29,7 +29,16 @@ class TestCallWithRateLimitRetry:
 
         assert call_with_rate_limit_retry(call, sleep=sleep) == "ok"
         sleep.assert_called_once()
-        assert sleep.call_args.args[0] == pytest.approx(0.871)
+        assert sleep.call_args.args[0] == 5.0    # la suggerita (0,87 s) non basta con la finestra piena
+
+    def test_waits_grow_with_each_attempt_up_to_the_cap(self):
+        call = MagicMock(side_effect=rate_limit())
+        sleep = MagicMock()
+
+        with pytest.raises(openai.RateLimitError):
+            call_with_rate_limit_retry(call, sleep=sleep, max_retries=5)
+
+        assert [c.args[0] for c in sleep.call_args_list] == [5.0, 10.0, 15.0, 20.0, 20.0]
 
     def test_a_persistent_limit_is_raised_after_the_retries(self):
         call = MagicMock(side_effect=rate_limit())
