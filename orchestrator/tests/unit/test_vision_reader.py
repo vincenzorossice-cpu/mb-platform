@@ -165,3 +165,39 @@ class TestRateLimit:
         client.client.chat.completions.create.side_effect = self._limit()
 
         assert VisionAmountReader(client).read(shot) == {"saldo": None, "posta": None}
+
+
+class TestVisionUnavailable:
+    def test_amount_strings_with_spaced_thousands_are_read(self, shot):
+        client = _client({"credit": "49 999.90", "bet": "0.10"})
+        assert VisionAmountReader(client).read(shot) == {"saldo": 49999.9, "posta": 0.1}
+
+    def test_an_ocr_value_that_contradicts_the_last_trusted_one_is_discarded(self, caplog):
+        vision = _vision({"saldo": 50000.0, "posta": 0.3}, {"saldo": None, "posta": None})
+        ocr = _ocr([{"saldo": 50.0, "posta": None}, {"saldo": 49.99, "posta": None}])
+        reader = ResilientOCRReader(ocr, vision)
+        reader.read_slot_state("/a.png")                        # prima lettura: OCR 50 contro visione 50000
+
+        with caplog.at_level("WARNING"):
+            state = reader.read_slot_state("/b.png")            # la visione non risponde
+
+        assert state["saldo"] is None and state["posta"] is None
+        assert any("visione non disponibile" in r.getMessage() for r in caplog.records)
+
+    def test_an_ocr_value_that_agrees_with_the_last_trusted_one_is_kept(self):
+        vision = _vision({"saldo": 50000.0, "posta": 0.3}, {"saldo": None, "posta": None})
+        ocr = _ocr([{"saldo": 50.0, "posta": None}, {"saldo": 49999.9, "posta": 0.3}])
+        reader = ResilientOCRReader(ocr, vision)
+        reader.read_slot_state("/a.png")
+
+        state = reader.read_slot_state("/b.png")
+
+        assert state["saldo"] == 49999.9 and state["posta"] == 0.3
+
+    def test_without_any_trusted_value_a_failing_vision_gives_unknown(self):
+        vision = _vision({"saldo": None, "posta": 0.3})
+        reader = ResilientOCRReader(_ocr([{"saldo": 50.0, "posta": None}]), vision)
+
+        state = reader.read_slot_state("/a.png")
+
+        assert reader.prefer_vision and state["saldo"] is None and state["posta"] == 0.3

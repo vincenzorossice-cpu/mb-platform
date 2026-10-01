@@ -3,7 +3,7 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
-from orchestrator.core.amount_format import normalize_number_run
+from orchestrator.core.amount_format import find_amount_run
 from orchestrator.core.result import Result
 
 logger = logging.getLogger(__name__)
@@ -212,7 +212,8 @@ class SlotOCRReader:
     def _extract_amount(self, text: str) -> Optional[float]:
         """Estrae un importo numerico da un testo OCR (es. '114,36 €', '5,000.00',
         '50.000' = cinquantamila). Le regole dei separatori stanno in
-        normalize_number_run."""
-        match = re.search(r'(\d[\d.,]*\d)', text)
-        if not match: return None
-        return float(normalize_number_run(match.group(1)))
+        find_amount_run (anche le migliaia separate da uno spazio, '49 999.90')."""
+        run = find_amount_run(text)
+        if run is None:
+            return None
+        return float(run)

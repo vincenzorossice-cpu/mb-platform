@@ -83,6 +83,20 @@ class TestThousandsSeparatorsInTheOcr:
         assert state["saldo"] == 50000.0
 
 
+class TestThousandsSeparatedBySpace:
+    @pytest.mark.parametrize("text,expected", [
+        ("49 999.90", 49999.9), ("50 000.00", 50000.0), ("6 405 921.88", 6405921.88),
+        ("SALDO: 49\u00a0999.90", 49999.9), ("CREDITO 49\u202f999,90", 49999.9), ("1 250,00", 1250.0),
+        ("0.10 0.20", 0.1), ("10 25", 10.0), ("1234 567", 1234.0), ("49 9999", 49.0),
+    ])
+    def test_amounts(self, text, expected):
+        assert SlotOCRReader()._extract_amount(text) == expected
+
+    def test_the_balance_line_with_spaced_thousands_is_one_amount(self):
+        state = _ocr_reader_with([_detection("SALDO: 49 999.90", 10, 10)]).read_slot_state("/tmp/s.png")
+        assert state["saldo"] == 49999.9
+
+
 class TestReadTextBoxes:
     def test_bbox_is_true_min_max_of_all_four_points(self):
         """Un quad non assiale: bbox deve essere il min/max reale dei 4 punti,

@@ -87,3 +87,14 @@ class TestThousandsSeparators:
     ])
     def test_everything_else_is_unchanged(self, text, expected):
         assert parse_amount(text).data == Decimal(expected)
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("49 999.90", "49999.90"), ("50 000.00", "50000.00"), ("6 405 921.88", "6405921.88"),
+    ("49\u00a0999,90 EUR", "49999.90"), ("\u20ac 1 250", "1250"), ("-49 999.90", "-49999.90"),
+    ("S0 000.00", "50000.00"),           # correzione OCR S->5 dentro l'importo con spazio
+    ("0.10 0.20", "0.10"), ("10 25", "10"), ("1234 567", "1234"),
+])
+def test_thousands_separated_by_a_space(text, expected):
+    result = parse_amount(text)
+    assert result.success and result.data == Decimal(expected)

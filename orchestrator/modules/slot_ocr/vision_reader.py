@@ -6,7 +6,7 @@ from typing import Optional
 
 import openai
 
-from orchestrator.core.amount_format import normalize_number_run
+from orchestrator.core.amount_format import find_amount_run
 from orchestrator.core.openai_retry import call_with_rate_limit_retry
 
 logger = logging.getLogger(__name__)
@@ -27,10 +27,10 @@ def _to_amount(value) -> Optional[float]:
     if isinstance(value, (int, float)):
         return float(value) if value >= 0 else None
     if isinstance(value, str):
-        match = re.search(r"\d[\d.,]*\d|\d", value)
-        if match:
+        run = find_amount_run(value, allow_single_digit=True)
+        if run is not None:
             try:
-                return float(normalize_number_run(match.group(0)))
+                return float(run)
             except ValueError:
                 return None
     return None
@@ -95,6 +95,8 @@ class ResilientOCRReader:
         self.tolerance = tolerance
         self.prefer_vision = False
         self._self_checked = False
+        # Ultimo valore fidato per campo (letto dalla visione, o dall'OCR e coerente con esso).
+        self._trusted = {"saldo": None, "posta": None}
 
     @property
     def region(self):
@@ -142,12 +144,28 @@ class ResilientOCRReader:
                 return True
         return False
 
-    @staticmethod
-    def _merged(state: dict, seen: dict) -> dict:
+    def _merged(self, state: dict, seen: dict) -> dict:
+        """Modalita' "uso la visione": gli importi sono quelli della visione. Se la visione non ne legge uno
+        (errore, limite di richieste), il valore dell'OCR vale SOLO se concorda con l'ultimo valore fidato:
+        l'OCR e' proprio quello che si e' dimostrato sbagliato, meglio "sconosciuto" che un importo falso."""
         merged = dict(state)
         for key in ("saldo", "posta"):
+            ocr_value, trusted = state.get(key), self._trusted[key]
             if seen.get(key) is not None:
                 merged[key] = seen[key]
+                self._trusted[key] = seen[key]
+            elif (
+                ocr_value is not None and trusted is not None
+                and abs(ocr_value - trusted) <= self.tolerance * max(abs(trusted), 1e-9)
+            ):
+                self._trusted[key] = ocr_value
+            else:
+                if ocr_value is not None:
+                    logger.warning(
+                        "visione non disponibile: scarto l'importo dell'OCR per '%s' (%s contro %s).",
+                        key, ocr_value, trusted,
+                    )
+                merged[key] = None
         return merged
 
     @staticmethod
