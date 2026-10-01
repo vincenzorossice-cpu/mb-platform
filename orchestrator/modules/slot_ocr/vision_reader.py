@@ -1,6 +1,7 @@
 import base64
 import json
 import logging
+import math
 import re
 from typing import Optional
 
@@ -13,11 +14,13 @@ logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = (
     "You read numbers off a screenshot of a mobile slot-machine game. Respond ONLY with JSON: "
-    '{"credit": <number or null>, "bet": <number or null>}. '
-    "credit = the player's balance / credit shown on screen. bet = the current TOTAL bet, i.e. the amount "
-    "staked on one spin (not the value of a single line or coin, unless that is the only bet shown). "
-    "Write numbers as plain decimals with a dot as the decimal separator and NO thousands separators "
-    "(for example 50000.00). Use null for anything you cannot read with certainty. Never guess."
+    '{"credit_text": <string or null>, "bet_text": <string or null>}. '
+    "credit_text = the player's balance / credit shown on screen. bet_text = the current TOTAL bet, i.e. the "
+    "amount staked on one spin (not the value of a single line or coin, unless that is the only bet shown). "
+    "COPY each amount EXACTLY as it is written on screen, character by character, including spaces, dots and "
+    "commas used as separators (for example \"49 999.90\" or \"1.250,00\"); leave out only the currency "
+    "symbol. Do NOT convert, round or reformat the numbers. Use null for anything you cannot read with "
+    "certainty. Never guess."
 )
 
 
@@ -54,7 +57,7 @@ class VisionAmountReader:
                 encoded = base64.b64encode(img_file.read()).decode("utf-8")
             response = call_with_rate_limit_retry(lambda: self.gpt_client.client.chat.completions.create(
                 model=self.gpt_client.model, response_format={"type": "json_object"},
-                temperature=0, max_tokens=80,
+                temperature=0, max_tokens=100,
                 messages=[
                     {"role": "system", "content": _SYSTEM_PROMPT},
                     {"role": "user", "content": [
@@ -75,28 +78,57 @@ class VisionAmountReader:
             return empty
         if not isinstance(data, dict):
             return empty
-        result = {"saldo": _to_amount(data.get("credit")), "posta": _to_amount(data.get("bet"))}
-        logger.info("lettura per visione: saldo=%s puntata=%s", result["saldo"], result["posta"])
+        # Si interpreta il TESTO copiato (il modello sbaglia a convertire "49 999.90" in un numero); le vecchie
+        # chiavi numeriche restano accettate.
+        credit = data.get("credit_text", data.get("credit"))
+        bet = data.get("bet_text", data.get("bet"))
+        result = {"saldo": _to_amount(credit), "posta": _to_amount(bet)}
+        logger.info("lettura per visione: saldo=%s (testo %r) puntata=%s (testo %r)",
+                    result["saldo"], credit, result["posta"], bet)
         if len(self._cache) >= 4:
             self._cache.clear()
         self._cache[screenshot_path] = dict(result)
         return result
 
 
+_KEYS = ("saldo", "posta")
+# Un singolo spin non puo' cambiare il saldo di oltre la meta': una lettura piu' lontana e' un errore di lettura.
+_BALANCE_CONTINUITY = 0.5
+
+
+def _within(value: float, reference: float, tolerance: float) -> bool:
+    return abs(value - reference) <= tolerance * max(abs(reference), 1e-9)
+
+
+def _powers_of_ten_apart(a: float, b: float) -> bool:
+    """True se i due valori differiscono di una potenza di dieci (49999.9 contro 49.99): il segno di cifre
+    delle migliaia perse da uno dei due lettori."""
+    if a <= 0 or b <= 0:
+        return False
+    ratio = max(a, b) / min(a, b)
+    exponent = round(math.log10(ratio))
+    return exponent >= 1 and abs(ratio - 10 ** exponent) <= 0.01 * 10 ** exponent
+
+
 class ResilientOCRReader:
     """Stessa interfaccia di SlotOCRReader, con la visione come rete di sicurezza per saldo e puntata.
-    Alla PRIMA lettura confronta OCR e visione: se discordano oltre la tolleranza (o l'OCR non legge) usa
-    la visione per tutta la sessione; altrimenti la chiama solo se mancano saldo o puntata. Dove l'OCR
-    basta non costa nulla. La vincita resta quella dell'OCR."""
+    Alla PRIMA lettura confronta OCR e visione CAMPO PER CAMPO: la visione prende solo i campi che l'OCR non
+    legge o contraddice. Dopo, per i campi affidati alla visione, vale il valore su cui i due concordano,
+    altrimenti (per il saldo) quello coerente con l'ultimo saldo fidato; se nessuno lo e', il campo resta
+    sconosciuto. Dove l'OCR basta non costa nulla. La vincita resta quella dell'OCR."""
 
     def __init__(self, ocr, vision: Optional[VisionAmountReader], tolerance: float = 0.10):
         self.ocr = ocr
         self.vision = vision
         self.tolerance = tolerance
-        self.prefer_vision = False
         self._self_checked = False
-        # Ultimo valore fidato per campo (letto dalla visione, o dall'OCR e coerente con esso).
+        self._vision_fields = set()
+        # Ultimo valore fidato per campo (concordato tra i due lettori o coerente con la storia).
         self._trusted = {"saldo": None, "posta": None}
+
+    @property
+    def prefer_vision(self) -> bool:
+        return bool(self._vision_fields)
 
     @property
     def region(self):
@@ -118,60 +150,83 @@ class ResilientOCRReader:
             return state
         if not self._self_checked:
             self._self_checked = True
-            seen = self.vision.read(screenshot_path)
-            self.prefer_vision = self._disagree(state, seen)
-            if self.prefer_vision:
-                logger.warning(
-                    "L'OCR legge saldo=%s puntata=%s, la visione saldo=%s puntata=%s: uso la visione per gli importi.",
-                    state.get("saldo"), state.get("posta"), seen.get("saldo"), seen.get("posta"),
-                )
-                return self._merged(state, seen)
-            return self._filled(state, seen)
-        if self.prefer_vision:
-            return self._merged(state, self.vision.read(screenshot_path))
-        if state.get("saldo") is None or state.get("posta") is None:
-            return self._filled(state, self.vision.read(screenshot_path))
+            return self._first_read(state, self.vision.read(screenshot_path))
+        if self._vision_fields or any(state.get(key) is None for key in _KEYS) or self._balance_is_suspicious(state):
+            return self._combine(state, self.vision.read(screenshot_path))
+        for key in _KEYS:
+            self._trusted[key] = state[key]
         return state
 
-    def _disagree(self, state: dict, seen: dict) -> bool:
-        for key in ("saldo", "posta"):
+    def _balance_is_suspicious(self, state: dict) -> bool:
+        balance, trusted = state.get("saldo"), self._trusted["saldo"]
+        return balance is not None and trusted is not None and not _within(balance, trusted, _BALANCE_CONTINUITY)
+
+    def _first_read(self, state: dict, seen: dict) -> dict:
+        merged = dict(state)
+        for key in _KEYS:
             ocr_value, vision_value = state.get(key), seen.get(key)
             if vision_value is None:
-                continue
+                continue                      # la visione non dice nulla: resta l'OCR
             if ocr_value is None:
-                return True
-            if abs(ocr_value - vision_value) > self.tolerance * max(abs(vision_value), 1e-9):
-                return True
-        return False
-
-    def _merged(self, state: dict, seen: dict) -> dict:
-        """Modalita' "uso la visione": gli importi sono quelli della visione. Se la visione non ne legge uno
-        (errore, limite di richieste), il valore dell'OCR vale SOLO se concorda con l'ultimo valore fidato:
-        l'OCR e' proprio quello che si e' dimostrato sbagliato, meglio "sconosciuto" che un importo falso."""
-        merged = dict(state)
-        for key in ("saldo", "posta"):
-            ocr_value, trusted = state.get(key), self._trusted[key]
-            if seen.get(key) is not None:
-                merged[key] = seen[key]
-                self._trusted[key] = seen[key]
-            elif (
-                ocr_value is not None and trusted is not None
-                and abs(ocr_value - trusted) <= self.tolerance * max(abs(trusted), 1e-9)
-            ):
-                self._trusted[key] = ocr_value
+                self._vision_fields.add(key)
+                merged[key] = self._trusted[key] = vision_value
+            elif _within(ocr_value, vision_value, self.tolerance):
+                merged[key] = self._trusted[key] = ocr_value
+            elif _powers_of_ten_apart(ocr_value, vision_value) and ocr_value > vision_value:
+                # Perdere le cifre delle migliaia e' molto piu' comune che inventarle: vince il valore piu' grande.
+                logger.warning("'%s': OCR %s contro visione %s (differiscono di una potenza di dieci): "
+                               "tengo il piu' grande, l'OCR.", key, ocr_value, vision_value)
+                merged[key] = self._trusted[key] = ocr_value
             else:
-                if ocr_value is not None:
-                    logger.warning(
-                        "visione non disponibile: scarto l'importo dell'OCR per '%s' (%s contro %s).",
-                        key, ocr_value, trusted,
-                    )
-                merged[key] = None
+                self._vision_fields.add(key)
+                merged[key] = self._trusted[key] = vision_value
+        if self._vision_fields:
+            logger.warning(
+                "L'OCR legge saldo=%s puntata=%s, la visione saldo=%s puntata=%s: uso la visione per: %s.",
+                state.get("saldo"), state.get("posta"), seen.get("saldo"), seen.get("posta"),
+                ", ".join(sorted(self._vision_fields)),
+            )
         return merged
 
-    @staticmethod
-    def _filled(state: dict, seen: dict) -> dict:
-        filled = dict(state)
-        for key in ("saldo", "posta"):
-            if filled.get(key) is None and seen.get(key) is not None:
-                filled[key] = seen[key]
-        return filled
+    def _combine(self, state: dict, seen: dict) -> dict:
+        merged = dict(state)
+        for key in _KEYS:
+            ocr_value, vision_value = state.get(key), seen.get(key)
+            if key in self._vision_fields or (
+                key == "saldo" and ocr_value is not None and self._balance_is_suspicious(state)
+            ):
+                merged[key] = self._arbitrate(key, ocr_value, vision_value)
+            elif ocr_value is None and vision_value is not None:
+                merged[key] = self._trusted[key] = vision_value
+            elif ocr_value is not None:
+                self._trusted[key] = ocr_value
+        return merged
+
+    def _arbitrate(self, key: str, ocr_value: Optional[float], vision_value: Optional[float]) -> Optional[float]:
+        trusted = self._trusted[key]
+
+        def accept(value):
+            self._trusted[key] = value
+            return value
+
+        if vision_value is None:
+            # La visione non risponde (errore, limite di richieste): l'OCR vale solo se concorda col fidato.
+            if ocr_value is not None and trusted is not None and _within(ocr_value, trusted, self.tolerance):
+                return accept(ocr_value)
+            if ocr_value is not None:
+                logger.warning("visione non disponibile: scarto l'importo dell'OCR per '%s' (%s contro %s).",
+                               key, ocr_value, trusted)
+            return None
+        if ocr_value is not None and _within(ocr_value, vision_value, self.tolerance):
+            return accept(vision_value)
+        if trusted is None or key != "saldo":
+            return accept(vision_value)
+        if _within(vision_value, trusted, _BALANCE_CONTINUITY):
+            return accept(vision_value)
+        if ocr_value is not None and _within(ocr_value, trusted, _BALANCE_CONTINUITY):
+            logger.warning("saldo: scarto la visione (%s) perche' incoerente con l'ultimo saldo (%s): tengo l'OCR (%s).",
+                           vision_value, trusted, ocr_value)
+            return accept(ocr_value)
+        logger.warning("saldo: ne' l'OCR (%s) ne' la visione (%s) sono coerenti con l'ultimo saldo (%s): lo ignoro.",
+                       ocr_value, vision_value, trusted)
+        return None

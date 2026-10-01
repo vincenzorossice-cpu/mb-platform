@@ -176,9 +176,19 @@ class SpinController:
             self.locator.save_verified_candidate(
                 _ELEMENT, candidate, slot_name, context.screen_width, context.screen_height,
             )
+        bet_understated = outcome == "success" and self._bet_understated(balance_before, balance_after, expected_bet)
+        if bet_understated:
+            # Una sola lettura sbagliata (cifre perse) non deve fermare la sessione: si rilegge il saldo.
+            second = self._reread_balance(context_provider)
+            if second is not None and not self._bet_understated(balance_before, second, expected_bet):
+                logger.warning(
+                    "spin %d: la prima lettura del saldo (%s) era incoerente, la seconda (%s) e' coerente: uso la seconda.",
+                    spin_index, balance_after, second,
+                )
+                balance_after = second
+                bet_understated = False
         if outcome == "success" and win_amount is None:
             win_amount = self._infer_win(balance_before, balance_after, expected_bet)
-        bet_understated = outcome == "success" and self._bet_understated(balance_before, balance_after, expected_bet)
         if bet_understated:
             logger.error(
                 "spin %d: il saldo e' sceso di %s con una puntata creduta di %s: la puntata reale e' piu' alta.",
@@ -209,6 +219,12 @@ class SpinController:
             accounting_anomaly=accounting_anomaly, strategy_name=candidate.strategy_name,
             screenshot_after=screenshot_after, state_after=state_after, bet_understated=bet_understated,
         ))
+
+    def _reread_balance(self, context_provider) -> Optional[Decimal]:
+        result = context_provider()
+        if not result.success:
+            return None
+        return self._read_amount(result.data, "saldo")
 
     def _bet_understated(self, balance_before, balance_after, bet) -> bool:
         """Una vincita puo' solo RIDURRE il calo di saldo: se il saldo scende di piu' del doppio

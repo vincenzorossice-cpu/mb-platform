@@ -462,10 +462,27 @@ class TestBetUnderstated:
         verifier = MagicMock()
         verifier.verified_tap.return_value = _tap_outcome(True, balance_after=Decimal(balance_after), win_amount=win)
         controller, _, _, _ = _controller(locator=locator, verifier=verifier)
-        return controller.spin(
-            "dev", "pirots5", "ep", 1, MagicMock(return_value=_context_result(Decimal(balance_before))),
-            True, Decimal(bet),
-        ).data
+        # Prima lettura: il saldo "prima"; ogni lettura successiva (la rilettura) mostra il saldo "dopo".
+        provider = MagicMock(side_effect=[_context_result(Decimal(balance_before))]
+                             + [_context_result(Decimal(balance_after))] * 3)
+        return controller.spin("dev", "pirots5", "ep", 1, provider, True, Decimal(bet)).data
+
+    def test_a_misread_balance_is_corrected_by_a_second_reading(self):
+        locator = MagicMock()
+        locator.locate.return_value = _candidate()
+        verifier = MagicMock()
+        verifier.verified_tap.return_value = _tap_outcome(True, balance_after=Decimal("0.99"))   # lettura sbagliata
+        controller, _, _, _ = _controller(locator=locator, verifier=verifier)
+        provider = MagicMock(side_effect=[_context_result(Decimal("99.99")), _context_result(Decimal("99.89"))])
+
+        result = controller.spin("dev", "pirots5", "ep", 1, provider, True, Decimal("0.10")).data
+
+        assert not result.bet_understated
+        assert result.balance_after == Decimal("99.89")
+        assert result.win_amount == Decimal("0.00") or result.win_amount is None
+
+    def test_an_alarm_confirmed_by_the_second_reading_still_stops(self):
+        assert self._spin("90.00").bet_understated
 
     def test_a_balance_drop_far_above_the_believed_bet_is_flagged(self):
         assert self._spin("90.00").bet_understated          # calo 10.00 con puntata creduta 0.10

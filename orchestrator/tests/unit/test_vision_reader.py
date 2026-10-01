@@ -194,10 +194,97 @@ class TestVisionUnavailable:
 
         assert state["saldo"] == 49999.9 and state["posta"] == 0.3
 
-    def test_without_any_trusted_value_a_failing_vision_gives_unknown(self):
+    def test_a_field_the_vision_says_nothing_about_stays_with_the_ocr(self):
         vision = _vision({"saldo": None, "posta": 0.3})
         reader = ResilientOCRReader(_ocr([{"saldo": 50.0, "posta": None}]), vision)
 
         state = reader.read_slot_state("/a.png")
 
-        assert reader.prefer_vision and state["saldo"] is None and state["posta"] == 0.3
+        assert reader.prefer_vision and state["saldo"] == 50.0 and state["posta"] == 0.3
+
+
+class TestVisionTranscription:
+    def test_the_copied_text_is_interpreted_by_us(self, shot):
+        client = _client({"credit_text": "49 999.90", "bet_text": "0.10"})
+        assert VisionAmountReader(client).read(shot) == {"saldo": 49999.9, "posta": 0.1}
+
+    def test_non_breaking_spaces_and_currency_text_are_fine(self, shot):
+        client = _client({"credit_text": "49\u00a0999,90", "bet_text": "\u20ac0,10"})
+        assert VisionAmountReader(client).read(shot) == {"saldo": 49999.9, "posta": 0.1}
+
+    def test_the_old_numeric_keys_are_still_accepted(self, shot):
+        client = _client({"credit": 50000, "bet": 1})
+        assert VisionAmountReader(client).read(shot) == {"saldo": 50000.0, "posta": 1.0}
+
+    def test_text_that_is_not_a_number_gives_none(self, shot):
+        client = _client({"credit_text": "n/a", "bet_text": None})
+        assert VisionAmountReader(client).read(shot) == {"saldo": None, "posta": None}
+
+    def test_the_prompt_asks_for_a_literal_copy(self):
+        from orchestrator.modules.slot_ocr import vision_reader
+        assert "COPY" in vision_reader._SYSTEM_PROMPT and "credit_text" in vision_reader._SYSTEM_PROMPT
+
+
+class TestPerFieldArbitration:
+    def test_the_ocr_balance_survives_when_only_the_bet_is_unreadable(self):
+        vision = _vision({"saldo": 49.99, "posta": 0.1}, {"saldo": 49.99, "posta": 0.1})
+        ocr = _ocr([{"saldo": 49999.9, "posta": None}, {"saldo": 49999.8, "posta": None}])
+        reader = ResilientOCRReader(ocr, vision)
+
+        first = reader.read_slot_state("/a.png")
+        second = reader.read_slot_state("/b.png")
+
+        assert first["saldo"] == 49999.9 and first["posta"] == 0.1          # saldo all'OCR, puntata alla visione
+        assert second["saldo"] == 49999.8 and second["posta"] == 0.1
+        assert reader._vision_fields == {"posta"}
+
+    def test_ocr_dropping_the_thousands_loses_to_the_vision(self):
+        reader = ResilientOCRReader(_ocr([{"saldo": 50.0, "posta": 1.0}]), _vision({"saldo": 50000.0, "posta": 1.0}))
+        assert reader.read_slot_state("/a.png")["saldo"] == 50000.0
+
+    def test_a_disagreement_that_is_not_a_power_of_ten_goes_to_the_vision(self):
+        reader = ResilientOCRReader(_ocr([{"saldo": 120.0, "posta": 1.0}]), _vision({"saldo": 100.0, "posta": 1.0}))
+        assert reader.read_slot_state("/a.png")["saldo"] == 100.0
+
+    def test_a_vision_misread_is_discarded_in_favour_of_a_coherent_ocr(self):
+        vision = _vision({"saldo": 50000.0, "posta": None}, {"saldo": 49.99, "posta": None})
+        ocr = _ocr([{"saldo": 50.0, "posta": 1.0}, {"saldo": 49999.9, "posta": 1.0}])
+        reader = ResilientOCRReader(ocr, vision)
+        reader.read_slot_state("/a.png")                       # OCR 50 contro visione 50000: visione
+
+        state = reader.read_slot_state("/b.png")               # visione 49.99, OCR 49999.9
+
+        assert state["saldo"] == 49999.9
+
+    def test_neither_reading_coherent_with_the_history_gives_unknown(self):
+        vision = _vision({"saldo": 50000.0, "posta": None}, {"saldo": 49.99, "posta": None})
+        ocr = _ocr([{"saldo": 50.0, "posta": 1.0}, {"saldo": 4.9, "posta": 1.0}])
+        reader = ResilientOCRReader(ocr, vision)
+        reader.read_slot_state("/a.png")
+
+        assert reader.read_slot_state("/b.png")["saldo"] is None
+
+    def test_both_readers_agreeing_on_a_big_jump_are_believed(self):
+        vision = _vision({"saldo": 50000.0, "posta": None}, {"saldo": 20000.0, "posta": None})
+        ocr = _ocr([{"saldo": 50.0, "posta": 1.0}, {"saldo": 20000.0, "posta": 1.0}])
+        reader = ResilientOCRReader(ocr, vision)
+        reader.read_slot_state("/a.png")
+
+        assert reader.read_slot_state("/b.png")["saldo"] == 20000.0
+
+    def test_the_bet_is_not_subject_to_the_continuity_check(self):
+        vision = _vision({"saldo": 100.0, "posta": 0.3}, {"saldo": 100.0, "posta": 0.1})
+        ocr = _ocr([{"saldo": 100.0, "posta": None}, {"saldo": 100.0, "posta": None}])
+        reader = ResilientOCRReader(ocr, vision)
+        reader.read_slot_state("/a.png")
+
+        assert reader.read_slot_state("/b.png")["posta"] == 0.1
+
+    def test_an_ocr_only_balance_that_jumps_is_checked_with_the_vision(self):
+        vision = _vision({"saldo": 50000.0, "posta": 1.0}, {"saldo": 49999.0, "posta": 1.0})
+        ocr = _ocr([{"saldo": 50000.0, "posta": 1.0}, {"saldo": 49.9, "posta": 1.0}])
+        reader = ResilientOCRReader(ocr, vision)
+        reader.read_slot_state("/a.png")
+
+        assert reader.read_slot_state("/b.png")["saldo"] == 49999.0
+        assert vision.read.call_count == 2
