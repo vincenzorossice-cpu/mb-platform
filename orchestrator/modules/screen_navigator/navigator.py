@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import time
@@ -27,6 +28,19 @@ _SCROLL_FRACTION = 0.3
 _SYSTEM_BAR_FRACTION = 0.95
 # Differenza sotto la quale due screenshot sono "lo stesso schermo" (la pagina non si e' mossa).
 _PAGE_UNCHANGED_THRESHOLD = 0.01
+_MAX_APP_RESTORES = 3
+
+_BOOK_HINTS_PATH = os.path.join(os.path.dirname(__file__), "book_hints.json")
+
+
+def load_book_hints(book: str, path: str = _BOOK_HINTS_PATH) -> list[str]:
+    """Suggerimenti scritti a mano per un book (file JSON modificabile); lista vuota se il file o il book mancano."""
+    try:
+        with open(path, encoding="utf-8") as hints_file:
+            hints = json.load(hints_file).get((book or "").upper(), [])
+    except (OSError, ValueError, AttributeError):
+        return []
+    return [str(hint) for hint in hints] if isinstance(hints, list) else []
 
 
 # Frazioni (x, y) del centro di ciascuna delle 9 regioni della griglia 3x3 usata dalla visione.
@@ -57,6 +71,7 @@ class ScreenNavigator(ScreenNavigatorInterface):
 
     LOW_CONFIDENCE_THRESHOLD = 0.15
     MAX_HISTORY = 5
+    TAP_SETTLE_SECONDS = 1.0   # attesa prima di confrontare lo schermo dopo un tocco
     MAX_ELEMENTS_SUMMARY = 20
 
     def __init__(
@@ -69,6 +84,8 @@ class ScreenNavigator(ScreenNavigatorInterface):
         max_vision_steps: int = 5,
         region_refiner: Optional[Callable] = None,
         step_observer: Optional[Callable[[int, str], None]] = None,
+        app_guard: Optional[Callable[[str], bool]] = None,
+        app_restore: Optional[Callable[[str], object]] = None,
     ):
         # screen_reader e' tipizzato come la classe concreta ScreenReader (non
         # ScreenReaderInterface): read_screen(..., force_refresh=True) esiste solo
@@ -87,6 +104,10 @@ class ScreenNavigator(ScreenNavigatorInterface):
         self.region_refiner = region_refiner
         # step_observer(step, percorso_screenshot): chiamato con lo screenshot guardato a ogni passo con la visione.
         self.step_observer = step_observer
+        # app_guard(device) -> True se l'app attesa (es. Chrome) e' davanti; se no, app_restore(device) la riporta
+        # davanti senza chiamare il modello (al massimo _MAX_APP_RESTORES volte per navigazione).
+        self.app_guard = app_guard
+        self.app_restore = app_restore
         self._current_step = 0
         self.last_history: list[dict] = []   # azioni dell'ultima navigazione, leggibili anche dopo un fallimento
 
@@ -115,11 +136,20 @@ class ScreenNavigator(ScreenNavigatorInterface):
         recovery_attempted = False
 
         vision_stuck_tried = False
+        app_restores = 0
 
         for step in range(1, self.max_steps + 1):
             self._current_step = step
             use_vision = vision_mode or force_vision_next_step
             force_vision_next_step = False
+
+            if self.app_guard is not None and self.app_restore is not None and not self._app_in_front(device_id):
+                if app_restores < _MAX_APP_RESTORES:
+                    app_restores += 1
+                    logger.warning(f"Step {step}: l'app attesa non e' piu' davanti: la riporto davanti.")
+                    self.app_restore(device_id)
+                    self._record(history, step, "rientro nell'app", f"tentativo {app_restores}")
+                    time.sleep(2)
 
             screen_res = self.screen_reader.read_screen(device_id, force_refresh=True)
             if screen_res.success:
@@ -219,6 +249,13 @@ class ScreenNavigator(ScreenNavigatorInterface):
 
         return Result.fail(f"Goal not reached after {self.max_steps} steps", "GOAL_NOT_REACHED")
 
+    def _app_in_front(self, device_id: str) -> bool:
+        try:
+            return bool(self.app_guard(device_id))
+        except Exception as exc:
+            logger.warning("app_guard fallito (%s): lo considero a posto.", exc)
+            return True
+
     def _record(self, history: list[dict], step: int, action: str, target) -> None:
         """Registra l'azione: lo storico passato al modello e' limitato a MAX_HISTORY, quello completo no."""
         entry = {"step": step, "action": action, "target": target}
@@ -279,16 +316,20 @@ class ScreenNavigator(ScreenNavigatorInterface):
 
         raw_target = answers.get("target", {}).get("choice")
         target = None
+        refine_failed = False
         if isinstance(raw_target, dict):
             if raw_target.get("text"):
                 target = raw_target["text"]
             elif raw_target.get("region") in _REGION_FRACTIONS:
                 description = (answers.get("target_description") or {}).get("choice")
                 point = self._refine_region(description, shot.data, width, height)
-                if point is None:
-                    fx, fy = _REGION_FRACTIONS[raw_target["region"]]
-                    point = (round(width * fx), round(height * fy))
-                target = (int(point[0]), int(point[1]))
+                if point is None and self.region_refiner is not None and description:
+                    refine_failed = True   # niente tocco alla cieca al centro della regione
+                else:
+                    if point is None:
+                        fx, fy = _REGION_FRACTIONS[raw_target["region"]]
+                        point = (round(width * fx), round(height * fy))
+                    target = (int(point[0]), int(point[1]))
         elif isinstance(raw_target, str):
             target = raw_target
         decision = {
@@ -302,6 +343,8 @@ class ScreenNavigator(ScreenNavigatorInterface):
             and target[1] > height * _SYSTEM_BAR_FRACTION
         ):
             decision["rejected"] = "barra di sistema"
+        elif decision["action"] == "tap" and refine_failed:
+            decision["rejected"] = "punto non precisato"
         return Result.ok(decision)
 
     def _refine_region(self, description, screenshot_path: str, width: int, height: int):
@@ -310,7 +353,7 @@ class ScreenNavigator(ScreenNavigatorInterface):
         try:
             return self.region_refiner(description, screenshot_path, width, height)
         except Exception as exc:
-            logger.warning("Affinamento della regione fallito (%s): uso il centro della regione.", exc)
+            logger.warning("Affinamento della regione fallito (%s).", exc)
             return None
 
     def _apply_demo_mode(self, goal: str) -> str:
@@ -342,11 +385,14 @@ class ScreenNavigator(ScreenNavigatorInterface):
     def _execute(self, device_id: str, action: str, target, answers: dict) -> str:
         """Esegue l'azione. Un fallimento viene loggato ma non interrompe il loop:
         il prossimo giro rilegge lo schermo e lascia ripianificare il Decision Engine."""
+        note = ""
         if action == "tap":
+            before = self._screenshot_path(device_id)
             if isinstance(target, tuple):
                 res = self.touch_injector.tap_coordinates(device_id, target[0], target[1])
             else:
                 res = self.touch_injector.tap_element(device_id, target)
+            note = self._tap_effect_note(device_id, before)
         elif action == "input_text":
             text = answers.get("text_to_type", {}).get("choice", "")
             res = self.touch_injector.input_text(device_id, text, field_hint=target)
@@ -361,6 +407,21 @@ class ScreenNavigator(ScreenNavigatorInterface):
 
         if not res.success:
             logger.warning(f"Azione '{action}' su '{target}' fallita: {res.error}")
+        return note
+
+    def _tap_effect_note(self, device_id: str, before: str) -> str:
+        """Confronto locale (0 token) tra lo schermo prima e dopo il tocco: l'esito di tap_element si basa sugli
+        elementi letti e su una pagina web di Chrome non e' affidabile."""
+        if not before:
+            return ""
+        time.sleep(self.TAP_SETTLE_SECONDS)
+        after = self._screenshot_path(device_id)
+        if not after:
+            return ""
+        from orchestrator.modules.slot_autopilot.frame_diff import diff_score
+        diff = diff_score(before, after)
+        if diff.success and diff.data < _PAGE_UNCHANGED_THRESHOLD:
+            return "schermo invariato: il tocco non ha fatto nulla"
         return ""
 
     def _scroll(self, device_id: str, target) -> str:
@@ -419,6 +480,9 @@ class ScreenNavigator(ScreenNavigatorInterface):
         hints = self._goal_hints(goal)
         if hints:
             parts.append(hints)
+        book_hints = load_book_hints(book)
+        if book_hints:
+            parts.append(f"Notes about {book}:\n" + "\n".join(f"- {hint}" for hint in book_hints))
         parts.append(f"Book: {book}\nGoal: {goal}\nStep: {step}")
         parts.append(f"Previous actions: {self._format_history(history)}")
         parts.append(f"Current screen elements:\n{elements_block}")

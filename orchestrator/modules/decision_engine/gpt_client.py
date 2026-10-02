@@ -100,6 +100,7 @@ class GPTDecisionClient(DecisionEngineClientInterface):
         # Ultima risposta riuscita di ask / ask_with_image: stessa richiesta identica -> niente nuova chiamata.
         self._cached_text = None
         self._cached_image = None
+        self._usage_by_purpose = {}   # scopo (visione, griglia icone, ...) -> numero di chiamate
         self._usage = {}   # modello -> {"calls", "in", "out", "cost"} (cost None = prezzo ignoto)
 
     def invalidate_cache(self) -> None:
@@ -117,6 +118,7 @@ class GPTDecisionClient(DecisionEngineClientInterface):
             tokens_out = _number(getattr(usage, "completion_tokens", 0))
             prices = _price_per_million(model)
             cost = None if prices is None else (tokens_in * prices[0] + tokens_out * prices[1]) / 1_000_000
+            self._usage_by_purpose[purpose or "decisione"] = self._usage_by_purpose.get(purpose or "decisione", 0) + 1
             entry = self._usage.setdefault(model, {"calls": 0, "in": 0, "out": 0, "cost": 0.0})
             entry["calls"] += 1
             entry["in"] += tokens_in
@@ -137,7 +139,8 @@ class GPTDecisionClient(DecisionEngineClientInterface):
         for model, entry in sorted(self._usage.items()):
             cost = "costo n/d" if entry["cost"] is None else f"costo stimato ~${entry['cost']:.4f}"
             parts.append(f"{model}: {entry['calls']} chiamate, {entry['in']} token in, {entry['out']} token out, {cost}")
-        return "GPT - " + "; ".join(parts)
+        by_purpose = ", ".join(f"{name} {calls}" for name, calls in sorted(self._usage_by_purpose.items()))
+        return "GPT - " + "; ".join(parts) + (f" (chiamate per scopo: {by_purpose})" if by_purpose else "")
 
     def _vision_max_tokens(self) -> int:
         return _VISION_MAX_TOKENS_COMPACT if self.model.startswith("gpt-6") else self._VISION_MAX_TOKENS
@@ -425,6 +428,13 @@ class GPTDecisionClient(DecisionEngineClientInterface):
             "page) and the item is not there, look for a button such as 'Carica altro', 'Mostra altro' or "
             "'Vedi altre' below the last box and tap it, then continue from the newly loaded boxes "
             "(do not restart from the top).",
+
+            "'Previous actions' may carry a note after a tap. If it says the screen did not change, that "
+            "element is not tappable: do not repeat it, change route. In demo mode never tap a game's tile "
+            "or title (it starts the real-money game): use an info 'i' icon or a 'Prova' button. A "
+            "notification from another app (Telegram, etc.) is not part of the page: never tap it and keep "
+            "operating. In 'target_description' give the visible text and position of the element "
+            "(for example 'round i icon, bottom-right inside the Turbo Storm Typhoon box').",
 
             "The goal may have several phases in order. Use 'Previous actions' to know which phase you "
             "are in and never go back to a phase already completed. Answer 'done' ONLY when the final "

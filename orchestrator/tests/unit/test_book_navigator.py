@@ -451,3 +451,38 @@ class TestNavigateToMyBets(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestForegroundApp:
+    def _navigator(self):
+        from orchestrator.modules.book_navigator.navigator import BookNavigator
+        return BookNavigator(screen_reader=MagicMock(), touch_injector=MagicMock())
+
+    def _run(self, focus):
+        from unittest.mock import patch
+        out = f"  mCurrentFocus={focus}\n"
+        return patch("orchestrator.modules.book_navigator.navigator.subprocess.run",
+                     return_value=MagicMock(stdout=out))
+
+    def test_package_is_parsed_from_the_focused_window(self):
+        with self._run("Window{abc u0 com.android.chrome/com.google.android.apps.chrome.Main}"):
+            assert self._navigator().foreground_package("D") == "com.android.chrome"
+
+    def test_unknown_focus_counts_as_in_front(self):
+        with self._run("Window{abc u0 NotificationShade}"):
+            nav = self._navigator()
+            assert nav.foreground_package("D") is None
+            assert nav.is_app_in_front("D", "com.android.chrome")
+
+    def test_another_app_is_not_in_front_but_system_ui_is_ignored(self):
+        with self._run("Window{abc u0 com.sec.android.app.launcher/com.sec.Launcher}"):
+            assert not self._navigator().is_app_in_front("D", "com.android.chrome")
+        with self._run("Window{abc u0 com.android.systemui/com.android.systemui.Main}"):
+            assert self._navigator().is_app_in_front("D", "com.android.chrome")
+
+    def test_bring_to_front_launches_the_package(self):
+        from unittest.mock import patch
+        with patch("orchestrator.modules.book_navigator.navigator.subprocess.run") as run, \
+                patch("orchestrator.modules.book_navigator.navigator.time.sleep"):
+            assert self._navigator().bring_to_front("D", "com.android.chrome").success
+        assert run.call_args[0][0][:6] == ["adb", "-s", "D", "shell", "monkey", "-p"]

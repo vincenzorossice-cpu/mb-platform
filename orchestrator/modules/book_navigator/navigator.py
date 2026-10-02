@@ -1,3 +1,4 @@
+import re
 import subprocess
 import time
 from typing import Optional
@@ -110,6 +111,38 @@ class BookNavigator(BookNavigatorInterface):
     # --------------------------------------------------------
     # PUBLIC: open_chrome
     # --------------------------------------------------------
+
+    def foreground_package(self, device_id: str) -> Optional[str]:
+        """Pacchetto dell'app con il focus (da 'dumpsys window'), None se non determinabile.
+        Nessuna AI: serve a sapere se il telefono e' ancora nel browser."""
+        try:
+            out = subprocess.run(
+                ["adb", "-s", device_id, "shell", "dumpsys", "window"],
+                capture_output=True, text=True, timeout=10,
+            ).stdout
+        except Exception:
+            return None
+        match = re.search(r"mCurrentFocus=Window\{\S+ \S+ ([\w.]+)/", out or "")
+        return match.group(1) if match else None
+
+    def is_app_in_front(self, device_id: str, package: str) -> bool:
+        """True se `package` e' davanti, o se non si riesce a dire (mai un falso allarme); la UI di sistema
+        (notifiche, barra) non conta come uscita dall'app."""
+        current = self.foreground_package(device_id)
+        return current is None or current in (package, "com.android.systemui")
+
+    def bring_to_front(self, device_id: str, package: str) -> Result[bool]:
+        """Riporta davanti un'app (Chrome riappare sull'ultima pagina aperta)."""
+        try:
+            subprocess.run(
+                ["adb", "-s", device_id, "shell", "monkey", "-p", package,
+                 "-c", "android.intent.category.LAUNCHER", "1"],
+                capture_output=True, text=True, timeout=10,
+            )
+            time.sleep(2)
+            return Result.ok(True)
+        except Exception as e:
+            return Result.fail(f"Cannot bring {package} to front: {e}", "BRING_TO_FRONT_FAILED")
 
     def open_chrome(self, device_id: str, url: str) -> Result[bool]:
         """Apre Chrome via ADB intent."""

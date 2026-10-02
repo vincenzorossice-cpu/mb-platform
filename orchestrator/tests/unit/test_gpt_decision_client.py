@@ -610,3 +610,17 @@ class TestNavigationVision:
             result = sol.ask_with_image(screenshot_path, "Goal: g", NAVIGATION_QUESTIONS, 540, 1200)
 
         assert not result.success and result.error_code == GPTDecisionClient.GPT_DECISION_PARSE_ERROR
+
+    def test_navigation_prompt_covers_notes_demo_tiles_and_notifications(self, client, screenshot_path):
+        with patch.object(client.client.chat.completions, "create", return_value=_mock_completion(json.dumps(self.NAV_PAYLOAD))) as create:
+            client.ask_with_image(screenshot_path, "Goal: g", NAVIGATION_QUESTIONS, 540, 1200)
+
+        system = create.call_args.kwargs["messages"][0]["content"]
+        assert "did not change" in system and "never tap a game's tile" in system and "Telegram" in system
+
+    def test_usage_summary_counts_calls_by_purpose(self, client):
+        client.record_usage(MagicMock(usage=MagicMock(prompt_tokens=1, completion_tokens=1)), "visione")
+        client.record_usage(MagicMock(usage=MagicMock(prompt_tokens=1, completion_tokens=1)), "griglia icone")
+        client.record_usage(MagicMock(usage=MagicMock(prompt_tokens=1, completion_tokens=1)), "griglia icone")
+
+        assert "griglia icone 2" in client.usage_summary() and "visione 1" in client.usage_summary()

@@ -1,3 +1,4 @@
+import pytest
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -7,6 +8,11 @@ from orchestrator.modules.screen_navigator.navigator import ScreenNavigator
 
 
 DEVICE = "emulator-5554"
+
+
+@pytest.fixture(autouse=True)
+def _no_tap_settle_delay(monkeypatch):
+    monkeypatch.setattr(ScreenNavigator, "TAP_SETTLE_SECONDS", 0)
 
 
 def _make_element(text="OK", bounds=None, resource_id=None):
@@ -459,7 +465,7 @@ class TestVisionMode:
         refiner.assert_called_once_with("coin stack icon", screenshot, 1000, 2000)
         touch.tap_coordinates.assert_called_once_with(DEVICE, 512, 1777)
 
-    def test_a_failing_refiner_falls_back_to_the_centre_of_the_region(self, screenshot):
+    def test_a_failing_refiner_drops_the_tap_instead_of_hitting_the_region_centre(self, screenshot):
         reader, touch, client = _vision_setup(screenshot)
         client.ask_with_image.side_effect = [
             _vision_answers(region="center", description="x"), _vision_answers("done"),
@@ -467,6 +473,17 @@ class TestVisionMode:
         navigator = ScreenNavigator(reader, touch, client, region_refiner=MagicMock(side_effect=RuntimeError("boom")))
 
         navigator.navigate(DEVICE, goal="g", vision_mode=True)
+
+        touch.tap_coordinates.assert_not_called()
+        assert navigator.last_history[0]["action"] == "tap scartato"
+        assert "punto non precisato" in navigator.last_history[0]["target"]
+
+    def test_without_a_description_the_region_centre_is_still_used(self, screenshot):
+        reader, touch, client = _vision_setup(screenshot)
+        client.ask_with_image.side_effect = [_vision_answers(region="center"), _vision_answers("done")]
+
+        ScreenNavigator(reader, touch, client, region_refiner=MagicMock(return_value=None)).navigate(
+            DEVICE, goal="g", vision_mode=True)
 
         touch.tap_coordinates.assert_called_once_with(DEVICE, 500, 1000)
 
@@ -592,7 +609,8 @@ class TestLastHistory:
         result = navigator.navigate(DEVICE, goal="g", vision_mode=True)
 
         assert not result.success
-        assert [(h["action"], h["target"]) for h in navigator.last_history] == [("tap", "Promo"), ("tap", "Attiva")]
+        assert [(h["action"], h["target"].split(" (")[0]) for h in navigator.last_history] == [
+            ("tap", "Promo"), ("tap", "Attiva")]
 
 
 class TestGentleScroll:
@@ -680,3 +698,81 @@ class TestStepObserverAndReasoning:
             _make_navigator(reader, touch, client).navigate(DEVICE, goal="g", vision_mode=True)
 
         assert "sono dentro la slot" in caplog.text
+
+
+class TestTapEffectNote:
+    def test_an_unchanged_screen_after_a_tap_is_reported(self, screenshot):
+        reader, touch, client = _vision_setup(screenshot)
+        client.ask_with_image.side_effect = [_vision_answers(text="Slot"), _vision_answers("done")]
+        navigator = _make_navigator(reader, touch, client)
+
+        navigator.navigate(DEVICE, goal="g", vision_mode=True)
+
+        assert "schermo invariato" in navigator.last_history[0]["target"]
+
+    def test_a_changed_screen_has_no_note_even_if_tap_element_says_no_effect(self, screenshot, tmp_path):
+        reader, touch, client = _vision_setup(screenshot)
+        touch.tap_element.return_value = Result.fail("Tap had no effect", "TAP_NO_EFFECT")
+        other = tmp_path / "changed.png"
+        Image.effect_noise((1000, 2000), 80).save(other)
+        reader._screenshot.side_effect = [Result.ok(screenshot), Result.ok(screenshot), Result.ok(str(other)),
+                                          Result.ok(str(other))]
+        client.ask_with_image.side_effect = [_vision_answers(text="Slot"), _vision_answers("done")]
+        navigator = _make_navigator(reader, touch, client)
+
+        navigator.navigate(DEVICE, goal="g", vision_mode=True)
+
+        assert navigator.last_history[0]["target"] == "Slot"
+
+
+class TestAppGuard:
+    def test_a_lost_app_is_restored_without_asking_the_model(self, screenshot):
+        reader, touch, client = _vision_setup(screenshot)
+        client.ask_with_image.side_effect = [_vision_answers("done")]
+        guard = MagicMock(side_effect=[False, True])
+        restore = MagicMock()
+        navigator = ScreenNavigator(reader, touch, client, app_guard=guard, app_restore=restore)
+
+        with patch("orchestrator.modules.screen_navigator.navigator.time.sleep"):
+            result = navigator.navigate(DEVICE, goal="g", vision_mode=True)
+
+        assert result.success
+        restore.assert_called_once_with(DEVICE)
+        assert navigator.last_history[0]["action"] == "rientro nell'app"
+        assert client.ask_with_image.call_count == 1
+
+    def test_restores_are_capped(self, screenshot):
+        reader, touch, client = _vision_setup(screenshot)
+        client.ask_with_image.side_effect = [_vision_answers("wait")] * 6 + [_vision_answers("done")]
+        restore = MagicMock()
+        navigator = ScreenNavigator(reader, touch, client, app_guard=lambda d: False, app_restore=restore, max_steps=6)
+
+        with patch("orchestrator.modules.screen_navigator.navigator.time.sleep"):
+            navigator.navigate(DEVICE, goal="g", vision_mode=True)
+
+        assert restore.call_count == 3
+
+    def test_a_failing_guard_is_treated_as_fine(self, screenshot):
+        reader, touch, client = _vision_setup(screenshot)
+        client.ask_with_image.side_effect = [_vision_answers("done")]
+        restore = MagicMock()
+        navigator = ScreenNavigator(reader, touch, client, app_guard=MagicMock(side_effect=OSError), app_restore=restore)
+
+        assert navigator.navigate(DEVICE, goal="g", vision_mode=True).success
+        restore.assert_not_called()
+
+
+class TestBookHints:
+    def test_sisal_hints_reach_the_state_and_forbid_the_game_tile(self):
+        state = _make_navigator()._build_state("SISAL", "g", 1, [], ["x"])
+        assert "Notes about SISAL" in state and "NEVER tap the game's box" in state and "'i'" in state
+
+    def test_unknown_book_has_no_notes(self):
+        assert "Notes about" not in _make_navigator()._build_state("ALTROBOOK", "g", 1, [], ["x"])
+
+    def test_missing_or_broken_file_is_tolerated(self, tmp_path):
+        from orchestrator.modules.screen_navigator.navigator import load_book_hints
+        assert load_book_hints("SISAL", str(tmp_path / "nope.json")) == []
+        broken = tmp_path / "b.json"
+        broken.write_text("{not json")
+        assert load_book_hints("SISAL", str(broken)) == []

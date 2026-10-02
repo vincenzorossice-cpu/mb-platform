@@ -21,6 +21,7 @@ import time
 
 SISAL_PROMOTIONS_URL = "https://www.sisal.it/bonus/promozioni"
 EXPECTED_MODEL = "gpt-6.1-sol"
+CHROME_PACKAGE = "com.android.chrome"
 LOGS_DIR = "logs"
 
 
@@ -33,6 +34,8 @@ def build_goal(promo_name: str, slot_name: str) -> str:
         f"non andare avanti finche' questo testo non e' leggibile. "
         f"FASE 4: trova la slot '{slot_name}' e tocca il suo nome. "
         f"FASE 5: nella pagina della slot tocca 'Prova' (modalita' demo, for fun), MAI 'Gioca'. "
+        f"Dopo l'attivazione preferisci la pagina della promozione: il nome sottolineato della slot. "
+        f"Non toccare mai il box o il titolo del gioco nella lobby (apre la slot reale). "
         f"Rispondi 'done' SOLO quando sei dentro la slot in demo, cioe' vedi il gioco caricato "
         f"(rulli e pulsante di spin). Non giocare nessuno spin."
     )
@@ -117,6 +120,8 @@ def run_navigation(args: argparse.Namespace) -> bool:
     navigator = ScreenNavigator(
         screen_reader=screen_reader, touch_injector=touch_injector, decision_engine_client=client,
         region_refiner=build_region_refiner(client), max_steps=args.max_steps, step_observer=step_saver,
+        app_guard=lambda device: book_navigator.is_app_in_front(device, CHROME_PACKAGE),
+        app_restore=lambda device: book_navigator.bring_to_front(device, CHROME_PACKAGE),
     )
 
     print(f"Apro {args.url} su {args.device_id}...")
