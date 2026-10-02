@@ -80,3 +80,12 @@ def test_burst_safety_check_defaults_and_validation():
 
 def test_floor_probe_is_on_by_default():
     assert _config().floor_probe_enabled is True and _config().validate().success
+
+
+def test_calm_check_defaults_and_validation():
+    config = AutoPilotConfig(device_id="d", slot_name="s", target_played_amount=Decimal("30"))
+    assert config.spin_calm_check is True and config.spin_calm_max_wait_seconds == 30.0
+    assert config.validate().success
+
+    bad = AutoPilotConfig(device_id="d", slot_name="s", target_played_amount=Decimal("30"), spin_calm_max_wait_seconds=0)
+    assert bad.validate().error_code == "CONFIG_INVALID"

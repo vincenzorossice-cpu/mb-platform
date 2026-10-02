@@ -41,6 +41,7 @@ class StabilityResult:
     screenshot_path: str
     stable: bool
     waited_seconds: float
+    captures: int = 0   # screenshot scattati (il costo di ciascuno e' waited_seconds / captures)
 
 
 def wait_until_stable(
@@ -56,17 +57,19 @@ def wait_until_stable(
     if not first.success:
         return Result.fail(first.error, first.error_code)
     previous_path = first.data
+    captures = 1
 
     while True:
         elapsed = time.monotonic() - start
         if elapsed >= max_wait_seconds:
-            return Result.ok(StabilityResult(previous_path, stable=False, waited_seconds=elapsed))
+            return Result.ok(StabilityResult(previous_path, stable=False, waited_seconds=elapsed, captures=captures))
 
         time.sleep(poll_interval)
         next_result = capture_fn()
         if not next_result.success:
             return Result.fail(next_result.error, next_result.error_code)
         next_path = next_result.data
+        captures += 1
 
         score_result = diff_score(previous_path, next_path, region)
         if not score_result.success:
@@ -74,9 +77,9 @@ def wait_until_stable(
 
         elapsed = time.monotonic() - start
         if score_result.data < stable_threshold:
-            return Result.ok(StabilityResult(next_path, stable=True, waited_seconds=elapsed))
+            return Result.ok(StabilityResult(next_path, stable=True, waited_seconds=elapsed, captures=captures))
 
         if elapsed >= max_wait_seconds:
-            return Result.ok(StabilityResult(next_path, stable=False, waited_seconds=elapsed))
+            return Result.ok(StabilityResult(next_path, stable=False, waited_seconds=elapsed, captures=captures))
 
         previous_path = next_path

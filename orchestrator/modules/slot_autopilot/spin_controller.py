@@ -98,6 +98,44 @@ class SpinController:
             ))
         candidate = locate_result.data
 
+        if self.config.spin_calm_check and not candidate.verified and context.screenshot_path:
+            # Mai toccare uno schermo che si muove (animazione di vincita, saldo che si aggiorna): il tocco
+            # andrebbe perso e ritoccare alla cieca rischia due spin.
+            calm = self.verifier.wait_until_calm(
+                device_id, context.screenshot_path, self.config.spin_calm_max_wait_seconds,
+            )
+            if calm.success and not calm.data.calm:
+                violated = "UNSAFE_SCREEN_STATE"
+                logger.info("spin %d: lo schermo non si ferma (animazione in corso?): non tocco.", spin_index)
+                self._log_step(
+                    episode_id, spin_index, slot_name, device_id, None, None,
+                    balance_before, balance_before, outcome="blocked", notes=violated,
+                )
+                return Result.ok(SpinResult(
+                    slot_name=slot_name, spin_index=spin_index, bet_amount=expected_bet,
+                    balance_before=balance_before, balance_after=balance_before, win_amount=None,
+                    verified=False, attempts=0, outcome="blocked", violated_invariant=violated,
+                ))
+            if calm.success and calm.data.waited:
+                # Si e' aspettato: il saldo letto prima e' vecchio (una vincita puo' essere stata accreditata
+                # nel frattempo e finirebbe nello spin sbagliato). Si rilegge.
+                fresh = context_provider()
+                if fresh.success:
+                    context = fresh.data
+                    balance_before = self._read_amount(context, "saldo")
+                    violated = self._check_invariants(min_bet_verified, balance_before, expected_bet, context)
+                    if violated is not None:
+                        logger.info("spin %d bloccato da invariante di sicurezza: %s", spin_index, violated)
+                        self._log_step(
+                            episode_id, spin_index, slot_name, device_id, None, None,
+                            balance_before, balance_before, outcome="blocked", notes=violated,
+                        )
+                        return Result.ok(SpinResult(
+                            slot_name=slot_name, spin_index=spin_index, bet_amount=expected_bet,
+                            balance_before=balance_before, balance_after=balance_before, win_amount=None,
+                            verified=False, attempts=0, outcome="blocked", violated_invariant=violated,
+                        ))
+
         attempts = 0
         screenshot_after = None
         state_after = None
@@ -159,6 +197,31 @@ class SpinController:
                 if tap_result.data.verified:
                     verified = True
                     self.locator.record_success(candidate.strategy_name, _ELEMENT)
+                    break
+                if (
+                    self.config.spin_calm_check and tap_result.data.outcome == "unexpected_change"
+                    and self.locator.is_trusted_strategy(candidate.strategy_name)
+                ):
+                    # Schermo cambiato ma saldo uguale: o un'animazione (il tocco e' andato perso) o uno
+                    # spin partito con il saldo non ancora scalato. Mai ritoccare alla cieca: si aspetta che
+                    # lo schermo si fermi e si rilegge il saldo.
+                    settled = self._settle_after_unexpected(
+                        device_id, tap_result.data, context_provider, balance_before,
+                    )
+                    if settled is not None:
+                        balance_after, screenshot_after, state_after = settled
+                        balance_after_read = True
+                        win_amount = None
+                        verified = True
+                        self.locator.record_success(candidate.strategy_name, _ELEMENT)
+                        logger.info("spin %d: addebito visto dopo l'attesa (saldo %s -> %s): lo spin e' partito.",
+                                    spin_index, balance_before, balance_after)
+                    else:
+                        logger.warning(
+                            "spin %d: schermo cambiato ma nessun addebito dopo l'attesa: non ritocco "
+                            "(potrebbe essere un'animazione); il prossimo spin riparte da uno schermo fermo.",
+                            spin_index,
+                        )
                     break
                 if not self.locator.is_trusted_strategy(candidate.strategy_name):
                     # Coordinata indovinata (es. da GPT) che non fa partire lo spin:
@@ -243,6 +306,19 @@ class SpinController:
         if balance_before is None or balance_after is None or bet is None or bet <= 0:
             return False
         return (balance_before - balance_after) > 2 * bet + self.config.accounting_tolerance
+
+    def _settle_after_unexpected(self, device_id: str, outcome, context_provider, balance_before):
+        """(saldo, screenshot, stato) dopo l'attesa se il saldo e' SCESO (c'e' stato un addebito: lo spin e'
+        partito), altrimenti None. Un saldo uguale o salito non prova nulla (puo' essere una vincita
+        accreditata): in quel caso non si ritocca."""
+        self.verifier.wait_until_calm(device_id, outcome.screenshot_after, self.config.spin_calm_max_wait_seconds)
+        fresh = context_provider()
+        if not fresh.success:
+            return None
+        balance_now = self._read_amount(fresh.data, "saldo")
+        if balance_now is None or balance_before is None or balance_now >= balance_before:
+            return None
+        return balance_now, fresh.data.screenshot_path, fresh.data.slot_ocr_state
 
     @staticmethod
     def _balance_win(balance_before, balance_after, bet) -> Optional[Decimal]:

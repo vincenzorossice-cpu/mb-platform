@@ -399,3 +399,76 @@ class TestTimingBreakdown:
 
         line = next(r.getMessage() for r in caplog.records if "esito=" in r.getMessage())
         assert "attesa schermo fermo" in line and "lettura" in line
+
+
+class TestWaitUntilCalm:
+    @staticmethod
+    def _image(tmp_path, name, color):
+        from PIL import Image
+        path = tmp_path / name
+        Image.new("RGB", (64, 64), color).save(path)
+        return str(path)
+
+    def _verifier(self, tmp_path, colors):
+        """Un lettore finto che scatta schermate dei colori dati, nell'ordine (poi ripete l'ultimo)."""
+        captures = {"n": 0}
+
+        def screenshot(device_id):
+            color = colors[min(captures["n"], len(colors) - 1)]
+            captures["n"] += 1
+            return Result.ok(self._image(tmp_path, f"cap_{captures['n']}.png", color))
+
+        reader = MagicMock()
+        reader._screenshot.side_effect = screenshot
+        device = FakeSlotDevice(tmp_path)
+        ocr = _RegionAwareOcr({"saldo": 10.0, "posta": 1.0}, FULL)
+        return ActionVerifier(fake_touch_injector(device), reader, ocr, _config())
+
+    def test_a_screen_equal_to_the_reference_is_calm_at_once(self, tmp_path):
+        verifier = self._verifier(tmp_path, ["white"])
+        reference = self._image(tmp_path, "ref.png", "white")
+
+        result = verifier.wait_until_calm("dev", reference, 5.0)
+
+        assert result.success and result.data.calm and not result.data.waited
+        assert verifier.screen_reader._screenshot.call_count == 1       # UNO screenshot, nessun ciclo
+
+    def test_a_changed_screen_that_then_settles_is_waited_for(self, tmp_path):
+        verifier = self._verifier(tmp_path, ["black"])        # diverso dal riferimento, poi resta fermo
+        reference = self._image(tmp_path, "ref.png", "white")
+
+        result = verifier.wait_until_calm("dev", reference, 5.0)
+
+        assert result.success and result.data.calm and result.data.waited
+
+    def test_a_screen_that_never_settles_reports_it(self, tmp_path):
+        verifier = self._verifier(tmp_path, ["black", "white"] * 40)       # cambia a ogni scatto
+        reference = self._image(tmp_path, "ref.png", "gray")
+
+        result = verifier.wait_until_calm("dev", reference, 0.5)
+
+        assert result.success and not result.data.calm and result.data.waited
+
+    def test_a_screenshot_failure_is_reported(self, tmp_path):
+        verifier = self._verifier(tmp_path, ["white"])
+        verifier.screen_reader._screenshot.side_effect = lambda device: Result.fail("adb down", "ADB_TIMEOUT")
+
+        result = verifier.wait_until_calm("dev", self._image(tmp_path, "ref.png", "white"), 1.0)
+
+        assert not result.success and result.error_code == "ADB_TIMEOUT"
+
+    def test_the_outcome_line_reports_the_number_of_captures(self, tmp_path, caplog):
+        device = FakeSlotDevice(tmp_path, balance=Decimal("10.00"), bet=Decimal("1.00"))
+        device.add_element("spin", 100, 100, lambda d: setattr(d, "balance", Decimal("9.00")))
+        ocr = _RegionAwareOcr({"saldo": 9.0, "posta": 1.0}, FULL)
+        verifier = ActionVerifier(fake_touch_injector(device), fake_screen_reader(device), ocr, _config())
+
+        with caplog.at_level("INFO"):
+            verifier.verified_tap(
+                "dev", 100, 100, Expectation(kind="balance_changed"),
+                screenshot_before=verifier.screen_reader._screenshot("dev").data,
+                state_before={"saldo": 10.0, "posta": 1.0},
+            )
+
+        line = next(r.getMessage() for r in caplog.records if "esito=" in r.getMessage())
+        assert "scatti" in line

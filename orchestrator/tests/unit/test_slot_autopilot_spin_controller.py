@@ -12,6 +12,7 @@ def _config(**overrides) -> AutoPilotConfig:
     defaults = dict(
         device_id="dev", slot_name="pirots5", target_played_amount=Decimal("30.00"),
         max_spin_attempts_per_step=3, accounting_tolerance=Decimal("0.01"),
+        spin_calm_check=False,   # ogni test lo accende se serve (verifier finto: non c'e' uno schermo vero)
     )
     defaults.update(overrides)
     return AutoPilotConfig(**defaults)
@@ -539,3 +540,129 @@ class TestBetUnderstated:
                                  MagicMock(return_value=_context_result(Decimal("100.00"))), True, Decimal("0.10"))
 
         assert not result.data.bet_understated
+
+
+from orchestrator.modules.slot_autopilot.verifier import CalmResult
+
+
+def _calm(calm=True, waited=False, path="/tmp/calm.png"):
+    return Result.ok(CalmResult(screenshot_path=path, calm=calm, waited=waited, seconds=0.5))
+
+
+def _unexpected(balance_before="4999.80", balance_after="4999.80"):
+    return Result.ok(TapOutcome(
+        tapped_coords=(540, 2000), verified=False, screenshot_before="/tmp/a.png", screenshot_after="/tmp/b.png",
+        diff_score=0.145, balance_before=Decimal(balance_before), balance_after=Decimal(balance_after),
+        bet_before=Decimal("0.20"), bet_after=Decimal("0.20"), screen_state_before="idle",
+        screen_state_after="idle", outcome="unexpected_change",
+    ))
+
+
+class TestCalmBeforeTapping:
+    def _spin(self, calm_results, tap_results, contexts, strategy="profile", expected_bet="0.20"):
+        locator = MagicMock()
+        locator.locate.return_value = _candidate(strategy)
+        locator.is_trusted_strategy.return_value = strategy in ("profile", "memory")
+        verifier = MagicMock()
+        verifier.wait_until_calm.side_effect = list(calm_results)
+        verifier.verified_tap.side_effect = list(tap_results)
+        controller, _, _, _ = _controller(
+            locator=locator, verifier=verifier, config=_config(spin_calm_check=True, max_spin_attempts_per_step=3),
+        )
+        provider = MagicMock(side_effect=list(contexts))
+        result = controller.spin("dev", "pirots5", "ep", 1, provider, True, Decimal(expected_bet))
+        return result, verifier, provider
+
+    def test_a_calm_screen_is_tapped_at_once_without_a_new_reading(self):
+        result, verifier, provider = self._spin(
+            [_calm()], [_tap_outcome(True, balance_after=Decimal("99.80"))], [_context_result(Decimal("100.00"))],
+        )
+
+        assert result.data.outcome == "success" and result.data.attempts == 1
+        assert provider.call_count == 1                           # nessuna rilettura: niente da aggiornare
+        verifier.wait_until_calm.assert_called_once()
+
+    def test_a_moving_screen_is_waited_for_and_the_balance_is_read_again(self):
+        """Scenario dello spin 2 di Pirots5: la vincita viene accreditata mentre si aspetta."""
+        result, verifier, provider = self._spin(
+            [_calm(waited=True)],
+            [_tap_outcome(True, balance_after=Decimal("4999.93"))],
+            [_context_result(Decimal("4999.80")), _context_result(Decimal("5000.13"))],   # accreditato nell'attesa
+            expected_bet="0.20",
+        )
+
+        assert provider.call_count == 2
+        assert result.data.balance_before == Decimal("5000.13")
+        assert result.data.win_amount is None            # 5000.13 -> 4999.93 = solo la puntata: nessuna vincita
+
+    def test_a_screen_that_never_calms_down_blocks_the_spin_without_tapping(self):
+        result, verifier, _ = self._spin([_calm(calm=False, waited=True)], [], [_context_result(Decimal("100"))])
+
+        assert result.data.outcome == "blocked" and result.data.violated_invariant == "UNSAFE_SCREEN_STATE"
+        verifier.verified_tap.assert_not_called()
+
+    def test_the_invariants_are_checked_again_on_the_fresh_reading(self):
+        result, verifier, _ = self._spin(
+            [_calm(waited=True)], [],
+            [_context_result(Decimal("100")), _context_result(Decimal("0.05"))],      # saldo ora insufficiente
+        )
+
+        assert result.data.violated_invariant == "INSUFFICIENT_BALANCE"
+        verifier.verified_tap.assert_not_called()
+
+    def test_with_the_check_off_nothing_is_added(self):
+        locator = MagicMock()
+        locator.locate.return_value = _candidate()
+        verifier = MagicMock()
+        verifier.verified_tap.return_value = _tap_outcome(True, balance_after=Decimal("99.90"))
+        controller, _, _, _ = _controller(locator=locator, verifier=verifier)    # spin_calm_check=False
+
+        controller.spin("dev", "pirots5", "ep", 1, MagicMock(return_value=_context_result(Decimal("100"))), True,
+                        Decimal("0.10"))
+
+        verifier.wait_until_calm.assert_not_called()
+
+
+class TestNoBlindRetapAfterAnUnexpectedChange:
+    def _spin(self, taps, calm_results, contexts, strategy="profile"):
+        return TestCalmBeforeTapping()._spin(calm_results, taps, contexts, strategy)
+
+    def test_a_charge_seen_after_the_wait_means_the_spin_started_no_retap(self):
+        result, verifier, provider = self._spin(
+            [_unexpected()], [_calm(), _calm(waited=True)],
+            [_context_result(Decimal("4999.80")), _context_result(Decimal("4999.60"))],
+        )
+
+        assert result.data.outcome == "success" and result.data.attempts == 1
+        assert result.data.balance_after == Decimal("4999.60")
+        assert verifier.verified_tap.call_count == 1
+
+    def test_an_unchanged_balance_does_not_trigger_a_blind_retap(self):
+        result, verifier, _ = self._spin(
+            [_unexpected()], [_calm(), _calm(waited=True)],
+            [_context_result(Decimal("4999.80")), _context_result(Decimal("4999.80"))],
+        )
+
+        assert result.data.outcome == "no_effect" and result.data.attempts == 1
+        assert verifier.verified_tap.call_count == 1      # prima i tocchi erano fino a 3
+
+    def test_a_balance_that_rose_is_a_credit_not_a_spin_and_no_retap(self):
+        result, verifier, _ = self._spin(
+            [_unexpected()], [_calm(), _calm(waited=True)],
+            [_context_result(Decimal("4999.80")), _context_result(Decimal("5000.13"))],
+        )
+
+        assert result.data.outcome == "no_effect" and verifier.verified_tap.call_count == 1
+
+    def test_a_plain_no_effect_is_still_retried_for_trusted_coordinates(self):
+        no_effect = Result.ok(TapOutcome(
+            tapped_coords=(540, 2000), verified=False, screenshot_before="/tmp/a.png", screenshot_after="/tmp/b.png",
+            diff_score=0.0, balance_before=Decimal("100"), balance_after=Decimal("100"), bet_before=None,
+            bet_after=None, screen_state_before="idle", screen_state_after="idle", outcome="no_effect",
+        ))
+        result, verifier, _ = self._spin(
+            [no_effect, _tap_outcome(True, balance_after=Decimal("99.80"))], [_calm()],
+            [_context_result(Decimal("100.00"))],
+        )
+
+        assert result.data.outcome == "success" and verifier.verified_tap.call_count == 2

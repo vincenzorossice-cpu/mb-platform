@@ -34,6 +34,15 @@ def classify_screen_state(ocr_state: dict) -> str:
 
 
 @dataclass
+class CalmResult:
+    """Esito di wait_until_calm: lo schermo e' fermo? E' stato necessario aspettare?"""
+    screenshot_path: str
+    calm: bool
+    waited: bool
+    seconds: float
+
+
+@dataclass
 class Expectation:
     kind: str  # "balance_decrease" | "balance_changed" | "bet_decrease" | "bet_increase" | "bet_unchanged_confirms_min" | "screen_changed"
     min_decrease: Decimal = Decimal("0.00")
@@ -107,6 +116,31 @@ class ActionVerifier:
         except Exception as exc:
             return Result.fail(f"Unexpected error during verified_tap: {exc}", "VERIFICATION_ERROR")
 
+    def wait_until_calm(
+        self, device_id: str, reference_screenshot: str, max_wait_seconds: Optional[float] = None,
+    ) -> Result[CalmResult]:
+        """Lo schermo e' fermo adesso? UNO screenshot confrontato in locale (nessuna AI, nessun token) con
+        l'ultimo schermo noto: uguale -> si puo' toccare subito; diverso -> si aspetta che si fermi, fino a
+        `max_wait_seconds`. Serve a non toccare dentro un'animazione (vincita, conteggio del saldo)."""
+        started = time.monotonic()
+        shot = self.screen_reader._screenshot(device_id)
+        if not shot.success:
+            return Result.fail(shot.error, shot.error_code)
+        diff = diff_score(reference_screenshot, shot.data)
+        if diff.success and diff.data < self.config.frame_diff_stable_threshold:
+            return Result.ok(CalmResult(shot.data, calm=True, waited=False, seconds=time.monotonic() - started))
+        wait = wait_until_stable(
+            lambda: self.screen_reader._screenshot(device_id),
+            max_wait_seconds=max_wait_seconds or self.config.frame_diff_max_wait_seconds,
+            poll_interval=self.config.frame_diff_poll_interval,
+            stable_threshold=self.config.frame_diff_stable_threshold,
+        )
+        if not wait.success:
+            return Result.fail(wait.error, wait.error_code)
+        return Result.ok(CalmResult(
+            wait.data.screenshot_path, calm=wait.data.stable, waited=True, seconds=time.monotonic() - started,
+        ))
+
     def _read_state_after(self, screenshot_path: str, region_hint: Optional[tuple]) -> dict:
         if region_hint is None or not hasattr(self.ocr_reader, "set_region"):
             return self.ocr_reader.read_slot_state(screenshot_path)
@@ -159,6 +193,7 @@ class ActionVerifier:
         screenshot_after = wait_result.data.screenshot_path
 
         wait_seconds = time.monotonic() - wait_started
+        wait_captures = wait_result.data.captures
         read_started = time.monotonic()
         try:
             state_after = self._read_state_after(screenshot_after, region_hint)
@@ -182,8 +217,10 @@ class ActionVerifier:
         )
         outcome = _classify_outcome(verified, diff, state_before, state_after, self.config)
         logger.info(
-            "verified_tap: esito=%s verified=%s diff=%.3f (bet %s->%s, saldo %s->%s) [attesa schermo fermo %.1f s, lettura %.1f s]",
-            outcome, verified, diff, bet_before, bet_after, balance_before, balance_after, wait_seconds, read_seconds,
+            "verified_tap: esito=%s verified=%s diff=%.3f (bet %s->%s, saldo %s->%s) "
+            "[attesa schermo fermo %.1f s in %d scatti, lettura %.1f s]",
+            outcome, verified, diff, bet_before, bet_after, balance_before, balance_after, wait_seconds,
+            wait_captures, read_seconds,
         )
 
         return Result.ok(TapOutcome(

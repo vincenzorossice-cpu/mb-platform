@@ -46,6 +46,11 @@ class AutoPilotConfig:
     # Puntata gia' al minimo senza un minimo noto: si PROVA che il "-" e' vivo (con un "+"
     # e poi un "-") invece di fermarsi dopo 3 tocchi a vuoto. Spegnibile.
     floor_probe_enabled: bool = True
+    # Spin: prima di OGNI tocco si controlla che lo schermo sia fermo (un tocco dentro l'animazione di una
+    # vincita non fa partire nulla, e ritoccare alla cieca rischia due spin). Se si muove si aspetta e si
+    # rilegge il saldo; dopo un tocco "schermo cambiato ma saldo uguale" non si ritocca: si aspetta e si rilegge.
+    spin_calm_check: bool = True
+    spin_calm_max_wait_seconds: float = 30.0
     # Spin: ogni N spin una lettura OCR completa (lo schermo intero) anche se di
     # norma si legge solo la fascia di saldo/puntata.
     full_read_every_spins: int = 10
@@ -70,6 +75,8 @@ class AutoPilotConfig:
             return Result.fail("tap_settle_seconds must be > 0", "CONFIG_INVALID")
         if self.spin_settle_seconds <= 0:
             return Result.fail("spin_settle_seconds must be > 0", "CONFIG_INVALID")
+        if self.spin_calm_max_wait_seconds <= 0:
+            return Result.fail("spin_calm_max_wait_seconds must be > 0", "CONFIG_INVALID")
         if self.stable_reads_for_min < 1:
             return Result.fail("stable_reads_for_min must be >= 1", "CONFIG_INVALID")
         if self.max_bet_lower_attempts < 1:

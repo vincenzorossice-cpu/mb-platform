@@ -115,3 +115,17 @@ class TestWaitUntilStable:
         assert result.success
         assert result.data.stable is False
         assert capture_fn.call_count == 2
+
+
+class TestCaptureCount:
+    def test_the_number_of_captures_is_reported(self, tmp_path):
+        paths = [
+            _solid_image(tmp_path / "a.png", color=(0, 0, 0)),
+            _solid_image(tmp_path / "b.png", color=(255, 255, 255)),
+            _solid_image(tmp_path / "c.png", color=(255, 255, 255)),
+        ]
+        capture = MagicMock(side_effect=[Result.ok(p) for p in paths])
+
+        result = wait_until_stable(capture, max_wait_seconds=5, poll_interval=0, stable_threshold=0.02)
+
+        assert result.success and result.data.stable and result.data.captures == 3
