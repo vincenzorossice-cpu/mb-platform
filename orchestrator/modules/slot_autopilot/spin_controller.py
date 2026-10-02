@@ -101,6 +101,7 @@ class SpinController:
         attempts = 0
         screenshot_after = None
         state_after = None
+        balance_after_read = False   # False: balance_after e' solo il valore "prima" usato come ripiego
         if candidate.verified:
             # Ramo HITL: nessun verified_tap di mezzo (l'operatore ha gia'
             # tappato e verificato), quindi nessun TapOutcome da cui leggere
@@ -109,7 +110,10 @@ class SpinController:
             verified = True
             final_context_result = context_provider()
             final_context = final_context_result.data if final_context_result.success else None
-            balance_after = self._read_amount(final_context, "saldo") if final_context else balance_before
+            balance_after = self._read_amount(final_context, "saldo") if final_context else None
+            balance_after_read = balance_after is not None
+            if balance_after is None:
+                balance_after = balance_before
             win_amount = self._read_amount(final_context, "vincita") if final_context else None
         else:
             verified = False
@@ -148,6 +152,7 @@ class SpinController:
                 # eliminare per velocita').
                 if tap_result.data.balance_after is not None:
                     balance_after = tap_result.data.balance_after
+                    balance_after_read = True
                 win_amount = tap_result.data.win_amount
                 screenshot_after = tap_result.data.screenshot_after
                 state_after = tap_result.data.state_after
@@ -187,19 +192,25 @@ class SpinController:
                 )
                 balance_after = second
                 bet_understated = False
-        if outcome == "success" and win_amount is None:
-            win_amount = self._infer_win(balance_before, balance_after, expected_bet)
+        if outcome == "success":
+            # La vincita si ricava dal SALDO (dopo - prima + puntata): la scritta "ultima vincita" del gioco
+            # resta a schermo finche' non ce n'e' un'altra (o puo' essere confusa con altri numeri) e non
+            # dice cosa e' successo in QUESTO spin. La vincita letta serve solo se manca un saldo.
+            # L'accredito puo' arrivare con la lettura dello spin dopo: il totale resta esatto.
+            from_balance = (
+                self._balance_win(balance_before, balance_after, expected_bet) if balance_after_read else None
+            )
+            if from_balance is not None:
+                if win_amount is not None and abs(win_amount - from_balance) > self.config.accounting_tolerance:
+                    logger.debug("spin %d: la vincita letta (%s) non coincide con quella dal saldo (%s): uso il saldo.",
+                                 spin_index, win_amount, from_balance)
+                win_amount = from_balance if from_balance >= Decimal("0.01") else None
         if bet_understated:
             logger.error(
                 "spin %d: il saldo e' sceso di %s con una puntata creduta di %s: la puntata reale e' piu' alta.",
                 spin_index, balance_before - balance_after, expected_bet,
             )
-        accounting_anomaly = None
-        if outcome == "success":
-            accounting_anomaly = self._check_accounting(balance_before, expected_bet, win_amount, balance_after)
-
-        if accounting_anomaly:
-            logger.warning("spin %d: anomalia contabile: %s", spin_index, accounting_anomaly)
+        accounting_anomaly = None   # il controllo per spin sulla vincita letta e' stato tolto: vedi sopra
         total_seconds = time.monotonic() - started
         logger.info(
             "spin %d: outcome=%s verified=%s saldo %s->%s vincita=%s (contesto %.1f s, tocco+attesa+lettura %.1f s)",
@@ -233,13 +244,12 @@ class SpinController:
             return False
         return (balance_before - balance_after) > 2 * bet + self.config.accounting_tolerance
 
-    def _infer_win(self, balance_before, balance_after, bet) -> Optional[Decimal]:
-        """La vincita non letta dall'OCR si deduce dal saldo: dopo - prima + puntata.
-        Sotto un centesimo e' rumore di lettura, non una vincita."""
+    @staticmethod
+    def _balance_win(balance_before, balance_after, bet) -> Optional[Decimal]:
+        """dopo - prima + puntata, o None se manca un valore."""
         if balance_before is None or balance_after is None or bet is None:
             return None
-        inferred = balance_after - balance_before + bet
-        return inferred if inferred >= Decimal("0.01") else None
+        return balance_after - balance_before + bet
 
     def _check_invariants(self, min_bet_verified, balance_before, expected_bet, context) -> Optional[str]:
         if not min_bet_verified:
@@ -248,17 +258,6 @@ class SpinController:
             return "INSUFFICIENT_BALANCE"
         if classify_screen_state(context.slot_ocr_state) != "idle":
             return "UNSAFE_SCREEN_STATE"
-        return None
-
-    def _check_accounting(self, balance_before, bet, win_amount, balance_after) -> Optional[str]:
-        if balance_before is None or balance_after is None:
-            return None
-        expected_after = balance_before - (bet or Decimal("0.00")) + (win_amount or Decimal("0.00"))
-        if abs(balance_after - expected_after) > self.config.accounting_tolerance:
-            return (
-                f"Accounting mismatch: expected balance {expected_after}, "
-                f"observed {balance_after} (bet={bet}, win={win_amount})"
-            )
         return None
 
     def _read_amount(self, context, field: str) -> Optional[Decimal]:

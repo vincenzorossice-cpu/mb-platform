@@ -18,6 +18,37 @@ class OCRBox:
     confidence: float
 
 
+_LEFT_GROUP = re.compile(r"^\d{1,3}(?:[ .,]\d{3})*$")          # "50", "6 405"
+_RIGHT_GROUP = re.compile(r"^\d{3}(?:[.,]\d{1,2})?$")           # "000.00", "921.88"
+
+
+def _merge_grouped_numbers(detections: list) -> list:
+    """EasyOCR spesso divide "50 000.00" in due caselle ("50" e "000.00"): quando una casella e' l'inizio di
+    un importo con le migliaia separate da uno spazio e la successiva, sulla stessa riga e subito accanto,
+    e' un gruppo di 3 cifre (con eventuale decimale), le si unisce in "50 000.00". Cosi' l'importo si legge
+    intero senza chiedere aiuto alla visione. Formato dei risultati invariato."""
+    merged = []
+    for bbox, text, conf in sorted(detections, key=lambda d: (round(min(p[1] for p in d[0]) / 20), min(p[0] for p in d[0]))):
+        if merged:
+            prev_bbox, prev_text, prev_conf = merged[-1]
+            px1, py1 = min(p[0] for p in prev_bbox), min(p[1] for p in prev_bbox)
+            px2, py2 = max(p[0] for p in prev_bbox), max(p[1] for p in prev_bbox)
+            x1, y1 = min(p[0] for p in bbox), min(p[1] for p in bbox)
+            x2, y2 = max(p[0] for p in bbox), max(p[1] for p in bbox)
+            height = max(py2 - py1, y2 - y1, 1)
+            same_row = abs((py1 + py2) / 2 - (y1 + y2) / 2) < height * 0.5
+            close = 0 <= x1 - px2 <= height * 1.2
+            if (
+                same_row and close and _LEFT_GROUP.match(prev_text.strip()) and _RIGHT_GROUP.match(text.strip())
+            ):
+                joined = [[min(px1, x1), min(py1, y1)], [max(px2, x2), min(py1, y1)],
+                          [max(px2, x2), max(py2, y2)], [min(px1, x1), max(py2, y2)]]
+                merged[-1] = (joined, f"{prev_text.strip()} {text.strip()}", min(prev_conf, conf))
+                continue
+        merged.append((bbox, text, conf))
+    return merged
+
+
 class SlotOCRReader:
     """Legge saldo e stato della slot via EasyOCR su screenshot (Canvas/WebGL,
     illeggibile da uiautomator). Lazy init: il primo readtext e' lento perche'
@@ -103,7 +134,7 @@ class SlotOCRReader:
             "raw_texts": [(text, coords, confidence), ...]
         }
         """
-        results = self._get_raw_detections(screenshot_path)
+        results = _merge_grouped_numbers(self._get_raw_detections(screenshot_path))
 
         state = {
             "saldo": None,
@@ -163,24 +194,28 @@ class SlotOCRReader:
         # Fallback: label senza importo nella propria stringa -> cerca
         # l'elemento numerico piu' vicino (stessa riga, y +-50px; a parita'
         # di riga vince quello piu' vicino in x).
+        used = set()  # numeri gia' assegnati a un campo: lo stesso numero non puo' essere anche un altro campo
         for key in ("saldo", "posta", "vincita"):
             if resolved[key] or label_coords[key] is None:
                 continue
             label_x, label_y = label_coords[key]
-            best_amount, best_dist = None, None
+            best_amount, best_dist, best_at = None, None, None
             for text_upper, x, y in detections:
                 if abs(y - label_y) >= self._LABEL_Y_TOLERANCE:
                     continue
                 if any(kw in text_upper for kw in self._ALL_AMOUNT_LABELS):
                     continue  # non riusare il testo di un'altra label come importo
+                if (x, y) in used:
+                    continue
                 amount = self._extract_amount(text_upper)
                 if amount is None:
                     continue
                 dist = abs(x - label_x)
                 if best_dist is None or dist < best_dist:
-                    best_amount, best_dist = amount, dist
+                    best_amount, best_dist, best_at = amount, dist, (x, y)
             if best_amount is not None:
                 state[key] = best_amount
+                used.add(best_at)
 
         return state
 

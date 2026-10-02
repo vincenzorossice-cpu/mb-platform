@@ -477,3 +477,14 @@ class TestRateLimit:
         result = GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
 
         assert result.error_code == "GPT_LOCATOR_UNRESOLVED_TARGET"
+
+
+def test_the_region_refiner_for_the_navigator_uses_the_grid_search(real_context):
+    from orchestrator.modules.slot_autopilot.strategies.gpt_locator_strategy import build_region_refiner
+
+    gpt_client = _client(None, _cell_answer("B6"), _cell_answer("C4"), _cell_answer("B2"))
+
+    point = build_region_refiner(gpt_client)("the hamburger menu icon", real_context.screenshot_path, 1080, 2400)
+
+    assert point is not None and len(point) == 2
+    assert "hamburger menu icon" in _grid_user_text(_grid_calls(gpt_client)[0])

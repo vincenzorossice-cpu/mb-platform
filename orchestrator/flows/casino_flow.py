@@ -2,10 +2,11 @@ import logging
 import time
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Optional
+from typing import Callable, Optional
 
 from orchestrator.core.result import Result
 from orchestrator.modules.screen_reader.reader import ScreenReader
+from orchestrator.modules.slot_autopilot.session import play_session
 from orchestrator.modules.slot_ocr.reader import SlotOCRReader  # re-export: SlotOCRReader
 # vive ora in orchestrator/modules/slot_ocr/reader.py. Tenuto qui per compatibilita':
 # test_slot_autonomous.py e altri moduli lo importano da questo path.
@@ -50,11 +51,28 @@ class CasinoFlow:
     gia' esistenti; la navigazione verso la slot (apertura promo/book) resta
     a carico del chiamante o di un adapter book-specific non ancora scritto."""
 
-    def __init__(self, screen_reader: ScreenReader, touch_injector: TouchInjector):
+    # Fasi che giocano con soldi veri (la "fun" e' un bonus virtuale).
+    _REAL_MONEY_PHASES = ("real", "real_bonus")
+
+    def __init__(
+        self,
+        screen_reader: ScreenReader,
+        touch_injector: TouchInjector,
+        autopilot_factory: Optional[Callable] = None,
+        slot_opener: Optional[Callable] = None,
+    ):
+        """autopilot_factory(device_id, slot_name, target: Decimal) -> Result[SlotAutoPilot]: se dato, gli
+        spin (fasi real, real_bonus e rollover 2B) li esegue lo SlotAutoPilot (puntata minima verificata,
+        spin verificati, sicurezza, memoria). Senza, resta il vecchio ciclo di spin a tempo fisso.
+        slot_opener(device_id, slot_name, phase) -> Result: apre la slot di una fase (navigazione); senza,
+        la slot e' gia' aperta a carico del chiamante."""
         self.screen_reader = screen_reader
         self.touch_injector = touch_injector
+        self.autopilot_factory = autopilot_factory
+        self.slot_opener = slot_opener
         self.ocr_reader = SlotOCRReader()
         self._stop_requested = False
+        self._real_money_enabled = False
 
     def execute_promo(
         self,
@@ -81,6 +99,8 @@ class CasinoFlow:
         }
         """
         self._stop_requested = False
+        # I soldi veri con lo SlotAutoPilot (validato finora in DEMO) vanno consentiti in modo esplicito.
+        self._real_money_enabled = bool(promo_config.get("real_money_enabled", False))
         phases: list[CasinoPhaseResult] = []
 
         initial = self.screen_reader.read_balance(device_id, book)
@@ -172,7 +192,13 @@ class CasinoFlow:
     ) -> CasinoPhaseResult:
         """Esegue una singola fase della promo (spin fino al target, gia'
         dentro la slot). La navigazione verso la slot resta a carico del
-        chiamante (book-specific adapter, non ancora scritto)."""
+        chiamante (book-specific adapter, non ancora scritto) o dello slot_opener."""
+        if self.autopilot_factory is not None:
+            return self._play_with_autopilot(device_id, slot_name, target_amount, spin_amount, phase_name)
+
+        open_error = self._open_slot(device_id, slot_name, phase_name)
+        if open_error:
+            return self._failed_phase(phase_name, slot_name, target_amount, open_error)
         initial_balance = self._read_slot_balance(device_id)
         if initial_balance is None:
             return CasinoPhaseResult(
@@ -245,6 +271,9 @@ class CasinoFlow:
     ) -> CasinoPhaseResult:
         """Fase 2: prima raggiungi target balance con spin alti, poi fai il
         rollover con spin minimi."""
+        open_error = self._open_slot(device_id, slot_name, "fun")
+        if open_error:
+            return self._failed_phase("fun", slot_name, rollover_target, open_error)
         initial_balance = self._read_slot_balance(device_id)
         if initial_balance is None:
             initial_balance = fun_bonus_amount
@@ -273,6 +302,19 @@ class CasinoFlow:
             logger.info("Target balance raggiunto: %.2f", current)
 
         # Sotto-fase B: fai rollover con spin minimi
+        if self.autopilot_factory is not None:
+            # Il rollover a puntata minima lo gioca lo SlotAutoPilot (la slot e' gia' aperta dalla 2A).
+            rollover = self._play_with_autopilot(
+                device_id, slot_name, rollover_target, spin_low, "fun", open_slot=False,
+            )
+            return CasinoPhaseResult(
+                phase="fun", slot_name=slot_name, initial_balance=initial_balance,
+                final_balance=rollover.final_balance, target_amount=rollover_target,
+                played_amount=rollover.played_amount, spins_done=spins_done + rollover.spins_done,
+                spins_needed=spins_done + rollover.spins_needed, completed=rollover.completed,
+                notes=rollover.notes,
+            )
+
         rollover_spins_needed = self._compute_spins_needed(rollover_target, spin_low)
         rollover_spins_done = 0
 
@@ -308,6 +350,72 @@ class CasinoFlow:
             target_amount=rollover_target, played_amount=rollover_target,
             spins_done=total_spins, spins_needed=rollover_spins_needed + spins_done,
             completed=rollover_spins_done >= rollover_spins_needed,
+        )
+
+    def _open_slot(self, device_id: str, slot_name: str, phase_name: str) -> Optional[str]:
+        """Apre la slot con lo slot_opener (se c'e'). Ritorna il motivo dell'errore, o None se ok/non serve."""
+        if self.slot_opener is None:
+            return None
+        result = self.slot_opener(device_id, slot_name, phase_name)
+        if result is not None and not getattr(result, "success", True):
+            return f"Impossibile aprire la slot '{slot_name}': {result.error} ({result.error_code})"
+        return None
+
+    def _failed_phase(self, phase_name: str, slot_name: str, target_amount: float, note: str) -> CasinoPhaseResult:
+        logger.warning("Fase %s: %s", phase_name, note)
+        return CasinoPhaseResult(
+            phase=phase_name, slot_name=slot_name, initial_balance=0, final_balance=0,
+            target_amount=target_amount, played_amount=0, spins_done=0, spins_needed=0,
+            completed=False, notes=[note],
+        )
+
+    def _play_with_autopilot(
+        self, device_id: str, slot_name: str, target_amount: float, spin_amount: float, phase_name: str,
+        open_slot: bool = True,
+    ) -> CasinoPhaseResult:
+        """Gioca la fase con lo SlotAutoPilot fino al giocato `target_amount`. Il flow decide fase, slot e
+        target; l'autopilot esegue (puntata minima verificata, spin, controlli di sicurezza, memoria)."""
+        if phase_name in self._REAL_MONEY_PHASES and not self._real_money_enabled:
+            return self._failed_phase(
+                phase_name, slot_name, target_amount,
+                "Fase con soldi veri non abilitata: manca promo_config['real_money_enabled']=True.",
+            )
+        if open_slot:
+            open_error = self._open_slot(device_id, slot_name, phase_name)
+            if open_error:
+                return self._failed_phase(phase_name, slot_name, target_amount, open_error)
+
+        target = Decimal(str(target_amount))
+        spins_needed = self._compute_spins_needed(target_amount, spin_amount)
+        built = self.autopilot_factory(device_id, slot_name, target)
+        if not built.success:
+            return self._failed_phase(
+                phase_name, slot_name, target_amount,
+                f"Impossibile creare lo SlotAutoPilot: {built.error} ({built.error_code})",
+            )
+        autopilot = built.data
+        try:
+            session = play_session(
+                autopilot, device_id, slot_name, target, max_steps=spins_needed * 3 + 50, log=logger,
+            )
+        except Exception as exc:   # una fase che fallisce non deve far crollare la promo: si riporta e ci si ferma
+            logger.exception("Errore imprevisto nella fase %s", phase_name)
+            return self._failed_phase(phase_name, slot_name, target_amount, f"Errore imprevisto: {exc}")
+        finally:
+            autopilot.shutdown(device_id)
+
+        notes = []
+        if session.stop_reason:
+            notes.append(f"Sessione ferma: {session.stop_reason}" + (
+                f" ({session.bet_aborted_reason})" if session.bet_aborted_reason else ""
+            ))
+        initial = float(session.initial_balance) if session.initial_balance is not None else 0.0
+        final = float(session.final_balance) if session.final_balance is not None else initial
+        return CasinoPhaseResult(
+            phase=phase_name, slot_name=slot_name, initial_balance=initial, final_balance=final,
+            target_amount=target_amount, played_amount=float(session.total_played),
+            spins_done=session.spins, spins_needed=spins_needed, completed=session.target_reached,
+            notes=notes,
         )
 
     def _compute_spins_needed(self, target_amount: float, spin_amount: float) -> int:

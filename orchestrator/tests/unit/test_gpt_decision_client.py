@@ -393,3 +393,179 @@ class TestSystemPrompt:
         assert "slot machine" in system_message.lower()
         assert "bookmaker" not in system_message.lower()
         assert "'spin'" not in system_message.lower()
+
+
+class TestModelResolution:
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch):
+        for name in ("GPT_MODEL", "DECISION_ENGINE_PROVIDER", "GPT_READER_MODEL"):
+            monkeypatch.delenv(name, raising=False)
+
+    def _client(self, **kwargs):
+        with patch("orchestrator.modules.decision_engine.gpt_client.openai.OpenAI"):
+            return GPTDecisionClient(api_key="k", **kwargs)
+
+    def test_default_is_gpt_4o_mini(self):
+        assert self._client().model == "gpt-4o-mini"
+
+    def test_provider_gpt6sol_selects_sol(self, monkeypatch):
+        monkeypatch.setenv("DECISION_ENGINE_PROVIDER", "gpt6sol")
+        assert self._client().model == "gpt-6.1-sol"
+
+    def test_provider_openjev_or_unknown_keeps_the_default_model(self, monkeypatch):
+        monkeypatch.setenv("DECISION_ENGINE_PROVIDER", "openjev")
+        assert self._client().model == "gpt-4o-mini"
+
+    def test_gpt_model_wins_over_the_provider(self, monkeypatch):
+        monkeypatch.setenv("DECISION_ENGINE_PROVIDER", "gpt6sol")
+        monkeypatch.setenv("GPT_MODEL", "gpt-6-luna")
+        assert self._client().model == "gpt-6-luna"
+
+    def test_the_constructor_argument_wins_over_everything(self, monkeypatch):
+        monkeypatch.setenv("GPT_MODEL", "gpt-6-luna")
+        assert self._client(model="gpt-4o").model == "gpt-4o"
+
+    def test_the_reader_model_is_separate_and_cheap_by_default(self, monkeypatch):
+        from orchestrator.modules.decision_engine.gpt_client import resolve_reader_model
+        monkeypatch.setenv("GPT_MODEL", "gpt-6.1-sol")
+        assert resolve_reader_model() == "gpt-4o-mini"
+        monkeypatch.setenv("GPT_READER_MODEL", "gpt-6-luna")
+        assert resolve_reader_model() == "gpt-6-luna"
+
+
+class TestVisionTokensByModel:
+    def test_compact_models_use_fewer_output_tokens(self, screenshot_path):
+        with patch("orchestrator.modules.decision_engine.gpt_client.openai.OpenAI"):
+            sol = GPTDecisionClient(api_key="k", model="gpt-6.1-sol")
+        payload = {"action": "tap", "screen_state": "idle", "target_text": "SPIN", "confidence": 0.9}
+        with patch.object(sol.client.chat.completions, "create", return_value=_mock_completion(json.dumps(payload))) as create:
+            sol.ask_with_image(screenshot_path, "state", VISION_QUESTIONS, 540, 1200)
+        assert create.call_args.kwargs["max_tokens"] == 150
+
+    def test_other_models_keep_300(self, client, screenshot_path):
+        payload = {"action": "tap", "screen_state": "idle", "target_text": "SPIN", "confidence": 0.9}
+        with patch.object(client.client.chat.completions, "create", return_value=_mock_completion(json.dumps(payload))) as create:
+            client.ask_with_image(screenshot_path, "state", VISION_QUESTIONS, 540, 1200)
+        assert create.call_args.kwargs["max_tokens"] == 300
+
+
+class TestCache:
+    PAYLOAD = {"action": "tap", "screen_state": "idle", "target_text": "SPIN", "confidence": 0.9}
+
+    def test_identical_image_question_is_asked_once(self, client, screenshot_path):
+        with patch.object(client.client.chat.completions, "create", return_value=_mock_completion(json.dumps(self.PAYLOAD))) as create:
+            first = client.ask_with_image(screenshot_path, "state", VISION_QUESTIONS, 540, 1200)
+            second = client.ask_with_image(screenshot_path, "state", VISION_QUESTIONS, 540, 1200)
+
+        assert create.call_count == 1 and first.data == second.data
+
+    def test_a_different_file_or_state_is_a_new_call(self, client, screenshot_path, tmp_path):
+        from PIL import Image
+        other = tmp_path / "other.png"
+        Image.new("RGB", (4, 4), color="black").save(other)
+        with patch.object(client.client.chat.completions, "create", return_value=_mock_completion(json.dumps(self.PAYLOAD))) as create:
+            client.ask_with_image(screenshot_path, "state", VISION_QUESTIONS, 540, 1200)
+            client.ask_with_image(str(other), "state", VISION_QUESTIONS, 540, 1200)
+            client.ask_with_image(str(other), "another state", VISION_QUESTIONS, 540, 1200)
+
+        assert create.call_count == 3
+
+    def test_invalidate_cache_forces_a_new_call(self, client, screenshot_path):
+        with patch.object(client.client.chat.completions, "create", return_value=_mock_completion(json.dumps(self.PAYLOAD))) as create:
+            client.ask_with_image(screenshot_path, "state", VISION_QUESTIONS, 540, 1200)
+            client.invalidate_cache()
+            client.ask_with_image(screenshot_path, "state", VISION_QUESTIONS, 540, 1200)
+
+        assert create.call_count == 2
+
+    def test_text_questions_are_cached_too(self, client):
+        payload = {"action": "tap", "target": "Accedi", "confidence": 0.9}
+        with patch.object(client.client.chat.completions, "create", return_value=_mock_completion(json.dumps(payload))) as create:
+            client.ask("state", NAVIGATION_QUESTIONS)
+            client.ask("state", NAVIGATION_QUESTIONS)
+            client.invalidate_cache()
+            client.ask("state", NAVIGATION_QUESTIONS)
+
+        assert create.call_count == 2
+
+    def test_failures_are_never_cached(self, client):
+        with patch.object(client.client.chat.completions, "create", return_value=_mock_completion("not json")) as create:
+            client.ask("state", NAVIGATION_QUESTIONS)
+            client.ask("state", NAVIGATION_QUESTIONS)
+
+        assert create.call_count == 2
+
+    def test_a_cached_answer_is_a_copy(self, client):
+        payload = {"action": "tap", "target": "Accedi", "confidence": 0.9}
+        with patch.object(client.client.chat.completions, "create", return_value=_mock_completion(json.dumps(payload))):
+            first = client.ask("state", NAVIGATION_QUESTIONS)
+            first.data["answers"]["action"]["choice"] = "MUTATED"
+            second = client.ask("state", NAVIGATION_QUESTIONS)
+
+        assert second.data["answers"]["action"]["choice"] == "tap"
+
+
+class TestUsageLog:
+    def _response(self, tokens_in, tokens_out):
+        from types import SimpleNamespace
+        return SimpleNamespace(usage=SimpleNamespace(prompt_tokens=tokens_in, completion_tokens=tokens_out))
+
+    def test_known_price_gives_an_estimated_cost(self, client, caplog):
+        with caplog.at_level("INFO"):
+            client.record_usage(self._response(1_000_000, 1_000_000), "prova")
+
+        assert "gpt-4o-mini" in caplog.text and "~$0.7500" in caplog.text
+        assert "1 chiamate" in client.usage_summary()
+
+    def test_unknown_price_is_declared_not_invented(self, caplog, monkeypatch):
+        monkeypatch.delenv("GPT_PRICE_INPUT_PER_M", raising=False)
+        with patch("orchestrator.modules.decision_engine.gpt_client.openai.OpenAI"):
+            sol = GPTDecisionClient(api_key="k", model="gpt-6.1-sol")
+        with caplog.at_level("INFO"):
+            sol.record_usage(self._response(100, 10))
+
+        assert "n/d" in caplog.text and "costo n/d" in sol.usage_summary()
+
+    def test_price_from_the_environment(self, monkeypatch):
+        monkeypatch.setenv("GPT_PRICE_INPUT_PER_M", "2.0")
+        monkeypatch.setenv("GPT_PRICE_OUTPUT_PER_M", "8.0")
+        with patch("orchestrator.modules.decision_engine.gpt_client.openai.OpenAI"):
+            sol = GPTDecisionClient(api_key="k", model="gpt-6.1-sol")
+        sol.record_usage(self._response(1_000_000, 500_000))
+
+        assert "~$6.0000" in sol.usage_summary()
+
+    def test_a_response_without_usage_never_raises(self, client):
+        client.record_usage(MagicMock())
+        client.record_usage(object())
+
+    def test_every_completion_is_recorded(self, client):
+        payload = {"action": "tap", "target": "Accedi", "confidence": 0.9}
+        with patch.object(client.client.chat.completions, "create", return_value=_mock_completion(json.dumps(payload))):
+            client.ask("state", NAVIGATION_QUESTIONS)
+
+        assert "1 chiamate" in client.usage_summary()
+
+
+class TestNavigationVision:
+    NAV_PAYLOAD = {
+        "action": "tap", "screen_state": "other", "target_text": None, "target_region": "top-left",
+        "target_description": "the hamburger menu icon", "text_to_type": "", "confidence": 0.8,
+    }
+
+    def test_navigation_actions_use_the_navigation_prompt(self, client, screenshot_path):
+        with patch.object(client.client.chat.completions, "create", return_value=_mock_completion(json.dumps(self.NAV_PAYLOAD))) as create:
+            result = client.ask_with_image(screenshot_path, "Goal: attiva la promo", NAVIGATION_QUESTIONS, 540, 1200)
+
+        system = create.call_args.kwargs["messages"][0]["content"]
+        assert "navigating a bookmaker" in system and "set the bet" not in system.lower()
+        assert result.data["answers"]["target_description"]["choice"] == "the hamburger menu icon"
+        assert "text_to_type" in result.data["answers"]
+
+    def test_slot_actions_still_use_the_slot_prompt(self, client, screenshot_path):
+        payload = {"action": "tap", "screen_state": "idle", "target_text": "SPIN", "confidence": 0.9}
+        with patch.object(client.client.chat.completions, "create", return_value=_mock_completion(json.dumps(payload))) as create:
+            result = client.ask_with_image(screenshot_path, "state", VISION_QUESTIONS, 540, 1200)
+
+        assert "slot machine" in create.call_args.kwargs["messages"][0]["content"]
+        assert "target_description" not in result.data["answers"]

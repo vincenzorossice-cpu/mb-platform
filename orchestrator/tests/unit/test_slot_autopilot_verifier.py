@@ -381,3 +381,21 @@ class TestRegionHint:
         )
 
         assert ocr.regions_seen == [(0, 247, 1080, 2400)] and result.data.state_after == FULL
+
+
+class TestTimingBreakdown:
+    def test_the_outcome_line_reports_the_wait_and_the_reading_times(self, tmp_path, caplog):
+        device = FakeSlotDevice(tmp_path, balance=Decimal("10.00"), bet=Decimal("1.00"))
+        device.add_element("spin", 100, 100, lambda d: setattr(d, "balance", Decimal("9.00")))
+        ocr = _RegionAwareOcr({"saldo": 9.0, "posta": 1.0}, FULL)
+        verifier = ActionVerifier(fake_touch_injector(device), fake_screen_reader(device), ocr, _config())
+
+        with caplog.at_level("INFO"):
+            verifier.verified_tap(
+                "dev", 100, 100, Expectation(kind="balance_changed"),
+                screenshot_before=verifier.screen_reader._screenshot("dev").data,
+                state_before={"saldo": 10.0, "posta": 1.0},
+            )
+
+        line = next(r.getMessage() for r in caplog.records if "esito=" in r.getMessage())
+        assert "attesa schermo fermo" in line and "lettura" in line

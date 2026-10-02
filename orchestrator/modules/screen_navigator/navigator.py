@@ -1,6 +1,7 @@
 import logging
 import os
 import time
+from typing import Callable, Optional
 
 from orchestrator.core.result import Result
 from orchestrator.modules.decision_engine.interface import (
@@ -18,10 +19,18 @@ logger = logging.getLogger(__name__)
 _STUCK_LOOP_THRESHOLD = 3
 
 
+# Frazioni (x, y) del centro di ciascuna delle 9 regioni della griglia 3x3 usata dalla visione.
+_REGION_FRACTIONS = {
+    "top-left": (1 / 6, 1 / 6), "top-center": (1 / 2, 1 / 6), "top-right": (5 / 6, 1 / 6),
+    "middle-left": (1 / 6, 1 / 2), "center": (1 / 2, 1 / 2), "middle-right": (5 / 6, 1 / 2),
+    "bottom-left": (1 / 6, 5 / 6), "bottom-center": (1 / 2, 5 / 6), "bottom-right": (5 / 6, 5 / 6),
+}
+
+
 def _create_default_decision_engine_client() -> DecisionEngineClientInterface:
     """Sceglie il Decision Engine in base a DECISION_ENGINE_PROVIDER (default: openjev)."""
     provider = os.environ.get("DECISION_ENGINE_PROVIDER", "openjev").lower()
-    if provider == "gpt4o":
+    if provider in ("gpt4o", "gpt6sol"):   # il modello lo sceglie GPTDecisionClient (resolve_model)
         from orchestrator.modules.decision_engine.gpt_client import GPTDecisionClient
 
         return GPTDecisionClient()
@@ -46,6 +55,9 @@ class ScreenNavigator(ScreenNavigatorInterface):
         touch_injector,
         decision_engine_client: DecisionEngineClientInterface = None,
         max_steps: int = 20,
+        vision_fallback: bool = False,
+        max_vision_steps: int = 5,
+        region_refiner: Optional[Callable] = None,
     ):
         # screen_reader e' tipizzato come la classe concreta ScreenReader (non
         # ScreenReaderInterface): read_screen(..., force_refresh=True) esiste solo
@@ -55,10 +67,27 @@ class ScreenNavigator(ScreenNavigatorInterface):
         self.touch_injector = touch_injector
         self.decision_engine_client = decision_engine_client or _create_default_decision_engine_client()
         self.max_steps = max_steps
+        # Con vision_fallback=True, quando il passo a solo testo non basta (confidenza bassa, schermo senza
+        # testi leggibili, loop) lo stesso passo si ripete UNA volta con la visione, fino a max_vision_steps.
+        self.vision_fallback = vision_fallback
+        self.max_vision_steps = max_vision_steps
+        # Opzionale: (descrizione, screenshot, larghezza, altezza) -> (x, y) | None, per precisare una
+        # regione 3x3 (troppo grossolana per un'icona) con la ricerca a griglia.
+        self.region_refiner = region_refiner
 
-    def navigate(self, device_id: str, goal: str, book: str = "", demo_mode: bool = False) -> Result[bool]:
+    def _can_see(self) -> bool:
+        return callable(getattr(self.decision_engine_client, "ask_with_image", None))
+
+    def navigate(
+        self, device_id: str, goal: str, book: str = "", demo_mode: bool = False, vision_mode: bool = False,
+    ) -> Result[bool]:
         if demo_mode:
             goal = self._apply_demo_mode(goal)
+        if vision_mode and not self._can_see():
+            logger.warning("Vision richiesta ma questo Decision Engine non vede le immagini: resto sul testo.")
+            vision_mode = False
+        vision_steps_used = 0
+        force_vision_next_step = False
 
         history: list[dict] = []
         # FIX-LOOP: rileva quando il Decision Engine ripropone la stessa
@@ -69,24 +98,49 @@ class ScreenNavigator(ScreenNavigatorInterface):
         last_action_signature = None
         recovery_attempted = False
 
+        vision_stuck_tried = False
+
         for step in range(1, self.max_steps + 1):
+            use_vision = vision_mode or force_vision_next_step
+            force_vision_next_step = False
+
             screen_res = self.screen_reader.read_screen(device_id, force_refresh=True)
-            if not screen_res.success:
+            if screen_res.success:
+                texts = self._extract_texts(screen_res.data.elements)
+            elif self._vision_allowed(vision_mode, vision_steps_used):
+                logger.warning("Lettura schermo fallita (%s): provo con la visione.", screen_res.error)
+                texts, use_vision = [], True
+            else:
                 return Result.fail(f"Screen read failed: {screen_res.error}", "SCREEN_READ_FAILED")
 
-            texts = self._extract_texts(screen_res.data.elements)
+            if not use_vision and not texts and self._vision_allowed(vision_mode, vision_steps_used):
+                logger.info("Nessun testo leggibile sullo schermo: provo con la visione.")
+                use_vision = True
+
             state = self._build_state(book, goal, step, history, texts)
             questions = self._build_questions(texts)
 
-            ask_res = self.decision_engine_client.ask(state, questions)
-            if not ask_res.success:
-                return Result.fail(f"Decision engine error: {ask_res.error}", ask_res.error_code)
+            if use_vision:
+                decision = self._ask_vision(device_id, state, questions)
+                if not vision_mode:
+                    vision_steps_used += 1
+            else:
+                decision = self._ask_text(state, questions)
+                if (
+                    decision.success and decision.data["confidence"] < self.LOW_CONFIDENCE_THRESHOLD
+                    and self._vision_allowed(vision_mode, vision_steps_used)
+                ):
+                    logger.info("Confidenza bassa a solo testo (%s): ripeto il passo con la visione.",
+                                decision.data["confidence"])
+                    decision = self._ask_vision(device_id, state, questions)
+                    vision_steps_used += 1
+            if not decision.success:
+                return Result.fail(decision.error, decision.error_code)
 
-            answers = ask_res.data.get("answers", {})
-            action_answer = answers.get("action", {})
-            action = action_answer.get("choice", "wait")
-            confidence = action_answer.get("confidence", 0.0)
-            target = answers.get("target", {}).get("choice")
+            action = decision.data["action"]
+            confidence = decision.data["confidence"]
+            target = decision.data["target"]
+            answers = decision.data["answers"]
 
             logger.info(f"Step {step}/{self.max_steps}: action={action} target={target} confidence={confidence}")
 
@@ -102,9 +156,20 @@ class ScreenNavigator(ScreenNavigatorInterface):
             else:
                 consecutive_same_action = 1
                 recovery_attempted = False
+                vision_stuck_tried = False
             last_action_signature = action_signature
 
             if consecutive_same_action >= _STUCK_LOOP_THRESHOLD:
+                if not use_vision and not vision_stuck_tried and self._vision_allowed(vision_mode, vision_steps_used):
+                    # Il solo testo gira a vuoto: prima di scrollare si prova a guardare lo schermo.
+                    logger.warning(
+                        f"Loop rilevato: azione '{action}' su '{target}' ripetuta {consecutive_same_action} volte. "
+                        "Provo con la visione."
+                    )
+                    vision_stuck_tried = True
+                    force_vision_next_step = True
+                    consecutive_same_action = 0
+                    continue
                 if recovery_attempted:
                     logger.warning(
                         f"Loop persistente su azione '{action}' su '{target}' anche dopo il recovery: "
@@ -117,6 +182,7 @@ class ScreenNavigator(ScreenNavigatorInterface):
                     f"{consecutive_same_action} volte consecutive. Forzo uno scroll di recovery."
                 )
                 self.touch_injector.scroll(device_id, "down")
+                self._invalidate_cache()
                 recovery_attempted = True
                 consecutive_same_action = 0
                 history.append({"step": step, "action": "scroll", "target": "down (recovery)"})
@@ -124,10 +190,86 @@ class ScreenNavigator(ScreenNavigatorInterface):
                 continue
 
             self._execute(device_id, action, target, answers)
+            self._invalidate_cache()   # lo schermo e' cambiato: la prossima domanda e' sempre nuova
             history.append({"step": step, "action": action, "target": target})
             history = history[-self.MAX_HISTORY:]
 
         return Result.fail(f"Goal not reached after {self.max_steps} steps", "GOAL_NOT_REACHED")
+
+    def _vision_allowed(self, vision_mode: bool, vision_steps_used: int) -> bool:
+        """Il ripiego sulla visione e' ammesso solo se attivo, se il motore vede le immagini e se il tetto
+        di passi con la visione non e' esaurito."""
+        return (
+            not vision_mode and self.vision_fallback and self._can_see()
+            and vision_steps_used < self.max_vision_steps
+        )
+
+    def _invalidate_cache(self) -> None:
+        invalidate = getattr(self.decision_engine_client, "invalidate_cache", None)
+        if callable(invalidate):
+            invalidate()
+
+    def _ask_text(self, state: str, questions: dict) -> Result[dict]:
+        ask_res = self.decision_engine_client.ask(state, questions)
+        if not ask_res.success:
+            return Result.fail(f"Decision engine error: {ask_res.error}", ask_res.error_code)
+        answers = ask_res.data.get("answers", {})
+        action_answer = answers.get("action", {})
+        return Result.ok({
+            "action": action_answer.get("choice", "wait"),
+            "confidence": action_answer.get("confidence", 0.0),
+            "target": answers.get("target", {}).get("choice"),
+            "answers": answers,
+        })
+
+    def _ask_vision(self, device_id: str, state: str, questions: dict) -> Result[dict]:
+        """Passo con la visione: screenshot, domanda al motore, e il bersaglio diventa un testo da tappare
+        o un punto (x, y)."""
+        shot = self.screen_reader._screenshot(device_id)
+        if not shot.success:
+            return Result.fail(f"Screenshot failed: {shot.error}", shot.error_code or "SCREENSHOT_FAILED")
+        try:
+            from PIL import Image
+            with Image.open(shot.data) as image:
+                width, height = image.size
+        except OSError as exc:
+            return Result.fail(f"Screenshot unreadable: {exc}", "SCREENSHOT_FAILED")
+
+        ask_res = self.decision_engine_client.ask_with_image(shot.data, state, questions, width, height)
+        if not ask_res.success:
+            return Result.fail(f"Decision engine error: {ask_res.error}", ask_res.error_code)
+        answers = ask_res.data.get("answers", {})
+        action_answer = answers.get("action", {})
+
+        raw_target = answers.get("target", {}).get("choice")
+        target = None
+        if isinstance(raw_target, dict):
+            if raw_target.get("text"):
+                target = raw_target["text"]
+            elif raw_target.get("region") in _REGION_FRACTIONS:
+                description = (answers.get("target_description") or {}).get("choice")
+                point = self._refine_region(description, shot.data, width, height)
+                if point is None:
+                    fx, fy = _REGION_FRACTIONS[raw_target["region"]]
+                    point = (round(width * fx), round(height * fy))
+                target = (int(point[0]), int(point[1]))
+        elif isinstance(raw_target, str):
+            target = raw_target
+        return Result.ok({
+            "action": action_answer.get("choice", "wait"),
+            "confidence": action_answer.get("confidence", 0.0),
+            "target": target,
+            "answers": answers,
+        })
+
+    def _refine_region(self, description, screenshot_path: str, width: int, height: int):
+        if not description or self.region_refiner is None:
+            return None
+        try:
+            return self.region_refiner(description, screenshot_path, width, height)
+        except Exception as exc:
+            logger.warning("Affinamento della regione fallito (%s): uso il centro della regione.", exc)
+            return None
 
     def _apply_demo_mode(self, goal: str) -> str:
         """Aggiunge l'intento demo/for-fun al goal, cosi' il Decision Engine
@@ -159,7 +301,10 @@ class ScreenNavigator(ScreenNavigatorInterface):
         """Esegue l'azione. Un fallimento viene loggato ma non interrompe il loop:
         il prossimo giro rilegge lo schermo e lascia ripianificare il Decision Engine."""
         if action == "tap":
-            res = self.touch_injector.tap_element(device_id, target)
+            if isinstance(target, tuple):
+                res = self.touch_injector.tap_coordinates(device_id, target[0], target[1])
+            else:
+                res = self.touch_injector.tap_element(device_id, target)
         elif action == "input_text":
             text = answers.get("text_to_type", {}).get("choice", "")
             res = self.touch_injector.input_text(device_id, text, field_hint=target)

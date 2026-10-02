@@ -97,6 +97,73 @@ class TestThousandsSeparatedBySpace:
         assert state["saldo"] == 49999.9
 
 
+class TestLastWinLabelDoesNotStealTheBalance:
+    def test_the_balance_number_is_not_also_the_last_win(self):
+        # "SALDO:" e "ULTIMA VINCITA:" sulla stessa riga; sotto, il solo numero del saldo (entro 50 px da entrambi).
+        state = _ocr_reader_with([
+            _detection("SALDO:", 10, 10), _detection("ULTIMA VINCITA:", 400, 10),
+            _detection("49 999.90", 10, 40),
+        ]).read_slot_state("/tmp/s.png")
+
+        assert state["saldo"] == 49999.9
+        assert state["vincita"] is None
+
+    def test_a_real_win_number_next_to_its_label_is_still_read(self):
+        state = _ocr_reader_with([
+            _detection("SALDO:", 10, 10), _detection("49 999.90", 10, 40),
+            _detection("ULTIMA VINCITA:", 400, 10), _detection("1.00", 400, 40),
+        ]).read_slot_state("/tmp/s.png")
+
+        assert state["saldo"] == 49999.9 and state["vincita"] == 1.0
+
+
+class TestSplitAmountsAreJoined:
+    """EasyOCR divide spesso "50 000.00" in due caselle: l'importo va letto intero."""
+
+    def test_two_boxes_of_one_amount_are_read_as_one(self):
+        state = _ocr_reader_with([
+            _detection("SALDO:", 10, 10), _detection("49", 10, 40), _detection("999.90", 170, 40),
+        ]).read_slot_state("/tmp/s.png")
+
+        assert state["saldo"] == 49999.9
+
+    def test_three_boxes_of_a_big_amount(self):
+        state = _ocr_reader_with([
+            _detection("SALDO", 10, 10), _detection("6", 10, 40), _detection("405", 170, 40),
+            _detection("921.88", 330, 40),
+        ]).read_slot_state("/tmp/s.png")
+
+        assert state["saldo"] == 6405921.88
+
+    def test_far_apart_boxes_are_not_joined(self):
+        state = _ocr_reader_with([
+            _detection("SALDO", 10, 10), _detection("49", 10, 40), _detection("999.90", 700, 40),
+        ]).read_slot_state("/tmp/s.png")
+
+        assert state["saldo"] == 49.0
+
+    def test_boxes_on_different_rows_are_not_joined(self):
+        state = _ocr_reader_with([
+            _detection("SALDO", 10, 10), _detection("49", 10, 40), _detection("999.90", 170, 120),
+        ]).read_slot_state("/tmp/s.png")
+
+        assert state["saldo"] == 49.0
+
+    def test_a_number_that_is_not_a_group_of_three_digits_is_left_alone(self):
+        state = _ocr_reader_with([
+            _detection("PUNTATA", 10, 10), _detection("0.10", 10, 40), _detection("0.20", 170, 40),
+        ]).read_slot_state("/tmp/s.png")
+
+        assert state["posta"] == 0.1
+
+    def test_labels_are_never_swallowed(self):
+        state = _ocr_reader_with([
+            _detection("SALDO", 10, 10), _detection("12", 170, 10), _detection("345.00", 330, 10),
+        ]).read_slot_state("/tmp/s.png")
+
+        assert state["saldo"] == 12345.0
+
+
 class TestReadTextBoxes:
     def test_bbox_is_true_min_max_of_all_four_points(self):
         """Un quad non assiale: bbox deve essere il min/max reale dei 4 punti,

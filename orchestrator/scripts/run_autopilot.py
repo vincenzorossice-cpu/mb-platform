@@ -10,7 +10,7 @@ from decimal import Decimal
 import openai
 
 from orchestrator.core.result import Result
-from orchestrator.modules.decision_engine.gpt_client import GPTDecisionClient
+from orchestrator.modules.decision_engine.gpt_client import GPTDecisionClient, resolve_reader_model
 from orchestrator.modules.provider_profile.loader import ProviderProfileLoader
 from orchestrator.modules.provider_profile.profile_builder import ProfileBuilder
 from orchestrator.modules.screen_reader.reader import ScreenReader
@@ -28,6 +28,11 @@ from orchestrator.modules.slot_autopilot.strategies.profile_strategy import Prof
 from orchestrator.modules.slot_autopilot.strategies.spatial_heuristic_strategy import SpatialHeuristicStrategy
 from orchestrator.modules.slot_autopilot.strategies.template_strategy import TemplateStrategy
 from orchestrator.modules.slot_autopilot.screen_recovery import ScreenRecovery
+from orchestrator.modules.slot_autopilot.session import (
+    BET_FAILURE_MESSAGES as _BET_FAILURE_MESSAGES,
+    progress_line as _progress_line,
+    play_session,
+)
 from orchestrator.modules.slot_autopilot.verifier import ActionVerifier
 from orchestrator.modules.slot_ocr.reader import SlotOCRReader
 from orchestrator.modules.slot_ocr.vision_reader import ResilientOCRReader, VisionAmountReader
@@ -35,14 +40,6 @@ from orchestrator.modules.step_logger.logger import JSONLStepLogger
 from orchestrator.modules.touch_injector.injector import TouchInjector
 
 logger = logging.getLogger(__name__)
-
-# Spin senza effetto di fila dopo i quali ci si ferma (invece di consumare --max-steps).
-_MAX_CONSECUTIVE_NO_EFFECT_SPINS = 3
-# Schermo non libero dopo uno spin (vincita/bonus/animazione lunga): si aspetta invece di
-# chiudere la sessione, fino a questo tempo.
-_MAX_BUSY_WAIT_SECONDS = 120
-_BUSY_POLL_SECONDS = 5
-
 
 # Loggers i cui messaggi INFO restano anche sulla console (progresso e eventi chiave);
 # tutto il resto va solo su file (a meno che non sia un avviso/errore).
@@ -82,27 +79,6 @@ def _configure_logging(log_dir: str, slot_name: str) -> str:
     return path
 
 
-_BET_FAILURE_MESSAGES = {
-    "BET_UNREADABLE": "Non riesco a leggere la puntata: non tocco nulla (e non spinno).",
-    "MONEY_MOVED": "Due tocchi durante la messa a punto della puntata hanno giocato uno spin: mi fermo.",
-    "MIN_NOT_PROVEN": "Non riesco a dimostrare che questa sia la puntata minima: per sicurezza non spinno.",
-    "MENU_BET_UNREADABLE": "Ho scelto la puntata dal menu ma non riesco a leggerla: non spinno.",
-    "GPT_UNAVAILABLE": "GPT non risponde (limite di richieste o rete): riprova tra un minuto. Non ho toccato altro.",
-    "ELEMENT_NOT_LOCATABLE": "Non trovo nessun modo di abbassare la puntata (ne' il tasto meno ne' il menu): mi fermo.",
-    "STUCK_ON_UNEXPECTED_SCREEN": "Sono rimasto su una schermata inattesa e non riesco a tornare indietro: mi fermo.",
-}
-
-
-def _progress_line(spin_index: int, spin_result, total_played: Decimal, target: Decimal, seconds: float) -> str:
-    bet = f"{spin_result.bet_amount:.2f}" if spin_result.bet_amount is not None else "-"
-    balance = f"{spin_result.balance_after}" if spin_result.balance_after is not None else "-"
-    win = f"{spin_result.win_amount:.2f}" if spin_result.win_amount else "0.00"
-    return (
-        f"Spin {spin_index} | puntata {bet} | saldo {balance} | vincita {win} | "
-        f"giocato {total_played:.2f}/{target:.2f} | {seconds:.0f} s"
-    )
-
-
 def _check_openai_key(gpt_client) -> Result[bool]:
     """Controllo gratuito (elenco modelli, nessun token) che la chiave sia
     accettata: una chiave rifiutata fa fallire in silenzio ogni chiamata GPT e
@@ -123,16 +99,29 @@ def _check_openai_key(gpt_client) -> Result[bool]:
 
 
 def build_autopilot(args: argparse.Namespace) -> Result[SlotAutoPilot]:
+    """Costruisce lo SlotAutoPilot dagli argomenti della riga di comando."""
+    return build_autopilot_for(
+        device_id=args.device, slot_name=args.slot, target=args.target, max_steps=args.max_steps,
+        enable_gpt=not args.no_gpt, enable_hitl=not args.no_hitl, live=getattr(args, "live", False),
+        require_profile=getattr(args, "require_profile", False),
+    )
+
+
+def build_autopilot_for(
+    device_id: str, slot_name: str, target, max_steps: int = 500, enable_gpt: bool = True,
+    enable_hitl: bool = True, live: bool = False, require_profile: bool = False,
+) -> Result[SlotAutoPilot]:
     """Unico punto del progetto dove queste classi concrete vengono
-    istanziate direttamente: ogni modulo a monte le riceve per DI."""
+    istanziate direttamente: ogni modulo a monte le riceve per DI. Usato dalla riga di comando
+    e da CasinoFlow (una istanza per slot/fase)."""
     config = AutoPilotConfig(
-        device_id=args.device, slot_name=args.slot, target_played_amount=Decimal(str(args.target)),
-        max_steps=args.max_steps, enable_gpt_fallback=not args.no_gpt,
-        enable_hitl_fallback=not args.no_hitl, dry_run=not getattr(args, "live", False),
+        device_id=device_id, slot_name=slot_name, target_played_amount=Decimal(str(target)),
+        max_steps=max_steps, enable_gpt_fallback=enable_gpt,
+        enable_hitl_fallback=enable_hitl, dry_run=not live,
         # Una slot nuova non ha ancora un profilo: deve poter partire e
         # impararlo (vedi ProfileBuilder). --require-profile ripristina il
         # blocco per chi vuole solo slot gia' curate.
-        require_profile=getattr(args, "require_profile", False),
+        require_profile=require_profile,
     )
     config_result = config.validate()
     if not config_result.success:
@@ -152,11 +141,13 @@ def build_autopilot(args: argparse.Namespace) -> Result[SlotAutoPilot]:
         "template": TemplateStrategy(),
     }
 
+    gpt_client = None
     if config.enable_gpt_fallback:
         try:
             gpt_client = GPTDecisionClient()
         except ValueError as exc:
             logger.warning("GPT fallback disabilitato (OPENAI_API_KEY mancante?): %s", exc)
+            gpt_client = None
         else:
             key_check = _check_openai_key(gpt_client)
             if not key_check.success:
@@ -164,7 +155,7 @@ def build_autopilot(args: argparse.Namespace) -> Result[SlotAutoPilot]:
             strategies["gpt"] = GPTLocatorStrategy(gpt_client, verify_icons=True)
             # Rete di sicurezza per saldo e puntata: se l'OCR non li legge o li legge male (es. "50000.00"
             # letto 50.0) si usa la visione; dove l'OCR basta non costa nulla.
-            ocr_reader = ResilientOCRReader(ocr_reader, VisionAmountReader(gpt_client))
+            ocr_reader = ResilientOCRReader(ocr_reader, VisionAmountReader(gpt_client, model=resolve_reader_model()))
 
     if config.enable_hitl_fallback:
         strategies["hitl"] = HITLStrategy(
@@ -187,96 +178,16 @@ def build_autopilot(args: argparse.Namespace) -> Result[SlotAutoPilot]:
         bet_controller=bet_controller, spin_controller=spin_controller, step_logger=step_logger,
         profile_builder=ProfileBuilder(profiles_dir=config.profiles_dir, memory_dir=config.slot_memory_dir),
     )
+    autopilot.gpt_client = gpt_client   # per il riepilogo dei costi a fine sessione
     return Result.ok(autopilot)
 
 
 def _run_session(autopilot: SlotAutoPilot, args: argparse.Namespace) -> int:
-    logger.info("Preparazione: profilo '%s', dispositivo %s...", args.slot, args.device)
-    prepare_result = autopilot.prepare(args.device)
-    if not prepare_result.success:
-        logger.error("prepare() fallito: %s (%s)", prepare_result.error, prepare_result.error_code)
-        return 1
-    logger.info("Preparazione completata.")
-
-    logger.info("Verifica puntata minima in corso...")
-    bet_result = autopilot.set_min_bet(args.device)
-    if not bet_result.success or not bet_result.data.min_bet_verified:
-        reason = bet_result.data.aborted_reason if bet_result.success else bet_result.error_code
-        logger.error(
-            "Impossibile verificare la puntata minima (%s): %s", reason,
-            _BET_FAILURE_MESSAGES.get(reason, "mi fermo senza spinnare."),
-        )
-        return 1
-    logger.info(
-        "Puntata minima verificata: %s EUR (outcome=%s, tentativi=%d)",
-        bet_result.data.final_bet, bet_result.data.outcome, bet_result.data.attempts,
+    """Una sessione da riga di comando: il ciclo vero sta in play_session (condiviso con CasinoFlow)."""
+    result = play_session(
+        autopilot, args.device, args.slot, Decimal(str(args.target)), args.max_steps, log=logger,
     )
-
-    target = Decimal(str(args.target))
-    total_played = Decimal("0.00")
-    spin_index = 0
-    consecutive_no_effect = 0
-    stopped_without_effect = False
-    busy_since = None
-    while total_played < target and spin_index < args.max_steps:
-        spin_index += 1
-        started = time.monotonic()
-        spin_result = autopilot.spin(args.device, spin_index)
-        seconds = time.monotonic() - started
-        if not spin_result.success:
-            logger.error("spin() fallito: %s (%s)", spin_result.error, spin_result.error_code)
-            return 1
-        if spin_result.data.bet_understated:
-            logger.error(
-                "La puntata reale sembra piu' alta di %s (il saldo e' sceso molto piu' del previsto): mi fermo.",
-                spin_result.data.bet_amount,
-            )
-            stopped_without_effect = True
-            break
-        if spin_result.data.outcome != "blocked":
-            busy_since = None
-        if spin_result.data.outcome == "no_effect":
-            consecutive_no_effect += 1
-            if consecutive_no_effect >= _MAX_CONSECUTIVE_NO_EFFECT_SPINS:
-                logger.error(
-                    "%d spin di fila senza effetto: il tasto spin non e' stato trovato. Mi fermo "
-                    "(rilancia: il punto sbagliato viene ricordato solo per la sessione).",
-                    consecutive_no_effect,
-                )
-                stopped_without_effect = True
-                break
-        else:
-            consecutive_no_effect = 0
-        if spin_result.data.outcome == "success" and spin_result.data.bet_amount:
-            total_played += spin_result.data.bet_amount
-            logger.info("%s", _progress_line(spin_index, spin_result.data, total_played, target, seconds))
-        elif spin_result.data.outcome == "blocked":
-            if spin_result.data.violated_invariant == "UNSAFE_SCREEN_STATE":
-                if busy_since is None:
-                    busy_since = time.monotonic()
-                    logger.info(
-                        "Schermo occupato (vincita/bonus in corso?): aspetto che finisca (al massimo %d s)...",
-                        _MAX_BUSY_WAIT_SECONDS,
-                    )
-                if time.monotonic() - busy_since < _MAX_BUSY_WAIT_SECONDS:
-                    time.sleep(_BUSY_POLL_SECONDS)
-                    spin_index -= 1   # l'attesa non consuma --max-steps
-                    continue
-                logger.warning("Lo schermo e' rimasto occupato per oltre %d s: mi fermo.", _MAX_BUSY_WAIT_SECONDS)
-                stopped_without_effect = True
-            else:
-                logger.warning("Spin bloccato da un'invariante di sicurezza: %s", spin_result.data.violated_invariant)
-            break
-    logger.info("Sessione conclusa: %s/%s EUR giocati in %d spin.", total_played, target, spin_index)
-
-    initial_balance, final_balance = autopilot.get_balance_summary()
-    if initial_balance is not None and final_balance is not None:
-        net = final_balance - initial_balance
-        logger.info(
-            "Riepilogo: saldo iniziale=%s, saldo finale=%s, netto=%s EUR",
-            initial_balance, final_balance, net,
-        )
-    return 1 if stopped_without_effect else 0
+    return 1 if result.failed else 0
 
 
 def _parse_args(argv=None) -> argparse.Namespace:
@@ -314,6 +225,9 @@ def main() -> None:
         logger.warning("Interrotto dall'operatore (KeyboardInterrupt).")
         exit_code = 1
     finally:
+        gpt_client = getattr(autopilot, "gpt_client", None)
+        if gpt_client is not None and hasattr(gpt_client, "usage_summary"):
+            logger.info("%s", gpt_client.usage_summary())
         shutdown_result = autopilot.shutdown(args.device)
         if not shutdown_result.success:
             logger.error("shutdown() fallito: %s (%s)", shutdown_result.error, shutdown_result.error_code)

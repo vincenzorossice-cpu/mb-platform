@@ -542,6 +542,32 @@ class TestFastSpinCycle:
 
         assert not result.success and screens.region == CANVAS
 
+    def test_the_reader_is_in_spin_mode_only_while_spinning(self, tmp_path):
+        autopilot, screens, _ = _pilot(tmp_path, [("no_effect", "memory")])
+        modes = []
+        autopilot.ocr_reader.set_spin_mode.side_effect = lambda active: modes.append(active)
+        original = autopilot.spin_controller.spin.side_effect
+        during = []
+
+        def peek(*args):
+            during.append(list(modes))
+            return original(*args)
+
+        autopilot.spin_controller.spin.side_effect = peek
+        autopilot.spin("dev", 1)
+
+        assert during == [[True]] and modes == [True, False]
+
+    def test_the_reader_leaves_spin_mode_even_when_the_spin_raises(self, tmp_path):
+        autopilot, screens, _ = _pilot(tmp_path, [])
+        modes = []
+        autopilot.ocr_reader.set_spin_mode.side_effect = lambda active: modes.append(active)
+        autopilot.spin_controller.spin.side_effect = RuntimeError("boom")
+
+        autopilot.spin("dev", 1)
+
+        assert modes == [True, False]
+
     def test_a_verified_trusted_spin_provides_the_next_context_without_a_new_reading(self, tmp_path):
         autopilot, screens, contexts = _pilot(tmp_path, [("success", "memory"), ("success", "memory")])
         autopilot.spin("dev", 1)

@@ -171,7 +171,10 @@ class SlotAutoPilot:
     def spin(self, device_id: str, spin_index: int) -> Result[SpinResult]:
         full_region = self.ocr_reader.region
         band = self._amounts_band
+        spin_mode = getattr(self.ocr_reader, "set_spin_mode", None)
         try:
+            if callable(spin_mode):
+                spin_mode(True)
             if band is not None:
                 # Lettura rapida: EasyOCR su una striscia di saldo/puntata invece
                 # che su tutto lo schermo (~1 s invece di ~9 s).
@@ -199,6 +202,8 @@ class SlotAutoPilot:
         except Exception as exc:
             return Result.fail(f"Unexpected error in spin: {exc}", "UNEXPECTED_ERROR")
         finally:
+            if callable(spin_mode):
+                spin_mode(False)
             if band is not None:
                 self.ocr_reader.set_region(full_region)
 

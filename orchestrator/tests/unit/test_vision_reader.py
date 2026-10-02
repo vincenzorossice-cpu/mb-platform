@@ -288,3 +288,103 @@ class TestPerFieldArbitration:
 
         assert reader.read_slot_state("/b.png")["saldo"] == 49999.0
         assert vision.read.call_count == 2
+
+
+class TestCheapVisionCall:
+    def test_the_image_is_reduced_and_marked_low_detail(self, tmp_path):
+        import base64
+        import io
+        path = tmp_path / "big.png"
+        Image.new("RGB", (1080, 2400), (10, 20, 30)).save(path)
+        client = _client({"credit_text": "50 000.00", "bet_text": "0.10"})
+
+        VisionAmountReader(client).read(str(path))
+
+        call = client.client.chat.completions.create.call_args
+        image = call.kwargs["messages"][1]["content"][1]["image_url"]
+        assert image["detail"] == "low"
+        sent = Image.open(io.BytesIO(base64.b64decode(image["url"].split(",", 1)[1])))
+        assert max(sent.size) == 960 and sent.size[0] < sent.size[1]      # lato lungo ridotto, proporzioni uguali
+
+    def test_a_small_image_is_never_enlarged(self, tmp_path):
+        import base64
+        import io
+        path = tmp_path / "small.png"
+        Image.new("RGB", (300, 500)).save(path)
+        client = _client({"credit_text": "1", "bet_text": "1"})
+
+        VisionAmountReader(client).read(str(path))
+
+        url = client.client.chat.completions.create.call_args.kwargs["messages"][1]["content"][1]["image_url"]["url"]
+        assert Image.open(io.BytesIO(base64.b64decode(url.split(",", 1)[1]))).size == (300, 500)
+
+    def test_the_prompt_says_the_highlighted_bet_is_the_current_one(self):
+        from orchestrator.modules.slot_ocr import vision_reader
+        assert "highlighted" in vision_reader._SYSTEM_PROMPT
+
+
+class TestSpinModeSkipsAUselessOcr:
+    def _reader(self, ocr_states, vision_reads):
+        ocr = _ocr(ocr_states)
+        return ResilientOCRReader(ocr, _vision(*vision_reads)), ocr
+
+    def test_ocr_that_reads_neither_amount_is_skipped_during_spins(self):
+        reader, ocr = self._reader(
+            [{"saldo": None, "posta": None, "raw_texts": ["x"]}],
+            [{"saldo": 50000.0, "posta": 0.3}, {"saldo": 49999.9, "posta": 0.1}],
+        )
+        reader.read_slot_state("/a.png")                       # primo controllo: OCR + visione
+        reader.set_spin_mode(True)
+
+        state = reader.read_slot_state("/b.png")
+
+        assert state["saldo"] == 49999.9 and state["posta"] == 0.1
+        assert state["raw_texts"] == [] and state["spin_button_coords"] is None
+        assert ocr.read_slot_state.call_count == 1             # nessuna seconda lettura OCR
+
+    def test_outside_spin_mode_the_ocr_is_still_read(self):
+        reader, ocr = self._reader(
+            [{"saldo": None, "posta": None}, {"saldo": None, "posta": None}],
+            [{"saldo": 50000.0, "posta": 0.3}, {"saldo": 49999.9, "posta": 0.1}],
+        )
+        reader.read_slot_state("/a.png")
+        reader.read_slot_state("/b.png")
+
+        assert ocr.read_slot_state.call_count == 2
+
+    def test_an_ocr_that_reads_the_amounts_is_never_skipped(self):
+        reader, ocr = self._reader(
+            [{"saldo": 100.0, "posta": 1.0}] * 3, [{"saldo": 100.0, "posta": 1.0}],
+        )
+        reader.read_slot_state("/a.png")
+        reader.set_spin_mode(True)
+        reader.read_slot_state("/b.png")
+        reader.read_slot_state("/c.png")
+
+        assert ocr.read_slot_state.call_count == 3
+
+
+class TestReaderModel:
+    def test_the_reader_uses_its_own_model_not_the_decision_one(self, shot):
+        client = _client({"credit_text": "1", "bet_text": "1"})
+        client.model = "gpt-6.1-sol"
+
+        VisionAmountReader(client, model="gpt-4o-mini").read(shot)
+
+        assert client.client.chat.completions.create.call_args.kwargs["model"] == "gpt-4o-mini"
+
+    def test_without_a_reader_model_the_client_model_is_used(self, shot):
+        client = _client({"credit_text": "1", "bet_text": "1"})
+        client.model = "gpt-4o"
+
+        VisionAmountReader(client).read(shot)
+
+        assert client.client.chat.completions.create.call_args.kwargs["model"] == "gpt-4o"
+
+    def test_usage_is_recorded_with_the_reader_model(self, shot):
+        client = _client({"credit_text": "1", "bet_text": "1"})
+
+        VisionAmountReader(client, model="gpt-4o-mini").read(shot)
+
+        client.record_usage.assert_called_once()
+        assert client.record_usage.call_args.args[2] == "gpt-4o-mini"

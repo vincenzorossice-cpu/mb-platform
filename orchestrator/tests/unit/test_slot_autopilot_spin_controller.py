@@ -151,12 +151,11 @@ class TestCleanSpins:
         assert result.data.accounting_anomaly is None
         assert result.data.win_amount == Decimal("0.50")
 
-    def test_accounting_mismatch_beyond_tolerance_is_not_a_failure(self):
+    def test_a_stale_ocr_win_is_ignored_in_favour_of_the_balance(self):
         locator = MagicMock()
         locator.locate.return_value = _candidate()
         verifier = MagicMock()
-        # Vincita letta 0.05 -> atteso 9.95 (10.00 - 0.10 + 0.05), osservato 10.40: scarto
-        # enorme, ma il tap era verificato -> successo comunque, anomalia solo annotata.
+        # La scritta "ultima vincita" dice 0.05 ma il saldo e' salito a 10.40: vale il saldo (vincita 0.50).
         verifier.verified_tap.return_value = _tap_outcome(
             True, balance_after=Decimal("10.40"), win_amount=Decimal("0.05"),
         )
@@ -164,9 +163,42 @@ class TestCleanSpins:
         context_provider = MagicMock(return_value=_context_result(Decimal("10.00")))
 
         result = controller.spin("dev", "pirots5", "ep1", 1, context_provider, True, Decimal("0.10"))
-        assert result.success  # la Result e' comunque ok
+        assert result.success
         assert result.data.outcome == "success"
-        assert result.data.accounting_anomaly is not None
+        assert result.data.win_amount == Decimal("0.50")
+        assert result.data.accounting_anomaly is None
+
+    def test_a_win_label_that_persists_does_not_invent_wins_or_anomalies(self):
+        # Sette spin di fila con la stessa "ultima vincita" (1.0) a schermo e il saldo che scende di una puntata.
+        locator = MagicMock()
+        locator.locate.return_value = _candidate()
+        results = []
+        balance = Decimal("100.00")
+        for index in range(7):
+            verifier = MagicMock()
+            verifier.verified_tap.return_value = _tap_outcome(
+                True, balance_after=balance - Decimal("0.10"), win_amount=Decimal("1.0"),
+            )
+            controller, _, _, _ = _controller(locator=locator, verifier=verifier)
+            results.append(controller.spin(
+                "dev", "pirots5", "ep", index + 1, MagicMock(return_value=_context_result(balance)),
+                True, Decimal("0.10"),
+            ).data)
+            balance -= Decimal("0.10")
+
+        assert all(r.win_amount is None and r.accounting_anomaly is None for r in results)
+
+    def test_the_read_win_is_the_fallback_when_a_balance_is_missing(self):
+        locator = MagicMock()
+        locator.locate.return_value = _candidate()
+        verifier = MagicMock()
+        verifier.verified_tap.return_value = _tap_outcome(True, balance_after=None, win_amount=Decimal("0.50"))
+        controller, _, _, _ = _controller(locator=locator, verifier=verifier)
+
+        result = controller.spin("dev", "pirots5", "ep1", 1,
+                                 MagicMock(return_value=_context_result(Decimal("10.00"))), True, Decimal("0.10"))
+
+        assert result.data.win_amount == Decimal("0.50")
 
     def test_accounting_mismatch_within_tolerance_is_not_an_anomaly(self):
         locator = MagicMock()

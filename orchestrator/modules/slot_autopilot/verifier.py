@@ -1,4 +1,5 @@
 import logging
+import time
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Optional
@@ -145,6 +146,7 @@ class ActionVerifier:
             logger.warning("verified_tap: tap fallito: %s (%s)", tap_result.error, tap_result.error_code)
             return Result.fail(tap_result.error, tap_result.error_code)
 
+        wait_started = time.monotonic()
         wait_result = wait_until_stable(
             lambda: self.screen_reader._screenshot(device_id),
             max_wait_seconds=self.config.frame_diff_max_wait_seconds,
@@ -156,10 +158,13 @@ class ActionVerifier:
             return Result.fail(wait_result.error, wait_result.error_code)
         screenshot_after = wait_result.data.screenshot_path
 
+        wait_seconds = time.monotonic() - wait_started
+        read_started = time.monotonic()
         try:
             state_after = self._read_state_after(screenshot_after, region_hint)
         except Exception as exc:
             return Result.fail(f"OCR error after tap: {exc}", "VERIFICATION_ERROR")
+        read_seconds = time.monotonic() - read_started
 
         diff_result = diff_score(screenshot_before, screenshot_after, expectation.region)
         if not diff_result.success:
@@ -177,8 +182,8 @@ class ActionVerifier:
         )
         outcome = _classify_outcome(verified, diff, state_before, state_after, self.config)
         logger.info(
-            "verified_tap: esito=%s verified=%s diff=%.3f (bet %s->%s, saldo %s->%s)",
-            outcome, verified, diff, bet_before, bet_after, balance_before, balance_after,
+            "verified_tap: esito=%s verified=%s diff=%.3f (bet %s->%s, saldo %s->%s) [attesa schermo fermo %.1f s, lettura %.1f s]",
+            outcome, verified, diff, bet_before, bet_after, balance_before, balance_after, wait_seconds, read_seconds,
         )
 
         return Result.ok(TapOutcome(

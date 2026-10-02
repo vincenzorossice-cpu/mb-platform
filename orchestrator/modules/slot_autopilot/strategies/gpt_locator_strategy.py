@@ -9,6 +9,7 @@ import openai
 
 from PIL import Image
 
+from orchestrator.core.openai_compat import create_with_param_fallback
 from orchestrator.core.openai_retry import call_with_rate_limit_retry
 from orchestrator.core.result import Result
 from orchestrator.modules.decision_engine.interface import choice_question
@@ -264,10 +265,12 @@ class GPTLocatorStrategy(LocatorStrategy):
             ]},
         ]
         try:
-            response = call_with_rate_limit_retry(lambda: self.gpt_client.client.chat.completions.create(
-                model=self.gpt_client.model, messages=messages,
-                response_format={"type": "json_object"}, temperature=0.1, max_tokens=250,
+            response = call_with_rate_limit_retry(lambda: create_with_param_fallback(
+                self.gpt_client.client.chat.completions.create,
+                dict(model=self.gpt_client.model, messages=messages,
+                     response_format={"type": "json_object"}, temperature=0.1, max_tokens=250),
             ))
+            self._record_usage(response, "griglia icone")
             data = json.loads(response.choices[0].message.content)
         except openai.OpenAIError as exc:
             logger.warning("'%s' (%s): errore OpenAI: %s", element_name, stage, exc)
@@ -363,6 +366,11 @@ class GPTLocatorStrategy(LocatorStrategy):
                 logger.warning("'%s': affinamento icona fallito: %s", element_name, exc)
                 return None
 
+    def _record_usage(self, response, purpose: str) -> None:
+        record = getattr(self.gpt_client, "record_usage", None)
+        if callable(record):
+            record(response, purpose)
+
     def _looks_like_expected(self, element_name: str, context: LocateContext, point: tuple, tmp: str) -> bool:
         """Classifica un ritaglio ~240 px centrato sul punto scelto: se non e' il tipo di elemento cercato,
         il punto non viene proposto (un tocco sbagliato puo' giocare uno spin o aprire un altro menu)."""
@@ -385,10 +393,12 @@ class GPTLocatorStrategy(LocatorStrategy):
                     {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}},
                 ]},
             ]
-            response = call_with_rate_limit_retry(lambda: self.gpt_client.client.chat.completions.create(
-                model=self.gpt_client.model, messages=messages,
-                response_format={"type": "json_object"}, temperature=0, max_tokens=60,
+            response = call_with_rate_limit_retry(lambda: create_with_param_fallback(
+                self.gpt_client.client.chat.completions.create,
+                dict(model=self.gpt_client.model, messages=messages,
+                     response_format={"type": "json_object"}, temperature=0, max_tokens=60),
             ))
+            self._record_usage(response, "verifica icona")
             data = json.loads(response.choices[0].message.content)
         except openai.OpenAIError as exc:
             logger.warning("'%s': verifica dell'icona non riuscita (errore OpenAI): %s", element_name, exc)
@@ -405,3 +415,18 @@ class GPTLocatorStrategy(LocatorStrategy):
             element_name, point[0], point[1], kind or "?", expected,
         )
         return False
+
+
+def build_region_refiner(gpt_client):
+    """Funzione (descrizione, screenshot, larghezza, altezza) -> (x, y) | None per ScreenNavigator
+    (region_refiner): precisa una regione 3x3 con la stessa ricerca a griglia delle icone."""
+    strategy = GPTLocatorStrategy(gpt_client)
+
+    def refine(description: str, screenshot_path: str, width: int, height: int):
+        context = LocateContext(
+            device_id="navigator", slot_name="navigation", screenshot_path=screenshot_path,
+            screen_width=width, screen_height=height,
+        )
+        return strategy.locate_described(description, context)
+
+    return refine

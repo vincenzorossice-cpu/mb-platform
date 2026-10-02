@@ -1,11 +1,14 @@
 import base64
+import copy
 import difflib
+import hashlib
 import json
 import logging
 import os
 
 import openai
 
+from orchestrator.core.openai_compat import create_with_param_fallback
 from orchestrator.core.result import Result
 from orchestrator.modules.decision_engine.interface import DecisionEngineClientInterface
 
@@ -35,8 +38,47 @@ _TARGET_REGIONS = (
 )
 
 
+_DEFAULT_MODEL = "gpt-4o-mini"
+# Modello associato a ciascun valore di DECISION_ENGINE_PROVIDER (openjev e' un altro motore, non OpenAI).
+_PROVIDER_MODELS = {"gpt4o": "gpt-4o-mini", "gpt6sol": "gpt-6.1-sol"}
+# Prezzi noti in dollari per milione di token (input, output). Per gli altri modelli si usano
+# GPT_PRICE_INPUT_PER_M / GPT_PRICE_OUTPUT_PER_M, altrimenti il costo risulta "n/d": nessun prezzo inventato.
+_KNOWN_PRICES = {"gpt-4o-mini": (0.15, 0.60)}
+_VISION_MAX_TOKENS_COMPACT = 150   # modelli gpt-6.*: risposte piu' concise
+
+
+def resolve_model(explicit: str = None) -> str:
+    """Precedenza: argomento esplicito > GPT_MODEL > DECISION_ENGINE_PROVIDER > gpt-4o-mini."""
+    if explicit:
+        return explicit
+    from_env = os.environ.get("GPT_MODEL", "").strip()
+    if from_env:
+        return from_env
+    provider = os.environ.get("DECISION_ENGINE_PROVIDER", "").strip().lower()
+    return _PROVIDER_MODELS.get(provider, _DEFAULT_MODEL)
+
+
+def resolve_reader_model() -> str:
+    """Modello (economico) per leggere saldo e puntata: GPT_READER_MODEL, default gpt-4o-mini."""
+    return os.environ.get("GPT_READER_MODEL", "").strip() or _DEFAULT_MODEL
+
+
+def _number(value) -> int:
+    return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
+
+
+def _price_per_million(model: str):
+    if model in _KNOWN_PRICES:
+        return _KNOWN_PRICES[model]
+    try:
+        return (float(os.environ["GPT_PRICE_INPUT_PER_M"]), float(os.environ["GPT_PRICE_OUTPUT_PER_M"]))
+    except (KeyError, ValueError):
+        return None
+
+
 class GPTDecisionClient(DecisionEngineClientInterface):
-    """Client per il Decision Engine basato su GPT-4o-mini (OpenAI Chat Completions)."""
+    """Client per il Decision Engine basato su GPT (OpenAI Chat Completions). Il modello e' configurabile
+    (vedi resolve_model); di default gpt-4o-mini."""
 
     GPT_DECISION_UNREACHABLE = "GPT_DECISION_UNREACHABLE"
     GPT_DECISION_TIMEOUT = "GPT_DECISION_TIMEOUT"
@@ -46,16 +88,70 @@ class GPTDecisionClient(DecisionEngineClientInterface):
 
     _VISION_MAX_TOKENS = 300
 
-    def __init__(self, api_key: str = None, model: str = "gpt-4o-mini", timeout: int = 30):
+    def __init__(self, api_key: str = None, model: str = None, timeout: int = 30):
         api_key = api_key or os.environ.get("OPENAI_API_KEY")
         if not api_key:
             raise ValueError(
                 "OPENAI_API_KEY non impostata: richiesta una API key per usare GPTDecisionClient."
             )
-        self.model = model
+        self.model = resolve_model(model)
         self.client = openai.OpenAI(api_key=api_key, timeout=timeout)
+        # Ultima risposta riuscita di ask / ask_with_image: stessa richiesta identica -> niente nuova chiamata.
+        self._cached_text = None
+        self._cached_image = None
+        self._usage = {}   # modello -> {"calls", "in", "out", "cost"} (cost None = prezzo ignoto)
+
+    def invalidate_cache(self) -> None:
+        """Da chiamare dopo un'azione che cambia lo schermo: la prossima domanda e' sempre nuova."""
+        self._cached_text = None
+        self._cached_image = None
+
+    def record_usage(self, response, purpose: str = "", model: str = None) -> None:
+        """Registra token e costo stimato di una chiamata (anche fatta da chi usa direttamente
+        `client`); mai eccezioni."""
+        try:
+            model = model or self.model
+            usage = getattr(response, "usage", None)
+            tokens_in = _number(getattr(usage, "prompt_tokens", 0))
+            tokens_out = _number(getattr(usage, "completion_tokens", 0))
+            prices = _price_per_million(model)
+            cost = None if prices is None else (tokens_in * prices[0] + tokens_out * prices[1]) / 1_000_000
+            entry = self._usage.setdefault(model, {"calls": 0, "in": 0, "out": 0, "cost": 0.0})
+            entry["calls"] += 1
+            entry["in"] += tokens_in
+            entry["out"] += tokens_out
+            entry["cost"] = None if (cost is None or entry["cost"] is None) else entry["cost"] + cost
+            logger.info(
+                "Chiamata GPT%s: modello=%s token in=%d out=%d costo=%s",
+                f" ({purpose})" if purpose else "", model, tokens_in, tokens_out,
+                "n/d (imposta GPT_PRICE_INPUT_PER_M e GPT_PRICE_OUTPUT_PER_M)" if cost is None else f"~${cost:.4f}",
+            )
+        except Exception as exc:  # il conteggio non deve mai rompere una chiamata
+            logger.debug("record_usage fallito: %s", exc)
+
+    def usage_summary(self) -> str:
+        if not self._usage:
+            return "GPT: nessuna chiamata."
+        parts = []
+        for model, entry in sorted(self._usage.items()):
+            cost = "costo n/d" if entry["cost"] is None else f"costo stimato ~${entry['cost']:.4f}"
+            parts.append(f"{model}: {entry['calls']} chiamate, {entry['in']} token in, {entry['out']} token out, {cost}")
+        return "GPT - " + "; ".join(parts)
+
+    def _vision_max_tokens(self) -> int:
+        return _VISION_MAX_TOKENS_COMPACT if self.model.startswith("gpt-6") else self._VISION_MAX_TOKENS
 
     def ask(self, state: str, questions: dict) -> Result[dict]:
+        key = hashlib.sha256(f"{self.model}|{state}|{json.dumps(questions, sort_keys=True, default=str)}".encode()).hexdigest()
+        if self._cached_text is not None and self._cached_text[0] == key:
+            logger.info("Chiamata GPT evitata: stessa domanda di prima (cache).")
+            return copy.deepcopy(self._cached_text[1])
+        result = self._ask_uncached(state, questions)
+        if result.success:
+            self._cached_text = (key, copy.deepcopy(result))
+        return result
+
+    def _ask_uncached(self, state: str, questions: dict) -> Result[dict]:
         """Chiama Chat Completions in JSON mode e mappa la risposta nel formato answers atteso."""
         valid_actions = set(questions.get("action", {}).get("criteria") or {}) or _DEFAULT_VALID_ACTIONS
         system_prompt = self._build_system_prompt(valid_actions)
@@ -82,6 +178,27 @@ class GPTDecisionClient(DecisionEngineClientInterface):
     def ask_with_image(
         self, screenshot_path: str, state: str, questions: dict, image_width: int, image_height: int,
     ) -> Result[dict]:
+        key = None
+        try:
+            with open(screenshot_path, "rb") as img_file:
+                digest = hashlib.sha256(img_file.read()).hexdigest()
+            key = hashlib.sha256(
+                f"{self.model}|{digest}|{state}|{json.dumps(questions, sort_keys=True, default=str)}|"
+                f"{image_width}x{image_height}".encode()
+            ).hexdigest()
+        except OSError:
+            pass   # l'errore di lettura lo riporta _ask_with_image_uncached come prima
+        if key is not None and self._cached_image is not None and self._cached_image[0] == key:
+            logger.info("Chiamata GPT evitata: stesso screenshot e stessa domanda di prima (cache).")
+            return copy.deepcopy(self._cached_image[1])
+        result = self._ask_with_image_uncached(screenshot_path, state, questions, image_width, image_height)
+        if key is not None and result.success:
+            self._cached_image = (key, copy.deepcopy(result))
+        return result
+
+    def _ask_with_image_uncached(
+        self, screenshot_path: str, state: str, questions: dict, image_width: int, image_height: int,
+    ) -> Result[dict]:
         """Come ask(), ma invia anche lo screenshot (Vision API): GPT vede il layout
         reale invece di un dump di testi OCR. NON restituisce coordinate [x,y]
         dirette (gpt-4o-mini e' inaffidabile nel grounding spaziale, vedi
@@ -90,7 +207,12 @@ class GPTDecisionClient(DecisionEngineClientInterface):
         un'etichetta, una regione grossolana su griglia 3x3 (target_region),
         oltre a classificare lo stato dello schermo (screen_state)."""
         valid_actions = set(questions.get("action", {}).get("criteria") or {}) or _SLOT_TAP_ACTIONS
-        system_prompt = self._build_vision_system_prompt(valid_actions, image_width, image_height)
+        # Azioni di navigazione di un book (scroll/done/input_text/wait): prompt dedicato, non quello delle slot.
+        navigation = bool(valid_actions & _NAVIGATION_SIGNAL_ACTIONS)
+        if navigation:
+            system_prompt = self._build_navigation_vision_prompt(valid_actions, image_width, image_height)
+        else:
+            system_prompt = self._build_vision_system_prompt(valid_actions, image_width, image_height)
         user_text = self._build_user_prompt(state, questions)
 
         try:
@@ -109,7 +231,7 @@ class GPTDecisionClient(DecisionEngineClientInterface):
             ]},
         ]
 
-        result = self._create_completion(messages, max_tokens=self._VISION_MAX_TOKENS)
+        result = self._create_completion(messages, max_tokens=self._vision_max_tokens(), purpose="visione")
         if not result.success:
             return result
         data = result.data
@@ -127,34 +249,36 @@ class GPTDecisionClient(DecisionEngineClientInterface):
             "target": {"choice": target, "confidence": confidence},
             "screen_state": {"choice": screen_state, "confidence": confidence},
         }
+        if navigation:
+            answers["text_to_type"] = {"choice": data.get("text_to_type") or "", "confidence": confidence}
+            answers["target_description"] = {"choice": data.get("target_description") or None, "confidence": confidence}
         return Result.ok({"answers": answers})
 
-    def _create_completion(self, messages: list, max_tokens: int = None) -> Result[dict]:
+    def _create_completion(self, messages: list, max_tokens: int = None, purpose: str = "decisione") -> Result[dict]:
         """Chiama Chat Completions in JSON mode e ritorna il JSON gia' parsato.
         Fattorizza la gestione errori condivisa tra ask() e ask_with_image()."""
         kwargs = {"max_tokens": max_tokens} if max_tokens is not None else {}
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                response_format={"type": "json_object"},
-                temperature=0.1,
-                **kwargs,
+            response = create_with_param_fallback(
+                self.client.chat.completions.create,
+                dict(model=self.model, messages=messages, response_format={"type": "json_object"},
+                     temperature=0.1, **kwargs),
             )
         except openai.APITimeoutError as exc:
-            return Result.fail(f"Timeout GPT-4o-mini: {exc}", self.GPT_DECISION_TIMEOUT)
+            return Result.fail(f"Timeout {self.model}: {exc}", self.GPT_DECISION_TIMEOUT)
         except openai.APIConnectionError as exc:
-            return Result.fail(f"GPT-4o-mini non raggiungibile: {exc}", self.GPT_DECISION_UNREACHABLE)
+            return Result.fail(f"{self.model} non raggiungibile: {exc}", self.GPT_DECISION_UNREACHABLE)
         except openai.APIStatusError as exc:
             return Result.fail(f"HTTP {exc.status_code} da OpenAI: {exc}", self.GPT_DECISION_HTTP_ERROR)
         except openai.OpenAIError as exc:
             return Result.fail(f"Errore OpenAI: {exc}", self.GPT_DECISION_UNREACHABLE)
 
+        self.record_usage(response, purpose)
         try:
             content = response.choices[0].message.content
             data = json.loads(content)
         except (json.JSONDecodeError, IndexError, AttributeError, TypeError) as exc:
-            return Result.fail(f"JSON non valido da GPT-4o-mini: {exc}", self.GPT_DECISION_PARSE_ERROR)
+            return Result.fail(f"JSON non valido da {self.model}: {exc}", self.GPT_DECISION_PARSE_ERROR)
 
         return Result.ok(data)
 
@@ -258,6 +382,47 @@ class GPTDecisionClient(DecisionEngineClientInterface):
             "}\n\n"
             f'"action" must be one of: {", ".join(sorted(valid_actions))}. Exactly one of "target_text"/'
             '"target_region" should be non-null when action is "tap" (never both, never neither).',
+        ])
+
+    def _build_navigation_vision_prompt(self, valid_actions: set, image_width: int, image_height: int) -> str:
+        """Prompt di visione per NAVIGARE un'app di book (menu, promozioni, attivazioni): non e' una slot."""
+        actions_list = "|".join(sorted(valid_actions))
+        states_list = "|".join(_SCREEN_STATES)
+        regions_list = "|".join(_TARGET_REGIONS)
+        return "\n\n".join([
+            "You are an AI agent navigating a bookmaker's app or website on an Android phone via ADB. "
+            "You can SEE the screen through the attached screenshot image. You are NOT playing a slot "
+            "right now: your job is to reach the goal written in the message below by tapping the right "
+            "menus, tabs and buttons (for example Home, Promozioni, Attiva/Aderisci, the game's name, "
+            "Gioca / Prova / For fun).",
+
+            "Look at the whole screen before choosing: popups, cookie banners or notices that cover the "
+            "page must be closed first (an X or a 'Chiudi/OK' button). Never choose a button that would "
+            "spend real money unless the goal explicitly says so; if the goal mentions demo/for fun, pick "
+            "'Prova' or 'For fun'. If the goal is already reached, answer 'done'. If the page needs to be "
+            "scrolled to find the element, answer 'scroll'. If the page is still loading, answer 'wait'.",
+
+            "You do NOT provide pixel coordinates. Choose 'target_text': the EXACT text of one of the "
+            "candidate elements listed in the message below (preferred whenever the element has a visible "
+            "label). If the element you want has no text (a plain icon), choose 'target_region' instead "
+            f"(a rough 3x3 location: {regions_list}) AND describe the element in 'target_description' "
+            "in a few words (for example 'the hamburger menu icon, top left'). Set the unused target "
+            f"fields to null. The image is {image_width}x{image_height} pixels, only for your own spatial "
+            "reasoning about regions.",
+
+            "Respond ONLY with a JSON object matching this exact schema, with no extra text:\n"
+            "{\n"
+            f'  "action": "{actions_list}",\n'
+            f'  "screen_state": "{states_list}",\n'
+            '  "target_text": "exact_text_of_a_candidate_element_or_null",\n'
+            f'  "target_region": "{regions_list}_or_null",\n'
+            '  "target_description": "short_description_or_null",\n'
+            '  "text_to_type": "text_only_if_action_is_input_text_else_empty",\n'
+            '  "confidence": 0.0-1.0,\n'
+            '  "reasoning": "brief_explanation"\n'
+            "}\n\n"
+            f'"action" must be one of: {", ".join(sorted(valid_actions))}. When action is "tap", exactly one of '
+            '"target_text"/"target_region" must be non-null.',
         ])
 
     def _resolve_screen_state(self, raw_state) -> str:
