@@ -578,3 +578,35 @@ class TestNavigationVision:
         assert "ONLY when the final condition" in system and "VISIBLE" in system
         assert "Previous actions" in system
         assert "'Prova' / 'For fun', never 'Gioca'" in system
+
+    def test_navigation_prompt_covers_gentle_scroll_and_load_more(self, client, screenshot_path):
+        with patch.object(client.client.chat.completions, "create", return_value=_mock_completion(json.dumps(self.NAV_PAYLOAD))) as create:
+            client.ask_with_image(screenshot_path, "Goal: g", NAVIGATION_QUESTIONS, 540, 1200)
+
+        system = create.call_args.kwargs["messages"][0]["content"]
+        assert "Carica altro" in system and "ONE more step" in system and "'up'" in system
+
+    def test_navigation_with_a_reasoning_model_gets_more_tokens(self, screenshot_path):
+        sol = GPTDecisionClient(api_key="k", model="gpt-6.1-sol")
+        with patch.object(sol.client.chat.completions, "create", return_value=_mock_completion(json.dumps(self.NAV_PAYLOAD))) as create:
+            sol.ask_with_image(screenshot_path, "Goal: g", NAVIGATION_QUESTIONS, 540, 1200)
+
+        kwargs = create.call_args.kwargs
+        assert kwargs.get("max_tokens", kwargs.get("max_completion_tokens")) == 300
+
+    def test_an_empty_answer_is_retried_once_with_double_tokens(self, screenshot_path):
+        sol = GPTDecisionClient(api_key="k", model="gpt-6.1-sol")
+        replies = [_mock_completion(""), _mock_completion(json.dumps(self.NAV_PAYLOAD))]
+        with patch.object(sol.client.chat.completions, "create", side_effect=replies) as create:
+            result = sol.ask_with_image(screenshot_path, "Goal: g", NAVIGATION_QUESTIONS, 540, 1200)
+
+        assert result.success and create.call_count == 2
+        last = create.call_args.kwargs
+        assert last.get("max_tokens", last.get("max_completion_tokens")) == 600
+
+    def test_two_empty_answers_fail_with_a_parse_error(self, screenshot_path):
+        sol = GPTDecisionClient(api_key="k", model="gpt-6.1-sol")
+        with patch.object(sol.client.chat.completions, "create", side_effect=[_mock_completion(""), _mock_completion("")]):
+            result = sol.ask_with_image(screenshot_path, "Goal: g", NAVIGATION_QUESTIONS, 540, 1200)
+
+        assert not result.success and result.error_code == GPTDecisionClient.GPT_DECISION_PARSE_ERROR

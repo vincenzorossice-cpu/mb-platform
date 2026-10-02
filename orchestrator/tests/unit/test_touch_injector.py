@@ -690,3 +690,32 @@ class TestHumanTapDelay(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestScrollFraction(unittest.TestCase):
+
+    @patch("orchestrator.modules.touch_injector.injector.time.sleep")
+    @patch("orchestrator.modules.touch_injector.injector.subprocess.run")
+    def test_fraction_and_duration_reach_the_swipe_command(self, mock_run, mock_sleep):
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="Physical size: 1000x2000", stderr=""),
+            MagicMock(returncode=0, stderr=""),
+        ]
+        injector = TouchInjector(screen_reader=MagicMock())
+
+        injector.scroll(DEVICE, "down", duration_ms=900, fraction=0.3)
+
+        cmd = mock_run.call_args_list[1][0][0]
+        self.assertEqual(cmd[6:], ["500", "1300", "500", "700", "900"])
+
+    @patch("orchestrator.modules.touch_injector.injector.time.sleep")
+    @patch("orchestrator.modules.touch_injector.injector.subprocess.run")
+    def test_default_swipe_is_unchanged(self, mock_run, mock_sleep):
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="Physical size: 1000x2000", stderr=""),
+            MagicMock(returncode=0, stderr=""),
+        ]
+        TouchInjector(screen_reader=MagicMock()).scroll(DEVICE, "down")
+
+        cmd = mock_run.call_args_list[1][0][0]
+        self.assertEqual(cmd[6:], ["500", "1500", "500", "500", "300"])

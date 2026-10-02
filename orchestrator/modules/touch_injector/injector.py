@@ -121,13 +121,18 @@ class TouchInjector(TouchInjectorInterface):
     # PUBLIC: scroll
     # --------------------------------------------------------
 
-    def scroll(self, device_id: str, direction: str = "down", duration_ms: int = 300) -> Result[bool]:
+    def scroll(
+        self, device_id: str, direction: str = "down", duration_ms: int = 300, fraction: float = 0.5,
+    ) -> Result[bool]:
         """Swipe di scroll. direction='down' fa scorrere il CONTENUTO verso l'alto
-        (swipe dal basso verso l'alto dello schermo), coerente con il gesto naturale."""
+        (swipe dal basso verso l'alto dello schermo), coerente con il gesto naturale.
+        fraction = quota di schermo percorsa dallo swipe (0.5 = dal 25% al 75%); con uno swipe lento
+        e corto il browser non genera lo scorrimento per inerzia."""
         w, h = self._get_screen_size(device_id)
         cx, cy = w // 2, h // 2
-        top, bottom = int(h * 0.25), int(h * 0.75)
-        left, right = int(w * 0.25), int(w * 0.75)
+        half = max(0.05, min(fraction, 0.9)) / 2
+        top, bottom = int(h * (0.5 - half)), int(h * (0.5 + half))
+        left, right = int(w * (0.5 - half)), int(w * (0.5 + half))
         coords = {
             "down": (cx, bottom, cx, top),
             "up": (cx, top, cx, bottom),

@@ -13,6 +13,7 @@ Uso:
 """
 
 import argparse
+import logging
 import os
 import shutil
 import sys
@@ -44,7 +45,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--promo-name", default="Slot in Esclusiva")
     parser.add_argument("--slot-name", default="Turbo Storm Typhoon")
     parser.add_argument("--url", default=SISAL_PROMOTIONS_URL)
-    parser.add_argument("--max-steps", type=int, default=25)
+    parser.add_argument("--max-steps", type=int, default=40)
+    parser.add_argument("--no-save-steps", action="store_true", help="Non salvare lo screenshot di ogni passo.")
     parser.add_argument("--demo", action="store_true", help="Obbligatorio: il test entra in demo (Prova), mai soldi veri.")
     return parser.parse_args(argv)
 
@@ -57,6 +59,28 @@ def _save_final_screenshot(screen_reader, device_id: str) -> str:
     target = os.path.join(LOGS_DIR, f"casino_navigation_final_{time.strftime('%Y%m%d_%H%M%S')}.png")
     shutil.copyfile(shot.data, target)
     return target
+
+
+def setup_logging(stamp: str, logs_dir: str = LOGS_DIR) -> str:
+    """Log su console e su file logs/casino_navigation_<data>.log; ritorna il percorso del file."""
+    os.makedirs(logs_dir, exist_ok=True)
+    path = os.path.join(logs_dir, f"casino_navigation_{stamp}.log")
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    handler = logging.FileHandler(path, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    root.addHandler(handler)
+    if not any(isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler) for h in root.handlers):
+        root.addHandler(logging.StreamHandler())
+    return path
+
+
+def make_step_saver(steps_dir: str):
+    """step_observer per ScreenNavigator: copia lo screenshot guardato a ogni passo in step_NN.png."""
+    def save(step: int, screenshot_path: str) -> None:
+        os.makedirs(steps_dir, exist_ok=True)
+        shutil.copyfile(screenshot_path, os.path.join(steps_dir, f"step_{step:02d}.png"))
+    return save
 
 
 def run_navigation(args: argparse.Namespace) -> bool:
@@ -79,12 +103,20 @@ def run_navigation(args: argparse.Namespace) -> bool:
         print(f"ERRORE: il test richiede {EXPECTED_MODEL}, ma il modello attivo e' {client.model}.")
         return False
 
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    log_path = setup_logging(stamp)
+    print(f"Log: {log_path}")
+    steps_dir = os.path.join(LOGS_DIR, f"casino_navigation_{stamp}")
+    step_saver = None if args.no_save_steps else make_step_saver(steps_dir)
+    if step_saver:
+        print(f"Screenshot dei passi: {steps_dir}")
+
     screen_reader = ScreenReader()
     touch_injector = TouchInjector(screen_reader=screen_reader)
     book_navigator = BookNavigator(screen_reader=screen_reader, touch_injector=touch_injector)
     navigator = ScreenNavigator(
         screen_reader=screen_reader, touch_injector=touch_injector, decision_engine_client=client,
-        region_refiner=build_region_refiner(client), max_steps=args.max_steps,
+        region_refiner=build_region_refiner(client), max_steps=args.max_steps, step_observer=step_saver,
     )
 
     print(f"Apro {args.url} su {args.device_id}...")

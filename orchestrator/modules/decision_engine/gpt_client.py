@@ -44,6 +44,7 @@ _PROVIDER_MODELS = {"gpt4o": "gpt-4o-mini", "gpt6sol": "gpt-6.1-sol"}
 # Prezzi noti in dollari per milione di token (input, output). Per gli altri modelli si usano
 # GPT_PRICE_INPUT_PER_M / GPT_PRICE_OUTPUT_PER_M, altrimenti il costo risulta "n/d": nessun prezzo inventato.
 _KNOWN_PRICES = {"gpt-4o-mini": (0.15, 0.60)}
+_VISION_MAX_TOKENS_NAVIGATION = 300
 _VISION_MAX_TOKENS_COMPACT = 150   # modelli gpt-6.*: risposte piu' concise
 
 
@@ -231,7 +232,10 @@ class GPTDecisionClient(DecisionEngineClientInterface):
             ]},
         ]
 
-        result = self._create_completion(messages, max_tokens=self._vision_max_tokens(), purpose="visione")
+        max_tokens = self._vision_max_tokens()
+        if navigation:
+            max_tokens = max(max_tokens, _VISION_MAX_TOKENS_NAVIGATION)   # un modello che ragiona ne usa una parte
+        result = self._create_completion(messages, max_tokens=max_tokens, purpose="visione")
         if not result.success:
             return result
         data = result.data
@@ -252,11 +256,23 @@ class GPTDecisionClient(DecisionEngineClientInterface):
         if navigation:
             answers["text_to_type"] = {"choice": data.get("text_to_type") or "", "confidence": confidence}
             answers["target_description"] = {"choice": data.get("target_description") or None, "confidence": confidence}
+            answers["reasoning"] = {"choice": data.get("reasoning") or "", "confidence": confidence}
         return Result.ok({"answers": answers})
 
     def _create_completion(self, messages: list, max_tokens: int = None, purpose: str = "decisione") -> Result[dict]:
         """Chiama Chat Completions in JSON mode e ritorna il JSON gia' parsato.
         Fattorizza la gestione errori condivisa tra ask() e ask_with_image()."""
+        result = self._create_completion_once(messages, max_tokens, purpose)
+        if (
+            not result.success and result.error_code == self.GPT_DECISION_PARSE_ERROR and max_tokens is not None
+        ):
+            # Risposta vuota/non JSON (tipico di un modello che ha speso i token nel ragionamento): un solo
+            # nuovo tentativo con il doppio dei token.
+            logger.warning("Risposta non valida da %s: riprovo con %s token.", self.model, max_tokens * 2)
+            result = self._create_completion_once(messages, max_tokens * 2, purpose)
+        return result
+
+    def _create_completion_once(self, messages: list, max_tokens: int = None, purpose: str = "decisione") -> Result[dict]:
         kwargs = {"max_tokens": max_tokens} if max_tokens is not None else {}
         try:
             response = create_with_param_fallback(
@@ -401,6 +417,14 @@ class GPTDecisionClient(DecisionEngineClientInterface):
             "spend real money unless the goal explicitly says so; if the goal mentions demo/for fun, pick "
             "'Prova' or 'For fun'. If the goal is already reached, answer 'done'. If the page needs to be "
             "scrolled to find the element, answer 'scroll'. If the page is still loading, answer 'wait'.",
+
+            "Each scroll moves the page by only about a third of the screen, so nothing is skipped. If "
+            "you see only the top part of a box without its title, scroll ONE more step and read it "
+            "before deciding. Answer scroll with target_text 'down' (default) or 'up' to go back if you "
+            "passed the element you wanted. If the scroll history says the screen did not change (end of "
+            "page) and the item is not there, look for a button such as 'Carica altro', 'Mostra altro' or "
+            "'Vedi altre' below the last box and tap it, then continue from the newly loaded boxes "
+            "(do not restart from the top).",
 
             "The goal may have several phases in order. Use 'Previous actions' to know which phase you "
             "are in and never go back to a phase already completed. Answer 'done' ONLY when the final "

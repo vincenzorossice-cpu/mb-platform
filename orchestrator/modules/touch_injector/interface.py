@@ -34,7 +34,9 @@ class TouchInjectorInterface(ABC):
         """Inserisce testo in un campo."""
 
     @abstractmethod
-    def scroll(self, device_id: str, direction: str = "down", duration_ms: int = 300) -> Result[bool]:
+    def scroll(
+        self, device_id: str, direction: str = "down", duration_ms: int = 300, fraction: float = 0.5,
+    ) -> Result[bool]:
         """Swipe di scroll (up/down/left/right) centrato sullo schermo."""
 
     @abstractmethod

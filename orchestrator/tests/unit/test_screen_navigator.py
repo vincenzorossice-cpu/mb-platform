@@ -109,7 +109,7 @@ class TestScrollAction(unittest.TestCase):
         result = navigator.navigate(DEVICE, goal="Trova la promo")
 
         self.assertTrue(result.success)
-        touch_injector.scroll.assert_called_once_with(DEVICE, "down")
+        touch_injector.scroll.assert_called_once_with(DEVICE, "down", duration_ms=900, fraction=0.3)
 
 
 class TestWaitAction(unittest.TestCase):
@@ -593,3 +593,90 @@ class TestLastHistory:
 
         assert not result.success
         assert [(h["action"], h["target"]) for h in navigator.last_history] == [("tap", "Promo"), ("tap", "Attiva")]
+
+
+class TestGentleScroll:
+    def test_scroll_up_is_executed_up_slowly(self, screenshot):
+        reader, touch, client = _vision_setup(screenshot)
+        touch.scroll.return_value = Result.ok(True)
+        client.ask_with_image.side_effect = [_vision_answers("scroll", text="up"), _vision_answers("done")]
+
+        with patch("orchestrator.modules.screen_navigator.navigator.time.sleep"):
+            _make_navigator(reader, touch, client).navigate(DEVICE, goal="g", vision_mode=True)
+
+        touch.scroll.assert_called_once_with(DEVICE, "up", duration_ms=900, fraction=0.3)
+
+    def test_an_unchanged_screen_after_the_scroll_is_reported_as_end_of_page(self, screenshot):
+        reader, touch, client = _vision_setup(screenshot)   # sempre lo stesso screenshot
+        touch.scroll.return_value = Result.ok(True)
+        client.ask_with_image.side_effect = [_vision_answers("scroll", text="down"), _vision_answers("done")]
+        navigator = _make_navigator(reader, touch, client)
+
+        with patch("orchestrator.modules.screen_navigator.navigator.time.sleep"):
+            navigator.navigate(DEVICE, goal="g", vision_mode=True)
+
+        assert "fine pagina" in navigator.last_history[0]["target"]
+
+    def test_a_moved_page_has_no_end_of_page_note(self, screenshot, tmp_path):
+        reader, touch, client = _vision_setup(screenshot)
+        other = tmp_path / "moved.png"
+        Image.effect_noise((1000, 2000), 80).save(other)
+        reader._screenshot.side_effect = [Result.ok(screenshot), Result.ok(screenshot), Result.ok(str(other)),
+                                          Result.ok(str(other))]
+        touch.scroll.return_value = Result.ok(True)
+        client.ask_with_image.side_effect = [_vision_answers("scroll", text="down"), _vision_answers("done")]
+        navigator = _make_navigator(reader, touch, client)
+
+        with patch("orchestrator.modules.screen_navigator.navigator.time.sleep"):
+            navigator.navigate(DEVICE, goal="g", vision_mode=True)
+
+        assert "fine pagina" not in str(navigator.last_history[0]["target"])
+
+
+class TestSystemBarGuard:
+    def test_a_tap_on_the_system_bar_is_dropped_and_recorded(self, screenshot):
+        reader, touch, client = _vision_setup(screenshot)
+        client.ask_with_image.side_effect = [_vision_answers(region="bottom-center", description="x"),
+                                             _vision_answers("done")]
+        refiner = MagicMock(return_value=(500, 1980))   # 99% dell'altezza (2000)
+        navigator = ScreenNavigator(reader, touch, client, region_refiner=refiner)
+
+        result = navigator.navigate(DEVICE, goal="g", vision_mode=True)
+
+        assert result.success
+        touch.tap_coordinates.assert_not_called()
+        assert navigator.last_history[0]["action"] == "tap scartato"
+
+    def test_a_tap_above_the_bar_is_executed(self, screenshot):
+        reader, touch, client = _vision_setup(screenshot)
+        client.ask_with_image.side_effect = [_vision_answers(region="bottom-center", description="x"),
+                                             _vision_answers("done")]
+        navigator = ScreenNavigator(reader, touch, client, region_refiner=MagicMock(return_value=(500, 1800)))
+
+        navigator.navigate(DEVICE, goal="g", vision_mode=True)
+
+        touch.tap_coordinates.assert_called_once_with(DEVICE, 500, 1800)
+
+
+class TestStepObserverAndReasoning:
+    def test_the_observer_gets_every_screenshot_seen(self, screenshot):
+        reader, touch, client = _vision_setup(screenshot)
+        client.ask_with_image.side_effect = [_vision_answers(text="Accedi"), _vision_answers("done")]
+        seen = []
+        navigator = ScreenNavigator(reader, touch, client, step_observer=lambda step, path: seen.append((step, path)))
+
+        navigator.navigate(DEVICE, goal="g", vision_mode=True)
+
+        assert seen == [(1, screenshot), (2, screenshot)]
+
+    def test_the_reasoning_is_logged(self, screenshot, caplog):
+        import logging
+        reader, touch, client = _vision_setup(screenshot)
+        answers = _vision_answers("done").data
+        answers["answers"]["reasoning"] = {"choice": "sono dentro la slot", "confidence": 0.9}
+        client.ask_with_image.return_value = Result.ok(answers)
+
+        with caplog.at_level(logging.INFO):
+            _make_navigator(reader, touch, client).navigate(DEVICE, goal="g", vision_mode=True)
+
+        assert "sono dentro la slot" in caplog.text

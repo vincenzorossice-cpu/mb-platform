@@ -18,6 +18,16 @@ logger = logging.getLogger(__name__)
 # essere proposta dal Decision Engine prima di considerarla un loop
 _STUCK_LOOP_THRESHOLD = 3
 
+# Scroll "dolce": swipe lento e corto (un terzo di schermo), cosi' il browser non scorre per inerzia
+# e ogni box della lista resta visibile almeno una volta con il suo titolo.
+_SCROLL_DURATION_MS = 900
+_SCROLL_FRACTION = 0.3
+# Sotto questa frazione di altezza c'e' la barra di navigazione di sistema (indietro/home/recenti):
+# un tocco li' fa uscire dal browser.
+_SYSTEM_BAR_FRACTION = 0.95
+# Differenza sotto la quale due screenshot sono "lo stesso schermo" (la pagina non si e' mossa).
+_PAGE_UNCHANGED_THRESHOLD = 0.01
+
 
 # Frazioni (x, y) del centro di ciascuna delle 9 regioni della griglia 3x3 usata dalla visione.
 _REGION_FRACTIONS = {
@@ -58,6 +68,7 @@ class ScreenNavigator(ScreenNavigatorInterface):
         vision_fallback: bool = False,
         max_vision_steps: int = 5,
         region_refiner: Optional[Callable] = None,
+        step_observer: Optional[Callable[[int, str], None]] = None,
     ):
         # screen_reader e' tipizzato come la classe concreta ScreenReader (non
         # ScreenReaderInterface): read_screen(..., force_refresh=True) esiste solo
@@ -74,6 +85,9 @@ class ScreenNavigator(ScreenNavigatorInterface):
         # Opzionale: (descrizione, screenshot, larghezza, altezza) -> (x, y) | None, per precisare una
         # regione 3x3 (troppo grossolana per un'icona) con la ricerca a griglia.
         self.region_refiner = region_refiner
+        # step_observer(step, percorso_screenshot): chiamato con lo screenshot guardato a ogni passo con la visione.
+        self.step_observer = step_observer
+        self._current_step = 0
         self.last_history: list[dict] = []   # azioni dell'ultima navigazione, leggibili anche dopo un fallimento
 
     def _can_see(self) -> bool:
@@ -103,6 +117,7 @@ class ScreenNavigator(ScreenNavigatorInterface):
         vision_stuck_tried = False
 
         for step in range(1, self.max_steps + 1):
+            self._current_step = step
             use_vision = vision_mode or force_vision_next_step
             force_vision_next_step = False
 
@@ -145,6 +160,14 @@ class ScreenNavigator(ScreenNavigatorInterface):
             answers = decision.data["answers"]
 
             logger.info(f"Step {step}/{self.max_steps}: action={action} target={target} confidence={confidence}")
+            reasoning = (answers.get("reasoning") or {}).get("choice")
+            if reasoning:
+                logger.info(f"Step {step} ragionamento: {reasoning}")
+
+            if decision.data.get("rejected"):
+                logger.warning(f"Step {step}: tocco scartato ({decision.data['rejected']}) su {target}.")
+                self._record(history, step, "tap scartato", f"{decision.data['rejected']} {target}")
+                continue
 
             if confidence < self.LOW_CONFIDENCE_THRESHOLD:
                 return Result.fail(f"Low confidence on action decision: {confidence}", "LOW_CONFIDENCE_HITL")
@@ -187,18 +210,21 @@ class ScreenNavigator(ScreenNavigatorInterface):
                 self._invalidate_cache()
                 recovery_attempted = True
                 consecutive_same_action = 0
-                history.append({"step": step, "action": "scroll", "target": "down (recovery)"})
-                self.last_history.append(history[-1])
-                history = history[-self.MAX_HISTORY:]
+                self._record(history, step, "scroll", "down (recovery)")
                 continue
 
-            self._execute(device_id, action, target, answers)
+            note = self._execute(device_id, action, target, answers)
             self._invalidate_cache()   # lo schermo e' cambiato: la prossima domanda e' sempre nuova
-            history.append({"step": step, "action": action, "target": target})
-            self.last_history.append(history[-1])
-            history = history[-self.MAX_HISTORY:]
+            self._record(history, step, action, f"{target} ({note})" if note else target)
 
         return Result.fail(f"Goal not reached after {self.max_steps} steps", "GOAL_NOT_REACHED")
+
+    def _record(self, history: list[dict], step: int, action: str, target) -> None:
+        """Registra l'azione: lo storico passato al modello e' limitato a MAX_HISTORY, quello completo no."""
+        entry = {"step": step, "action": action, "target": target}
+        self.last_history.append(entry)
+        history.append(entry)
+        del history[:-self.MAX_HISTORY]
 
     def _vision_allowed(self, vision_mode: bool, vision_steps_used: int) -> bool:
         """Il ripiego sulla visione e' ammesso solo se attivo, se il motore vede le immagini e se il tetto
@@ -239,6 +265,12 @@ class ScreenNavigator(ScreenNavigatorInterface):
         except OSError as exc:
             return Result.fail(f"Screenshot unreadable: {exc}", "SCREENSHOT_FAILED")
 
+        if self.step_observer is not None:
+            try:
+                self.step_observer(self._current_step, shot.data)
+            except Exception as exc:
+                logger.warning("step_observer fallito: %s", exc)
+
         ask_res = self.decision_engine_client.ask_with_image(shot.data, state, questions, width, height)
         if not ask_res.success:
             return Result.fail(f"Decision engine error: {ask_res.error}", ask_res.error_code)
@@ -259,12 +291,18 @@ class ScreenNavigator(ScreenNavigatorInterface):
                 target = (int(point[0]), int(point[1]))
         elif isinstance(raw_target, str):
             target = raw_target
-        return Result.ok({
+        decision = {
             "action": action_answer.get("choice", "wait"),
             "confidence": action_answer.get("confidence", 0.0),
             "target": target,
             "answers": answers,
-        })
+        }
+        if (
+            decision["action"] == "tap" and isinstance(target, tuple)
+            and target[1] > height * _SYSTEM_BAR_FRACTION
+        ):
+            decision["rejected"] = "barra di sistema"
+        return Result.ok(decision)
 
     def _refine_region(self, description, screenshot_path: str, width: int, height: int):
         if not description or self.region_refiner is None:
@@ -301,7 +339,7 @@ class ScreenNavigator(ScreenNavigatorInterface):
             "text_to_type": noul_question("Testo da digitare, solo se l'azione e' input_text"),
         }
 
-    def _execute(self, device_id: str, action: str, target, answers: dict) -> None:
+    def _execute(self, device_id: str, action: str, target, answers: dict) -> str:
         """Esegue l'azione. Un fallimento viene loggato ma non interrompe il loop:
         il prossimo giro rilegge lo schermo e lascia ripianificare il Decision Engine."""
         if action == "tap":
@@ -313,16 +351,44 @@ class ScreenNavigator(ScreenNavigatorInterface):
             text = answers.get("text_to_type", {}).get("choice", "")
             res = self.touch_injector.input_text(device_id, text, field_hint=target)
         elif action == "scroll":
-            res = self.touch_injector.scroll(device_id, "down")
+            return self._scroll(device_id, target)
         elif action == "wait":
             time.sleep(3)
-            return
+            return ""
         else:
             logger.warning(f"Azione non riconosciuta: {action}")
-            return
+            return ""
 
         if not res.success:
             logger.warning(f"Azione '{action}' su '{target}' fallita: {res.error}")
+        return ""
+
+    def _scroll(self, device_id: str, target) -> str:
+        """Scroll lento e corto nella direzione scelta (up/down, default down). Se lo schermo non cambia la
+        pagina e' finita: lo si dice al modello (nota nello storico), che puo' cercare 'Carica altro'."""
+        direction = target if target in ("up", "down") else "down"
+        before = self._screenshot_path(device_id)
+        res = self.touch_injector.scroll(
+            device_id, direction, duration_ms=_SCROLL_DURATION_MS, fraction=_SCROLL_FRACTION,
+        )
+        if not res.success:
+            logger.warning(f"Scroll fallito: {res.error}")
+            return ""
+        time.sleep(0.8)   # fine dell'inerzia residua
+        after = self._screenshot_path(device_id)
+        if before and after:
+            from orchestrator.modules.slot_autopilot.frame_diff import diff_score
+            diff = diff_score(before, after)
+            if diff.success and diff.data < _PAGE_UNCHANGED_THRESHOLD:
+                return "fine pagina, schermo invariato"
+        return ""
+
+    def _screenshot_path(self, device_id: str) -> str:
+        try:
+            shot = self.screen_reader._screenshot(device_id)
+        except Exception:
+            return ""
+        return shot.data if shot.success is True and isinstance(shot.data, str) else ""
 
     def _extract_texts(self, elements: list[UIElement]) -> list[str]:
         """Testi non vuoti, deduplicati, in ordine di apparizione. Esclude gli
