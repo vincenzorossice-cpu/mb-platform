@@ -402,6 +402,14 @@ class GPTDecisionClient(DecisionEngineClientInterface):
             "'Prova' or 'For fun'. If the goal is already reached, answer 'done'. If the page needs to be "
             "scrolled to find the element, answer 'scroll'. If the page is still loading, answer 'wait'.",
 
+            "The goal may have several phases in order. Use 'Previous actions' to know which phase you "
+            "are in and never go back to a phase already completed. Answer 'done' ONLY when the final "
+            "condition of the goal is VISIBLE on the current screen, not because you tapped the last "
+            "button. If the goal asks you to verify a text (for example a confirmation message), do not "
+            "move on until that text is readable on screen: answer 'wait' if it is not there yet. In demo "
+            "mode tap only 'Prova' / 'For fun', never 'Gioca', 'Deposita', 'Registrati' or any banner or "
+            "advertisement.",
+
             "You do NOT provide pixel coordinates. Choose 'target_text': the EXACT text of one of the "
             "candidate elements listed in the message below (preferred whenever the element has a visible "
             "label). If the element you want has no text (a plain icon), choose 'target_region' instead "

@@ -569,3 +569,12 @@ class TestNavigationVision:
 
         assert "slot machine" in create.call_args.kwargs["messages"][0]["content"]
         assert "target_description" not in result.data["answers"]
+
+    def test_navigation_prompt_has_the_phase_done_and_demo_rules(self, client, screenshot_path):
+        with patch.object(client.client.chat.completions, "create", return_value=_mock_completion(json.dumps(self.NAV_PAYLOAD))) as create:
+            client.ask_with_image(screenshot_path, "Goal: g", NAVIGATION_QUESTIONS, 540, 1200)
+
+        system = create.call_args.kwargs["messages"][0]["content"]
+        assert "ONLY when the final condition" in system and "VISIBLE" in system
+        assert "Previous actions" in system
+        assert "'Prova' / 'For fun', never 'Gioca'" in system

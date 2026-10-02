@@ -579,3 +579,17 @@ class TestVisionFallback:
         assert result.success
         assert client.ask_with_image.call_count == 2
         touch.scroll.assert_not_called()
+
+
+class TestLastHistory:
+    def test_the_full_history_is_readable_after_a_failure(self, screenshot):
+        reader, touch, client = _vision_setup(screenshot)
+        client.ask_with_image.side_effect = [_vision_answers(text="Promo"), _vision_answers(text="Attiva")] + [
+            _vision_answers("wait") for _ in range(5)
+        ]
+        navigator = _make_navigator(reader, touch, client, max_steps=2)
+
+        result = navigator.navigate(DEVICE, goal="g", vision_mode=True)
+
+        assert not result.success
+        assert [(h["action"], h["target"]) for h in navigator.last_history] == [("tap", "Promo"), ("tap", "Attiva")]

@@ -74,6 +74,7 @@ class ScreenNavigator(ScreenNavigatorInterface):
         # Opzionale: (descrizione, screenshot, larghezza, altezza) -> (x, y) | None, per precisare una
         # regione 3x3 (troppo grossolana per un'icona) con la ricerca a griglia.
         self.region_refiner = region_refiner
+        self.last_history: list[dict] = []   # azioni dell'ultima navigazione, leggibili anche dopo un fallimento
 
     def _can_see(self) -> bool:
         return callable(getattr(self.decision_engine_client, "ask_with_image", None))
@@ -90,6 +91,7 @@ class ScreenNavigator(ScreenNavigatorInterface):
         force_vision_next_step = False
 
         history: list[dict] = []
+        self.last_history = []   # storico completo (history, passata al modello, e' limitata a MAX_HISTORY)
         # FIX-LOOP: rileva quando il Decision Engine ripropone la stessa
         # (azione, target) troppe volte di fila (es. tap su un elemento che non
         # produce alcun effetto reale) e prova a sbloccarsi con uno scroll forzato
@@ -186,12 +188,14 @@ class ScreenNavigator(ScreenNavigatorInterface):
                 recovery_attempted = True
                 consecutive_same_action = 0
                 history.append({"step": step, "action": "scroll", "target": "down (recovery)"})
+                self.last_history.append(history[-1])
                 history = history[-self.MAX_HISTORY:]
                 continue
 
             self._execute(device_id, action, target, answers)
             self._invalidate_cache()   # lo schermo e' cambiato: la prossima domanda e' sempre nuova
             history.append({"step": step, "action": action, "target": target})
+            self.last_history.append(history[-1])
             history = history[-self.MAX_HISTORY:]
 
         return Result.fail(f"Goal not reached after {self.max_steps} steps", "GOAL_NOT_REACHED")
