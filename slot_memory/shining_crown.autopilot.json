@@ -1,0 +1,17 @@
+{
+  "elements": {},
+  "flags": {
+    "bet_via_menu": true
+  },
+  "rejected": {
+    "bet_minus": [
+      [
+        518,
+        1475
+      ]
+    ]
+  },
+  "values": {
+    "min_bet": "0.1"
+  }
+}

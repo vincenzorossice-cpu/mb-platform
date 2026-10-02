@@ -1,0 +1,31 @@
+{
+  "slot_name": "Big Bass Bonanza",
+  "provider": "",
+  "screen_width": 1080,
+  "screen_height": 2400,
+  "verified": true,
+  "auto_generated": true,
+  "auto_sessions_ok": 2,
+  "canvas_bbox": null,
+  "known_min_bet": 0.1,
+  "elements": {
+    "bet_minus": {
+      "norm_x": 0.312963,
+      "norm_y": 0.739583,
+      "notes": "Auto-generato da coordinate verificate dal vivo in sessioni reali."
+    },
+    "bet_plus": {
+      "norm_x": 0.687037,
+      "norm_y": 0.71875,
+      "notes": "Auto-generato da coordinate verificate dal vivo in sessioni reali."
+    },
+    "spin": {
+      "norm_x": 0.52037,
+      "norm_y": 0.739583,
+      "notes": "Auto-generato da coordinate verificate dal vivo in sessioni reali."
+    }
+  },
+  "states": {},
+  "macros": {},
+  "_notes": "Profilo AUTO-GENERATO. Diventa verified dopo 2 sessioni consecutive pulite con le stesse coordinate; un aiuto GPT/HITL, un tap a vuoto o una coordinata diversa azzerano il conteggio."
+}

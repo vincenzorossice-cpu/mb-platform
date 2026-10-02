@@ -1,0 +1,14 @@
+{
+  "known_spin_coords": [
+    540,
+    2000
+  ],
+  "learned_hints": [
+    "The screen changed after the operator's tap. Look at the CURRENT screenshot: if a bet menu is open, select the LOWEST amount available; if you are back on the main game screen with the bet at minimum, look for the SPIN button."
+  ],
+  "known_min_bet": 0.2,
+  "known_bet_menu_toggle": [
+    719,
+    2225
+  ]
+}
