@@ -26,8 +26,10 @@ class HITLStrategy(LocatorStrategy):
         # Ultimo punto tappato su indicazione dell'operatore (anche quando l'esito e' solo un
         # "hint": e' il punto che ha cambiato lo schermo, es. l'icona che apre un menu).
         self.last_tap = None
+        self.interventions = 0   # quante volte e' stato chiamato l'operatore (per il riepilogo di fine sessione)
 
     def locate(self, element_name: str, context: LocateContext) -> Result[LocateCandidate]:
+        self.interventions += 1
         current_bet = context.slot_ocr_state.get("posta")
         known_min_bet = context.profile.known_min_bet if context.profile else None
 
@@ -48,6 +50,8 @@ class HITLStrategy(LocatorStrategy):
             return Result.fail("Operator requested stop", "HITL_STOP_REQUESTED")
         if action == "skip":
             return Result.fail("Operator requested skip", "HITL_SKIPPED")
+        if action == "info":
+            return Result.fail(f"Operator statement, no tap: {_data}", "HITL_INFO_ONLY")
         if action == "hint":
             return Result.fail(f"Operator hint only, no tap: {_data}", "HITL_HINT_ONLY")
         if action in ("resolved", "spin_confirmed"):

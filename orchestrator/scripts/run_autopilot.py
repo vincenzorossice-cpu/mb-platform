@@ -9,6 +9,7 @@ from decimal import Decimal
 
 import openai
 
+from orchestrator.core import model_metrics
 from orchestrator.core.result import Result
 from orchestrator.modules.decision_engine.gpt_client import GPTDecisionClient, resolve_reader_model
 from orchestrator.modules.provider_profile.loader import ProviderProfileLoader
@@ -20,6 +21,7 @@ from orchestrator.modules.slot_autopilot.bet_menu import BetMenuSelector
 from orchestrator.modules.slot_autopilot.config import AutoPilotConfig
 from orchestrator.modules.slot_autopilot.locator import ElementLocator
 from orchestrator.modules.slot_autopilot.spin_controller import SpinController
+from orchestrator.modules.slot_autopilot.supervisor import SlotSupervisor
 from orchestrator.modules.slot_autopilot.strategies.gpt_locator_strategy import GPTLocatorStrategy
 from orchestrator.modules.slot_autopilot.strategies.hitl_strategy import HITLStrategy
 from orchestrator.modules.slot_autopilot.strategies.memory_strategy import MemoryStrategy
@@ -155,20 +157,32 @@ def build_autopilot_for(
             strategies["gpt"] = GPTLocatorStrategy(gpt_client, verify_icons=True)
             # Rete di sicurezza per saldo e puntata: se l'OCR non li legge o li legge male (es. "50000.00"
             # letto 50.0) si usa la visione; dove l'OCR basta non costa nulla.
-            ocr_reader = ResilientOCRReader(ocr_reader, VisionAmountReader(gpt_client, model=resolve_reader_model()))
+            def capture_screen():
+                shot = screen_reader._screenshot(device_id)
+                return shot.data if shot.success else None
+
+            ocr_reader = ResilientOCRReader(
+                ocr_reader, VisionAmountReader(gpt_client, model=resolve_reader_model()), capture=capture_screen,
+            )
 
     if config.enable_hitl_fallback:
         strategies["hitl"] = HITLStrategy(
             screen_reader, ocr_reader, touch_injector, describer=strategies.get("gpt"),
         )
 
+    supervisor = None
+    if gpt_client is not None and "gpt" in strategies:
+        # Sol guarda lo schermo intero quando i controlli locali si bloccano, prima di chiamare l'operatore.
+        supervisor = SlotSupervisor(
+            gpt_client, screen_reader, touch_injector, describe=strategies["gpt"].locate_described,
+        )
     locator = ElementLocator(strategies, memory_dir=config.slot_memory_dir)
     verifier = ActionVerifier(touch_injector, screen_reader, ocr_reader, config)
     screen_recovery = ScreenRecovery(locator, verifier, config)
     bet_controller = BetController(
         locator, verifier, step_logger, config,
-        menu_selector=BetMenuSelector(locator, verifier, screen_recovery=screen_recovery),
-        screen_recovery=screen_recovery,
+        menu_selector=BetMenuSelector(locator, verifier, screen_recovery=screen_recovery, supervisor=supervisor),
+        screen_recovery=screen_recovery, supervisor=supervisor,
     )
     spin_controller = SpinController(locator, verifier, step_logger, config)
 
@@ -179,15 +193,41 @@ def build_autopilot_for(
         profile_builder=ProfileBuilder(profiles_dir=config.profiles_dir, memory_dir=config.slot_memory_dir),
     )
     autopilot.gpt_client = gpt_client   # per il riepilogo dei costi a fine sessione
+    autopilot.hitl_strategy = strategies.get("hitl")
+    autopilot.supervisor = supervisor
     return Result.ok(autopilot)
 
 
 def _run_session(autopilot: SlotAutoPilot, args: argparse.Namespace) -> int:
     """Una sessione da riga di comando: il ciclo vero sta in play_session (condiviso con CasinoFlow)."""
+    model_metrics.start_run("slot_autopilot", args.slot.replace(" ", "_"))
+    started = time.monotonic()
     result = play_session(
         autopilot, args.device, args.slot, Decimal(str(args.target)), args.max_steps, log=logger,
     )
+    _log_run_metrics(autopilot, args, result, time.monotonic() - started)
     return 1 if result.failed else 0
+
+
+def _log_run_metrics(autopilot: SlotAutoPilot, args: argparse.Namespace, result, seconds: float) -> None:
+    """Esito della sessione nel file di metriche (performance e tempo; costo e secondi per chiamata sono nelle righe
+    delle chiamate dello stesso run). Mai eccezioni: misurare non deve rompere la sessione."""
+    try:
+        gpt_client = getattr(autopilot, "gpt_client", None)
+        hitl = getattr(autopilot, "hitl_strategy", None)
+        supervisor = getattr(autopilot, "supervisor", None)
+        model_metrics.log_run(
+            type_of_run="slot", model=getattr(gpt_client, "model", None), reader_model=resolve_reader_model(),
+            slot=args.slot, device=args.device, target=str(args.target), spins=result.spins,
+            total_played=str(result.total_played), failed=result.failed, stop_reason=result.stop_reason,
+            bet_aborted_reason=result.bet_aborted_reason, seconds=round(seconds, 1),
+            seconds_per_spin=round(seconds / result.spins, 1) if result.spins else None,
+            operator_interventions=getattr(hitl, "interventions", 0),
+            supervisor_calls=getattr(supervisor, "calls", 0),
+            calls_by_purpose=dict(getattr(gpt_client, "_usage_by_purpose", {}) or {}),
+        )
+    except Exception as exc:
+        logger.debug("metriche del run non scritte: %s", exc)
 
 
 def _parse_args(argv=None) -> argparse.Namespace:
@@ -228,6 +268,9 @@ def main() -> None:
         gpt_client = getattr(autopilot, "gpt_client", None)
         if gpt_client is not None and hasattr(gpt_client, "usage_summary"):
             logger.info("%s", gpt_client.usage_summary())
+        hitl = getattr(autopilot, "hitl_strategy", None)
+        if hitl is not None:
+            logger.info("Interventi dell'operatore: %d", getattr(hitl, "interventions", 0))
         shutdown_result = autopilot.shutdown(args.device)
         if not shutdown_result.success:
             logger.error("shutdown() fallito: %s (%s)", shutdown_result.error, shutdown_result.error_code)

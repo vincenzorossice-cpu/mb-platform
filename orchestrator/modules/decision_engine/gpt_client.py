@@ -5,9 +5,11 @@ import hashlib
 import json
 import logging
 import os
+import time
 
 import openai
 
+from orchestrator.core import model_metrics
 from orchestrator.core.openai_compat import create_with_param_fallback
 from orchestrator.core.result import Result
 from orchestrator.modules.decision_engine.interface import DecisionEngineClientInterface
@@ -41,9 +43,8 @@ _TARGET_REGIONS = (
 _DEFAULT_MODEL = "gpt-4o-mini"
 # Modello associato a ciascun valore di DECISION_ENGINE_PROVIDER (openjev e' un altro motore, non OpenAI).
 _PROVIDER_MODELS = {"gpt4o": "gpt-4o-mini", "gpt6sol": "gpt-6.1-sol"}
-# Prezzi noti in dollari per milione di token (input, output). Per gli altri modelli si usano
-# GPT_PRICE_INPUT_PER_M / GPT_PRICE_OUTPUT_PER_M, altrimenti il costo risulta "n/d": nessun prezzo inventato.
-_KNOWN_PRICES = {"gpt-4o-mini": (0.15, 0.60)}
+# I prezzi stanno in config/model_prices.json (o in GPT_PRICE_INPUT_PER_M / GPT_PRICE_OUTPUT_PER_M): se il prezzo
+# di un modello e' ignoto il costo risulta "n/d", nessun prezzo inventato (vedi core/model_metrics.py).
 _VISION_MAX_TOKENS_NAVIGATION = 300
 _VISION_MAX_TOKENS_COMPACT = 150   # modelli gpt-6.*: risposte piu' concise
 
@@ -66,15 +67,6 @@ def resolve_reader_model() -> str:
 
 def _number(value) -> int:
     return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
-
-
-def _price_per_million(model: str):
-    if model in _KNOWN_PRICES:
-        return _KNOWN_PRICES[model]
-    try:
-        return (float(os.environ["GPT_PRICE_INPUT_PER_M"]), float(os.environ["GPT_PRICE_OUTPUT_PER_M"]))
-    except (KeyError, ValueError):
-        return None
 
 
 class GPTDecisionClient(DecisionEngineClientInterface):
@@ -100,6 +92,7 @@ class GPTDecisionClient(DecisionEngineClientInterface):
         # Ultima risposta riuscita di ask / ask_with_image: stessa richiesta identica -> niente nuova chiamata.
         self._cached_text = None
         self._cached_image = None
+        self._seconds_by_purpose = {}   # scopo -> secondi di ogni chiamata
         self._usage_by_purpose = {}   # scopo (visione, griglia icone, ...) -> numero di chiamate
         self._usage = {}   # modello -> {"calls", "in", "out", "cost"} (cost None = prezzo ignoto)
 
@@ -108,17 +101,28 @@ class GPTDecisionClient(DecisionEngineClientInterface):
         self._cached_text = None
         self._cached_image = None
 
-    def record_usage(self, response, purpose: str = "", model: str = None) -> None:
-        """Registra token e costo stimato di una chiamata (anche fatta da chi usa direttamente
-        `client`); mai eccezioni."""
+    def set_run(self, task: str, label: str = "") -> str:
+        """Da qui le chiamate registrate nel file di metriche appartengono a questo run (compito)."""
+        return model_metrics.start_run(task, label)
+
+    def record_event(self, kind: str, purpose: str = "", model: str = None) -> None:
+        """Un fatto utile alla performance (risposta vuota, cella non valida, tocco scartato...)."""
+        model_metrics.log_event(kind, model or self.model, purpose)
+
+    def record_usage(self, response, purpose: str = "", model: str = None, seconds: float = None) -> None:
+        """Registra token, secondi e costo stimato di una chiamata (anche fatta da chi usa direttamente
+        `client`), anche nel file di metriche; mai eccezioni."""
         try:
             model = model or self.model
             usage = getattr(response, "usage", None)
             tokens_in = _number(getattr(usage, "prompt_tokens", 0))
             tokens_out = _number(getattr(usage, "completion_tokens", 0))
-            prices = _price_per_million(model)
-            cost = None if prices is None else (tokens_in * prices[0] + tokens_out * prices[1]) / 1_000_000
+            cached = _number(getattr(getattr(usage, "prompt_tokens_details", None), "cached_tokens", 0))
+            cost = model_metrics.compute_cost(model, tokens_in, tokens_out, cached)
+            model_metrics.log_call(model, purpose or "decisione", seconds, tokens_in, tokens_out, cached)
             self._usage_by_purpose[purpose or "decisione"] = self._usage_by_purpose.get(purpose or "decisione", 0) + 1
+            if seconds is not None:
+                self._seconds_by_purpose.setdefault(purpose or "decisione", []).append(float(seconds))
             entry = self._usage.setdefault(model, {"calls": 0, "in": 0, "out": 0, "cost": 0.0})
             entry["calls"] += 1
             entry["in"] += tokens_in
@@ -127,7 +131,11 @@ class GPTDecisionClient(DecisionEngineClientInterface):
             logger.info(
                 "Chiamata GPT%s: modello=%s token in=%d out=%d costo=%s",
                 f" ({purpose})" if purpose else "", model, tokens_in, tokens_out,
-                "n/d (imposta GPT_PRICE_INPUT_PER_M e GPT_PRICE_OUTPUT_PER_M)" if cost is None else f"~${cost:.4f}",
+                "n/d (prezzo mancante in config/model_prices.json)" if cost is None else f"~${cost:.4f}",
+            ) if seconds is None else logger.info(
+                "Chiamata GPT%s: modello=%s token in=%d out=%d costo=%s tempo=%.1f s",
+                f" ({purpose})" if purpose else "", model, tokens_in, tokens_out,
+                "n/d (prezzo mancante in config/model_prices.json)" if cost is None else f"~${cost:.4f}", seconds,
             )
         except Exception as exc:  # il conteggio non deve mai rompere una chiamata
             logger.debug("record_usage fallito: %s", exc)
@@ -139,7 +147,13 @@ class GPTDecisionClient(DecisionEngineClientInterface):
         for model, entry in sorted(self._usage.items()):
             cost = "costo n/d" if entry["cost"] is None else f"costo stimato ~${entry['cost']:.4f}"
             parts.append(f"{model}: {entry['calls']} chiamate, {entry['in']} token in, {entry['out']} token out, {cost}")
-        by_purpose = ", ".join(f"{name} {calls}" for name, calls in sorted(self._usage_by_purpose.items()))
+        by_purpose = ", ".join(
+            f"{name} {calls}" + (
+                f" (~{sum(self._seconds_by_purpose[name]) / len(self._seconds_by_purpose[name]):.1f} s)"
+                if self._seconds_by_purpose.get(name) else ""
+            )
+            for name, calls in sorted(self._usage_by_purpose.items())
+        )
         return "GPT - " + "; ".join(parts) + (f" (chiamate per scopo: {by_purpose})" if by_purpose else "")
 
     def _vision_max_tokens(self) -> int:
@@ -277,6 +291,7 @@ class GPTDecisionClient(DecisionEngineClientInterface):
 
     def _create_completion_once(self, messages: list, max_tokens: int = None, purpose: str = "decisione") -> Result[dict]:
         kwargs = {"max_tokens": max_tokens} if max_tokens is not None else {}
+        started = time.monotonic()
         try:
             response = create_with_param_fallback(
                 self.client.chat.completions.create,
@@ -284,22 +299,31 @@ class GPTDecisionClient(DecisionEngineClientInterface):
                      temperature=0.1, **kwargs),
             )
         except openai.APITimeoutError as exc:
+            self._record_failure("timeout", purpose, started)
             return Result.fail(f"Timeout {self.model}: {exc}", self.GPT_DECISION_TIMEOUT)
         except openai.APIConnectionError as exc:
+            self._record_failure("non_raggiungibile", purpose, started)
             return Result.fail(f"{self.model} non raggiungibile: {exc}", self.GPT_DECISION_UNREACHABLE)
         except openai.APIStatusError as exc:
+            self._record_failure(f"http_{exc.status_code}", purpose, started)
             return Result.fail(f"HTTP {exc.status_code} da OpenAI: {exc}", self.GPT_DECISION_HTTP_ERROR)
         except openai.OpenAIError as exc:
+            self._record_failure("errore_openai", purpose, started)
             return Result.fail(f"Errore OpenAI: {exc}", self.GPT_DECISION_UNREACHABLE)
 
-        self.record_usage(response, purpose)
+        self.record_usage(response, purpose, seconds=time.monotonic() - started)
         try:
             content = response.choices[0].message.content
             data = json.loads(content)
         except (json.JSONDecodeError, IndexError, AttributeError, TypeError) as exc:
+            self.record_event("risposta_non_valida", purpose)
             return Result.fail(f"JSON non valido da {self.model}: {exc}", self.GPT_DECISION_PARSE_ERROR)
 
         return Result.ok(data)
+
+    def _record_failure(self, kind: str, purpose: str, started: float) -> None:
+        """Una chiamata fallita: nel file di metriche con i secondi spesi e il tipo di errore."""
+        model_metrics.log_call(self.model, purpose or "decisione", time.monotonic() - started, 0, 0, 0, outcome=kind)
 
     def _build_system_prompt(self, valid_actions: set) -> str:
         lines = [

@@ -84,9 +84,12 @@ class BetMenuSelector:
     e' una lista (es. righe con pulsanti -/+) lo lascia aperto e fallisce con
     MENU_OPEN_NOT_A_LIST: lo gestisce il chiamante con i pulsanti meno."""
 
-    def __init__(self, locator: ElementLocator, verifier: ActionVerifier, screen_recovery=None):
+    def __init__(self, locator: ElementLocator, verifier: ActionVerifier, screen_recovery=None, supervisor=None):
         self.locator = locator
         self.verifier = verifier
+        # Opzionale: se la puntata riletta dopo la scelta non e' leggibile o non torna, Sol guarda lo schermo
+        # intero prima di dichiarare il fallimento (l'OCR/visione economica puo' leggere un contatore jackpot).
+        self.supervisor = supervisor
         # Opzionale: senza, un tocco sul bersaglio sbagliato non viene annullato.
         self.screen_recovery = screen_recovery
 
@@ -204,6 +207,11 @@ class BetMenuSelector:
             if again is not None:
                 after = again
                 bet = after.slot_ocr_state.get("posta")
+        if self.supervisor is not None and (bet is None or Decimal(str(bet)) != lowest):
+            seen = self.supervisor.read_bet(device_id)
+            if seen is not None:
+                logger.info("bet menu: la lettura locale dice %s, il supervisore vede %s (atteso %s).", bet, seen, lowest)
+                bet = seen
         if bet is None:
             return Result.fail(
                 f"Bet after menu selection cannot be read (expected {lowest})", "MENU_SELECTION_UNREADABLE",

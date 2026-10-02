@@ -1,0 +1,5 @@
+{
+  "_note": "Dollari per milione di token. 'cached_input' = prezzo dei token di prompt gia' in cache. Verificare su platform.openai.com/docs/pricing: gpt-6.1-sol ($2 / $0,10 / $10) trovato su fonti online (la pagina ufficiale non era leggibile dallo strumento), oltre 272.000 token di prompt il prezzo cambia (input x2, output x1,5).",
+  "gpt-6.1-sol": {"input": 2.0, "cached_input": 0.10, "output": 10.0},
+  "gpt-4o-mini": {"input": 0.15, "cached_input": 0.075, "output": 0.60}
+}

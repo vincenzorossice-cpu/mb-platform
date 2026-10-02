@@ -149,6 +149,7 @@ class ScreenNavigator(ScreenNavigatorInterface):
                     logger.warning(f"Step {step}: l'app attesa non e' piu' davanti: la riporto davanti.")
                     self.app_restore(device_id)
                     self._record(history, step, "rientro nell'app", f"tentativo {app_restores}")
+                    self._event("rientro_nell_app")
                     time.sleep(2)
 
             screen_res = self.screen_reader.read_screen(device_id, force_refresh=True)
@@ -197,6 +198,7 @@ class ScreenNavigator(ScreenNavigatorInterface):
             if decision.data.get("rejected"):
                 logger.warning(f"Step {step}: tocco scartato ({decision.data['rejected']}) su {target}.")
                 self._record(history, step, "tap scartato", f"{decision.data['rejected']} {target}")
+                self._event("tocco_scartato")
                 continue
 
             if confidence < self.LOW_CONFIDENCE_THRESHOLD:
@@ -248,6 +250,11 @@ class ScreenNavigator(ScreenNavigatorInterface):
             self._record(history, step, action, f"{target} ({note})" if note else target)
 
         return Result.fail(f"Goal not reached after {self.max_steps} steps", "GOAL_NOT_REACHED")
+
+    def _event(self, kind: str) -> None:
+        record = getattr(self.decision_engine_client, "record_event", None)
+        if callable(record):
+            record(kind, "navigazione")
 
     def _app_in_front(self, device_id: str) -> bool:
         try:

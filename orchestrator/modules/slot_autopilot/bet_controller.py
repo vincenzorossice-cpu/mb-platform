@@ -19,6 +19,7 @@ from orchestrator.modules.slot_autopilot.config import AutoPilotConfig
 from orchestrator.modules.slot_autopilot.frame_diff import diff_score
 from orchestrator.modules.slot_autopilot.locator import ElementLocator
 from orchestrator.modules.slot_autopilot.screen_recovery import ScreenRecovery, money_moved
+from orchestrator.modules.slot_autopilot.supervisor import Assist
 from orchestrator.modules.slot_autopilot.verifier import ActionVerifier, Expectation
 from orchestrator.modules.step_logger.interface import StepLoggerInterface, StepRecord
 
@@ -68,7 +69,8 @@ class BetController:
     def __init__(self, locator: ElementLocator, verifier: ActionVerifier,
                  step_logger: StepLoggerInterface, config: AutoPilotConfig,
                  menu_selector: Optional[BetMenuSelector] = None,
-                 screen_recovery: Optional[ScreenRecovery] = None):
+                 screen_recovery: Optional[ScreenRecovery] = None,
+                 supervisor=None):
         self.locator = locator
         self.verifier = verifier
         self.step_logger = step_logger
@@ -77,6 +79,8 @@ class BetController:
         self.menu_selector = menu_selector
         # None = nessun recupero da schermate aperte per errore (storico).
         self.screen_recovery = screen_recovery
+        # None = nessun supervisore: si passa direttamente all'operatore (storico).
+        self.supervisor = supervisor
 
     def set_min_bet(
         self, device_id: str, slot_name: str, episode_id: str,
@@ -220,10 +224,46 @@ class BetController:
                         context = refreshed.data
                     if menu_open:
                         continue
-                    locate_result = self.locator.locate(_ELEMENT, context)
+                    locate_result = self._locate_before_operator(context)
+                    if isinstance(locate_result, Assist):
+                        verdict = locate_result
+                        if verdict.outcome == "at_min":
+                            return self._supervisor_confirmed_min(
+                                slot_name, episode_id, device_id, starting_bet, verdict.bet,
+                                strategy_sequence, attempts, any_decrease_seen,
+                            )
+                        strategy_sequence.append("supervisor")
+                        self.locator.reset_failures(_ELEMENT)
+                        refreshed = context_provider()
+                        if refreshed.success:
+                            context = refreshed.data
+                        continue
             else:
-                locate_result = self.locator.locate(_ELEMENT, context)
+                locate_result = self._locate_before_operator(context)
+                if isinstance(locate_result, Assist):
+                    verdict = locate_result
+                    if verdict.outcome == "at_min":
+                        return self._supervisor_confirmed_min(
+                            slot_name, episode_id, device_id, starting_bet, verdict.bet,
+                            strategy_sequence, attempts, any_decrease_seen,
+                        )
+                    # "closed": un menu non voluto e' stato chiuso, lo schermo e' nuovo
+                    strategy_sequence.append("supervisor")
+                    self.locator.reset_failures(_ELEMENT)
+                    refreshed = context_provider()
+                    if refreshed.success:
+                        context = refreshed.data
+                    continue
             if not locate_result.success:
+                if locate_result.error_code == "HITL_INFO_ONLY":
+                    # L'operatore non ha dato un'istruzione ma un'informazione ("la puntata e' gia' al minimo"):
+                    # nessun tocco. Vale come riscontro indipendente (come un aiuto dell'operatore).
+                    final_bet = self.supervisor.read_bet(device_id) if self.supervisor is not None else None
+                    logger.info("set_min_bet: l'operatore conferma la puntata minima (letta: %s).", final_bet)
+                    return self._supervisor_confirmed_min(
+                        slot_name, episode_id, device_id, starting_bet, final_bet,
+                        strategy_sequence + ["hitl"], attempts, any_decrease_seen, by_operator=True,
+                    )
                 if locate_result.error_code == "HITL_STOP_REQUESTED":
                     logger.warning("set_min_bet: l'operatore ha chiesto di fermarsi, abort=HITL_STOP")
                     self._log_step(
@@ -907,6 +947,49 @@ class BetController:
         candidate = toggle_result.data
         self.verifier.verified_tap(device_id, candidate.x, candidate.y, Expectation(kind="screen_changed"))
         logger.info("set_min_bet: menu puntata richiuso.")
+
+    def _locate_before_operator(self, context):
+        """locate(_ELEMENT) con Sol come supervisore PRIMA dell'operatore: se la catena senza operatore fallisce, Sol
+        guarda lo schermo (puntata gia' al minimo? menu non voluto aperto?). Ritorna il Result del locate oppure un
+        Assist se il supervisore ha risolto o cambiato qualcosa. Senza supervisore e' il locate di sempre."""
+        if self.supervisor is None:
+            return self.locator.locate(_ELEMENT, context)
+        result = self.locator.locate(_ELEMENT, context, exclude_strategies=("hitl",))
+        if result.success or result.error_code == "GPT_LOCATOR_UNAVAILABLE":
+            return result
+        verdict = self.supervisor.assist(context.device_id, self._known_min(context))
+        if verdict.outcome != "nothing":
+            return verdict
+        only_operator = tuple(name for name in self.locator._STRATEGY_ORDER if name != "hitl")
+        return self.locator.locate(_ELEMENT, context, exclude_strategies=only_operator)
+
+    def _known_min(self, context) -> Optional[Decimal]:
+        profile = context.profile
+        if profile is not None and profile.verified and profile.known_min_bet is not None:
+            return Decimal(str(profile.known_min_bet))
+        return self._remembered_min(context.slot_name)
+
+    def _supervisor_confirmed_min(
+        self, slot_name, episode_id, device_id, starting_bet, final_bet, strategy_sequence, attempts,
+        any_decrease_seen, by_operator: bool = False,
+    ) -> Result[BetResult]:
+        """La puntata e' al minimo per riscontro di Sol (valore letto <= minimo noto) o dell'operatore."""
+        sequence = list(strategy_sequence)
+        if "supervisor" not in sequence and not by_operator:
+            sequence.append("supervisor")
+        if final_bet is not None and not by_operator:
+            self._remember_min(slot_name, final_bet)
+        logger.info("set_min_bet: puntata minima confermata (%s) senza altri tocchi: %s.",
+                    "operatore" if by_operator else "supervisore", final_bet)
+        self._log_step(
+            episode_id, attempts, slot_name, device_id, "supervisor" if not by_operator else "hitl", None,
+            starting_bet, final_bet, outcome="success", verified=True,
+        )
+        return Result.ok(BetResult(
+            slot_name=slot_name, starting_bet=starting_bet, final_bet=final_bet,
+            min_bet_verified=True, attempts=attempts, strategy_sequence=sequence,
+            aborted_reason=None, outcome="min_bet_confirmed" if any_decrease_seen else "unchanged_already_min",
+        ))
 
     def _read_bet(self, context) -> Optional[Decimal]:
         value = context.slot_ocr_state.get("posta") if context else None

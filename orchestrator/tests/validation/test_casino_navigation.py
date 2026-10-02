@@ -54,6 +54,19 @@ def parse_args(argv=None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def ask_verdict(input_fn=input, interactive=None) -> "bool | None":
+    """Esito verificato da una persona: True/False, None se non c'e' un terminale o si salta (invio)."""
+    if interactive is None:
+        interactive = sys.stdin.isatty()
+    if not interactive:
+        return None
+    try:
+        answer = input_fn("Sei davvero dentro la slot in demo? (s/n, invio per saltare): ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    return True if answer.startswith("s") else False if answer.startswith("n") else None
+
+
 def _save_final_screenshot(screen_reader, device_id: str) -> str:
     shot = screen_reader._screenshot(device_id)
     if not shot.success:
@@ -87,6 +100,7 @@ def make_step_saver(steps_dir: str):
 
 
 def run_navigation(args: argparse.Namespace) -> bool:
+    from orchestrator.core import model_metrics
     from orchestrator.modules.book_navigator.navigator import BookNavigator
     from orchestrator.modules.decision_engine.gpt_client import GPTDecisionClient
     from orchestrator.modules.screen_navigator.navigator import ScreenNavigator
@@ -132,7 +146,10 @@ def run_navigation(args: argparse.Namespace) -> bool:
 
     goal = build_goal(args.promo_name, args.slot_name)
     print(f"Goal: {goal}\n")
+    client.set_run("navigazione_casino", args.book)
+    started = time.monotonic()
     result = navigator.navigate(args.device_id, goal=goal, book=args.book, demo_mode=True, vision_mode=True)
+    seconds = time.monotonic() - started
 
     print("\n=== STORICO AZIONI ===")
     for entry in navigator.last_history:
@@ -145,9 +162,16 @@ def run_navigation(args: argparse.Namespace) -> bool:
     if result.success:
         print("\nNAVIGAZIONE COMPLETATA - slot pronta per gioco")
         print("Controlla lo screenshot finale: 'done' e' deciso dal modello, non verificato dal codice.")
-        return True
-    print(f"\nERRORE: navigazione fallita: {result.error} ({result.error_code})")
-    return False
+    else:
+        print(f"\nERRORE: navigazione fallita: {result.error} ({result.error_code})")
+    verified = ask_verdict()
+    model_metrics.log_run(
+        type_of_run="navigazione", model=client.model, book=args.book, device=args.device_id,
+        done_declared=bool(result.success), error_code=None if result.success else result.error_code,
+        verified_by_user=verified, steps=len(navigator.last_history), seconds=round(seconds, 1),
+        calls_by_purpose=dict(client._usage_by_purpose),
+    )
+    return bool(result.success)
 
 
 def main(argv=None) -> None:

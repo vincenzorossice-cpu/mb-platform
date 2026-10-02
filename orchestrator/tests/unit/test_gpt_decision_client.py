@@ -520,7 +520,7 @@ class TestUsageLog:
     def test_unknown_price_is_declared_not_invented(self, caplog, monkeypatch):
         monkeypatch.delenv("GPT_PRICE_INPUT_PER_M", raising=False)
         with patch("orchestrator.modules.decision_engine.gpt_client.openai.OpenAI"):
-            sol = GPTDecisionClient(api_key="k", model="gpt-6.1-sol")
+            sol = GPTDecisionClient(api_key="k", model="gpt-x-unknown")
         with caplog.at_level("INFO"):
             sol.record_usage(self._response(100, 10))
 
@@ -530,10 +530,36 @@ class TestUsageLog:
         monkeypatch.setenv("GPT_PRICE_INPUT_PER_M", "2.0")
         monkeypatch.setenv("GPT_PRICE_OUTPUT_PER_M", "8.0")
         with patch("orchestrator.modules.decision_engine.gpt_client.openai.OpenAI"):
-            sol = GPTDecisionClient(api_key="k", model="gpt-6.1-sol")
+            sol = GPTDecisionClient(api_key="k", model="gpt-x-unknown")
         sol.record_usage(self._response(1_000_000, 500_000))
 
         assert "~$6.0000" in sol.usage_summary()
+
+    def test_sol_has_a_price_in_the_price_file(self, monkeypatch):
+        monkeypatch.delenv("GPT_PRICE_INPUT_PER_M", raising=False)
+        with patch("orchestrator.modules.decision_engine.gpt_client.openai.OpenAI"):
+            sol = GPTDecisionClient(api_key="k", model="gpt-6.1-sol")
+        sol.record_usage(self._response(1_000_000, 1_000_000))
+
+        assert "~$12.0000" in sol.usage_summary()      # $2 in + $10 out
+
+    def test_seconds_are_logged_and_summarised_by_purpose(self, client, caplog):
+        with caplog.at_level("INFO"):
+            client.record_usage(self._response(10, 1), "visione", seconds=4.2)
+            client.record_usage(self._response(10, 1), "visione", seconds=5.8)
+
+        assert "tempo=4.2 s" in caplog.text and "visione 2 (~5.0 s)" in client.usage_summary()
+
+    def test_cached_tokens_use_the_cached_price(self, monkeypatch):
+        from types import SimpleNamespace
+        with patch("orchestrator.modules.decision_engine.gpt_client.openai.OpenAI"):
+            sol = GPTDecisionClient(api_key="k", model="gpt-6.1-sol")
+        response = SimpleNamespace(usage=SimpleNamespace(
+            prompt_tokens=1_000_000, completion_tokens=0, prompt_tokens_details=SimpleNamespace(cached_tokens=1_000_000),
+        ))
+        sol.record_usage(response)
+
+        assert "~$0.1000" in sol.usage_summary()
 
     def test_a_response_without_usage_never_raises(self, client):
         client.record_usage(MagicMock())

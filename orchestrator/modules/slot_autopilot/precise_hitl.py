@@ -18,6 +18,12 @@ _TAP_SETTLE_SECONDS = 3
 # Una frase che indica la cella da un VALORE ("il piu' basso", "quella da 0.10", "il minimo"): se la
 # vista non la trova, il vecchio interprete a parole chiave leggerebbe "basso" come "in basso" e
 # toccherebbe un punto a caso. Meglio ammettere di non aver capito e richiedere aiuto.
+# Verbi all'imperativo con cui l'operatore chiede un tocco ("premi la X", "tocca il meno", "apri il menu").
+_TAP_INSTRUCTION = re.compile(
+    r"\b(premi|premere|tocca|toccare|tappa|tappare|clicca|cliccare|apri|aprire|chiudi|chiudere|seleziona|"
+    r"scegli|usa|vai|press|tap|click|open|close|select|choose)\b",
+    re.IGNORECASE,
+)
 _VALUE_DESCRIPTION = re.compile(
     r"\d+[.,]\d+|\b(pi[uù]'?\s+(basso|bassa|alto|alta|piccolo|piccola|grande)|minim\w*|massim\w*|"
     r"lowest|highest|smallest|largest)\b",
@@ -57,9 +63,13 @@ def handle_precise_hitl_escalation(
         else:
             description = outcome[1]
             if _looks_like_min_bet_confirmation(description):
-                confirmed_min_bet = current_bet
-                bet_str = f"{current_bet:.2f} EUR" if current_bet is not None else "sconosciuta"
-                print(f"Operatore conferma: {bet_str} e' la puntata minima per questa slot.")
+                if not _TAP_INSTRUCTION.search(description):
+                    # Una frase di stato, non un'istruzione: niente da cercare e da toccare.
+                    print("Operatore conferma che la puntata e' gia' al minimo: non tocco nulla, verifico io lo schermo.")
+                    return ("info", description, current_bet, None)
+                if current_bet is not None:
+                    confirmed_min_bet = current_bet
+                    print(f"Operatore conferma: {current_bet:.2f} EUR e' la puntata minima per questa slot.")
 
             shot = screen_reader._screenshot(device_id)
             if not shot.success:

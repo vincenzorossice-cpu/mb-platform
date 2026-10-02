@@ -8,6 +8,7 @@ import time
 from typing import Optional
 
 import openai
+from typing import Callable
 from PIL import Image
 
 from orchestrator.core.amount_format import find_amount_run
@@ -25,7 +26,10 @@ _SYSTEM_PROMPT = (
     "commas used as separators (for example \"49 999.90\" or \"1.250,00\"); leave out only the currency "
     "symbol. Do NOT convert, round or reformat the numbers. If several amounts are shown as selectable "
     "options (a row of bet buttons), the current bet is the one that is highlighted/selected; if you cannot "
-    "tell which, use null. Use null for anything you cannot read with certainty. Never guess."
+    "tell which, use null. Use null for anything you cannot read with certainty. Never guess. IGNORE jackpot and "
+    "progressive meters (labels such as JACKPOT, MINI, MIDI, MAXI, GRAND, or any large number that keeps "
+    "changing while the game is idle): they are neither the credit nor the bet. The credit and the bet are "
+    "never the same number."
 )
 # Per leggere un importo non serve l'immagine intera: lato lungo ridotto e detail "low" (circa 2.800 token
 # invece di decine di migliaia: risposta piu' veloce e lontani dal limite di token al minuto).
@@ -93,10 +97,10 @@ class VisionAmountReader:
                     ],
                 ),
             ))
+            call_seconds = time.monotonic() - started
             record = getattr(self.gpt_client, "record_usage", None)
             if callable(record):
-                record(response, "importi", model)
-            call_seconds = time.monotonic() - started
+                record(response, "importi", model, seconds=call_seconds)
             data = json.loads(response.choices[0].message.content)
         except OSError as exc:
             logger.warning("lettura per visione: screenshot illeggibile: %s", exc)
@@ -148,10 +152,18 @@ class ResilientOCRReader:
     altrimenti (per il saldo) quello coerente con l'ultimo saldo fidato; se nessuno lo e', il campo resta
     sconosciuto. Dove l'OCR basta non costa nulla. La vincita resta quella dell'OCR."""
 
-    def __init__(self, ocr, vision: Optional[VisionAmountReader], tolerance: float = 0.10):
+    def __init__(
+        self, ocr, vision: Optional[VisionAmountReader], tolerance: float = 0.10,
+        capture: Optional[Callable[[], Optional[str]]] = None, confirm_delay: float = 1.5,
+    ):
         self.ocr = ocr
         self.vision = vision
         self.tolerance = tolerance
+        # capture() -> percorso di uno screenshot NUOVO: serve a smascherare i contatori (jackpot) che la visione
+        # scambia per saldo/puntata: un numero che cambia tra due letture ravvicinate non e' il credito.
+        self._capture = capture
+        self._confirm_delay = confirm_delay
+        self._warn_counts = {}
         self._self_checked = False
         self._vision_fields = set()
         # Alla prima lettura l'OCR non ha letto NE' saldo NE' puntata: durante gli spin e' tempo perso.
@@ -216,20 +228,27 @@ class ResilientOCRReader:
 
     def _first_read(self, state: dict, seen: dict) -> dict:
         merged = dict(state)
+        second = {}                           # seconda lettura (screenshot nuovo), fatta al piu' una volta
         for key in _KEYS:
             ocr_value, vision_value = state.get(key), seen.get(key)
             if vision_value is None:
                 continue                      # la visione non dice nulla: resta l'OCR
-            if ocr_value is None:
-                self._vision_fields.add(key)
-                merged[key] = self._trusted[key] = vision_value
-            elif _within(ocr_value, vision_value, self.tolerance):
+            if ocr_value is not None and _within(ocr_value, vision_value, self.tolerance):
                 merged[key] = self._trusted[key] = ocr_value
-            elif _powers_of_ten_apart(ocr_value, vision_value) and ocr_value > vision_value:
+            elif ocr_value is not None and _powers_of_ten_apart(ocr_value, vision_value) and ocr_value > vision_value:
                 # Perdere le cifre delle migliaia e' molto piu' comune che inventarle: vince il valore piu' grande.
                 logger.warning("'%s': OCR %s contro visione %s (differiscono di una potenza di dieci): "
                                "tengo il piu' grande, l'OCR.", key, ocr_value, vision_value)
                 merged[key] = self._trusted[key] = ocr_value
+            elif self._is_stable(key, vision_value, second) is False:
+                # La visione ha letto un numero che cambia da una lettura all'altra: un contatore (jackpot), non
+                # il credito. Non e' un ancoraggio: resta l'OCR (o sconosciuto) e la visione non lo ridefinisce.
+                logger.warning("'%s': la visione ha letto %s ma il valore cambia tra due letture (contatore?): "
+                               "lo scarto.", key, vision_value)
+                self._vision_fields.add(key)
+                merged[key] = ocr_value
+                if ocr_value is not None:
+                    self._trusted[key] = ocr_value
             else:
                 self._vision_fields.add(key)
                 merged[key] = self._trusted[key] = vision_value
@@ -239,7 +258,39 @@ class ResilientOCRReader:
                 state.get("saldo"), state.get("posta"), seen.get("saldo"), seen.get("posta"),
                 ", ".join(sorted(self._vision_fields)),
             )
+        return self._sane(merged)
+
+    def _is_stable(self, key: str, first_value: float, second: dict) -> Optional[bool]:
+        """True se una seconda lettura ravvicinata (screenshot nuovo) da' lo stesso valore, False se cambia o non
+        c'e' piu', None se non si puo' controllare (nessuna cattura disponibile)."""
+        if self._capture is None or self.vision is None:
+            return None
+        if "read" not in second:
+            time.sleep(self._confirm_delay)
+            path = self._capture()
+            second["read"] = self.vision.read(path) if path else None
+        if second["read"] is None:
+            return None
+        again = second["read"].get(key)
+        # Identico: un contatore che sale di pochi centesimi e' 'quasi uguale' ma non e' il credito.
+        return again is not None and abs(again - first_value) < 0.005
+
+    @staticmethod
+    def _sane(merged: dict) -> dict:
+        """Una puntata che non e' minore del saldo e' un errore di lettura (credito letto come puntata)."""
+        bet, balance = merged.get("posta"), merged.get("saldo")
+        if bet is not None and balance is not None and bet >= balance:
+            logger.warning("puntata %s non inferiore al saldo %s: la scarto.", bet, balance)
+            merged = dict(merged)
+            merged["posta"] = None
         return merged
+
+    def _warn(self, kind: str, message: str, *args) -> None:
+        """Lo stesso avviso ripetuto a ogni lettura copre il resto del log: il primo e poi uno ogni 10."""
+        count = self._warn_counts.get(kind, 0)
+        self._warn_counts[kind] = count + 1
+        if count % 10 == 0:
+            logger.warning(message + ("" if count == 0 else f" [ripetuto {count} volte]"), *args)
 
     def _combine(self, state: dict, seen: dict) -> dict:
         merged = dict(state)
@@ -253,7 +304,7 @@ class ResilientOCRReader:
                 merged[key] = self._trusted[key] = vision_value
             elif ocr_value is not None:
                 self._trusted[key] = ocr_value
-        return merged
+        return self._sane(merged)
 
     def _arbitrate(self, key: str, ocr_value: Optional[float], vision_value: Optional[float]) -> Optional[float]:
         trusted = self._trusted[key]
@@ -267,8 +318,8 @@ class ResilientOCRReader:
             if ocr_value is not None and trusted is not None and _within(ocr_value, trusted, self.tolerance):
                 return accept(ocr_value)
             if ocr_value is not None:
-                logger.warning("visione non disponibile: scarto l'importo dell'OCR per '%s' (%s contro %s).",
-                               key, ocr_value, trusted)
+                self._warn("no_vision_" + key, "visione non disponibile: scarto l'importo dell'OCR per '%s' (%s contro %s).",
+                           key, ocr_value, trusted)
             return None
         if ocr_value is not None and _within(ocr_value, vision_value, self.tolerance):
             return accept(vision_value)
@@ -277,9 +328,9 @@ class ResilientOCRReader:
         if _within(vision_value, trusted, _BALANCE_CONTINUITY):
             return accept(vision_value)
         if ocr_value is not None and _within(ocr_value, trusted, _BALANCE_CONTINUITY):
-            logger.warning("saldo: scarto la visione (%s) perche' incoerente con l'ultimo saldo (%s): tengo l'OCR (%s).",
-                           vision_value, trusted, ocr_value)
+            self._warn("discard_vision", "saldo: scarto la visione (%s) perche' incoerente con l'ultimo saldo (%s): tengo l'OCR (%s).",
+                       vision_value, trusted, ocr_value)
             return accept(ocr_value)
-        logger.warning("saldo: ne' l'OCR (%s) ne' la visione (%s) sono coerenti con l'ultimo saldo (%s): lo ignoro.",
-                       ocr_value, vision_value, trusted)
+        self._warn("ignore_balance", "saldo: ne' l'OCR (%s) ne' la visione (%s) sono coerenti con l'ultimo saldo (%s): lo ignoro.",
+                   ocr_value, vision_value, trusted)
         return None

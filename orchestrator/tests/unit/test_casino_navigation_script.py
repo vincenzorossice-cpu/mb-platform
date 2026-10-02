@@ -43,3 +43,10 @@ def test_log_file_and_step_screenshots_are_created(tmp_path):
     Image.new("RGB", (10, 10)).save(shot)
     script.make_step_saver(str(tmp_path / "steps"))(3, str(shot))
     assert (tmp_path / "steps" / "step_03.png").exists()
+
+
+def test_verdict_is_taken_from_the_operator_and_skipped_without_a_terminal():
+    assert script.ask_verdict(lambda prompt: "s", interactive=True) is True
+    assert script.ask_verdict(lambda prompt: "No", interactive=True) is False
+    assert script.ask_verdict(lambda prompt: "", interactive=True) is None
+    assert script.ask_verdict(lambda prompt: "s", interactive=False) is None

@@ -4,6 +4,7 @@ import logging
 import math
 import os
 import tempfile
+import time
 
 import openai
 
@@ -264,13 +265,14 @@ class GPTLocatorStrategy(LocatorStrategy):
                 {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}},
             ]},
         ]
+        started = time.monotonic()
         try:
             response = call_with_rate_limit_retry(lambda: create_with_param_fallback(
                 self.gpt_client.client.chat.completions.create,
                 dict(model=self.gpt_client.model, messages=messages,
                      response_format={"type": "json_object"}, temperature=0.1, max_tokens=250),
             ))
-            self._record_usage(response, "griglia icone")
+            self._record_usage(response, "griglia icone", time.monotonic() - started)
             data = json.loads(response.choices[0].message.content)
         except openai.OpenAIError as exc:
             logger.warning("'%s' (%s): errore OpenAI: %s", element_name, stage, exc)
@@ -306,6 +308,7 @@ class GPTLocatorStrategy(LocatorStrategy):
                 label = self._ask_cell(element_name, coarse_path, list(coarse), "coarse", note, description)
                 if label not in coarse:
                     logger.warning("'%s': passo A senza cella valida (%r)", element_name, label)
+                    self._record_event("cella_non_valida", "griglia icone")
                     return None
 
                 fine_cols, fine_rows = _FINE_GRID
@@ -327,6 +330,7 @@ class GPTLocatorStrategy(LocatorStrategy):
                 label_b = self._ask_cell(element_name, fine_path, fine_labels, "fine", note, description)
                 if label_b not in fine_labels:
                     logger.warning("'%s': passo B senza cella valida (%r)", element_name, label_b)
+                    self._record_event("cella_non_valida", "griglia icone")
                     return None
                 point = fine[label_b]
 
@@ -366,10 +370,15 @@ class GPTLocatorStrategy(LocatorStrategy):
                 logger.warning("'%s': affinamento icona fallito: %s", element_name, exc)
                 return None
 
-    def _record_usage(self, response, purpose: str) -> None:
+    def _record_usage(self, response, purpose: str, seconds: float = None) -> None:
         record = getattr(self.gpt_client, "record_usage", None)
         if callable(record):
-            record(response, purpose)
+            record(response, purpose, seconds=seconds)
+
+    def _record_event(self, kind: str, purpose: str) -> None:
+        record = getattr(self.gpt_client, "record_event", None)
+        if callable(record):
+            record(kind, purpose)
 
     def _looks_like_expected(self, element_name: str, context: LocateContext, point: tuple, tmp: str) -> bool:
         """Classifica un ritaglio ~240 px centrato sul punto scelto: se non e' il tipo di elemento cercato,
@@ -393,12 +402,13 @@ class GPTLocatorStrategy(LocatorStrategy):
                     {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}},
                 ]},
             ]
+            started = time.monotonic()
             response = call_with_rate_limit_retry(lambda: create_with_param_fallback(
                 self.gpt_client.client.chat.completions.create,
                 dict(model=self.gpt_client.model, messages=messages,
                      response_format={"type": "json_object"}, temperature=0, max_tokens=60),
             ))
-            self._record_usage(response, "verifica icona")
+            self._record_usage(response, "verifica icona", time.monotonic() - started)
             data = json.loads(response.choices[0].message.content)
         except openai.OpenAIError as exc:
             logger.warning("'%s': verifica dell'icona non riuscita (errore OpenAI): %s", element_name, exc)
