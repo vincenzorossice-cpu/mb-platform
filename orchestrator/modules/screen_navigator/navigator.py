@@ -246,6 +246,10 @@ class ScreenNavigator(ScreenNavigatorInterface):
                 continue
 
             note = self._execute(device_id, action, target, answers)
+            if action == "scroll" and not note:
+                # La pagina si e' mossa: uno scroll che avanza non e' un loop (liste lunghe, "Carica altro").
+                consecutive_same_action = 0
+                last_action_signature = None
             self._invalidate_cache()   # lo schermo e' cambiato: la prossima domanda e' sempre nuova
             self._record(history, step, action, f"{target} ({note})" if note else target)
 
@@ -399,7 +403,7 @@ class ScreenNavigator(ScreenNavigatorInterface):
                 res = self.touch_injector.tap_coordinates(device_id, target[0], target[1])
             else:
                 res = self.touch_injector.tap_element(device_id, target)
-            note = self._tap_effect_note(device_id, before)
+            note = self._tap_effect_note(device_id, before, is_point=isinstance(target, tuple))
         elif action == "input_text":
             text = answers.get("text_to_type", {}).get("choice", "")
             res = self.touch_injector.input_text(device_id, text, field_hint=target)
@@ -416,7 +420,7 @@ class ScreenNavigator(ScreenNavigatorInterface):
             logger.warning(f"Azione '{action}' su '{target}' fallita: {res.error}")
         return note
 
-    def _tap_effect_note(self, device_id: str, before: str) -> str:
+    def _tap_effect_note(self, device_id: str, before: str, is_point: bool = False) -> str:
         """Confronto locale (0 token) tra lo schermo prima e dopo il tocco: l'esito di tap_element si basa sugli
         elementi letti e su una pagina web di Chrome non e' affidabile."""
         if not before:
@@ -428,7 +432,7 @@ class ScreenNavigator(ScreenNavigatorInterface):
         from orchestrator.modules.slot_autopilot.frame_diff import diff_score
         diff = diff_score(before, after)
         if diff.success and diff.data < _PAGE_UNCHANGED_THRESHOLD:
-            return "schermo invariato: il tocco non ha fatto nulla"
+            return "schermo invariato: il tocco non ha fatto nulla" + (" (punto forse impreciso)" if is_point else "")
         return ""
 
     def _scroll(self, device_id: str, target) -> str:

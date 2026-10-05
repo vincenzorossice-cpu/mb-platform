@@ -650,3 +650,10 @@ class TestNavigationVision:
         client.record_usage(MagicMock(usage=MagicMock(prompt_tokens=1, completion_tokens=1)), "griglia icone")
 
         assert "griglia icone 2" in client.usage_summary() and "visione 1" in client.usage_summary()
+
+    def test_navigation_prompt_allows_one_retry_after_a_missed_point(self, client, screenshot_path):
+        with patch.object(client.client.chat.completions, "create", return_value=_mock_completion(json.dumps(self.NAV_PAYLOAD))) as create:
+            client.ask_with_image(screenshot_path, "Goal: g", NAVIGATION_QUESTIONS, 540, 1200)
+
+        system = create.call_args.kwargs["messages"][0]["content"]
+        assert "POINT (coordinates)" in system and "try ONCE more" in system

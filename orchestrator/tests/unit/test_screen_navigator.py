@@ -776,3 +776,68 @@ class TestBookHints:
         broken = tmp_path / "b.json"
         broken.write_text("{not json")
         assert load_book_hints("SISAL", str(broken)) == []
+
+
+class TestScrollingIsNotALoop:
+    def _moving_reader(self, tmp_path, count):
+        """Uno screenshot diverso a ogni lettura: la pagina si muove a ogni scroll."""
+        reader = MagicMock()
+        reader.read_screen.return_value = Result.ok(_make_screen(elements=[_make_element(text="Promo")]))
+        paths = []
+        for index in range(count):
+            path = tmp_path / f"s{index}.png"
+            Image.effect_noise((200, 400), 60 + index).save(path)
+            paths.append(Result.ok(str(path)))
+        reader._screenshot.side_effect = lambda device: paths.pop(0) if paths else Result.ok(str(tmp_path / "s0.png"))
+        return reader
+
+    def test_many_scrolls_that_move_the_page_do_not_trigger_recovery_or_stuck(self, tmp_path):
+        reader = self._moving_reader(tmp_path, 40)
+        touch = MagicMock()
+        touch.scroll.return_value = Result.ok(True)
+        client = MagicMock()
+        client.ask_with_image.side_effect = [_vision_answers("scroll", text="down")] * 8 + [_vision_answers("done")]
+        navigator = _make_navigator(reader, touch, client, max_steps=20)
+
+        with patch("orchestrator.modules.screen_navigator.navigator.time.sleep"):
+            result = navigator.navigate(DEVICE, goal="g", vision_mode=True)
+
+        assert result.success and touch.scroll.call_count == 8      # nessuno scroll di recovery in piu'
+
+    def test_scrolls_that_do_not_move_the_page_still_end_in_stuck(self, screenshot):
+        reader, touch, client = _vision_setup(screenshot)    # stesso screenshot: la pagina non si muove
+        touch.scroll.return_value = Result.ok(True)
+        client.ask_with_image.side_effect = [_vision_answers("scroll", text="down")] * 12
+        navigator = _make_navigator(reader, touch, client, max_steps=12)
+
+        with patch("orchestrator.modules.screen_navigator.navigator.time.sleep"):
+            result = navigator.navigate(DEVICE, goal="g", vision_mode=True)
+
+        assert result.error_code == "NAVIGATION_STUCK"
+
+
+class TestPointNote:
+    def test_a_missed_point_is_flagged_as_probably_imprecise(self, screenshot):
+        reader, touch, client = _vision_setup(screenshot)
+        client.ask_with_image.side_effect = [_vision_answers(region="center", description="underlined link"),
+                                             _vision_answers("done")]
+        navigator = ScreenNavigator(reader, touch, client, region_refiner=MagicMock(return_value=(500, 900)))
+
+        navigator.navigate(DEVICE, goal="g", vision_mode=True)
+
+        assert "punto forse impreciso" in navigator.last_history[0]["target"]
+
+    def test_a_text_tap_without_effect_has_the_plain_note(self, screenshot):
+        reader, touch, client = _vision_setup(screenshot)
+        client.ask_with_image.side_effect = [_vision_answers(text="Slot"), _vision_answers("done")]
+        navigator = _make_navigator(reader, touch, client)
+
+        navigator.navigate(DEVICE, goal="g", vision_mode=True)
+
+        assert "schermo invariato" in navigator.last_history[0]["target"]
+        assert "impreciso" not in navigator.last_history[0]["target"]
+
+
+def test_sisal_hint_mentions_activated_promotions_and_not_leaving_the_page():
+    state = _make_navigator()._build_state("SISAL", "g", 1, [], ["x"])
+    assert "Promozioni attivate" in state and "single missed tap" in state

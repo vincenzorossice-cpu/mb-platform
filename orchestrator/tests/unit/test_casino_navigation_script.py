@@ -50,3 +50,9 @@ def test_verdict_is_taken_from_the_operator_and_skipped_without_a_terminal():
     assert script.ask_verdict(lambda prompt: "No", interactive=True) is False
     assert script.ask_verdict(lambda prompt: "", interactive=True) is None
     assert script.ask_verdict(lambda prompt: "s", interactive=False) is None
+
+
+def test_the_run_record_carries_promo_and_slot():
+    import inspect
+    assert "promo=args.promo_name" in inspect.getsource(script.run_navigation)
+    assert "slot=args.slot_name" in inspect.getsource(script.run_navigation)

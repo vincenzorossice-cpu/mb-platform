@@ -167,6 +167,7 @@ def run_navigation(args: argparse.Namespace) -> bool:
     verified = ask_verdict()
     model_metrics.log_run(
         type_of_run="navigazione", model=client.model, book=args.book, device=args.device_id,
+        promo=args.promo_name, slot=args.slot_name,
         done_declared=bool(result.success), error_code=None if result.success else result.error_code,
         verified_by_user=verified, steps=len(navigator.last_history), seconds=round(seconds, 1),
         calls_by_purpose=dict(client._usage_by_purpose),

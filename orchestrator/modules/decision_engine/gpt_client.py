@@ -453,8 +453,11 @@ class GPTDecisionClient(DecisionEngineClientInterface):
             "'Vedi altre' below the last box and tap it, then continue from the newly loaded boxes "
             "(do not restart from the top).",
 
-            "'Previous actions' may carry a note after a tap. If it says the screen did not change, that "
-            "element is not tappable: do not repeat it, change route. In demo mode never tap a game's tile "
+            "'Previous actions' may carry a note after a tap. If it says the screen did not change after "
+            "tapping a TEXT by name, that element is not tappable: do not repeat it, change route. If the tap "
+            "was a POINT (coordinates) the point was probably imprecise: try ONCE more, describing the same "
+            "element better (its text, underline, position); only after a second miss change route. In demo "
+            "mode never tap a game's tile "
             "or title (it starts the real-money game): use an info 'i' icon or a 'Prova' button. A "
             "notification from another app (Telegram, etc.) is not part of the page: never tap it and keep "
             "operating. In 'target_description' give the visible text and position of the element "
