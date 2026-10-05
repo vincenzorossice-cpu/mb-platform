@@ -1,3 +1,4 @@
+import pytest
 from orchestrator.tests.validation import test_casino_navigation as script
 
 
@@ -56,3 +57,32 @@ def test_the_run_record_carries_promo_and_slot():
     import inspect
     assert "promo=args.promo_name" in inspect.getsource(script.run_navigation)
     assert "slot=args.slot_name" in inspect.getsource(script.run_navigation)
+
+
+class TestAlreadyActivatedPromo:
+    def test_auto_goal_covers_both_cases(self):
+        goal = script.build_goal("Happy Monday", "Slot X")
+        assert "Promozioni attivate" in goal and "gia' attivata" in goal and "salta questa fase" in goal
+        assert "Attiva la promozione" in goal and "Promozione attivata correttamente" in goal
+
+    def test_already_active_goal_starts_from_activated_promotions_and_never_activates(self):
+        goal = script.build_goal("Happy Monday", "Slot X", already_active=True)
+        assert goal.index("Promozioni attivate") < goal.index("Slot X")
+        assert "NON attivare nulla" in goal and "non andare avanti finche'" not in goal
+        assert "MAI 'Gioca'" in goal and "'done' SOLO" in goal
+
+    def test_not_active_goal_is_yesterdays_goal(self):
+        goal = script.build_goal("Happy Monday", "Slot X", already_active=False)
+        assert "non andare avanti finche' questo testo non e' leggibile" in goal
+        assert "Promozioni attivate" not in goal
+
+    def test_flags_map_to_modes_and_exclude_each_other(self):
+        assert script.already_active_mode(script.parse_args(["--demo"])) is None
+        assert script.already_active_mode(script.parse_args(["--demo", "--already-active"])) is True
+        assert script.already_active_mode(script.parse_args(["--demo", "--not-active"])) is False
+        with pytest.raises(SystemExit):
+            script.parse_args(["--demo", "--already-active", "--not-active"])
+
+    def test_the_run_record_carries_the_mode(self):
+        import inspect
+        assert "already_active=" in inspect.getsource(script.run_navigation)

@@ -657,3 +657,10 @@ class TestNavigationVision:
 
         system = create.call_args.kwargs["messages"][0]["content"]
         assert "POINT (coordinates)" in system and "try ONCE more" in system
+
+    def test_navigation_prompt_lets_a_goal_skip_a_verification_when_the_step_is_already_done(self, client, screenshot_path):
+        with patch.object(client.client.chat.completions, "create", return_value=_mock_completion(json.dumps(self.NAV_PAYLOAD))) as create:
+            client.ask_with_image(screenshot_path, "Goal: g", NAVIGATION_QUESTIONS, 540, 1200)
+
+        system = create.call_args.kwargs["messages"][0]["content"]
+        assert "EXCEPT when the goal says the step may already be done" in system

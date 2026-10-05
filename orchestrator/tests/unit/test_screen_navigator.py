@@ -841,3 +841,8 @@ class TestPointNote:
 def test_sisal_hint_mentions_activated_promotions_and_not_leaving_the_page():
     state = _make_navigator()._build_state("SISAL", "g", 1, [], ["x"])
     assert "Promozioni attivate" in state and "single missed tap" in state
+
+
+def test_sisal_hint_says_to_look_in_activated_promotions_when_not_in_the_list():
+    state = _make_navigator()._build_state("SISAL", "g", 1, [], ["x"])
+    assert "not in the main list" in state and "no activation button" in state

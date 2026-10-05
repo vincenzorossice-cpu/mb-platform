@@ -4,6 +4,7 @@
     "Preferred route to the slot: stay on the promotion's own page after activating it and tap the underlined slot name there. Do NOT leave that page after a single missed tap: describe the link more precisely and try once more. If you do have to reopen the promotion: once activated, it disappears from the main promotions list and moves to the 'Promozioni attivate' (activated promotions) section, reachable from the promotions page; open that section, enter the promotion and tap the underlined slot name. Never scroll the main list looking for an activated promotion.",
     "Alternative route: use the casino search bar ('Quale slot stai cercando?') to find the slot. In DEMO mode NEVER tap the game's box or its title: tap the small round 'i' (info) icon at the bottom-right INSIDE the box; it opens the slot page where 'Prova' is available.",
     "Close app-download and cookie banners first: they hide useful tools such as the search bar.",
-    "A notification from another app (for example Telegram) at the top of the screen is not part of the site: never tap it and never wait for it, it disappears by itself; keep operating on the page. If the element you need is covered by it, wait once."
+    "A notification from another app (for example Telegram) at the top of the screen is not part of the site: never tap it and never wait for it, it disappears by itself; keep operating on the page. If the element you need is covered by it, wait once.",
+    "'Promozioni attivate' is also where to look for a promotion that is not in the main list (already activated): it opens from the promotions page. On the page of an already activated promotion there is no activation button and the confirmation message 'Promozione attivata correttamente' may not be shown."
   ]
 }

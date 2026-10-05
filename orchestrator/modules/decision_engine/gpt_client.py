@@ -467,7 +467,9 @@ class GPTDecisionClient(DecisionEngineClientInterface):
             "are in and never go back to a phase already completed. Answer 'done' ONLY when the final "
             "condition of the goal is VISIBLE on the current screen, not because you tapped the last "
             "button. If the goal asks you to verify a text (for example a confirmation message), do not "
-            "move on until that text is readable on screen: answer 'wait' if it is not there yet. In demo "
+            "move on until that text is readable on screen: answer 'wait' if it is not there yet, EXCEPT when "
+            "the goal says the step may already be done (for example the promotion is already activated): then "
+            "a screen showing that state is enough and the verification is skipped. In demo "
             "mode tap only 'Prova' / 'For fun', never 'Gioca', 'Deposita', 'Registrati' or any banner or "
             "advertisement.",
 

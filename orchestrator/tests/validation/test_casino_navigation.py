@@ -25,20 +25,57 @@ CHROME_PACKAGE = "com.android.chrome"
 LOGS_DIR = "logs"
 
 
-def build_goal(promo_name: str, slot_name: str) -> str:
+_SLOT_RULES = (
+    "Non toccare mai il box o il titolo del gioco nella lobby (apre la slot reale). "
+    "Rispondi 'done' SOLO quando sei dentro la slot in demo, cioe' vedi il gioco caricato "
+    "(rulli e pulsante di spin). Non giocare nessuno spin."
+)
+
+
+def build_goal(promo_name: str, slot_name: str, already_active: "bool | None" = None) -> str:
+    """already_active: None = il goal copre entrambi i casi (promo nuova o gia' attiva); True = la promo e' gia'
+    attiva (cercarla in 'Promozioni attivate', nessuna attivazione ne' messaggio da verificare); False = promo
+    da attivare, con la verifica del messaggio di conferma."""
+    if already_active is True:
+        return (
+            f"Percorso in ordine, una fase alla volta. "
+            f"FASE 1: la promo '{promo_name}' e' GIA' attivata: dalla pagina delle promozioni apri 'Promozioni "
+            f"attivate' (non cercarla nella lista principale) e toccala. "
+            f"FASE 2: nella pagina della promo NON attivare nulla e non cercare 'Promozione attivata "
+            f"correttamente': e' gia' attiva. Trova la slot '{slot_name}' (il suo nome sottolineato nel testo "
+            f"della promo) e tocca il suo nome. "
+            f"FASE 3: nella pagina della slot tocca 'Prova' (modalita' demo, for fun), MAI 'Gioca'. "
+            + _SLOT_RULES
+        )
+    if already_active is False:
+        return (
+            f"Percorso in ordine, una fase alla volta. "
+            f"FASE 1: nella lista delle promozioni trova la promo '{promo_name}' e toccala. "
+            f"FASE 2: nella pagina della promo tocca 'Attiva la promozione' oppure 'Aderisci'. "
+            f"FASE 3: verifica che sullo schermo sia scritto 'Promozione attivata correttamente'; "
+            f"non andare avanti finche' questo testo non e' leggibile. "
+            f"FASE 4: trova la slot '{slot_name}' e tocca il suo nome. "
+            f"FASE 5: nella pagina della slot tocca 'Prova' (modalita' demo, for fun), MAI 'Gioca'. "
+            f"Dopo l'attivazione preferisci la pagina della promozione: il nome sottolineato della slot. "
+            + _SLOT_RULES
+        )
     return (
         f"Percorso in ordine, una fase alla volta. "
-        f"FASE 1: nella lista delle promozioni trova la promo '{promo_name}' e toccala. "
-        f"FASE 2: nella pagina della promo tocca 'Attiva la promozione' oppure 'Aderisci'. "
-        f"FASE 3: verifica che sullo schermo sia scritto 'Promozione attivata correttamente'; "
-        f"non andare avanti finche' questo testo non e' leggibile. "
-        f"FASE 4: trova la slot '{slot_name}' e tocca il suo nome. "
+        f"FASE 1: trova la promo '{promo_name}': prima nella lista delle promozioni; se non la vedi, o se e' "
+        f"gia' stata attivata, cercala in 'Promozioni attivate' (si apre dalla pagina delle promozioni) e toccala. "
+        f"FASE 2: nella pagina della promo, se c'e' 'Attiva la promozione' oppure 'Aderisci' toccalo; se la promo "
+        f"risulta gia' attivata (nessun bottone di attivazione) salta questa fase e la successiva. "
+        f"FASE 3: dopo una attivazione verifica che sullo schermo sia scritto 'Promozione attivata correttamente'; "
+        f"non andare avanti finche' questo testo non e' leggibile (se la promo era gia' attiva questa verifica "
+        f"non serve). "
+        f"FASE 4: trova la slot '{slot_name}' (il suo nome sottolineato nella pagina della promo) e tocca il suo nome. "
         f"FASE 5: nella pagina della slot tocca 'Prova' (modalita' demo, for fun), MAI 'Gioca'. "
-        f"Dopo l'attivazione preferisci la pagina della promozione: il nome sottolineato della slot. "
-        f"Non toccare mai il box o il titolo del gioco nella lobby (apre la slot reale). "
-        f"Rispondi 'done' SOLO quando sei dentro la slot in demo, cioe' vedi il gioco caricato "
-        f"(rulli e pulsante di spin). Non giocare nessuno spin."
+        + _SLOT_RULES
     )
+
+
+def already_active_mode(args: argparse.Namespace) -> "bool | None":
+    return True if args.already_active else False if args.not_active else None
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -50,6 +87,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--url", default=SISAL_PROMOTIONS_URL)
     parser.add_argument("--max-steps", type=int, default=40)
     parser.add_argument("--no-save-steps", action="store_true", help="Non salvare lo screenshot di ogni passo.")
+    activation = parser.add_mutually_exclusive_group()
+    activation.add_argument("--already-active", action="store_true",
+                            help="La promo e' gia' attiva: si cerca in 'Promozioni attivate', senza attivare.")
+    activation.add_argument("--not-active", action="store_true",
+                            help="La promo e' da attivare: attivazione e verifica del messaggio di conferma.")
     parser.add_argument("--demo", action="store_true", help="Obbligatorio: il test entra in demo (Prova), mai soldi veri.")
     return parser.parse_args(argv)
 
@@ -144,7 +186,8 @@ def run_navigation(args: argparse.Namespace) -> bool:
         print(f"ERRORE FATALE: impossibile aprire Chrome: {opened.error} ({opened.error_code})")
         return False
 
-    goal = build_goal(args.promo_name, args.slot_name)
+    mode = already_active_mode(args)
+    goal = build_goal(args.promo_name, args.slot_name, mode)
     print(f"Goal: {goal}\n")
     client.set_run("navigazione_casino", args.book)
     started = time.monotonic()
@@ -167,7 +210,7 @@ def run_navigation(args: argparse.Namespace) -> bool:
     verified = ask_verdict()
     model_metrics.log_run(
         type_of_run="navigazione", model=client.model, book=args.book, device=args.device_id,
-        promo=args.promo_name, slot=args.slot_name,
+        promo=args.promo_name, slot=args.slot_name, already_active="auto" if mode is None else mode,
         done_declared=bool(result.success), error_code=None if result.success else result.error_code,
         verified_by_user=verified, steps=len(navigator.last_history), seconds=round(seconds, 1),
         calls_by_purpose=dict(client._usage_by_purpose),
