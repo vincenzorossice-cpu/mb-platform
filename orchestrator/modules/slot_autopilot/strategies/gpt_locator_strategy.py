@@ -228,12 +228,14 @@ class GPTLocatorStrategy(LocatorStrategy):
         x, y = _text_center(coords, context)
         return Result.ok(LocateCandidate(x=x, y=y, confidence=confidence, strategy_name=self.name))
 
-    def locate_described(self, description: str, context: LocateContext):
+    def locate_described(self, description: str, context: LocateContext, lenient: bool = False):
         """(x, y) di un elemento descritto a parole dall'operatore (es. "l'icona
         delle monete impilate in basso al centro"), con lo stesso affinamento a
         griglia delle icone: la frase diventa la descrizione dell'elemento. None
-        se GPT non lo trova."""
-        return self._refine_icon("operator_target", context, description=description)
+        se GPT non lo trova. lenient=True (navigazione dei book, mai slot): se nello zoom finale
+        GPT non riconosce l'elemento (tipico di una scheda grande ingrandita troppo) si tiene il
+        centro della cella fine invece di non dare nessun punto."""
+        return self._refine_icon("operator_target", context, description=description, lenient=lenient)
 
     def _ask_cell(self, element_name: str, image_path: str, labels: list, stage: str, note: str = "",
                   description: str = None):
@@ -292,7 +294,8 @@ class GPTLocatorStrategy(LocatorStrategy):
             return None
         return cell.strip().upper()
 
-    def _refine_icon(self, element_name: str, context: LocateContext, description: str = None):
+    def _refine_icon(self, element_name: str, context: LocateContext, description: str = None,
+                     lenient: bool = False):
         """(x, y) assoluti del centro della cella fine scelta, o None."""
         width, height = context.screen_width, context.screen_height
         self._api_unavailable = False
@@ -342,7 +345,10 @@ class GPTLocatorStrategy(LocatorStrategy):
                 finest_path = os.path.join(tmp, "finest.png")
                 finest = annotate_grid(context.screenshot_path, box_c, finest_cols, finest_rows, finest_path)
                 label_c = self._ask_cell(element_name, finest_path, list(finest), "finest", note, description)
-                if label_c == _NOT_VISIBLE:
+                if label_c == _NOT_VISIBLE and lenient:
+                    logger.warning("'%s': al passo C GPT non vede l'elemento nella cella %s: modalita' permissiva, "
+                                   "tengo il centro della cella.", element_name, label_b)
+                elif label_c == _NOT_VISIBLE:
                     # Nel ritaglio zoomato GPT NON vede l'elemento: il passo B aveva sbagliato.
                     # Tappare comunque il centro della cella B e' tirare a indovinare (e ha gia'
                     # colpito uno spin): nessun punto.
@@ -427,9 +433,10 @@ class GPTLocatorStrategy(LocatorStrategy):
         return False
 
 
-def build_region_refiner(gpt_client):
+def build_region_refiner(gpt_client, lenient: bool = True):
     """Funzione (descrizione, screenshot, larghezza, altezza) -> (x, y) | None per ScreenNavigator
-    (region_refiner): precisa una regione 3x3 con la stessa ricerca a griglia delle icone."""
+    (region_refiner): precisa una regione 3x3 con la stessa ricerca a griglia delle icone. Permissiva di
+    default: in navigazione un tocco impreciso non spende soldi e lo schermo dopo il tocco lo verifica."""
     strategy = GPTLocatorStrategy(gpt_client)
 
     def refine(description: str, screenshot_path: str, width: int, height: int):
@@ -437,6 +444,6 @@ def build_region_refiner(gpt_client):
             device_id="navigator", slot_name="navigation", screenshot_path=screenshot_path,
             screen_width=width, screen_height=height,
         )
-        return strategy.locate_described(description, context)
+        return strategy.locate_described(description, context, lenient=lenient)
 
     return refine

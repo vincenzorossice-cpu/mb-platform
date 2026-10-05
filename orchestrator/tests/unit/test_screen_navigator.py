@@ -846,3 +846,51 @@ def test_sisal_hint_mentions_activated_promotions_and_not_leaving_the_page():
 def test_sisal_hint_says_to_look_in_activated_promotions_when_not_in_the_list():
     state = _make_navigator()._build_state("SISAL", "g", 1, [], ["x"])
     assert "not in the main list" in state and "no activation button" in state
+
+
+class TestRejectionBrake:
+    def _client_rejecting(self, count, then="done"):
+        client = MagicMock()
+        client.ask_with_image.side_effect = [_vision_answers(region="center", description="card")] * count + [
+            _vision_answers(then)]
+        return client
+
+    def test_the_second_rejection_in_a_row_reframes_with_a_slow_scroll(self, screenshot):
+        reader, touch, _ = _vision_setup(screenshot)
+        touch.scroll.return_value = Result.ok(True)
+        client = self._client_rejecting(2)
+        navigator = ScreenNavigator(reader, touch, client, region_refiner=MagicMock(return_value=None))
+
+        with patch("orchestrator.modules.screen_navigator.navigator.time.sleep"):
+            result = navigator.navigate(DEVICE, goal="g", vision_mode=True)
+
+        assert result.success
+        touch.scroll.assert_called_once_with(DEVICE, "down", duration_ms=900, fraction=0.3)
+        assert [h["action"] for h in navigator.last_history] == ["tap scartato", "tap scartato", "scroll"]
+        assert "cambio inquadratura" in navigator.last_history[-1]["target"]
+
+    def test_the_fourth_rejection_in_a_row_stops_with_a_clear_error(self, screenshot):
+        reader, touch, _ = _vision_setup(screenshot)
+        touch.scroll.return_value = Result.ok(True)
+        client = self._client_rejecting(10)
+        navigator = ScreenNavigator(reader, touch, client, region_refiner=MagicMock(return_value=None), max_steps=20)
+
+        with patch("orchestrator.modules.screen_navigator.navigator.time.sleep"):
+            result = navigator.navigate(DEVICE, goal="g", vision_mode=True)
+
+        assert result.error_code == "TAP_NOT_LOCATABLE"
+        assert client.ask_with_image.call_count == 4          # niente 10+ passi uguali
+
+    def test_an_executed_action_resets_the_counter(self, screenshot):
+        reader, touch, _ = _vision_setup(screenshot)
+        touch.scroll.return_value = Result.ok(True)
+        client = MagicMock()
+        rejected = _vision_answers(region="center", description="card")
+        client.ask_with_image.side_effect = [rejected, _vision_answers(text="Accedi"), rejected, _vision_answers("done")]
+        navigator = ScreenNavigator(reader, touch, client, region_refiner=MagicMock(return_value=None))
+
+        with patch("orchestrator.modules.screen_navigator.navigator.time.sleep"):
+            result = navigator.navigate(DEVICE, goal="g", vision_mode=True)
+
+        assert result.success
+        touch.scroll.assert_not_called()                       # mai due rifiuti di fila

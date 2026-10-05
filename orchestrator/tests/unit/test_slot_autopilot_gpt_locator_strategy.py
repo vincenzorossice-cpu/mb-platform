@@ -488,3 +488,31 @@ def test_the_region_refiner_for_the_navigator_uses_the_grid_search(real_context)
 
     assert point is not None and len(point) == 2
     assert "hamburger menu icon" in _grid_user_text(_grid_calls(gpt_client)[0])
+
+
+class TestLenientNavigationRefiner:
+    NOT_VISIBLE = json.dumps({"cell": None, "confidence": 0.9})
+
+    def test_the_navigator_refiner_keeps_the_fine_cell_when_the_zoom_does_not_recognise_a_big_card(self, real_context, caplog):
+        from orchestrator.modules.slot_autopilot.strategies.gpt_locator_strategy import build_region_refiner
+        gpt_client = _client(None, _cell_answer("B6"), _cell_answer("C4"), self.NOT_VISIBLE)
+
+        with caplog.at_level("WARNING"):
+            point = build_region_refiner(gpt_client)("the Happy Monday promotion card", real_context.screenshot_path,
+                                                     1080, 2400)
+
+        assert point is not None
+        assert any("modalita' permissiva" in r.getMessage() for r in caplog.records)
+
+    def test_the_strict_mode_still_gives_no_point(self, real_context):
+        from orchestrator.modules.slot_autopilot.strategies.gpt_locator_strategy import build_region_refiner
+        gpt_client = _client(None, _cell_answer("B6"), _cell_answer("C4"), self.NOT_VISIBLE)
+
+        point = build_region_refiner(gpt_client, lenient=False)("the spin icon", real_context.screenshot_path, 1080, 2400)
+
+        assert point is None
+
+    def test_the_operator_description_search_is_strict_by_default(self, real_context):
+        gpt_client = _client(None, _cell_answer("B6"), _cell_answer("C4"), self.NOT_VISIBLE)
+
+        assert GPTLocatorStrategy(gpt_client).locate_described("icona x", real_context) is None

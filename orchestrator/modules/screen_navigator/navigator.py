@@ -29,6 +29,9 @@ _SYSTEM_BAR_FRACTION = 0.95
 # Differenza sotto la quale due screenshot sono "lo stesso schermo" (la pagina non si e' mossa).
 _PAGE_UNCHANGED_THRESHOLD = 0.01
 _MAX_APP_RESTORES = 3
+# Tocchi scartati di fila (punto non precisabile): al 2o si cambia inquadratura con uno scroll, al 4o si ferma.
+_REFRAME_AFTER_REJECTIONS = 2
+_STOP_AFTER_REJECTIONS = 4
 
 _BOOK_HINTS_PATH = os.path.join(os.path.dirname(__file__), "book_hints.json")
 
@@ -137,6 +140,7 @@ class ScreenNavigator(ScreenNavigatorInterface):
 
         vision_stuck_tried = False
         app_restores = 0
+        rejections = 0
 
         for step in range(1, self.max_steps + 1):
             self._current_step = step
@@ -199,7 +203,16 @@ class ScreenNavigator(ScreenNavigatorInterface):
                 logger.warning(f"Step {step}: tocco scartato ({decision.data['rejected']}) su {target}.")
                 self._record(history, step, "tap scartato", f"{decision.data['rejected']} {target}")
                 self._event("tocco_scartato")
+                rejections += 1
+                if rejections >= _STOP_AFTER_REJECTIONS:
+                    logger.error(f"{rejections} tocchi scartati di fila: non riesco a precisare il punto, mi fermo.")
+                    return Result.fail(
+                        f"Cannot pin down the tap point after {rejections} rejections in a row", "TAP_NOT_LOCATABLE",
+                    )
+                if rejections == _REFRAME_AFTER_REJECTIONS:
+                    self._reframe(device_id, history, step)
                 continue
+            rejections = 0
 
             if confidence < self.LOW_CONFIDENCE_THRESHOLD:
                 return Result.fail(f"Low confidence on action decision: {confidence}", "LOW_CONFIDENCE_HITL")
@@ -259,6 +272,20 @@ class ScreenNavigator(ScreenNavigatorInterface):
         record = getattr(self.decision_engine_client, "record_event", None)
         if callable(record):
             record(kind, "navigazione")
+
+    def _reframe(self, device_id: str, history: list, step: int) -> None:
+        """Dopo due punti non precisabili di fila lo stesso bersaglio e' probabilmente a un bordo: uno scroll
+        lento lo sposta e la prossima domanda parte da un'inquadratura nuova."""
+        res = self.touch_injector.scroll(
+            device_id, "down", duration_ms=_SCROLL_DURATION_MS, fraction=_SCROLL_FRACTION,
+        )
+        if not res.success:
+            logger.warning(f"Scroll di cambio inquadratura fallito: {res.error}")
+            return
+        time.sleep(0.8)
+        self._invalidate_cache()
+        self._record(history, step, "scroll", "down (cambio inquadratura)")
+        self._event("cambio_inquadratura")
 
     def _app_in_front(self, device_id: str) -> bool:
         try:
