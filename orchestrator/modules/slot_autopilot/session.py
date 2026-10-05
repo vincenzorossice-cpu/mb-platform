@@ -12,6 +12,9 @@ MAX_CONSECUTIVE_NO_EFFECT_SPINS = 3
 # chiudere la sessione, fino a questo tempo.
 MAX_BUSY_WAIT_SECONDS = 120
 BUSY_POLL_SECONDS = 5
+# Dopo tanto tempo di "occupato" si chiede a Sol se il gioco e' in realta' pronto (overlay di una vincita che
+# lampeggia sopra i rulli) invece di aspettare fino alla fine e arrendersi.
+BUSY_ASK_AFTER_SECONDS = 45
 
 BET_FAILURE_MESSAGES = {
     "BET_UNREADABLE": "Non riesco a leggere la puntata: non tocco nulla (e non spinno).",
@@ -43,6 +46,33 @@ class SlotSessionResult:
     def target_reached(self) -> bool:
         """Il giocato ha raggiunto il target senza arresti di sicurezza."""
         return not self.failed and self.stop_reason is None and self.total_played >= self.target
+
+
+def _ask_if_ready(autopilot, device_id: str) -> str:
+    diagnose = getattr(autopilot, "diagnose_busy", None)
+    if not callable(diagnose):
+        return "unknown"
+    verdict = diagnose(device_id)
+    return verdict if isinstance(verdict, str) else "unknown"
+
+
+def _log_event(kind: str) -> None:
+    try:
+        from orchestrator.core import model_metrics
+        model_metrics.log_event(kind)
+    except Exception:
+        pass
+
+
+def _busy_diagnostics(autopilot, device_id: str, label: str, log, event: Optional[str]) -> None:
+    """Screenshot dello schermo occupato in logs/ (per capire cosa lo blocca) ed evento nelle metriche."""
+    if event:
+        _log_event(event)
+    save = getattr(autopilot, "save_debug_screenshot", None)
+    if callable(save):
+        path = save(device_id, label)
+        if isinstance(path, str):
+            log.info("Screenshot dello schermo occupato: %s", path)
 
 
 def progress_line(spin_index: int, spin_result, total_played: Decimal, target: Decimal, seconds: float) -> str:
@@ -92,10 +122,16 @@ def play_session(
     stop_reason = None
     failed = False
     busy_since = None
+    busy_asked = False
+    force_next = False
     while total_played < target and spin_index < max_steps:
         spin_index += 1
         started = time.monotonic()
-        spin_result = autopilot.spin(device_id, spin_index)
+        if force_next:
+            force_next = False
+            spin_result = autopilot.spin(device_id, spin_index, force=True)   # Sol: il gioco e' pronto
+        else:
+            spin_result = autopilot.spin(device_id, spin_index)
         seconds = time.monotonic() - started
         if not spin_result.success:
             log.error("spin() fallito: %s (%s)", spin_result.error, spin_result.error_code)
@@ -109,6 +145,7 @@ def play_session(
             break
         if spin_result.data.outcome != "blocked":
             busy_since = None
+            busy_asked = False
         if spin_result.data.outcome == "no_effect":
             consecutive_no_effect += 1
             if consecutive_no_effect >= MAX_CONSECUTIVE_NO_EFFECT_SPINS:
@@ -129,13 +166,32 @@ def play_session(
                 if busy_since is None:
                     busy_since = time.monotonic()
                     log.info(
-                        "Schermo occupato (vincita/bonus in corso?): aspetto che finisca (al massimo %d s)...",
+                        "Schermo occupato (%s; vincita/bonus in corso?): aspetto che finisca (al massimo %d s)...",
+                        getattr(spin_result.data, "blocked_detail", None) or "causa non indicata",
                         MAX_BUSY_WAIT_SECONDS,
                     )
-                if time.monotonic() - busy_since < MAX_BUSY_WAIT_SECONDS:
+                    _busy_diagnostics(autopilot, device_id, "occupato_inizio", log, "schermo_occupato")
+                waited = time.monotonic() - busy_since
+                if waited >= BUSY_ASK_AFTER_SECONDS and not busy_asked:
+                    busy_asked = True
+                    verdict = _ask_if_ready(autopilot, device_id)
+                    if verdict == "ready":
+                        log.info("Sol: il gioco e' pronto (overlay/animazione sui rulli): provo uno spin.")
+                        _log_event("schermo_occupato_risolto_da_sol")
+                        force_next = True
+                        spin_index -= 1
+                        continue
+                    if verdict == "closed":
+                        log.info("Sol: c'era un menu non voluto, chiuso: riprendo.")
+                        _log_event("schermo_occupato_risolto_da_sol")
+                        busy_since, busy_asked = None, False
+                        spin_index -= 1
+                        continue
+                if waited < MAX_BUSY_WAIT_SECONDS:
                     time.sleep(BUSY_POLL_SECONDS)
                     spin_index -= 1   # l'attesa non consuma max_steps
                     continue
+                _busy_diagnostics(autopilot, device_id, "occupato_scaduto", log, None)
                 log.warning("Lo schermo e' rimasto occupato per oltre %d s: mi fermo.", MAX_BUSY_WAIT_SECONDS)
                 failed, stop_reason = True, "BUSY_TIMEOUT"
             else:

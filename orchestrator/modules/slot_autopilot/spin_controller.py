@@ -15,6 +15,8 @@ from orchestrator.modules.step_logger.interface import StepLoggerInterface, Step
 logger = logging.getLogger(__name__)
 
 _ELEMENT = "spin"
+_SPIN_ZONE_HALF_PX = 160          # quadrato di ~320 px attorno al pulsante spin
+_BOTTOM_STRIP_FRACTION = 0.12     # ultimo 12% dell'altezza: saldo, puntata, vincita
 
 
 @dataclass
@@ -29,6 +31,8 @@ class SpinResult:
     attempts: int
     outcome: str  # "success" | "blocked" | "no_effect" | "error"
     violated_invariant: Optional[str] = None  # "MIN_BET_NOT_VERIFIED" | "INSUFFICIENT_BALANCE" | "UNSAFE_SCREEN_STATE"
+    # Quale controllo ha bloccato (solo per UNSAFE_SCREEN_STATE): "schermo non fermo" | "saldo/puntata non leggibili"
+    blocked_detail: Optional[str] = None
     accounting_anomaly: Optional[str] = None
     strategy_name: Optional[str] = None  # strategia che ha localizzato lo spin (None se non tappato)
     # Schermo stabile dopo lo spin e relativa lettura OCR (da TapOutcome): chi deve
@@ -55,8 +59,10 @@ class SpinController:
     def spin(
         self, device_id: str, slot_name: str, episode_id: str, spin_index: int,
         context_provider: Callable[[], Result], min_bet_verified: bool,
-        expected_bet: Optional[Decimal],
+        expected_bet: Optional[Decimal], force: bool = False,
     ) -> Result[SpinResult]:
+        """force=True (solo dopo che Sol ha giudicato il gioco pronto): salta il controllo di calma e l'invariante
+        'schermo libero'; restano puntata minima verificata e saldo sufficiente."""
         started = time.monotonic()
         context_result = context_provider()
         context_seconds = time.monotonic() - started
@@ -69,7 +75,7 @@ class SpinController:
         context = context_result.data
         balance_before = self._read_amount(context, "saldo")
 
-        violated = self._check_invariants(min_bet_verified, balance_before, expected_bet, context)
+        violated = self._check_invariants(min_bet_verified, balance_before, expected_bet, context, force)
         if violated is not None:
             # Schermo occupato (vincita/bonus in corso): chi chiama aspetta e riprova, non e'
             # un avviso da mostrare a ogni tentativo. Le altre invarianti restano avvisi.
@@ -83,6 +89,7 @@ class SpinController:
                 slot_name=slot_name, spin_index=spin_index, bet_amount=expected_bet,
                 balance_before=balance_before, balance_after=balance_before, win_amount=None,
                 verified=False, attempts=0, outcome="blocked", violated_invariant=violated,
+                blocked_detail="saldo/puntata non leggibili" if violated == "UNSAFE_SCREEN_STATE" else None,
             ))
 
         locate_result = self.locator.locate(_ELEMENT, context)
@@ -98,12 +105,16 @@ class SpinController:
             ))
         candidate = locate_result.data
 
-        if self.config.spin_calm_check and not candidate.verified and context.screenshot_path:
+        if self.config.spin_calm_check and not force and not candidate.verified and context.screenshot_path:
             # Mai toccare uno schermo che si muove (animazione di vincita, saldo che si aggiorna): il tocco
             # andrebbe perso e ritoccare alla cieca rischia due spin.
             calm = self.verifier.wait_until_calm(
                 device_id, context.screenshot_path, self.config.spin_calm_max_wait_seconds,
+                regions=self._calm_regions(context, candidate) if self.config.spin_partial_calm else None,
             )
+            if calm.success and calm.data.partial:
+                logger.info("spin %d: i rulli sono in animazione ma barra degli importi e pulsante sono fermi: "
+                            "tocco (calma parziale).", spin_index)
             if calm.success and not calm.data.calm:
                 violated = "UNSAFE_SCREEN_STATE"
                 logger.info("spin %d: lo schermo non si ferma (animazione in corso?): non tocco.", spin_index)
@@ -115,6 +126,7 @@ class SpinController:
                     slot_name=slot_name, spin_index=spin_index, bet_amount=expected_bet,
                     balance_before=balance_before, balance_after=balance_before, win_amount=None,
                     verified=False, attempts=0, outcome="blocked", violated_invariant=violated,
+                    blocked_detail="schermo non fermo",
                 ))
             if calm.success and calm.data.waited:
                 # Si e' aspettato: il saldo letto prima e' vecchio (una vincita puo' essere stata accreditata
@@ -134,6 +146,7 @@ class SpinController:
                             slot_name=slot_name, spin_index=spin_index, bet_amount=expected_bet,
                             balance_before=balance_before, balance_after=balance_before, win_amount=None,
                             verified=False, attempts=0, outcome="blocked", violated_invariant=violated,
+                            blocked_detail="saldo/puntata non leggibili" if violated == "UNSAFE_SCREEN_STATE" else None,
                         ))
 
         attempts = 0
@@ -327,12 +340,26 @@ class SpinController:
             return None
         return balance_after - balance_before + bet
 
-    def _check_invariants(self, min_bet_verified, balance_before, expected_bet, context) -> Optional[str]:
+    @staticmethod
+    def _calm_regions(context, candidate) -> Optional[list]:
+        """Le zone che contano per toccare lo spin: la striscia in basso con saldo/puntata/vincita e un quadrato
+        attorno al pulsante spin. I rulli (dove passano gli overlay delle vincite) non contano."""
+        width, height = context.screen_width, context.screen_height
+        if not width or not height:
+            return None
+        half = _SPIN_ZONE_HALF_PX
+        spin_zone = (
+            max(0, int(candidate.x) - half), max(0, int(candidate.y) - half),
+            min(int(width), int(candidate.x) + half), min(int(height), int(candidate.y) + half),
+        )
+        return [(0, int(height * (1 - _BOTTOM_STRIP_FRACTION)), int(width), int(height)), spin_zone]
+
+    def _check_invariants(self, min_bet_verified, balance_before, expected_bet, context, force: bool = False) -> Optional[str]:
         if not min_bet_verified:
             return "MIN_BET_NOT_VERIFIED"
         if balance_before is None or expected_bet is None or balance_before < expected_bet:
             return "INSUFFICIENT_BALANCE"
-        if classify_screen_state(context.slot_ocr_state) != "idle":
+        if not force and classify_screen_state(context.slot_ocr_state) != "idle":
             return "UNSAFE_SCREEN_STATE"
         return None
 

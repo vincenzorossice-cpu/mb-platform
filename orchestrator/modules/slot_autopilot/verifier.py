@@ -33,6 +33,9 @@ def classify_screen_state(ocr_state: dict) -> str:
     return "unsafe"
 
 
+_PARTIAL_CALM_STREAK = 3   # confronti consecutivi con le zone ferme (~1 s)
+
+
 @dataclass
 class CalmResult:
     """Esito di wait_until_calm: lo schermo e' fermo? E' stato necessario aspettare?"""
@@ -40,6 +43,7 @@ class CalmResult:
     calm: bool
     waited: bool
     seconds: float
+    partial: bool = False   # fermi solo la barra degli importi e il pulsante spin, i rulli si muovono
 
 
 @dataclass
@@ -118,6 +122,7 @@ class ActionVerifier:
 
     def wait_until_calm(
         self, device_id: str, reference_screenshot: str, max_wait_seconds: Optional[float] = None,
+        regions: Optional[list] = None,
     ) -> Result[CalmResult]:
         """Lo schermo e' fermo adesso? UNO screenshot confrontato in locale (nessuna AI, nessun token) con
         l'ultimo schermo noto: uguale -> si puo' toccare subito; diverso -> si aspetta che si fermi, fino a
@@ -129,6 +134,8 @@ class ActionVerifier:
         diff = diff_score(reference_screenshot, shot.data)
         if diff.success and diff.data < self.config.frame_diff_stable_threshold:
             return Result.ok(CalmResult(shot.data, calm=True, waited=False, seconds=time.monotonic() - started))
+        if regions:
+            return self._wait_calm_with_regions(device_id, shot.data, started, max_wait_seconds, regions)
         wait = wait_until_stable(
             lambda: self.screen_reader._screenshot(device_id),
             max_wait_seconds=max_wait_seconds or self.config.frame_diff_max_wait_seconds,
@@ -140,6 +147,42 @@ class ActionVerifier:
         return Result.ok(CalmResult(
             wait.data.screenshot_path, calm=wait.data.stable, waited=True, seconds=time.monotonic() - started,
         ))
+
+    def _wait_calm_with_regions(
+        self, device_id: str, first_path: str, started: float, max_wait_seconds: Optional[float], regions: list,
+    ) -> Result[CalmResult]:
+        """Come wait_until_stable, ma accetta anche la 'calma parziale': l'intero schermo si muove (overlay di una
+        vincita che compare e scompare) ma tutte le zone indicate restano ferme per _PARTIAL_CALM_STREAK
+        confronti di fila. Se una zona cambia (vincita che si conta, spin in corso) non e' calma."""
+        threshold = self.config.frame_diff_stable_threshold
+        limit = max_wait_seconds or self.config.frame_diff_max_wait_seconds
+        previous = first_path
+        streak = 0
+        while True:
+            elapsed = time.monotonic() - started
+            if elapsed >= limit:
+                return Result.ok(CalmResult(previous, calm=False, waited=True, seconds=elapsed))
+            time.sleep(self.config.frame_diff_poll_interval)
+            shot = self.screen_reader._screenshot(device_id)
+            if not shot.success:
+                return Result.fail(shot.error, shot.error_code)
+            whole = diff_score(previous, shot.data)
+            if not whole.success:
+                return Result.fail(whole.error, whole.error_code)
+            if whole.data < threshold:
+                return Result.ok(CalmResult(shot.data, calm=True, waited=True, seconds=time.monotonic() - started))
+            zones_still = True
+            for region in regions:
+                part = diff_score(previous, shot.data, region)
+                if not part.success or part.data >= threshold:
+                    zones_still = False
+                    break
+            streak = streak + 1 if zones_still else 0
+            if streak >= _PARTIAL_CALM_STREAK:
+                return Result.ok(CalmResult(
+                    shot.data, calm=True, waited=True, seconds=time.monotonic() - started, partial=True,
+                ))
+            previous = shot.data
 
     def _read_state_after(self, screenshot_path: str, region_hint: Optional[tuple]) -> dict:
         if region_hint is None or not hasattr(self.ocr_reader, "set_region"):

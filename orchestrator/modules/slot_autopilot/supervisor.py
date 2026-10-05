@@ -21,7 +21,7 @@ _SYSTEM_PROMPT = (
     "You supervise an automatic player of a slot machine game on an Android phone. You see ONE screenshot. "
     "Answer ONLY with JSON: "
     '{"screen_state": "' + "|".join(_SCREEN_STATES) + '", "credit_text": <string|null>, "bet_text": <string|null>, '
-    '"action": "none|close", "target_description": <string|null>, "reasoning": <short string>}. '
+    '"action": "none|close", "target_description": <string|null>, "spin_ready": <true|false>, "reasoning": <short string>}. '
     "screen_state: idle = reels stopped and nothing covers the game; modal = a menu/popup/panel covers part of the "
     "game (bet selection menu, settings, info, paytable); spinning; win_presentation; loading; intro; error; other. "
     "credit_text = the player's balance/credit; bet_text = the current TOTAL bet of one spin. COPY each amount exactly "
@@ -30,7 +30,9 @@ _SYSTEM_PROMPT = (
     "number that keeps changing): they are NOT the credit and NOT the bet. The bet and the credit are never the same "
     "number. action: 'close' ONLY if a menu or popup is open that the player did not ask for and is hiding the game; "
     "then target_description = the close control (for example 'the X at the top right of the panel'). Otherwise "
-    "'none'. NEVER suggest spinning or tapping the spin button."
+    "'none'. spin_ready = true if the spin button is visible and the game is waiting for the player, EVEN IF a win "
+    "overlay, a big win number or an animation is shown over the reels; false during a spin in progress, a bonus / "
+    "free-spins feature, a loading screen or an open menu. NEVER suggest spinning or tapping the spin button."
 )
 
 
@@ -42,6 +44,7 @@ class Observation:
     action: str
     target_description: Optional[str]
     reasoning: str
+    spin_ready: Optional[bool] = None
 
 
 @dataclass
@@ -110,9 +113,10 @@ class SlotSupervisor:
         observation = Observation(
             screen_state=state, bet=bet, credit=credit, action=action,
             target_description=data.get("target_description") or None, reasoning=str(data.get("reasoning") or ""),
+            spin_ready=data.get("spin_ready") if isinstance(data.get("spin_ready"), bool) else None,
         )
-        logger.info("supervisore: stato=%s puntata=%s saldo=%s azione=%s (%s)", state, bet, credit, action,
-                    observation.reasoning)
+        logger.info("supervisore: stato=%s puntata=%s saldo=%s pronto_allo_spin=%s azione=%s (%s)", state, bet, credit,
+                    observation.spin_ready, action, observation.reasoning)
         return observation
 
     def read_bet(self, device_id: str) -> Optional[Decimal]:
@@ -147,6 +151,28 @@ class SlotSupervisor:
         if at_min and observation.screen_state != "modal":
             return Assist("at_min", observation.bet)
         return Assist("nothing", observation.bet)
+
+    def check_ready(self, device_id: str) -> str:
+        """Lo schermo risulta 'occupato' al controllo locale: Sol dice se il gioco e' in realta' pronto.
+        'ready' = pulsante spin visibile e gioco in attesa (anche con overlay di vincita); 'closed' = chiuso un
+        menu non voluto; 'busy' = bonus/spin/caricamento in corso; 'unknown' = nessuna risposta o budget finito."""
+        if self.interventions >= self.max_interventions:
+            return "unknown"
+        self.interventions += 1
+        path = self._screenshot(device_id)
+        if path is None:
+            return "unknown"
+        observation = self.observe(
+            path, "the automatic player believes the screen is busy (win or bonus in progress): is the game ready "
+                  "for a new spin?",
+        )
+        if observation is None:
+            return "unknown"
+        if observation.action == "close" and observation.target_description:
+            return "closed" if self._close(device_id, observation.target_description, path) else "busy"
+        if observation.spin_ready is True and observation.screen_state in ("idle", "win_presentation", "other"):
+            return "ready"
+        return "busy"
 
     def _close(self, device_id: str, description: str, before_path: str) -> bool:
         if self.describe is None or any(word in description.lower() for word in _SPIN_WORDS):

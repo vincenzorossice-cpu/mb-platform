@@ -51,6 +51,9 @@ class AutoPilotConfig:
     # rilegge il saldo; dopo un tocco "schermo cambiato ma saldo uguale" non si ritocca: si aspetta e si rilegge.
     spin_calm_check: bool = True
     spin_calm_max_wait_seconds: float = 30.0
+    # Calma parziale: se l'intero schermo non si ferma (overlay che compare e scompare nei rulli) ma la striscia
+    # di saldo/puntata/vincita e la zona attorno al pulsante spin restano ferme, si puo' toccare.
+    spin_partial_calm: bool = True
     # Spin: ogni N spin una lettura OCR completa (lo schermo intero) anche se di
     # norma si legge solo la fascia di saldo/puntata.
     full_read_every_spins: int = 10

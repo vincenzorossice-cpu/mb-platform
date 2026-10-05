@@ -168,7 +168,35 @@ class SlotAutoPilot:
         except Exception as exc:
             return Result.fail(f"Unexpected error in set_min_bet: {exc}", "UNEXPECTED_ERROR")
 
-    def spin(self, device_id: str, spin_index: int) -> Result[SpinResult]:
+    def diagnose_busy(self, device_id: str) -> str:
+        """Dopo un'attesa lunga di 'schermo occupato': Sol guarda lo schermo ('ready' | 'closed' | 'busy' |
+        'unknown'). Senza supervisore (GPT spento) e' sempre 'unknown'."""
+        supervisor = getattr(self, "supervisor", None)
+        if supervisor is None:
+            return "unknown"
+        try:
+            return supervisor.check_ready(device_id)
+        except Exception as exc:   # il supervisore non deve mai rompere la sessione
+            logger.warning("supervisore: controllo dello schermo occupato fallito: %s", exc)
+            return "unknown"
+
+    def save_debug_screenshot(self, device_id: str, label: str) -> Optional[str]:
+        """Copia lo screenshot corrente in logs/<label>_<ora>.png per capire cosa blocca; None se non riesce."""
+        try:
+            import os
+            import shutil
+            shot = self.screen_reader._screenshot(device_id)
+            if not shot.success:
+                return None
+            os.makedirs("logs", exist_ok=True)
+            target = os.path.join("logs", f"{label}_{time.strftime('%Y%m%d_%H%M%S')}.png")
+            shutil.copyfile(shot.data, target)
+            return target
+        except Exception as exc:
+            logger.debug("screenshot di diagnosi non salvato: %s", exc)
+            return None
+
+    def spin(self, device_id: str, spin_index: int, force: bool = False) -> Result[SpinResult]:
         full_region = self.ocr_reader.region
         band = self._amounts_band
         spin_mode = getattr(self.ocr_reader, "set_spin_mode", None)
@@ -182,6 +210,7 @@ class SlotAutoPilot:
             result = self.spin_controller.spin(
                 device_id, self.config.slot_name, self._episode_id, spin_index,
                 lambda: self._spin_context(device_id, full_region), self._min_bet_verified, self._current_bet,
+                **({"force": True} if force else {}),
             )
             self._spins_since_full_read += 1
             self._cached_spin_context = None
