@@ -22,6 +22,16 @@ Uso:
         --device-id ZE223HNBKJ --target-spins 10 --provider gpt4o
 """
 
+# Load credentials from .env
+import os
+from pathlib import Path
+env_file = Path(__file__).resolve().parents[2] / ".env"
+if env_file.exists():
+    for line in env_file.read_text().splitlines():
+        if "=" in line and not line.startswith("#"):
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip())
+
 import argparse
 import sys
 import time
