@@ -19,7 +19,7 @@ class AutoPilotConfig:
     max_bet_lower_attempts: int = 20
     max_spin_attempts_per_step: int = 3
     frame_diff_stable_threshold: float = 0.02
-    frame_diff_poll_interval: float = 0.3
+    frame_diff_poll_interval: float = 0.05   # tra due screenshot: la cattura (~0,7 s) e' gia' l'attesa
     # 20s, non 5: alcune slot (es. Pirots5) hanno animazioni di vincita piu'
     # lunghe del normale - il ciclo di attesa esce comunque subito appena lo
     # schermo si stabilizza, quindi un tetto piu' alto non rallenta gli spin
@@ -54,9 +54,15 @@ class AutoPilotConfig:
     # Calma parziale: se l'intero schermo non si ferma (overlay che compare e scompare nei rulli) ma la striscia
     # di saldo/puntata/vincita e la zona attorno al pulsante spin restano ferme, si puo' toccare.
     spin_partial_calm: bool = True
+    # Dopo uno spin senza vincita (saldo alla mano) e con lo schermo fermo recente, il controllo di calma
+    # prima del tocco successivo e' ridondante: si salta (con una vincita resta).
+    spin_skip_calm_after_loss: bool = True
+    spin_calm_skip_max_age_seconds: float = 2.0
+    # Attesa casuale dopo ogni tocco dell'autopilot (min, max): niente pausa "umana" da 0,3-1,5 s.
+    tap_delay_seconds: tuple = (0.05, 0.15)
     # Spin: ogni N spin una lettura OCR completa (lo schermo intero) anche se di
     # norma si legge solo la fascia di saldo/puntata.
-    full_read_every_spins: int = 10
+    full_read_every_spins: int = 30
     balance_rise_abort_margin: Decimal = Decimal("0.00")
     accounting_tolerance: Decimal = Decimal("0.01")
     enable_gpt_fallback: bool = True
@@ -94,6 +100,13 @@ class AutoPilotConfig:
             return Result.fail("recovery_return_threshold must be > 0", "CONFIG_INVALID")
         if self.max_recovery_attempts < 1:
             return Result.fail("max_recovery_attempts must be >= 1", "CONFIG_INVALID")
+        if (
+            len(self.tap_delay_seconds) != 2 or self.tap_delay_seconds[0] < 0
+            or self.tap_delay_seconds[1] < self.tap_delay_seconds[0]
+        ):
+            return Result.fail("tap_delay_seconds must be (min, max) with 0 <= min <= max", "CONFIG_INVALID")
+        if self.spin_calm_skip_max_age_seconds <= 0:
+            return Result.fail("spin_calm_skip_max_age_seconds must be > 0", "CONFIG_INVALID")
         if self.full_read_every_spins < 1:
             return Result.fail("full_read_every_spins must be >= 1", "CONFIG_INVALID")
         if self.bet_burst_check_every < 1:

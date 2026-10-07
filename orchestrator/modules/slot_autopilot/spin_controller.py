@@ -33,6 +33,8 @@ class SpinResult:
     violated_invariant: Optional[str] = None  # "MIN_BET_NOT_VERIFIED" | "INSUFFICIENT_BALANCE" | "UNSAFE_SCREEN_STATE"
     # Quale controllo ha bloccato (solo per UNSAFE_SCREEN_STATE): "schermo non fermo" | "saldo/puntata non leggibili"
     blocked_detail: Optional[str] = None
+    # Secondi per fase di questo spin: contesto, calma, tocco, attesa (con scatti), lettura, altro, totale.
+    timings: Optional[dict] = None
     accounting_anomaly: Optional[str] = None
     strategy_name: Optional[str] = None  # strategia che ha localizzato lo spin (None se non tappato)
     # Schermo stabile dopo lo spin e relativa lettura OCR (da TapOutcome): chi deve
@@ -55,6 +57,9 @@ class SpinController:
         self.verifier = verifier
         self.step_logger = step_logger
         self.config = config
+        # Fino a quando (monotonic) il prossimo spin puo' saltare il controllo di calma: lo spin precedente e'
+        # finito senza vincita, lo schermo fermo e' recente.
+        self._calm_skip_deadline = 0.0
 
     def spin(
         self, device_id: str, slot_name: str, episode_id: str, spin_index: int,
@@ -64,6 +69,8 @@ class SpinController:
         """force=True (solo dopo che Sol ha giudicato il gioco pronto): salta il controllo di calma e l'invariante
         'schermo libero'; restano puntata minima verificata e saldo sufficiente."""
         started = time.monotonic()
+        skip_calm_until, self._calm_skip_deadline = self._calm_skip_deadline, 0.0
+        calm_seconds = 0.0
         context_result = context_provider()
         context_seconds = time.monotonic() - started
         if not context_result.success:
@@ -105,13 +112,24 @@ class SpinController:
             ))
         candidate = locate_result.data
 
-        if self.config.spin_calm_check and not force and not candidate.verified and context.screenshot_path:
+        calm_skippable = (
+            self.config.spin_skip_calm_after_loss and time.monotonic() <= skip_calm_until
+        )
+        if calm_skippable:
+            logger.debug("spin %d: lo spin precedente non ha vinto e lo schermo fermo e' recente: salto la calma.",
+                         spin_index)
+        if (
+            self.config.spin_calm_check and not force and not calm_skippable
+            and not candidate.verified and context.screenshot_path
+        ):
             # Mai toccare uno schermo che si muove (animazione di vincita, saldo che si aggiorna): il tocco
             # andrebbe perso e ritoccare alla cieca rischia due spin.
+            calm_started = time.monotonic()
             calm = self.verifier.wait_until_calm(
                 device_id, context.screenshot_path, self.config.spin_calm_max_wait_seconds,
                 regions=self._calm_regions(context, candidate) if self.config.spin_partial_calm else None,
             )
+            calm_seconds = time.monotonic() - calm_started
             if calm.success and calm.data.partial:
                 logger.info("spin %d: i rulli sono in animazione ma barra degli importi e pulsante sono fermi: "
                             "tocco (calma parziale).", spin_index)
@@ -150,6 +168,8 @@ class SpinController:
                         ))
 
         attempts = 0
+        tap_seconds = wait_seconds = read_seconds = 0.0
+        wait_captures = 0
         screenshot_after = None
         state_after = None
         balance_after_read = False   # False: balance_after e' solo il valore "prima" usato come ripiego
@@ -198,6 +218,10 @@ class SpinController:
                         balance_before=balance_before, balance_after=balance_before, win_amount=None,
                         verified=False, attempts=attempts, outcome="error",
                     ))
+                tap_seconds += tap_result.data.tap_seconds
+                wait_seconds += tap_result.data.wait_seconds
+                wait_captures += tap_result.data.wait_captures
+                read_seconds += tap_result.data.read_seconds
                 # Gia' disponibili dal tap appena verificato: nessuna lettura
                 # di contesto aggiuntiva necessaria (era la ridondanza da
                 # eliminare per velocita').
@@ -281,6 +305,9 @@ class SpinController:
                     logger.debug("spin %d: la vincita letta (%s) non coincide con quella dal saldo (%s): uso il saldo.",
                                  spin_index, win_amount, from_balance)
                 win_amount = from_balance if from_balance >= Decimal("0.01") else None
+                if from_balance < Decimal("0.01"):
+                    # Perso (saldo alla mano): il prossimo spin puo' saltare il controllo di calma se parte subito.
+                    self._calm_skip_deadline = time.monotonic() + self.config.spin_calm_skip_max_age_seconds
         if bet_understated:
             logger.error(
                 "spin %d: il saldo e' sceso di %s con una puntata creduta di %s: la puntata reale e' piu' alta.",
@@ -288,6 +315,13 @@ class SpinController:
             )
         accounting_anomaly = None   # il controllo per spin sulla vincita letta e' stato tolto: vedi sopra
         total_seconds = time.monotonic() - started
+        timings = {
+            "contesto": round(context_seconds, 2), "calma": round(calm_seconds, 2), "tocco": round(tap_seconds, 2),
+            "attesa": round(wait_seconds, 2), "scatti": wait_captures, "lettura": round(read_seconds, 2),
+            "totale": round(total_seconds, 2),
+        }
+        timings["altro"] = round(max(0.0, total_seconds - context_seconds - calm_seconds - tap_seconds
+                                     - wait_seconds - read_seconds), 2)
         logger.info(
             "spin %d: outcome=%s verified=%s saldo %s->%s vincita=%s (contesto %.1f s, tocco+attesa+lettura %.1f s)",
             spin_index, outcome, verified, balance_before, balance_after, win_amount,
@@ -305,6 +339,7 @@ class SpinController:
             verified=verified, attempts=attempts, outcome=outcome,
             accounting_anomaly=accounting_anomaly, strategy_name=candidate.strategy_name,
             screenshot_after=screenshot_after, state_after=state_after, bet_understated=bet_understated,
+            timings=timings,
         ))
 
     def _reread_balance(self, context_provider) -> Optional[Decimal]:

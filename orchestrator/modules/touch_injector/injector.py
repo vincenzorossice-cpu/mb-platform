@@ -33,7 +33,11 @@ class TouchInjector(TouchInjectorInterface):
         screen_reader: ScreenReaderInterface,
         adb_timeout: int = 10,
         bet_confirm_timeout: int = 15,
+        tap_delay_seconds: tuple = (0.3, 1.5),
     ):
+        # Attesa casuale (min, max) dopo ogni tocco "umanizzato": 0.3-1.5 s e' lo storico; l'autopilot la riduce
+        # (uno spin non ha bisogno di una pausa umana, il jitter spaziale resta).
+        self.tap_delay_seconds = tuple(tap_delay_seconds)
         self.screen_reader = screen_reader
         self.adb_timeout = adb_timeout
         self.bet_confirm_timeout = bet_confirm_timeout
@@ -359,7 +363,7 @@ class TouchInjector(TouchInjectorInterface):
                 text=True,
                 timeout=self.adb_timeout,
             )
-            delay = random.uniform(0.3, 1.5)
+            delay = random.uniform(*self.tap_delay_seconds)
             time.sleep(delay)
             if result.returncode != 0:
                 return Result.fail(f"ADB tap failed: {result.stderr}", "TAP_MISSED")

@@ -75,6 +75,12 @@ class TapOutcome:
     # La lettura OCR completa dopo il tocco (testi inclusi): chi ha bisogno dello
     # stato dello schermo subito dopo puo' riusarla invece di rifare l'OCR.
     state_after: Optional[dict] = None
+    # Dove e' andato il tempo di questo tocco (secondi): il tocco (con la sua attesa), l'attesa dello schermo fermo
+    # con il numero di scatti, la lettura OCR.
+    tap_seconds: float = 0.0
+    wait_seconds: float = 0.0
+    wait_captures: int = 0
+    read_seconds: float = 0.0
 
 
 def _to_decimal(value) -> Optional[Decimal]:
@@ -218,7 +224,9 @@ class ActionVerifier:
                 return Result.fail(f"OCR error before tap: {exc}", "VERIFICATION_ERROR")
 
         logger.info("verified_tap: tap (%d,%d), attesa '%s'", x, y, expectation.kind)
+        tap_started = time.monotonic()
         tap_result = self.touch_injector.tap_coordinates(device_id, x, y)
+        tap_seconds = time.monotonic() - tap_started
         if not tap_result.success:
             logger.warning("verified_tap: tap fallito: %s (%s)", tap_result.error, tap_result.error_code)
             return Result.fail(tap_result.error, tap_result.error_code)
@@ -281,6 +289,10 @@ class ActionVerifier:
             outcome=outcome,
             win_amount=win_amount,
             state_after=state_after,
+            tap_seconds=tap_seconds,
+            wait_seconds=wait_seconds,
+            wait_captures=wait_captures,
+            read_seconds=read_seconds,
         ))
 
     def _evaluate_expectation(self, expectation: Expectation, diff: float,

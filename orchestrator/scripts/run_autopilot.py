@@ -140,7 +140,9 @@ def build_autopilot_for(
         return Result.fail(config_result.error, config_result.error_code)
 
     screen_reader = ScreenReader(adb_timeout=config.adb_timeout)
-    touch_injector = TouchInjector(screen_reader=screen_reader, adb_timeout=config.adb_timeout)
+    touch_injector = TouchInjector(
+        screen_reader=screen_reader, adb_timeout=config.adb_timeout, tap_delay_seconds=config.tap_delay_seconds,
+    )
     ocr_reader = SlotOCRReader(ocr_url=os.environ.get("OCR_URL"))
     if ocr_reader.remote:
         logger.info("OCR remoto: %s", ocr_reader._ocr_url)
@@ -236,6 +238,7 @@ def _log_run_metrics(autopilot: SlotAutoPilot, args: argparse.Namespace, result,
             total_played=str(result.total_played), failed=result.failed, stop_reason=result.stop_reason,
             bet_aborted_reason=result.bet_aborted_reason, seconds=round(seconds, 1),
             seconds_per_spin=round(seconds / result.spins, 1) if result.spins else None,
+            avg_timings=getattr(result, "avg_timings", None),
             operator_interventions=getattr(hitl, "interventions", 0),
             supervisor_calls=getattr(supervisor, "calls", 0),
             calls_by_purpose=dict(getattr(gpt_client, "_usage_by_purpose", {}) or {}),

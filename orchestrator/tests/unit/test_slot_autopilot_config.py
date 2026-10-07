@@ -67,7 +67,7 @@ def test_negative_burst_interval_fails():
 
 
 def test_full_read_every_spins_default_and_validation():
-    assert _config().full_read_every_spins == 10
+    assert _config().full_read_every_spins == 30
     assert not _config(full_read_every_spins=0).validate().success
 
 

@@ -41,6 +41,8 @@ class SlotSessionResult:
     initial_balance: Optional[Decimal] = None
     final_balance: Optional[Decimal] = None
     target: Decimal = Decimal("0.00")
+    # Media per fase (secondi) degli spin riusciti: calma, tocco, attesa, lettura, altro, totale (None se nessuno).
+    avg_timings: Optional[dict] = None
 
     @property
     def target_reached(self) -> bool:
@@ -79,9 +81,36 @@ def progress_line(spin_index: int, spin_result, total_played: Decimal, target: D
     bet = f"{spin_result.bet_amount:.2f}" if spin_result.bet_amount is not None else "-"
     balance = f"{spin_result.balance_after}" if spin_result.balance_after is not None else "-"
     win = f"{spin_result.win_amount:.2f}" if spin_result.win_amount else "0.00"
-    return (
+    line = (
         f"Spin {spin_index} | puntata {bet} | saldo {balance} | vincita {win} | "
         f"giocato {total_played:.2f}/{target:.2f} | {seconds:.0f} s"
+    )
+    timings = getattr(spin_result, "timings", None)
+    if isinstance(timings, dict):
+        line += (
+            f" [calma {timings.get('calma', 0):.1f} | tocco {timings.get('tocco', 0):.1f} | attesa "
+            f"{timings.get('attesa', 0):.1f} ({timings.get('scatti', 0)} scatti) | lettura "
+            f"{timings.get('lettura', 0):.1f} | altro {timings.get('altro', 0):.1f}]"
+        )
+    return line
+
+
+_TIMING_KEYS = ("contesto", "calma", "tocco", "attesa", "lettura", "altro", "totale")
+
+
+def average_timings(collected: list) -> Optional[dict]:
+    """Media per fase dei dizionari `timings` degli spin; None se non ce n'e' nessuno."""
+    rows = [t for t in collected if isinstance(t, dict)]
+    if not rows:
+        return None
+    return {key: round(sum(float(t.get(key, 0) or 0) for t in rows) / len(rows), 2) for key in _TIMING_KEYS}
+
+
+def timing_summary_line(averages: dict, spins: int) -> str:
+    return (
+        f"Tempo medio per spin ({spins} spin): totale {averages['totale']:.1f} s = contesto {averages['contesto']:.1f} "
+        f"+ calma {averages['calma']:.1f} + tocco {averages['tocco']:.1f} + attesa schermo fermo "
+        f"{averages['attesa']:.1f} + lettura {averages['lettura']:.1f} + altro {averages['altro']:.1f}"
     )
 
 
@@ -124,6 +153,7 @@ def play_session(
     busy_since = None
     busy_asked = False
     force_next = False
+    collected_timings = []
     while total_played < target and spin_index < max_steps:
         spin_index += 1
         started = time.monotonic()
@@ -160,6 +190,7 @@ def play_session(
             consecutive_no_effect = 0
         if spin_result.data.outcome == "success" and spin_result.data.bet_amount:
             total_played += spin_result.data.bet_amount
+            collected_timings.append(getattr(spin_result.data, "timings", None))
             log.info("%s", progress_line(spin_index, spin_result.data, total_played, target, seconds))
         elif spin_result.data.outcome == "blocked":
             if spin_result.data.violated_invariant == "UNSAFE_SCREEN_STATE":
@@ -199,6 +230,9 @@ def play_session(
                 stop_reason = "BLOCKED"
             break
     log.info("Sessione conclusa: %s/%s EUR giocati in %d spin.", total_played, target, spin_index)
+    averages = average_timings(collected_timings)
+    if averages is not None:
+        log.info("%s", timing_summary_line(averages, len([t for t in collected_timings if isinstance(t, dict)])))
 
     initial_balance, final_balance = autopilot.get_balance_summary()
     if initial_balance is not None and final_balance is not None:
@@ -209,5 +243,5 @@ def play_session(
         )
     return SlotSessionResult(
         total_played, spin_index, failed=failed, stop_reason=stop_reason,
-        initial_balance=initial_balance, final_balance=final_balance, target=target,
+        initial_balance=initial_balance, final_balance=final_balance, target=target, avg_timings=averages,
     )
