@@ -245,10 +245,13 @@ class ResilientOCRReader:
                 # il credito. Non e' un ancoraggio: resta l'OCR (o sconosciuto) e la visione non lo ridefinisce.
                 logger.warning("'%s': la visione ha letto %s ma il valore cambia tra due letture (contatore?): "
                                "lo scarto.", key, vision_value)
-                self._vision_fields.add(key)
                 merged[key] = ocr_value
                 if ocr_value is not None:
+                    # L'OCR legge il campo: la visione e' quella inaffidabile e NON entra nel ciclo (altrimenti a ogni
+                    # spin partirebbe una chiamata di visione inutile, e un suo errore scarterebbe l'OCR giusto).
                     self._trusted[key] = ocr_value
+                else:
+                    self._vision_fields.add(key)   # l'OCR non legge nulla: la visione resta l'unica fonte (non confermata)
             else:
                 self._vision_fields.add(key)
                 merged[key] = self._trusted[key] = vision_value

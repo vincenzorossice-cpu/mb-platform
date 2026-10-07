@@ -57,6 +57,18 @@ def _log_phase(autopilot, label: str, seconds: float, log) -> None:
         log.info("%s", text)
 
 
+def _log_capture_stats(autopilot, log) -> None:
+    """Quanto sono costati gli screenshot ADB in tutta la sessione (il collo di bottiglia misurato il 7 ottobre)."""
+    try:
+        stats = autopilot.screen_reader.capture_stats
+        calls, seconds = int(stats["calls"]), float(stats["seconds"])
+        if calls > 0:
+            log.info("Screenshot ADB (modo %s): %d in %.0f s, %.2f s a scatto.",
+                     getattr(autopilot.screen_reader, "capture_mode", "?"), calls, seconds, seconds / calls)
+    except Exception:
+        pass
+
+
 def _ask_if_ready(autopilot, device_id: str) -> str:
     diagnose = getattr(autopilot, "diagnose_busy", None)
     if not callable(diagnose):
@@ -244,6 +256,7 @@ def play_session(
     averages = average_timings(collected_timings)
     if averages is not None:
         log.info("%s", timing_summary_line(averages, len([t for t in collected_timings if isinstance(t, dict)])))
+    _log_capture_stats(autopilot, log)
 
     initial_balance, final_balance = autopilot.get_balance_summary()
     if initial_balance is not None and final_balance is not None:

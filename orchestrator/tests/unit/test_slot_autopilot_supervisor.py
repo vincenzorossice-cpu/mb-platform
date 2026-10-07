@@ -399,3 +399,39 @@ class TestJackpotCounters:
                 reader._warn("k", "messaggio ripetuto %s", 1)
 
         assert len([r for r in caplog.records if "messaggio ripetuto" in r.getMessage()]) == 3
+
+
+class TestUnstableVisionDoesNotJoinTheSpinLoop:
+    def test_pirots5_session_of_the_7th_ocr_reads_the_bet_fine_and_the_vision_misreads_it_once(self):
+        # 12:39: OCR saldo 4995.78 e puntata 0.2; la visione legge la puntata 2.0, poi (seconda lettura) 0.2.
+        vision = _vision({"saldo": 4995.78, "posta": 2.0}, {"saldo": 4995.78, "posta": 0.2})
+        ocr = _ocr([{"saldo": 4995.78, "posta": 0.2, "raw_texts": []}] + [
+            {"saldo": 4995.58 - 0.2 * i, "posta": 0.2, "raw_texts": []} for i in range(5)])
+        reader = ResilientOCRReader(ocr, vision, capture=lambda: "/second.png", confirm_delay=0)
+
+        first = reader.read_slot_state("/first.png")
+        later = [reader.read_slot_state(f"/spin{i}.png") for i in range(5)]
+
+        assert first["posta"] == 0.2 and all(state["posta"] == 0.2 for state in later)
+        assert not reader.prefer_vision                       # la visione non e' piu' un campo del ciclo
+        assert vision.read.call_count == 2                    # solo prima lettura + conferma, nessuna chiamata per spin
+
+    def test_a_vision_error_never_discards_an_ocr_amount_when_the_ocr_drives_the_field(self):
+        vision = _vision({"saldo": 100.0, "posta": 2.0}, {"saldo": 100.0, "posta": 0.2})
+        ocr = _ocr([{"saldo": 100.0, "posta": 0.2, "raw_texts": []}, {"saldo": 99.8, "posta": 0.2, "raw_texts": []}])
+        reader = ResilientOCRReader(ocr, vision, capture=lambda: "/second.png", confirm_delay=0)
+        reader.read_slot_state("/first.png")
+        vision.read.side_effect = AssertionError("la visione non deve essere chiamata")
+
+        assert reader.read_slot_state("/spin1.png")["posta"] == 0.2
+
+    def test_with_an_empty_ocr_the_unstable_vision_still_stays_in_play_but_unconfirmed(self):
+        vision = _vision({"saldo": 50000.0, "posta": 7181009.38}, {"saldo": 50000.0, "posta": 7181045.77})
+        reader = ResilientOCRReader(
+            _ocr([{"saldo": 50000.0, "posta": None, "raw_texts": []}]), vision,
+            capture=lambda: "/second.png", confirm_delay=0,
+        )
+
+        state = reader.read_slot_state("/first.png")
+
+        assert state["posta"] is None and reader.prefer_vision

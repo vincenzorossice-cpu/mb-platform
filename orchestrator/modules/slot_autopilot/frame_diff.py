@@ -7,16 +7,27 @@ from PIL import Image, ImageChops
 from orchestrator.core.result import Result
 
 
+def _load_gray(image_path: str):
+    """Screenshot in scala di grigi (decodificato una volta sola), o l'eccezione di lettura."""
+    try:
+        with Image.open(image_path) as image:
+            return image.convert("L")
+    except (OSError, FileNotFoundError) as exc:
+        return exc
+
+
 def diff_score(image_path_a: str, image_path_b: str, region: Optional[tuple] = None) -> Result[float]:
     """Punteggio di differenza 0..1 tra due screenshot, solo PIL (nessuna
     dipendenza numpy/opencv). region, se dato, e' (x1,y1,x2,y2) e limita il
     confronto a quel rettangolo."""
-    try:
-        img_a = Image.open(image_path_a).convert("L")
-        img_b = Image.open(image_path_b).convert("L")
-    except (OSError, FileNotFoundError) as exc:
-        return Result.fail(f"Cannot read image: {exc}", "IMAGE_READ_ERROR")
+    img_a, img_b = _load_gray(image_path_a), _load_gray(image_path_b)
+    for loaded in (img_a, img_b):
+        if isinstance(loaded, Exception):
+            return Result.fail(f"Cannot read image: {loaded}", "IMAGE_READ_ERROR")
+    return _gray_diff(img_a, img_b, region)
 
+
+def _gray_diff(img_a, img_b, region: Optional[tuple] = None) -> Result[float]:
     if region is not None:
         img_a = img_a.crop(region)
         img_b = img_b.crop(region)
@@ -57,6 +68,9 @@ def wait_until_stable(
     if not first.success:
         return Result.fail(first.error, first.error_code)
     previous_path = first.data
+    previous_gray = _load_gray(previous_path)
+    if isinstance(previous_gray, Exception):
+        return Result.fail(f"Cannot read image: {previous_gray}", "IMAGE_READ_ERROR")
     captures = 1
 
     while True:
@@ -71,7 +85,10 @@ def wait_until_stable(
         next_path = next_result.data
         captures += 1
 
-        score_result = diff_score(previous_path, next_path, region)
+        next_gray = _load_gray(next_path)        # ogni frame si decodifica una volta sola (poi diventa il "precedente")
+        if isinstance(next_gray, Exception):
+            return Result.fail(f"Cannot read image: {next_gray}", "IMAGE_READ_ERROR")
+        score_result = _gray_diff(previous_gray, next_gray, region)
         if not score_result.success:
             return Result.fail(score_result.error, score_result.error_code)
 
@@ -83,3 +100,4 @@ def wait_until_stable(
             return Result.ok(StabilityResult(next_path, stable=False, waited_seconds=elapsed, captures=captures))
 
         previous_path = next_path
+        previous_gray = next_gray

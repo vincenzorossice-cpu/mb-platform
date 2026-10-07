@@ -1,5 +1,7 @@
+import struct
 import subprocess
 import time
+import logging
 import xml.etree.ElementTree as ET
 import re
 import os
@@ -14,6 +16,28 @@ from orchestrator.modules.screen_reader.interface import (
     BetStatus,
     MovementReading,
 )
+
+logger = logging.getLogger(__name__)
+
+_CAPTURE_MODES = ("png", "raw", "auto")
+_RAW_FORMATS = (1, 2)            # RGBA_8888, RGBX_8888
+_MAX_RAW_PIXELS = 25_000_000
+
+
+def parse_raw_screencap(data: bytes):
+    """(larghezza, altezza, pixel RGBA) da un 'adb exec-out screencap' grezzo, o None se il formato non e' quello
+    atteso. L'intestazione e' di 12 byte (larghezza, altezza, formato) o di 16 su Android recenti (spazio colore)."""
+    if len(data) < 16:
+        return None
+    width, height, fmt = struct.unpack("<III", data[:12])
+    if fmt not in _RAW_FORMATS or width <= 0 or height <= 0 or width * height > _MAX_RAW_PIXELS:
+        return None
+    size = width * height * 4
+    for header in (12, 16):
+        if len(data) == header + size:
+            return width, height, data[header:header + size]
+    return None
+
 
 # FIX-1: etichette generiche di saldo, in ordine di priorita' di ricerca
 _BALANCE_LABELS = ("saldo", "balance", "disponibile", "wallet", "conto", "fondo", "credito")
@@ -66,7 +90,15 @@ class ScreenReader(ScreenReaderInterface):
         ocr_confidence_threshold: float = 0.85,
         adb_timeout: int = 10,
         screenshot_dir: str = None,
+        capture_mode: str = None,
     ):
+        # png = 'screencap -p' (il telefono comprime il PNG: ~2 s a scatto misurati); raw = 'screencap' grezzo (nessuna
+        # compressione sul telefono, ~10 MB sulla USB: spesso piu' veloce, da misurare con benchmark_capture);
+        # auto = grezzo con ripiego su png al primo problema. Default png finche' non si decide con i numeri.
+        mode = (capture_mode or os.environ.get("ADB_CAPTURE_MODE") or "png").strip().lower()
+        self.capture_mode = mode if mode in _CAPTURE_MODES else "png"
+        self.capture_stats = {"calls": 0, "seconds": 0.0, "raw_failures": 0}
+        self._raw_disabled = False
         self.ocr_confidence_threshold = ocr_confidence_threshold
         self.adb_timeout = adb_timeout
         self.screenshot_dir = screenshot_dir or tempfile.gettempdir()
@@ -271,8 +303,42 @@ class ScreenReader(ScreenReaderInterface):
             return Result.fail(f"Unexpected error: {e}", "ADB_ERROR")  # FIX-16
 
     def _screenshot(self, device_id: str) -> Result[str]:
+        started = time.monotonic()
         try:
             local_path = os.path.join(self.screenshot_dir, f"screen_{device_id}_{int(time.time() * 1000)}.png")  # FIX-BASSA-4
+            if self.capture_mode in ("raw", "auto") and not self._raw_disabled and self._capture_raw(device_id, local_path):
+                return Result.ok(local_path)
+            return self._capture_png(device_id, local_path)
+        finally:
+            self.capture_stats["calls"] += 1
+            self.capture_stats["seconds"] += time.monotonic() - started
+
+    def _capture_raw(self, device_id: str, local_path: str) -> bool:
+        """Cattura grezza e PNG leggero (compress_level=1). False se qualcosa non torna (e in modo 'auto' il grezzo
+        si spegne): chi chiama ripiega su 'screencap -p'."""
+        try:
+            completed = subprocess.run(
+                ["adb", "-s", device_id, "exec-out", "screencap"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=self.adb_timeout,
+            )
+            parsed = parse_raw_screencap(completed.stdout or b"")
+            if parsed is None:
+                raise ValueError("formato di screencap grezzo non riconosciuto")
+            width, height, pixels = parsed
+            from PIL import Image
+            Image.frombuffer("RGBX", (width, height), pixels, "raw", "RGBX", 0, 1).convert("RGB").save(
+                local_path, format="PNG", compress_level=1,
+            )
+            return os.path.exists(local_path) and os.path.getsize(local_path) > 0
+        except Exception as exc:
+            self.capture_stats["raw_failures"] += 1
+            if self.capture_mode == "auto":
+                self._raw_disabled = True
+            logger.warning("Cattura grezza non riuscita (%s): uso 'screencap -p'.", exc)
+            return False
+
+    def _capture_png(self, device_id: str, local_path: str) -> Result[str]:
+        try:
             # exec-out: un solo round-trip, i byte PNG arrivano direttamente su
             # stdout (scritto su file binario), senza passare da /sdcard + pull.
             with open(local_path, "wb") as out:
