@@ -69,7 +69,7 @@ class TestRawCapture:
 
         assert result.success and calls[-1][-1] == "-p"
         assert reader.capture_stats["raw_failures"] == 1
-        assert not reader._raw_disabled                      # in modo 'raw' si riprova al giro dopo
+        assert "raw" not in reader._disabled_methods          # in modo 'raw' si riprova al giro dopo
 
     def test_auto_mode_gives_up_on_raw_after_the_first_failure(self, tmp_path):
         reader = ScreenReader(screenshot_dir=str(tmp_path), capture_mode="auto")
@@ -86,7 +86,7 @@ class TestRawCapture:
             reader._screenshot("dev1")
             reader._screenshot("dev1")
 
-        assert [c[-1] for c in calls] == ["screencap", "-p", "-p"]        # il grezzo solo la prima volta
+        assert [c[-1] for c in calls] == ["screencap | gzip -1", "screencap", "-p", "-p"]   # i metodi grezzi solo la prima volta
 
     def test_captures_are_counted_with_their_seconds(self, tmp_path):
         reader = ScreenReader(screenshot_dir=str(tmp_path))
@@ -170,3 +170,48 @@ class TestBenchmark:
             session_module._log_capture_stats(autopilot, session_module.logger)
 
         assert "Screenshot ADB (modo png): 40 in 80 s, 2.00 s a scatto." in caplog.text
+
+
+class TestRawGzipCapture:
+    def test_rawgz_runs_screencap_through_gzip_and_decodes_the_answer(self, tmp_path):
+        import gzip
+        reader = ScreenReader(screenshot_dir=str(tmp_path), capture_mode="rawgz")
+
+        with patch(RUN, return_value=SimpleNamespace(stdout=gzip.compress(_raw(width=6, height=5)), returncode=0)) as run:
+            result = reader._screenshot("dev1")
+
+        assert run.call_args[0][0] == ["adb", "-s", "dev1", "exec-out", "screencap | gzip -1"]
+        assert result.success and reader.last_method == "rawgz"
+        with Image.open(result.data) as image:
+            assert image.size == (6, 5)
+
+    def test_a_phone_without_gzip_falls_back_to_raw_then_png(self, tmp_path):
+        reader = ScreenReader(screenshot_dir=str(tmp_path), capture_mode="rawgz")
+        calls = []
+
+        def run(cmd, stdout=None, **kwargs):
+            calls.append(cmd[-1])
+            if cmd[-1] == "screencap | gzip -1":
+                return SimpleNamespace(stdout=b"/system/bin/sh: gzip: not found\n", returncode=127)
+            return SimpleNamespace(stdout=_raw(), returncode=0)
+
+        with patch(RUN, side_effect=run):
+            first = reader._screenshot("dev1")
+            second = reader._screenshot("dev1")
+
+        assert first.success and second.success and reader.last_method == "raw"
+        assert calls == ["screencap | gzip -1", "screencap", "screencap"]     # gzip spento dopo il primo fallimento
+
+    def test_the_last_resort_is_still_the_png_command(self, tmp_path):
+        reader = ScreenReader(screenshot_dir=str(tmp_path), capture_mode="auto")
+
+        def run(cmd, stdout=None, **kwargs):
+            if cmd[-1] == "-p":
+                stdout.write(b"\x89PNG-bytes")
+                return MagicMock(returncode=0)
+            return SimpleNamespace(stdout=b"nope", returncode=1)
+
+        with patch(RUN, side_effect=run):
+            result = reader._screenshot("dev1")
+
+        assert result.success and reader.last_method == "png"

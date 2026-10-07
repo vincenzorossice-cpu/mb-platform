@@ -1,4 +1,6 @@
 import logging
+import os
+import statistics
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -15,6 +17,8 @@ from orchestrator.modules.step_logger.interface import StepLoggerInterface, Step
 logger = logging.getLogger(__name__)
 
 _ELEMENT = "spin"
+_MAX_NORMAL_DURATION_SECONDS = 20.0   # oltre, e' un bonus/feature: non conta per la durata tipica
+_MAX_INITIAL_WAIT_SECONDS = 8.0
 _BUSY_SAMPLE_DELAY_SECONDS = 1.0  # quanto dopo il tocco si campiona il pulsante "occupato"
 _SPIN_ZONE_HALF_PX = 160          # quadrato di ~320 px attorno al pulsante spin
 _BOTTOM_STRIP_FRACTION = 0.12     # ultimo 12% dell'altezza: saldo, puntata, vincita
@@ -36,6 +40,8 @@ class SpinResult:
     blocked_detail: Optional[str] = None
     # Secondi per fase di questo spin: contesto, calma, tocco, attesa (con scatti), lettura, altro, totale.
     timings: Optional[dict] = None
+    # Solo nello spin in cui si e' tentato di apprendere il pulsante: com'e' andata (appreso / perche' no).
+    button_status: Optional[str] = None
     accounting_anomaly: Optional[str] = None
     strategy_name: Optional[str] = None  # strategia che ha localizzato lo spin (None se non tappato)
     # Schermo stabile dopo lo spin e relativa lettura OCR (da TapOutcome): chi deve
@@ -60,6 +66,8 @@ class SpinController:
         self.config = config
         # SpinButtonState opzionale: senza, solo il confronto tra screenshot (comportamento storico).
         self.button = button
+        self._button_logged = set()        # righe sul pulsante spin gia' scritte (una volta per slot e motivo)
+        self._durations = {}               # slot -> durate recenti (s) tra tocco e fine animazione, spin normali
         # Fino a quando (monotonic) il prossimo spin puo' saltare il controllo di calma: lo spin precedente e'
         # finito senza vincita, lo schermo fermo e' recente.
         self._calm_skip_deadline = 0.0
@@ -117,13 +125,37 @@ class SpinController:
 
         ready_check = None
         learning_button = False
-        if self.button is not None and self.config.spin_button_detection and not candidate.verified:
+        detection_on = self.config.spin_button_detection and os.environ.get(
+            "SPIN_BUTTON_DETECTION", "1").strip().lower() not in ("0", "false", "no")
+        if self.button is None:
+            self._log_button_once(slot_name, "nessun oggetto", logging.INFO, "disattivato: nessun rilevatore collegato")
+        elif not detection_on:
+            self._log_button_once(slot_name, "spento", logging.INFO,
+                                  "disattivato (spin_button_detection=False o SPIN_BUTTON_DETECTION=0)")
+        elif candidate.verified:
+            self._log_button_once(slot_name, "operatore", logging.INFO,
+                                  "non usato: la coordinata dello spin arriva dall'operatore")
+        else:
             screen_size = (context.screen_width, context.screen_height)
             if self.button.reference(slot_name, screen_size) is not None:
+                self._log_button_once(slot_name, "riferimento", logging.INFO,
+                                      f"riferimento trovato (dimensione schermo {screen_size}): lo uso")
+
                 def ready_check(path, _x=candidate.x, _y=candidate.y, _size=screen_size):
                     return self.button.classify(slot_name, _size, path, _x, _y)
-            elif context.screenshot_path and self.button.needs_learning(slot_name, screen_size):
+            elif not context.screenshot_path:
+                self._log_button_once(slot_name, "senza screenshot", logging.WARNING,
+                                      "apprendimento saltato: il contesto non ha uno screenshot")
+            elif self.button.needs_learning(slot_name, screen_size):
                 learning_button = True
+                self._log_button_once(slot_name, "apprendimento", logging.INFO,
+                                      "nessun riferimento: lo apprendo in questo spin (campione 'pronto' ora, "
+                                      "'occupato' ~1 s dopo il tocco)")
+            else:
+                self._log_button_once(
+                    slot_name, "rinunciato", logging.WARNING,
+                    "apprendimento saltato: riferimento mancante e tentativi gia' esauriti; uso il confronto tra "
+                    "screenshot (SPIN_BUTTON_RELEARN=1 per riprovare)")
         calm_skippable = (
             self.config.spin_skip_calm_after_loss and time.monotonic() <= skip_calm_until
         )
@@ -188,6 +220,7 @@ class SpinController:
         tap_seconds = wait_seconds = read_seconds = 0.0
         wait_captures = 0
         ended_ready = False
+        last_wait_seconds = None
         busy_sample = {}
         screenshot_after = None
         state_after = None
@@ -221,6 +254,9 @@ class SpinController:
                 # schermo e' cambiato, quindi si rilegge davvero.
                 reuse = attempts == 1
                 extra = {}
+                initial_wait = self._initial_wait(slot_name)
+                if initial_wait > 0:
+                    extra["initial_wait"] = initial_wait
                 if ready_check is not None:
                     extra["ready_check"] = ready_check
                 if learning_button and attempts == 1:
@@ -244,6 +280,7 @@ class SpinController:
                         verified=False, attempts=attempts, outcome="error",
                     ))
                 ended_ready = bool(getattr(tap_result.data, "ended_ready", False))
+                last_wait_seconds = float(getattr(tap_result.data, "wait_seconds", 0.0) or 0.0) or None
                 tap_seconds += tap_result.data.tap_seconds
                 wait_seconds += tap_result.data.wait_seconds
                 wait_captures += tap_result.data.wait_captures
@@ -300,11 +337,19 @@ class SpinController:
                     break
 
         outcome = "success" if verified else "no_effect"
-        if verified and learning_button and busy_sample.get("path"):
-            self.button.learn(
-                slot_name, (context.screen_width, context.screen_height), candidate.x, candidate.y,
-                context.screenshot_path, busy_sample["path"],
-            )
+        button_status = None
+        if verified and learning_button:
+            if busy_sample.get("path"):
+                self.button.learn(
+                    slot_name, (context.screen_width, context.screen_height), candidate.x, candidate.y,
+                    context.screenshot_path, busy_sample["path"],
+                )
+                button_status = self.button.status(slot_name)
+            else:
+                button_status = "NON appreso: lo screenshot 'occupato' dopo il tocco non e' stato raccolto"
+                logger.warning("pulsante spin: %s", button_status)
+        if verified and not force and last_wait_seconds is not None:
+            self._record_duration(slot_name, last_wait_seconds)
         if verified and ended_ready:
             # La freccia e' tornata: se il prossimo spin parte subito non serve controllare di nuovo.
             self._calm_skip_deadline = time.monotonic() + self.config.spin_calm_skip_max_age_seconds
@@ -373,7 +418,7 @@ class SpinController:
             verified=verified, attempts=attempts, outcome=outcome,
             accounting_anomaly=accounting_anomaly, strategy_name=candidate.strategy_name,
             screenshot_after=screenshot_after, state_after=state_after, bet_understated=bet_understated,
-            timings=timings,
+            timings=timings, button_status=button_status,
         ))
 
     def _reread_balance(self, context_provider) -> Optional[Decimal]:
@@ -408,6 +453,35 @@ class SpinController:
         if balance_before is None or balance_after is None or bet is None:
             return None
         return balance_after - balance_before + bet
+
+    def _log_button_once(self, slot_name: str, key: str, level: int, message: str) -> None:
+        if (slot_name, key) not in self._button_logged:
+            self._button_logged.add((slot_name, key))
+            logger.log(level, "pulsante spin: %s", message)
+
+    def _record_duration(self, slot_name: str, seconds: float) -> None:
+        """Durata tra tocco e fine animazione di uno spin NORMALE: i bonus (molto piu' lunghi della mediana) non
+        entrano, cosi' l'attesa iniziale non si allunga per colpa loro."""
+        history = self._durations.setdefault(slot_name, [])
+        if seconds <= 0 or seconds > _MAX_NORMAL_DURATION_SECONDS:
+            return
+        if len(history) >= 2 and seconds > 1.6 * statistics.median(history):
+            return
+        history.append(seconds)
+        del history[:-5]
+
+    def _initial_wait(self, slot_name: str) -> float:
+        """Quanto aspettare dopo il tocco prima di scattare: nei primi secondi l'animazione c'e' di sicuro. Prudente:
+        70% della piu' corta delle ultime 3 durate normali, meno il costo di uno scatto; niente prima di 2 spin."""
+        history = self._durations.get(slot_name, [])
+        if len(history) < 2 or not self.config.spin_smart_wait:
+            return 0.0
+        stats = getattr(getattr(self.verifier, "screen_reader", None), "capture_stats", None)
+        try:
+            shot = float(stats["seconds"]) / float(stats["calls"]) if stats and stats["calls"] else 1.5
+        except (TypeError, KeyError, ZeroDivisionError):
+            shot = 1.5
+        return round(min(_MAX_INITIAL_WAIT_SECONDS, max(0.0, 0.7 * min(history[-3:]) - shot)), 2)
 
     def _sample_busy_button(self, device_id: str, holder: dict) -> None:
         """Nello spin di apprendimento: uno screenshot ~1 s dopo il tocco, mentre il gioco gira."""

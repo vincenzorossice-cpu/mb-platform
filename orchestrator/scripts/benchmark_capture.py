@@ -45,14 +45,18 @@ def measure_diff(path: str, n: int) -> Optional[float]:
     return (time.monotonic() - started) / n
 
 
-def recommendation(png: dict, raw: dict) -> str:
+def recommendation(png: dict, raw: dict, rawgz: Optional[dict] = None) -> str:
+    """Il metodo piu' veloce tra quelli senza fallimenti, se batte il png di almeno il 20%."""
     if png["mean"] is None:
         return "Nessuna cattura PNG riuscita: controlla il telefono (adb devices)."
-    if raw["mean"] is None or raw["raw_failures"] > 0:
+    candidates = [(name, data) for name, data in (("raw", raw), ("rawgz", rawgz))
+                  if data is not None and data["mean"] is not None and data["raw_failures"] == 0]
+    if not candidates:
         return "Il formato grezzo non funziona su questo telefono: resta ADB_CAPTURE_MODE=png."
-    if raw["mean"] < 0.8 * png["mean"]:
-        return (f"Il grezzo e' piu' veloce ({raw['mean']:.2f} s contro {png['mean']:.2f} s a scatto): "
-                f"imposta $env:ADB_CAPTURE_MODE = \"raw\" prima di lanciare l'autopilot.")
+    name, best = min(candidates, key=lambda item: item[1]["mean"])
+    if best["mean"] < 0.8 * png["mean"]:
+        return (f"Il metodo '{name}' e' il piu' veloce ({best['mean']:.2f} s contro {png['mean']:.2f} s a scatto): "
+                f"imposta $env:ADB_CAPTURE_MODE = \"{name}\" prima di lanciare l'autopilot.")
     return "Nessun vantaggio netto col grezzo: resta ADB_CAPTURE_MODE=png."
 
 
@@ -70,18 +74,19 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     png_reader = ScreenReader(capture_mode="png")
-    raw_reader = ScreenReader(capture_mode="raw")
     png = measure_capture(png_reader, args.device, args.n)
-    raw = measure_capture(raw_reader, args.device, args.n)
+    raw = measure_capture(ScreenReader(capture_mode="raw"), args.device, args.n)
+    rawgz = measure_capture(ScreenReader(capture_mode="rawgz"), args.device, args.n)
     print("Costo di uno screenshot sul tuo telefono:")
     print(_row("png (oggi)", png))
     print(_row("grezzo", raw))
+    print(_row("grezzo+gzip", rawgz))
     last = png_reader._screenshot(args.device)
     if last.success:
         diff = measure_diff(last.data, 3)
         if diff is not None:
             print(f"  decodifica + confronto di due frame sul PC: {diff:.2f} s")
-    print(recommendation(png, raw))
+    print(recommendation(png, raw, rawgz))
     return 0
 
 

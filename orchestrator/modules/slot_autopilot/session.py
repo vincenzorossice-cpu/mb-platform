@@ -177,6 +177,7 @@ def play_session(
     busy_asked = False
     force_next = False
     collected_timings = []
+    button_status_shown = False
     while total_played < target and spin_index < max_steps:
         spin_index += 1
         started = time.monotonic()
@@ -214,6 +215,10 @@ def play_session(
         if spin_result.data.outcome == "success" and spin_result.data.bet_amount:
             total_played += spin_result.data.bet_amount
             collected_timings.append(getattr(spin_result.data, "timings", None))
+            status = getattr(spin_result.data, "button_status", None)
+            if isinstance(status, str) and not button_status_shown:
+                button_status_shown = True
+                log.info("Pulsante spin: %s", status)
             log.info("%s", progress_line(spin_index, spin_result.data, total_played, target, seconds))
         elif spin_result.data.outcome == "blocked":
             if spin_result.data.violated_invariant == "UNSAFE_SCREEN_STATE":

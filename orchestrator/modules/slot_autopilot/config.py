@@ -59,6 +59,8 @@ class AutoPilotConfig:
     # Stato del pulsante spin: la freccia a ruota visibile = gioco pronto, assente = animazione in corso (appreso dal
     # gioco al primo spin, vedi spin_button.py). Prevale sul confronto tra screenshot quando e' utilizzabile.
     spin_button_detection: bool = True
+    # Dopo il tocco non si scatta nei primi secondi (durata appresa dagli spin normali precedenti): meno screenshot.
+    spin_smart_wait: bool = True
     spin_skip_calm_after_loss: bool = True
     spin_calm_skip_max_age_seconds: float = 2.0
     # Attesa casuale dopo ogni tocco dell'autopilot (min, max): niente pausa "umana" da 0,3-1,5 s.

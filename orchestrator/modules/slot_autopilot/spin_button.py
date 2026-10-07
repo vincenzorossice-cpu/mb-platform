@@ -21,13 +21,18 @@ HALF_PX = 110              # ritaglio di ~220 px attorno al pulsante
 _GRID = 32                 # maschera ridotta a 32x32
 _BRIGHT_LUMA = 200         # pixel "chiaro": luminosita' minima...
 _WHITE_SPREAD = 60         # ...e quasi bianco (differenza massima tra i canali)
+# Parametri (luminosita' minima, differenza massima tra i canali) provati in ordine all'apprendimento: la freccia di
+# un pulsante traslucido puo' non essere bianca pura, quindi si sceglie quello che separa meglio pronto e occupato.
+_MASK_PARAMS = ((200, 60), (180, 80), (160, 100), (140, 120), (120, 255), (100, 255))
 _CELL_MIN_FRACTION = 0.25  # una cella 32x32 e' "accesa" se almeno il 25% dei suoi pixel e' chiaro
 _MIN_ARROW_CELLS = 15      # sotto, il pulsante "pronto" non ha una freccia riconoscibile
 _MAX_BUSY_SIMILARITY = 0.6 # pronto/occupato troppo simili: non distinguibili
 _MAX_LEARNING_ATTEMPTS = 3
 
 
-def button_mask(screenshot_path: str, x: int, y: int, half: int = HALF_PX) -> Optional[np.ndarray]:
+def button_mask(
+    screenshot_path: str, x: int, y: int, half: int = HALF_PX, luma: int = _BRIGHT_LUMA, spread_max: int = _WHITE_SPREAD,
+) -> Optional[np.ndarray]:
     """Maschera booleana 32x32 dei pixel chiari attorno al pulsante; None se l'immagine non si legge."""
     try:
         with Image.open(screenshot_path) as image:
@@ -38,9 +43,9 @@ def button_mask(screenshot_path: str, x: int, y: int, half: int = HALF_PX) -> Op
             pixels = np.asarray(image.convert("RGB").crop(box)).astype(np.int16)
     except OSError:
         return None
-    luma = pixels.mean(axis=2)
+    brightness = pixels.mean(axis=2)
     spread = pixels.max(axis=2) - pixels.min(axis=2)
-    bright = ((luma >= _BRIGHT_LUMA) & (spread <= _WHITE_SPREAD)).astype(np.uint8) * 255
+    bright = ((brightness >= luma) & (spread <= spread_max)).astype(np.uint8) * 255
     small = np.asarray(Image.fromarray(bright).resize((_GRID, _GRID), Image.BOX)) / 255.0
     return small >= _CELL_MIN_FRACTION
 
@@ -66,6 +71,8 @@ class SpinButtonReference:
     screen: tuple
     threshold: float
     busy_similarity: float
+    luma: int = _BRIGHT_LUMA
+    spread_max: int = _WHITE_SPREAD
 
 
 class SpinButtonState:
@@ -76,6 +83,20 @@ class SpinButtonState:
         self.memory_dir = memory_dir
         self.debug_dir = debug_dir
         self._cache = {}
+        # SPIN_BUTTON_RELEARN=1: il riferimento salvato di ogni slot viene cancellato la prima volta che serve.
+        self._relearn = os.environ.get("SPIN_BUTTON_RELEARN", "").strip() in ("1", "true", "yes")
+        self._relearn_done = set()
+        self.last_status = {}      # slot -> frase sull'esito dell'ultimo apprendimento (per la console)
+
+    def _maybe_reset(self, slot_name: str) -> None:
+        if self._relearn and slot_name not in self._relearn_done:
+            self._relearn_done.add(slot_name)
+            try:
+                os.remove(self._path(slot_name))
+                logger.warning("pulsante spin: SPIN_BUTTON_RELEARN: riferimento di '%s' cancellato, si riapprende.", slot_name)
+            except OSError:
+                pass
+            self._cache = {k: v for k, v in self._cache.items() if k[0] != slot_name}
 
     def _path(self, slot_name: str) -> str:
         return os.path.join(self.memory_dir, f"{_slugify(slot_name)}.spin_button.json")
@@ -90,6 +111,7 @@ class SpinButtonState:
 
     def reference(self, slot_name: str, screen_size: tuple) -> Optional[SpinButtonReference]:
         """Il riferimento appreso, se esiste, e' utilizzabile e vale per questa dimensione dello schermo."""
+        self._maybe_reset(slot_name)
         key = (slot_name, tuple(screen_size))
         if key in self._cache:
             return self._cache[key]
@@ -100,6 +122,7 @@ class SpinButtonState:
                 reference = SpinButtonReference(
                     idle=_from_rows(data["idle"]), busy=_from_rows(data["busy"]), screen=tuple(screen_size),
                     threshold=float(data["threshold"]), busy_similarity=float(data["busy_similarity"]),
+                    luma=int(data.get("luma", _BRIGHT_LUMA)), spread_max=int(data.get("spread_max", _WHITE_SPREAD)),
                 )
         except (KeyError, TypeError, ValueError):
             reference = None
@@ -119,8 +142,9 @@ class SpinButtonState:
         reference = self.reference(slot_name, screen_size)
         if reference is None:
             return None
-        mask = button_mask(screenshot_path, x, y)
+        mask = button_mask(screenshot_path, x, y, luma=reference.luma, spread_max=reference.spread_max)
         if mask is None:
+            logger.warning("pulsante spin: ritaglio illeggibile (%s): classificazione impossibile.", screenshot_path)
             return None
         to_idle = similarity(reference.idle, mask)
         to_busy = similarity(reference.busy, mask)
@@ -131,29 +155,53 @@ class SpinButtonState:
 
     def learn(self, slot_name: str, screen_size: tuple, x: int, y: int, idle_path: str, busy_path: str) -> str:
         """Apprende dai due screenshot. Ritorna 'learned', 'retry' (campioni non distinguibili: si riprova al
-        prossimo spin) o 'unusable' (tentativi esauriti: per questa slot si usa il confronto tra screenshot)."""
-        idle = button_mask(idle_path, x, y)
-        busy = button_mask(busy_path, x, y)
-        if idle is None or busy is None:
-            return "retry"
+        prossimo spin) o 'unusable' (tentativi esauriti: per questa slot si usa il confronto tra screenshot).
+        Nessuna uscita silenziosa: ogni esito scrive una riga e aggiorna `last_status`."""
         data = self._load_raw(slot_name)
         attempts = int(data.get("attempts", 0)) + 1 if tuple(data.get("screen", ())) == tuple(screen_size) else 1
-        busy_similarity = similarity(idle, busy)
-        separable = int(idle.sum()) >= _MIN_ARROW_CELLS and busy_similarity <= _MAX_BUSY_SIMILARITY
+        best = None                       # (somiglianza pronto/occupato, luma, spread, idle, busy)
+        for luma, spread_max in _MASK_PARAMS:
+            idle = button_mask(idle_path, x, y, luma=luma, spread_max=spread_max)
+            busy = button_mask(busy_path, x, y, luma=luma, spread_max=spread_max)
+            if idle is None or busy is None:
+                self.last_status[slot_name] = "NON appreso: ritaglio del pulsante illeggibile (screenshot mancante o punto fuori schermo)"
+                logger.warning("pulsante spin: apprendimento %d: %s (idle=%s, busy=%s, punto %d,%d)", attempts,
+                               self.last_status[slot_name], idle_path, busy_path, x, y)
+                return "retry"
+            if int(idle.sum()) < _MIN_ARROW_CELLS:
+                continue                  # con questi parametri la freccia del "pronto" non si vede
+            sim = similarity(idle, busy)
+            if best is None or sim < best[0]:
+                best = (sim, luma, spread_max, idle, busy)
+            if sim <= _MAX_BUSY_SIMILARITY:
+                break                     # separazione sufficiente: parametri scelti
+        separable = best is not None and best[0] <= _MAX_BUSY_SIMILARITY
+        gave_up = (not separable) and attempts >= _MAX_LEARNING_ATTEMPTS
         record = {"screen": list(screen_size), "center": [int(x), int(y)], "attempts": attempts,
-                  "usable": bool(separable), "gave_up": (not separable) and attempts >= _MAX_LEARNING_ATTEMPTS}
+                  "usable": bool(separable), "gave_up": gave_up}
         if separable:
-            record.update({"idle": _to_rows(idle), "busy": _to_rows(busy), "busy_similarity": busy_similarity,
-                           "threshold": (1.0 + busy_similarity) / 2.0})
+            sim, luma, spread_max, idle, busy = best
+            record.update({"idle": _to_rows(idle), "busy": _to_rows(busy), "busy_similarity": sim,
+                           "threshold": (1.0 + sim) / 2.0, "luma": luma, "spread_max": spread_max})
+            self.last_status[slot_name] = (f"appreso (soglia di somiglianza {record['threshold']:.2f}, "
+                                           f"luminosita' {luma}, {int(idle.sum())} celle nella freccia)")
+        elif best is None:
+            self.last_status[slot_name] = "NON appreso: nel pulsante 'pronto' non si riconosce nessuna freccia chiara"
+        else:
+            self.last_status[slot_name] = (f"NON appreso: pronto e occupato troppo simili ({best[0]:.2f}): la freccia non "
+                                           f"sparisce durante l'animazione o non si distingue")
         self._write(slot_name, record)
         self._cache.pop((slot_name, tuple(screen_size)), None)
         self._dump_debug(idle_path, busy_path, x, y)
-        logger.info("pulsante spin: apprendimento %d: somiglianza pronto/occupato %.2f, celle della freccia %d -> %s",
-                    attempts, busy_similarity, int(idle.sum()),
-                    "APPRESO" if separable else ("rinuncio" if record["gave_up"] else "riprovo"))
+        level = logging.INFO if separable else logging.WARNING
+        logger.log(level, "pulsante spin: apprendimento %d: %s%s", attempts, self.last_status[slot_name],
+                   " - rinuncio per questa slot" if gave_up else ("" if separable else " - riprovo al prossimo spin"))
         if separable:
             return "learned"
-        return "unusable" if record["gave_up"] else "retry"
+        return "unusable" if gave_up else "retry"
+
+    def status(self, slot_name: str) -> Optional[str]:
+        return self.last_status.get(slot_name)
 
     def _write(self, slot_name: str, record: dict) -> None:
         try:

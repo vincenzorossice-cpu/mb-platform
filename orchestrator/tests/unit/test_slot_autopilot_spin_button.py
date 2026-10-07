@@ -170,8 +170,35 @@ class TestVerifierUsesTheArrow:
         wait, ended_ready = verifier._wait_after_tap("d", SimpleNamespace(region=None), check, 100.0)
 
         assert ended_ready and wait.data.stable
-        assert counter["n"] >= 5                      # 3 occupati + 2 pronti
+        assert counter["n"] == 4                      # 3 occupati + 1 pronto: la transizione vista e' gia' la prova
         assert wait.data.waited_seconds >= 1.2
+
+    def test_without_ever_seeing_the_busy_state_two_ready_frames_are_needed(self, button, tmp_path, monkeypatch):
+        _learned(button, tmp_path)
+        frames = [_screen(tmp_path / f"r{i}.png") for i in range(8)]          # sempre pronto
+        verifier, counter = _verifier(frames)
+        verifier.config.spin_calm_max_wait_seconds = 30.0
+        clock = {"now": 100.0}
+        monkeypatch.setattr("orchestrator.modules.slot_autopilot.verifier.time.monotonic", lambda: clock["now"])
+        monkeypatch.setattr("orchestrator.modules.slot_autopilot.verifier.time.sleep",
+                            lambda s: clock.__setitem__("now", clock["now"] + 0.5))
+        check = lambda path: button.classify("Pirots 5", (W, H), path, BX, BY)
+
+        wait, ended_ready = verifier._wait_after_tap("d", SimpleNamespace(region=None), check, 100.0)
+
+        assert ended_ready and counter["n"] == 5      # 3 frame prima dei 1,2 s minimi + 2 pronti di fila
+
+    def test_the_initial_wait_skips_the_first_seconds_without_screenshots(self, button, tmp_path, monkeypatch):
+        _learned(button, tmp_path)
+        frames = [_screen(tmp_path / "r.png")]
+        verifier, counter = _verifier(frames)
+        slept = []
+        monkeypatch.setattr("orchestrator.modules.slot_autopilot.verifier.time.sleep", slept.append)
+        check = lambda path: button.classify("Pirots 5", (W, H), path, BX, BY)
+
+        verifier._wait_after_tap("d", SimpleNamespace(region=None), check, 0.0, initial_wait=3.5)
+
+        assert slept[0] == 3.5
 
     def test_an_unclassifiable_first_frame_falls_back_to_the_stable_screen(self, tmp_path):
         frames = [_screen(tmp_path / "a.png")] * 5
