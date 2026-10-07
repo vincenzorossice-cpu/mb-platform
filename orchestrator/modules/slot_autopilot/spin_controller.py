@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 _ELEMENT = "spin"
 _MAX_NORMAL_DURATION_SECONDS = 20.0   # oltre, e' un bonus/feature: non conta per la durata tipica
+_MAX_FIRST_SAMPLE_SECONDS = 12.0      # primi campioni: sopra e' quasi certamente una vincita/bonus
 _MAX_INITIAL_WAIT_SECONDS = 8.0
 _BUSY_SAMPLE_DELAY_SECONDS = 1.0  # quanto dopo il tocco si campiona il pulsante "occupato"
 _SPIN_ZONE_HALF_PX = 160          # quadrato di ~320 px attorno al pulsante spin
@@ -257,6 +258,9 @@ class SpinController:
                 initial_wait = self._initial_wait(slot_name)
                 if initial_wait > 0:
                     extra["initial_wait"] = initial_wait
+                typical = self._typical_duration(slot_name)
+                if typical > 0:
+                    extra["typical_duration"] = typical
                 if ready_check is not None:
                     extra["ready_check"] = ready_check
                 if learning_button and attempts == 1:
@@ -348,8 +352,6 @@ class SpinController:
             else:
                 button_status = "NON appreso: lo screenshot 'occupato' dopo il tocco non e' stato raccolto"
                 logger.warning("pulsante spin: %s", button_status)
-        if verified and not force and last_wait_seconds is not None:
-            self._record_duration(slot_name, last_wait_seconds)
         if verified and ended_ready:
             # La freccia e' tornata: se il prossimo spin parte subito non serve controllare di nuovo.
             self._calm_skip_deadline = time.monotonic() + self.config.spin_calm_skip_max_age_seconds
@@ -393,6 +395,10 @@ class SpinController:
                 spin_index, balance_before - balance_after, expected_bet,
             )
         accounting_anomaly = None   # il controllo per spin sulla vincita letta e' stato tolto: vedi sopra
+        if outcome == "success" and not force and last_wait_seconds is not None:
+            self._record_duration(
+                slot_name, last_wait_seconds, had_win=win_amount is not None and win_amount >= Decimal("0.01"),
+            )
         total_seconds = time.monotonic() - started
         timings = {
             "contesto": round(context_seconds, 2), "calma": round(calm_seconds, 2), "tocco": round(tap_seconds, 2),
@@ -459,16 +465,23 @@ class SpinController:
             self._button_logged.add((slot_name, key))
             logger.log(level, "pulsante spin: %s", message)
 
-    def _record_duration(self, slot_name: str, seconds: float) -> None:
-        """Durata tra tocco e fine animazione di uno spin NORMALE: i bonus (molto piu' lunghi della mediana) non
-        entrano, cosi' l'attesa iniziale non si allunga per colpa loro."""
+    def _record_duration(self, slot_name: str, seconds: float, had_win: bool = False) -> None:
+        """Durata tra tocco e fine animazione di uno spin NORMALE: gli spin con una vincita (animazione piu' lunga) e i
+        bonus (molto piu' lunghi della mediana) non entrano, cosi' l'attesa iniziale non si allunga per colpa loro."""
         history = self._durations.setdefault(slot_name, [])
-        if seconds <= 0 or seconds > _MAX_NORMAL_DURATION_SECONDS:
+        if had_win or seconds <= 0 or seconds > _MAX_NORMAL_DURATION_SECONDS:
             return
+        if len(history) < 2 and seconds > _MAX_FIRST_SAMPLE_SECONDS:
+            return                      # senza mediana: un campione lungo e' quasi di certo una vincita o un bonus
         if len(history) >= 2 and seconds > 1.6 * statistics.median(history):
             return
         history.append(seconds)
         del history[:-5]
+
+    def _typical_duration(self, slot_name: str) -> float:
+        """Mediana delle durate normali recenti (0 finche' non ce ne sono almeno 2)."""
+        history = self._durations.get(slot_name, [])
+        return float(statistics.median(history)) if len(history) >= 2 else 0.0
 
     def _initial_wait(self, slot_name: str) -> float:
         """Quanto aspettare dopo il tocco prima di scattare: nei primi secondi l'animazione c'e' di sicuro. Prudente:

@@ -129,6 +129,7 @@ class VisionAmountReader:
 _KEYS = ("saldo", "posta")
 # Un singolo spin non puo' cambiare il saldo di oltre la meta': una lettura piu' lontana e' un errore di lettura.
 _BALANCE_CONTINUITY = 0.5
+_BET_RECHECK_EVERY = 10   # letture in modo spin tra due riletture di controllo della puntata con la visione
 
 
 def _within(value: float, reference: float, tolerance: float) -> bool:
@@ -169,6 +170,7 @@ class ResilientOCRReader:
         # Alla prima lettura l'OCR non ha letto NE' saldo NE' puntata: durante gli spin e' tempo perso.
         self._ocr_useless_for_amounts = False
         self._spin_mode = False
+        self._bet_skips = 0       # letture consecutive in cui la puntata fidata ha sostituito la visione
         # Ultimo valore fidato per campo (concordato tra i due lettori o coerente con la storia).
         self._trusted = {"saldo": None, "posta": None}
 
@@ -177,6 +179,8 @@ class ResilientOCRReader:
         di saldo/puntata salta l'OCR a schermo intero (~7 s su CPU) e usa solo la visione. Le letture
         dei testi con le caselle (menu, icone) restano all'OCR."""
         self._spin_mode = bool(active)
+        if not active:
+            self._bet_skips = 0
 
     @property
     def prefer_vision(self) -> bool:
@@ -213,7 +217,15 @@ class ResilientOCRReader:
             self._self_checked = True
             self._ocr_useless_for_amounts = state.get("saldo") is None and state.get("posta") is None
             return self._first_read(state, self.vision.read(screenshot_path))
+        if self._can_reuse_trusted_bet(state):
+            # La puntata non cambia durante gli spin e l'OCR non la legge: la lettura verificata vale, senza una
+            # chiamata di visione a ogni spin (~1 s e un costo). Ogni _BET_RECHECK_EVERY letture si ricontrolla.
+            self._bet_skips += 1
+            merged = dict(state)
+            merged["posta"] = self._trusted["posta"]
+            return self._sane(merged)
         if self._vision_fields or any(state.get(key) is None for key in _KEYS) or self._balance_is_suspicious(state):
+            self._bet_skips = 0
             vision_started = time.monotonic()
             merged = self._combine(state, self.vision.read(screenshot_path))
             logger.info("lettura importi: OCR %.1f s, visione %.1f s", ocr_seconds, time.monotonic() - vision_started)
@@ -221,6 +233,13 @@ class ResilientOCRReader:
         for key in _KEYS:
             self._trusted[key] = state[key]
         return state
+
+    def _can_reuse_trusted_bet(self, state: dict) -> bool:
+        return (
+            self._spin_mode and self._vision_fields == {"posta"} and self._trusted["posta"] is not None
+            and state.get("posta") is None and state.get("saldo") is not None
+            and not self._balance_is_suspicious(state) and self._bet_skips < _BET_RECHECK_EVERY
+        )
 
     def _balance_is_suspicious(self, state: dict) -> bool:
         balance, trusted = state.get("saldo"), self._trusted["saldo"]

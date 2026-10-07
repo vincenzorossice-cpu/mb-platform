@@ -39,14 +39,28 @@ def spin_point_from_profile(slot_name: str, screen_size: tuple, profiles_dir: st
 
 
 def analyse(rows: list) -> dict:
-    """Riassunto dai frame: rows = [(secondi, somiglianza col primo frame)]. 'assente' = freccia non riconosciuta."""
-    absent = [seconds for seconds, similarity_value in rows if similarity_value < _SAME_AS_START]
-    if not absent:
-        return {"absent_from": None, "absent_to": None, "duration": None, "back_at": None}
-    last_absent = absent[-1]
-    later = [seconds for seconds, similarity_value in rows if seconds > last_absent and similarity_value >= _SAME_AS_START]
-    return {"absent_from": absent[0], "absent_to": last_absent, "duration": last_absent - absent[0],
-            "back_at": later[0] if later else None}
+    """Riassunto dai frame: rows = [(secondi, somiglianza col primo frame)]. 'assente' = freccia non riconosciuta.
+    L'animazione e' il tratto in cui la freccia manca FINO AL PRIMO RITORNO; dopo il ritorno la freccia puo' pulsare
+    (overlay di una vincita: visibile solo in alcuni scatti): quello e' "gioco pronto", non animazione."""
+    empty = {"absent_from": None, "absent_to": None, "duration": None, "back_at": None, "pulsing": False,
+             "pulses": 0, "pulse_period": None}
+    absent_idx = [i for i, (_, similarity_value) in enumerate(rows) if similarity_value < _SAME_AS_START]
+    if not absent_idx:
+        return empty
+    first = absent_idx[0]
+    back_idx = next((i for i in range(first + 1, len(rows)) if rows[i][1] >= _SAME_AS_START), None)
+    last_before_return = max(i for i in absent_idx if back_idx is None or i < back_idx)
+    result = dict(empty, absent_from=rows[first][0], absent_to=rows[last_before_return][0],
+                  duration=rows[last_before_return][0] - rows[first][0],
+                  back_at=rows[back_idx][0] if back_idx is not None else None)
+    if back_idx is not None:
+        after = rows[back_idx:]
+        onsets = [t for i, (t, s) in enumerate(after) if s >= _SAME_AS_START and (i == 0 or after[i - 1][1] < _SAME_AS_START)]
+        result["pulses"] = len(onsets)
+        result["pulsing"] = len(onsets) >= 3
+        if len(onsets) >= 2:
+            result["pulse_period"] = (onsets[-1] - onsets[0]) / (len(onsets) - 1)
+    return result
 
 
 def _crop(path: str, x: int, y: int, target: str) -> None:
@@ -107,6 +121,11 @@ def main(argv=None, input_fn=input) -> int:
         back = f", torna a {summary['back_at']:.1f} s" if summary["back_at"] is not None else ", non e' tornata nel tempo di misura"
         print(f"Freccia assente da {summary['absent_from']:.1f} s a {summary['absent_to']:.1f} s "
               f"(animazione ~{summary['duration']:.1f} s{back}).")
+        if summary["pulsing"]:
+            print(f"Dopo il ritorno la freccia PULSA: {summary['pulses']} comparse, una ogni ~{summary['pulse_period']:.1f} s "
+                  f"(e' l'overlay della vincita: il gioco e' pronto, non c'e' un'animazione in corso).")
+        elif summary["back_at"] is not None:
+            print("Dopo il ritorno la freccia resta stabile.")
     print(f"Ritagli salvati in {out_dir}. Catture: {len(rows)} in {args.seconds:.0f} s "
           f"({args.seconds / max(1, len(rows)):.2f} s a scatto, modo {reader.last_method}).")
     return 0

@@ -36,6 +36,7 @@ def classify_screen_state(ocr_state: dict) -> str:
 _PARTIAL_CALM_STREAK = 3   # confronti consecutivi con le zone ferme (~1 s)
 # Dopo un tocco lo spin parte entro un istante: la freccia dello spin non puo' dirsi "tornata" prima di questo tempo.
 _MIN_SECONDS_BEFORE_READY = 1.2
+_LATE_FRACTION = 0.85         # oltre questa quota della durata tipica un solo frame con la freccia basta
 _READY_STREAK_AFTER_TAP = 2   # screenshot di fila con la freccia visibile per dire che lo spin e' finito
 
 
@@ -125,6 +126,7 @@ class ActionVerifier:
         self, device_id: str, x: int, y: int, expectation: Expectation,
         screenshot_before: Optional[str] = None, state_before: Optional[dict] = None,
         region_hint: Optional[tuple] = None, ready_check=None, on_after_tap=None, initial_wait: float = 0.0,
+        typical_duration: float = 0.0,
     ) -> Result[TapOutcome]:
         """`region_hint` (x1,y1,x2,y2): lettura OCR rapida "dopo" solo su quella fascia
         (saldo/puntata); se li' mancano saldo o puntata si rilegge lo stesso screenshot
@@ -132,11 +134,13 @@ class ActionVerifier:
         `ready_check(path) -> True | False | None`: se dato (e utilizzabile) l'attesa dopo il tocco finisce quando
         la freccia dello spin e' tornata visibile invece che a schermo fermo. `on_after_tap()`: chiamata subito
         dopo il tocco (serve ad apprendere come appare il pulsante durante l'animazione).
-        `initial_wait`: secondi senza scattare dopo il tocco (l'animazione c'e' di sicuro)."""
+        `initial_wait`: secondi senza scattare dopo il tocco (l'animazione c'e' di sicuro).
+        `typical_duration`: durata tipica di uno spin normale: un frame con la freccia dopo l'85% di questo tempo e'
+        gia' la fine (non servono due)."""
         try:
             return self._verified_tap(
                 device_id, x, y, expectation, screenshot_before, state_before, region_hint, ready_check, on_after_tap,
-                initial_wait,
+                initial_wait, typical_duration,
             )
         except Exception as exc:
             return Result.fail(f"Unexpected error during verified_tap: {exc}", "VERIFICATION_ERROR")
@@ -223,6 +227,7 @@ class ActionVerifier:
         self, device_id: str, x: int, y: int, expectation: Expectation,
         screenshot_before: Optional[str] = None, state_before: Optional[dict] = None,
         region_hint: Optional[tuple] = None, ready_check=None, on_after_tap=None, initial_wait: float = 0.0,
+        typical_duration: float = 0.0,
     ) -> Result[TapOutcome]:
         # Se il chiamante ha gia' una lettura fresca dello STESSO schermo (presa
         # un istante prima, senza nulla in mezzo che lo cambi), riusarla evita
@@ -254,7 +259,7 @@ class ActionVerifier:
 
         wait_started = time.monotonic()
         wait_result, ended_ready = self._wait_after_tap(
-            device_id, expectation, ready_check, wait_started, initial_wait,
+            device_id, expectation, ready_check, wait_started, initial_wait, typical_duration,
         )
         if not wait_result.success:
             return Result.fail(wait_result.error, wait_result.error_code)
@@ -321,6 +326,7 @@ class ActionVerifier:
 
     def _wait_after_tap(
         self, device_id: str, expectation: Expectation, ready_check, tap_moment: float, initial_wait: float = 0.0,
+        typical_duration: float = 0.0,
     ) -> tuple:
         """(Result[StabilityResult], ended_ready). Con ready_check utilizzabile l'attesa finisce al ritorno della
         freccia dello spin (2 screenshot di fila, non prima di _MIN_SECONDS_BEFORE_READY dal tocco); se la
@@ -344,7 +350,8 @@ class ActionVerifier:
                     seen_busy = True
                 streak = streak + 1 if (state and now - tap_moment >= _MIN_SECONDS_BEFORE_READY) else 0
                 # Una transizione occupato -> pronto vista dal vivo e' gia' la prova: basta un frame pronto.
-                if streak >= (1 if seen_busy else _READY_STREAK_AFTER_TAP):
+                late_enough = typical_duration > 0 and (now - tap_moment) >= _LATE_FRACTION * typical_duration
+                if streak >= (1 if (seen_busy or late_enough) else _READY_STREAK_AFTER_TAP):
                     return Result.ok(StabilityResult(shot.data, stable=True, waited_seconds=now - tap_moment,
                                                      captures=captures)), True
                 if now - tap_moment >= limit:
@@ -362,9 +369,12 @@ class ActionVerifier:
     def wait_until_button_ready(self, device_id: str, ready_check, max_wait_seconds: float) -> Optional[Result[CalmResult]]:
         """Prima del tocco: la freccia dello spin e' visibile? Un solo screenshot se lo e' gia'; se non lo e' si
         aspetta (2 screenshot di fila con la freccia). None se la freccia non e' classificabile (chi chiama
-        usa il controllo di calma di sempre)."""
+        usa il controllo di calma di sempre).
+        Con l'overlay di una vincita la freccia PULSA (visibile 1 scatto su 3): dopo aver visto "occupato" basta UN
+        pronto, come dopo il tocco, altrimenti due pronti di fila non arrivano mai."""
         started = time.monotonic()
         streak = captures = 0
+        seen_busy = False
         while True:
             shot = self.screen_reader._screenshot(device_id)
             if not shot.success:
@@ -373,8 +383,10 @@ class ActionVerifier:
             if state is None and captures == 0:
                 return None
             captures += 1
+            if state is False:
+                seen_busy = True
             streak = streak + 1 if state else 0
-            if streak >= (1 if captures == 1 else _READY_STREAK_AFTER_TAP):
+            if streak >= (1 if (captures == 1 or seen_busy) else _READY_STREAK_AFTER_TAP):
                 return Result.ok(CalmResult(shot.data, calm=True, waited=captures > 1,
                                             seconds=time.monotonic() - started))
             if time.monotonic() - started >= max_wait_seconds:
