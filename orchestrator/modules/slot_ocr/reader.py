@@ -1,5 +1,8 @@
+import io
 import logging
+import os
 import re
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -64,7 +67,19 @@ class SlotOCRReader:
     _LABEL_Y_TOLERANCE = 50
     _MIN_OCR_CONFIDENCE = 0.3
 
-    def __init__(self):
+    _DEFAULT_REMOTE_TIMEOUT = 20.0
+
+    def __init__(self, ocr_url: Optional[str] = None, ocr_timeout: Optional[float] = None):
+        """ocr_url (o la variabile OCR_URL): server OCR remoto (GPU, es. RunPod) con POST /ocr. Se impostato
+        EasyOCR non viene mai caricato in locale; senza, comportamento storico (EasyOCR su CPU)."""
+        url = (ocr_url or os.environ.get("OCR_URL") or "").strip().rstrip("/")
+        if url and not url.endswith("/ocr"):
+            url += "/ocr"
+        self._ocr_url = url or None
+        try:
+            self._ocr_timeout = float(ocr_timeout or os.environ.get("OCR_TIMEOUT") or self._DEFAULT_REMOTE_TIMEOUT)
+        except ValueError:
+            self._ocr_timeout = self._DEFAULT_REMOTE_TIMEOUT
         self._ocr = None
         self._last_screenshot_path = None
         self._last_raw_results = None
@@ -82,6 +97,11 @@ class SlotOCRReader:
         self._last_screenshot_path = None
         self._last_raw_results = None
 
+    @property
+    def remote(self) -> bool:
+        """True se l'OCR passa dal server remoto."""
+        return self._ocr_url is not None
+
     def _get_ocr(self):
         if self._ocr is None:
             import easyocr
@@ -95,13 +115,61 @@ class SlotOCRReader:
         bottiglia su CPU) verrebbe eseguito due volte sulla stessa immagine."""
         if screenshot_path == self._last_screenshot_path and self._last_raw_results is not None:
             return self._last_raw_results
-        ocr = self._get_ocr()
-        if self._region is None:
-            results = ocr.readtext(screenshot_path)
+        if self._ocr_url is not None:
+            results = self._readtext_remote(screenshot_path)
+            if results is None:
+                return []           # errore gia' loggato; nessuna cache, la lettura dopo riprova
         else:
-            results = self._readtext_in_region(ocr, screenshot_path)
+            ocr = self._get_ocr()
+            if self._region is None:
+                results = ocr.readtext(screenshot_path)
+            else:
+                results = self._readtext_in_region(ocr, screenshot_path)
         self._last_screenshot_path = screenshot_path
         self._last_raw_results = results
+        return results
+
+    def _readtext_remote(self, screenshot_path: str) -> Optional[list]:
+        """Rilevazioni dal server OCR remoto nello stesso formato di EasyOCR: [(bbox, testo, conf)], con bbox =
+        4 punti [x, y] in pixel assoluti. Con una regione si invia solo il ritaglio e si sommano gli offset.
+        None se la chiamata fallisce (mai eccezioni: lo stato torna vuoto e chi legge ripiega sulla visione)."""
+        import requests
+        from PIL import Image
+
+        started = time.monotonic()
+        try:
+            offset_x = offset_y = 0
+            if self._region is None:
+                with open(screenshot_path, "rb") as screenshot_file:
+                    payload = screenshot_file.read()          # lo screenshot e' gia' un PNG: nessuna ricodifica
+            else:
+                with Image.open(screenshot_path) as image:
+                    x1, y1, x2, y2 = self._region
+                    box = (max(0, x1), max(0, y1), min(image.width, x2), min(image.height, y2))
+                    buffer = io.BytesIO()
+                    image.convert("RGB").crop(box).save(buffer, format="PNG")
+                    payload = buffer.getvalue()
+                    offset_x, offset_y = box[0], box[1]
+            response = requests.post(
+                self._ocr_url, files={"file": ("screenshot.png", payload, "image/png")},
+                timeout=self._ocr_timeout,
+            )
+            response.raise_for_status()
+            texts = response.json()["texts"]
+        except (OSError, ValueError, KeyError, TypeError, requests.RequestException) as exc:
+            logger.warning("OCR remoto non disponibile (%s): %s", self._ocr_url, exc)
+            return None
+
+        results = []
+        for item in texts if isinstance(texts, list) else []:
+            try:
+                coords = [[int(px) + offset_x, int(py) + offset_y] for px, py in item["coords"]]
+                if not coords:
+                    continue
+                results.append((coords, str(item["text"]), float(item.get("conf", 0.0))))
+            except (KeyError, TypeError, ValueError):
+                continue          # voce malformata: si salta
+        logger.info("OCR remoto: %d testi in %.1f s", len(results), time.monotonic() - started)
         return results
 
     def _readtext_in_region(self, ocr, screenshot_path: str):

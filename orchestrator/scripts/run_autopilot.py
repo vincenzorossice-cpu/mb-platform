@@ -141,7 +141,11 @@ def build_autopilot_for(
 
     screen_reader = ScreenReader(adb_timeout=config.adb_timeout)
     touch_injector = TouchInjector(screen_reader=screen_reader, adb_timeout=config.adb_timeout)
-    ocr_reader = SlotOCRReader()
+    ocr_reader = SlotOCRReader(ocr_url=os.environ.get("OCR_URL"))
+    if ocr_reader.remote:
+        logger.info("OCR remoto: %s", ocr_reader._ocr_url)
+    else:
+        logger.info("OCR locale (EasyOCR)")
     profile_loader = ProviderProfileLoader(profiles_dir=config.profiles_dir)
     step_logger = JSONLStepLogger(dataset_dir=config.dataset_dir)
 
