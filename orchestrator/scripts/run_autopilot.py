@@ -30,6 +30,7 @@ from orchestrator.modules.slot_autopilot.bet_controller import BetController
 from orchestrator.modules.slot_autopilot.bet_menu import BetMenuSelector
 from orchestrator.modules.slot_autopilot.config import AutoPilotConfig
 from orchestrator.modules.slot_autopilot.locator import ElementLocator
+from orchestrator.modules.slot_autopilot.spin_button import SpinButtonState
 from orchestrator.modules.slot_autopilot.spin_controller import SpinController
 from orchestrator.modules.slot_autopilot.supervisor import SlotSupervisor
 from orchestrator.modules.slot_autopilot.strategies.gpt_locator_strategy import GPTLocatorStrategy
@@ -200,7 +201,9 @@ def build_autopilot_for(
         menu_selector=BetMenuSelector(locator, verifier, screen_recovery=screen_recovery, supervisor=supervisor),
         screen_recovery=screen_recovery, supervisor=supervisor,
     )
-    spin_controller = SpinController(locator, verifier, step_logger, config)
+    spin_controller = SpinController(
+        locator, verifier, step_logger, config, button=SpinButtonState(memory_dir=config.slot_memory_dir),
+    )
 
     autopilot = SlotAutoPilot(
         config=config, screen_reader=screen_reader, touch_injector=touch_injector,

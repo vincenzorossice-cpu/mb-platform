@@ -56,6 +56,9 @@ class AutoPilotConfig:
     spin_partial_calm: bool = True
     # Dopo uno spin senza vincita (saldo alla mano) e con lo schermo fermo recente, il controllo di calma
     # prima del tocco successivo e' ridondante: si salta (con una vincita resta).
+    # Stato del pulsante spin: la freccia a ruota visibile = gioco pronto, assente = animazione in corso (appreso dal
+    # gioco al primo spin, vedi spin_button.py). Prevale sul confronto tra screenshot quando e' utilizzabile.
+    spin_button_detection: bool = True
     spin_skip_calm_after_loss: bool = True
     spin_calm_skip_max_age_seconds: float = 2.0
     # Attesa casuale dopo ogni tocco dell'autopilot (min, max): niente pausa "umana" da 0,3-1,5 s.

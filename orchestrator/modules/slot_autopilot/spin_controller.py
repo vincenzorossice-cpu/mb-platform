@@ -15,6 +15,7 @@ from orchestrator.modules.step_logger.interface import StepLoggerInterface, Step
 logger = logging.getLogger(__name__)
 
 _ELEMENT = "spin"
+_BUSY_SAMPLE_DELAY_SECONDS = 1.0  # quanto dopo il tocco si campiona il pulsante "occupato"
 _SPIN_ZONE_HALF_PX = 160          # quadrato di ~320 px attorno al pulsante spin
 _BOTTOM_STRIP_FRACTION = 0.12     # ultimo 12% dell'altezza: saldo, puntata, vincita
 
@@ -52,11 +53,13 @@ class SpinController:
     viene solo annotata, non trasformata in un fallimento."""
 
     def __init__(self, locator: ElementLocator, verifier: ActionVerifier,
-                 step_logger: StepLoggerInterface, config: AutoPilotConfig):
+                 step_logger: StepLoggerInterface, config: AutoPilotConfig, button=None):
         self.locator = locator
         self.verifier = verifier
         self.step_logger = step_logger
         self.config = config
+        # SpinButtonState opzionale: senza, solo il confronto tra screenshot (comportamento storico).
+        self.button = button
         # Fino a quando (monotonic) il prossimo spin puo' saltare il controllo di calma: lo spin precedente e'
         # finito senza vincita, lo schermo fermo e' recente.
         self._calm_skip_deadline = 0.0
@@ -112,6 +115,15 @@ class SpinController:
             ))
         candidate = locate_result.data
 
+        ready_check = None
+        learning_button = False
+        if self.button is not None and self.config.spin_button_detection and not candidate.verified:
+            screen_size = (context.screen_width, context.screen_height)
+            if self.button.reference(slot_name, screen_size) is not None:
+                def ready_check(path, _x=candidate.x, _y=candidate.y, _size=screen_size):
+                    return self.button.classify(slot_name, _size, path, _x, _y)
+            elif context.screenshot_path and self.button.needs_learning(slot_name, screen_size):
+                learning_button = True
         calm_skippable = (
             self.config.spin_skip_calm_after_loss and time.monotonic() <= skip_calm_until
         )
@@ -125,10 +137,15 @@ class SpinController:
             # Mai toccare uno schermo che si muove (animazione di vincita, saldo che si aggiorna): il tocco
             # andrebbe perso e ritoccare alla cieca rischia due spin.
             calm_started = time.monotonic()
-            calm = self.verifier.wait_until_calm(
-                device_id, context.screenshot_path, self.config.spin_calm_max_wait_seconds,
-                regions=self._calm_regions(context, candidate) if self.config.spin_partial_calm else None,
-            )
+            calm = None
+            if ready_check is not None:
+                # La freccia dello spin e' la misura giusta (un overlay di vincita muove lo schermo anche a gioco pronto)
+                calm = self.verifier.wait_until_button_ready(device_id, ready_check, self.config.spin_calm_max_wait_seconds)
+            if calm is None:
+                calm = self.verifier.wait_until_calm(
+                    device_id, context.screenshot_path, self.config.spin_calm_max_wait_seconds,
+                    regions=self._calm_regions(context, candidate) if self.config.spin_partial_calm else None,
+                )
             calm_seconds = time.monotonic() - calm_started
             if calm.success and calm.data.partial:
                 logger.info("spin %d: i rulli sono in animazione ma barra degli importi e pulsante sono fermi: "
@@ -170,6 +187,8 @@ class SpinController:
         attempts = 0
         tap_seconds = wait_seconds = read_seconds = 0.0
         wait_captures = 0
+        ended_ready = False
+        busy_sample = {}
         screenshot_after = None
         state_after = None
         balance_after_read = False   # False: balance_after e' solo il valore "prima" usato come ripiego
@@ -201,11 +220,17 @@ class SpinController:
                 # spin(), locate() non tocca lo schermo). Ai ritap successivi lo
                 # schermo e' cambiato, quindi si rilegge davvero.
                 reuse = attempts == 1
+                extra = {}
+                if ready_check is not None:
+                    extra["ready_check"] = ready_check
+                if learning_button and attempts == 1:
+                    extra["on_after_tap"] = lambda: self._sample_busy_button(device_id, busy_sample)
                 tap_result = self.verifier.verified_tap(
                     device_id, candidate.x, candidate.y,
                     Expectation(kind="balance_changed"),
                     screenshot_before=context.screenshot_path if reuse else None,
                     state_before=context.slot_ocr_state if reuse else None,
+                    **extra,
                 )
                 if not tap_result.success:
                     self._log_step(
@@ -218,6 +243,7 @@ class SpinController:
                         balance_before=balance_before, balance_after=balance_before, win_amount=None,
                         verified=False, attempts=attempts, outcome="error",
                     ))
+                ended_ready = bool(getattr(tap_result.data, "ended_ready", False))
                 tap_seconds += tap_result.data.tap_seconds
                 wait_seconds += tap_result.data.wait_seconds
                 wait_captures += tap_result.data.wait_captures
@@ -274,6 +300,14 @@ class SpinController:
                     break
 
         outcome = "success" if verified else "no_effect"
+        if verified and learning_button and busy_sample.get("path"):
+            self.button.learn(
+                slot_name, (context.screen_width, context.screen_height), candidate.x, candidate.y,
+                context.screenshot_path, busy_sample["path"],
+            )
+        if verified and ended_ready:
+            # La freccia e' tornata: se il prossimo spin parte subito non serve controllare di nuovo.
+            self._calm_skip_deadline = time.monotonic() + self.config.spin_calm_skip_max_age_seconds
         if verified:
             # Come fa BetController: una coordinata verificata dal vivo e
             # trovata da GPT/HITL va ricordata, altrimenti ogni sessione la
@@ -374,6 +408,13 @@ class SpinController:
         if balance_before is None or balance_after is None or bet is None:
             return None
         return balance_after - balance_before + bet
+
+    def _sample_busy_button(self, device_id: str, holder: dict) -> None:
+        """Nello spin di apprendimento: uno screenshot ~1 s dopo il tocco, mentre il gioco gira."""
+        time.sleep(_BUSY_SAMPLE_DELAY_SECONDS)
+        shot = self.verifier.screen_reader._screenshot(device_id)
+        if shot.success:
+            holder["path"] = shot.data
 
     @staticmethod
     def _calm_regions(context, candidate) -> Optional[list]:

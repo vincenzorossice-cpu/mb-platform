@@ -50,6 +50,13 @@ class SlotSessionResult:
         return not self.failed and self.stop_reason is None and self.total_played >= self.target
 
 
+def _log_phase(autopilot, label: str, seconds: float, log) -> None:
+    report = getattr(autopilot, "phase_report", None)
+    text = report(label, seconds) if callable(report) else None
+    if isinstance(text, str) and text:
+        log.info("%s", text)
+
+
 def _ask_if_ready(autopilot, device_id: str) -> str:
     diagnose = getattr(autopilot, "diagnose_busy", None)
     if not callable(diagnose):
@@ -122,14 +129,18 @@ def play_session(
     tenere i propri messaggi (filtri della console compresi)."""
     log = log or logger
     log.info("Preparazione: profilo '%s', dispositivo %s...", slot_name, device_id)
+    phase_started = time.monotonic()
     prepare_result = autopilot.prepare(device_id)
     if not prepare_result.success:
         log.error("prepare() fallito: %s (%s)", prepare_result.error, prepare_result.error_code)
         return SlotSessionResult(Decimal("0.00"), 0, failed=True, stop_reason="PREPARE_FAILED", target=target)
     log.info("Preparazione completata.")
+    _log_phase(autopilot, "Preparazione", time.monotonic() - phase_started, log)
 
     log.info("Verifica puntata minima in corso...")
+    phase_started = time.monotonic()
     bet_result = autopilot.set_min_bet(device_id)
+    _log_phase(autopilot, "Puntata minima", time.monotonic() - phase_started, log)
     if not bet_result.success or not bet_result.data.min_bet_verified:
         reason = bet_result.data.aborted_reason if bet_result.success else bet_result.error_code
         log.error(

@@ -93,7 +93,7 @@ class TestRemote:
         assert state["saldo"] == 50000.0
 
     def test_with_a_region_only_the_crop_is_sent_and_coordinates_are_absolute(self, shot):
-        reader = SlotOCRReader(ocr_url="https://x")
+        reader = SlotOCRReader(ocr_url="https://x", remote_min_area=0)
         reader.set_region((100, 2000, 1000, 2300))
 
         with patch(POST, return_value=_response([_item("SALDO 5,00", 20, 30)])) as post:
@@ -116,20 +116,29 @@ class TestRemote:
     @pytest.mark.parametrize("failure", [
         requests.Timeout("lento"), requests.ConnectionError("giu'"),
     ])
-    def test_network_errors_never_raise_and_are_not_cached(self, shot, caplog, failure):
+    def test_network_errors_never_raise_fall_back_to_the_local_ocr_and_retry_the_server_next_time(
+        self, shot, tmp_path, caplog, failure,
+    ):
         reader = SlotOCRReader(ocr_url="https://x")
+        reader._ocr = MagicMock()
+        reader._ocr.readtext.return_value = []
         good = _response([_item("SALDO 5,00", 10, 10)])
+        other = tmp_path / "second.png"
+        Image.new("RGB", (1080, 2400), "white").save(other)
 
         with caplog.at_level("WARNING"), patch(POST, side_effect=[failure, good]) as post:
             first = reader.read_slot_state(shot)
-            second = reader.read_slot_state(shot)
+            second = reader.read_slot_state(str(other))      # un altro screenshot: il server viene riprovato
 
-        assert first["saldo"] is None and first["raw_texts"] == []
-        assert second["saldo"] == 5.0 and post.call_count == 2           # la lettura dopo riprova
-        assert "OCR remoto non disponibile" in caplog.text
+        assert first["saldo"] is None and first["raw_texts"] == []      # la lettura locale (finta) non vede nulla
+        reader._ocr.readtext.assert_called_once()
+        assert second["saldo"] == 5.0 and post.call_count == 2           # il server viene riprovato
+        assert "OCR remoto non disponibile" in caplog.text and "EasyOCR locale" in caplog.text
 
     def test_http_error_bad_json_and_missing_texts_give_an_empty_state(self, shot):
         reader = SlotOCRReader(ocr_url="https://x")
+        reader._ocr = MagicMock()
+        reader._ocr.readtext.return_value = []
         bad_json = MagicMock()
         bad_json.json.side_effect = ValueError("non json")
         no_texts = MagicMock()
@@ -151,9 +160,58 @@ class TestRemote:
 
     def test_a_missing_screenshot_never_raises(self):
         reader = SlotOCRReader(ocr_url="https://x")
+        reader._ocr = MagicMock()
+        reader._ocr.readtext.return_value = []
 
         with patch(POST) as post:
             state = reader.read_slot_state("/nonexistent.png")
 
         assert state["saldo"] is None
         post.assert_not_called()
+
+    def test_without_easyocr_installed_a_failed_server_gives_an_empty_reading_not_a_crash(self, shot):
+        reader = SlotOCRReader(ocr_url="https://x")
+
+        with patch(POST, side_effect=requests.ConnectionError("giu'")), \
+                patch.object(SlotOCRReader, "_get_ocr", side_effect=ImportError("no easyocr")):
+            state = reader.read_slot_state(shot)
+
+        assert state["saldo"] is None and state["raw_texts"] == []
+
+
+class TestHybridReadings:
+    def test_a_small_band_is_read_locally_even_with_a_server(self, shot):
+        reader = SlotOCRReader(ocr_url="https://x")                 # soglia di default: 30% dello schermo
+        reader.set_region((0, 2000, 1080, 2300))                    # ~12%: la fascia di saldo e puntata
+        reader._ocr = MagicMock()
+        reader._ocr.readtext.return_value = []
+
+        with patch(POST) as post:
+            reader.read_slot_state(shot)
+
+        post.assert_not_called()
+        reader._ocr.readtext.assert_called_once()
+
+    def test_a_big_region_or_the_full_screen_goes_to_the_server(self, shot):
+        reader = SlotOCRReader(ocr_url="https://x")
+
+        with patch(POST, return_value=_response([_item("SALDO 5,00", 10, 10)])) as post:
+            reader.read_slot_state(shot)
+            reader.set_region((0, 300, 1080, 2400))                  # ~87%
+            reader.read_slot_state(shot)
+
+        assert post.call_count == 2
+
+    def test_the_threshold_comes_from_the_environment(self, monkeypatch):
+        monkeypatch.setenv("OCR_REMOTE_MIN_AREA", "0.05")
+        assert SlotOCRReader(ocr_url="https://x")._remote_min_area == 0.05
+        monkeypatch.setenv("OCR_REMOTE_MIN_AREA", "boh")
+        assert SlotOCRReader(ocr_url="https://x")._remote_min_area == 0.3
+
+    def test_the_reader_counts_its_readings_and_seconds(self, shot):
+        reader = SlotOCRReader(ocr_url="https://x")
+
+        with patch(POST, return_value=_response([_item("SALDO 5,00", 10, 10)])):
+            reader.read_slot_state(shot)
+
+        assert reader.stats["calls"] == 1 and reader.stats["remote_calls"] == 1 and reader.stats["seconds"] >= 0

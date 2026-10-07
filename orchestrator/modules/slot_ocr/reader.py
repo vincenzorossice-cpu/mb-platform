@@ -69,7 +69,12 @@ class SlotOCRReader:
 
     _DEFAULT_REMOTE_TIMEOUT = 20.0
 
-    def __init__(self, ocr_url: Optional[str] = None, ocr_timeout: Optional[float] = None):
+    _DEFAULT_REMOTE_MIN_AREA = 0.3
+
+    def __init__(
+        self, ocr_url: Optional[str] = None, ocr_timeout: Optional[float] = None,
+        remote_min_area: Optional[float] = None,
+    ):
         """ocr_url (o la variabile OCR_URL): server OCR remoto (GPU, es. RunPod) con POST /ocr. Se impostato
         EasyOCR non viene mai caricato in locale; senza, comportamento storico (EasyOCR su CPU)."""
         url = (ocr_url or os.environ.get("OCR_URL") or "").strip().rstrip("/")
@@ -80,6 +85,16 @@ class SlotOCRReader:
             self._ocr_timeout = float(ocr_timeout or os.environ.get("OCR_TIMEOUT") or self._DEFAULT_REMOTE_TIMEOUT)
         except ValueError:
             self._ocr_timeout = self._DEFAULT_REMOTE_TIMEOUT
+        # Il server remoto (1,5-2 s) batte l'OCR locale solo sulle letture grandi (schermo intero ~9 s); sulla fascia
+        # di saldo/puntata (~0,6 s in locale) e' piu' lento: sotto questa frazione dello schermo si legge in locale.
+        try:
+            self._remote_min_area = float(
+                remote_min_area if remote_min_area is not None
+                else os.environ.get("OCR_REMOTE_MIN_AREA") or self._DEFAULT_REMOTE_MIN_AREA
+            )
+        except ValueError:
+            self._remote_min_area = self._DEFAULT_REMOTE_MIN_AREA
+        self.stats = {"calls": 0, "seconds": 0.0, "remote_calls": 0}   # letture fatte e secondi spesi
         self._ocr = None
         self._last_screenshot_path = None
         self._last_raw_results = None
@@ -115,19 +130,50 @@ class SlotOCRReader:
         bottiglia su CPU) verrebbe eseguito due volte sulla stessa immagine."""
         if screenshot_path == self._last_screenshot_path and self._last_raw_results is not None:
             return self._last_raw_results
-        if self._ocr_url is not None:
+        started = time.monotonic()
+        results = None
+        remote = False
+        if self._ocr_url is not None and self._use_remote(screenshot_path):
             results = self._readtext_remote(screenshot_path)
+            remote = results is not None
             if results is None:
-                return []           # errore gia' loggato; nessuna cache, la lettura dopo riprova
-        else:
-            ocr = self._get_ocr()
-            if self._region is None:
-                results = ocr.readtext(screenshot_path)
-            else:
-                results = self._readtext_in_region(ocr, screenshot_path)
+                logger.warning("OCR remoto non disponibile: per questa lettura uso l'EasyOCR locale.")
+        if results is None:
+            try:
+                results = self._readtext_local(screenshot_path)
+            except ImportError as exc:
+                if self._ocr_url is None:
+                    raise
+                logger.warning("EasyOCR locale non disponibile (%s): lettura vuota.", exc)
+                return []           # nessuna cache: la lettura dopo riprova
+        elapsed = time.monotonic() - started
+        self.stats["calls"] += 1
+        self.stats["seconds"] += elapsed
+        self.stats["remote_calls"] += 1 if remote else 0
+        if not remote:
+            logger.info("OCR locale: %d testi in %.1f s", len(results), elapsed)
         self._last_screenshot_path = screenshot_path
         self._last_raw_results = results
         return results
+
+    def _use_remote(self, screenshot_path: str) -> bool:
+        """Remoto per le letture a schermo intero o comunque grandi; locale per la fascia di saldo e puntata."""
+        if self._region is None:
+            return True
+        try:
+            from PIL import Image
+            with Image.open(screenshot_path) as image:
+                total = image.width * image.height
+        except OSError:
+            return True
+        x1, y1, x2, y2 = self._region
+        return total > 0 and max(0, x2 - x1) * max(0, y2 - y1) / total >= self._remote_min_area
+
+    def _readtext_local(self, screenshot_path: str):
+        ocr = self._get_ocr()
+        if self._region is None:
+            return ocr.readtext(screenshot_path)
+        return self._readtext_in_region(ocr, screenshot_path)
 
     def _readtext_remote(self, screenshot_path: str) -> Optional[list]:
         """Rilevazioni dal server OCR remoto nello stesso formato di EasyOCR: [(bbox, testo, conf)], con bbox =

@@ -117,6 +117,7 @@ class SlotAutoPilot:
         self._spins_since_full_read = 0
         self._prepared_context: Optional[LocateContext] = None
         self._prepared_at = 0.0
+        self._phase_marker: dict = {}
 
     def prepare(self, device_id: str) -> Result[bool]:
         try:
@@ -167,6 +168,31 @@ class SlotAutoPilot:
             return result
         except Exception as exc:
             return Result.fail(f"Unexpected error in set_min_bet: {exc}", "UNEXPECTED_ERROR")
+
+    def phase_report(self, label: str, seconds: float) -> str:
+        """Dove e' andato il tempo di una fase (preparazione, puntata minima): letture OCR (locali/remote), attese
+        dello schermo fermo, tocchi. Differenza dai contatori dall'ultima chiamata; stringa vuota se non disponibili."""
+        try:
+            ocr_stats = self.ocr_reader.stats
+            verifier = getattr(self.bet_controller, "verifier", None)
+            current = {
+                "ocr_calls": int(ocr_stats["calls"]), "ocr_s": float(ocr_stats["seconds"]),
+                "ocr_remote": int(ocr_stats["remote_calls"]),
+                **(verifier.snapshot() if verifier is not None else {}),
+            }
+            before = self._phase_marker
+            self._phase_marker = current
+
+            def delta(key):
+                return current.get(key, 0) - before.get(key, 0)
+
+            return (
+                f"{label}: {seconds:.0f} s = letture OCR {delta('ocr_calls')} ({delta('ocr_s'):.1f} s, di cui "
+                f"{delta('ocr_remote')} dal server remoto) + attese schermo fermo {delta('wait_s'):.1f} s in "
+                f"{delta('captures')} screenshot + tocchi {delta('taps')} ({delta('tap_s'):.1f} s)"
+            )
+        except Exception:
+            return ""
 
     def diagnose_busy(self, device_id: str) -> str:
         """Dopo un'attesa lunga di 'schermo occupato': Sol guarda lo schermo ('ready' | 'closed' | 'busy' |
