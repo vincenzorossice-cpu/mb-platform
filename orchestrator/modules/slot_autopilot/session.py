@@ -8,6 +8,7 @@ logger = logging.getLogger(__name__)
 
 # Spin senza effetto di fila dopo i quali ci si ferma (invece di consumare max_steps).
 MAX_CONSECUTIVE_NO_EFFECT_SPINS = 3
+MAX_HELP_REQUESTS = 5       # richieste di aiuto all'operatore per sessione prima di fermarsi
 MAX_OPERATOR_ACTIONS = 3   # interventi dell'operatore senza spin prima di fermarsi
 # Schermo non libero dopo uno spin (vincita/bonus/animazione lunga): si aspetta invece di
 # chiudere la sessione, fino a questo tempo.
@@ -54,6 +55,51 @@ class SlotSessionResult:
 def _looks_disconnected(result) -> bool:
     text = f"{getattr(result, 'error', '')} {getattr(result, 'error_code', '')}".lower()
     return any(word in text for word in ("adb_timeout", "device_offline", "screenshot file not created", "no devices"))
+
+
+def _operator_available(autopilot) -> bool:
+    hitl = getattr(autopilot, "hitl_strategy", None)
+    return callable(getattr(hitl, "ask_for_help", None)) and isinstance(getattr(hitl, "interventions", None), int)
+
+
+def _ask_operator(autopilot, device_id: str, reason: str, log, help_state: dict) -> str:
+    """Prima di fermarsi la sessione chiede all'operatore. 'unavailable' = nessun operatore o richieste finite
+    (ci si ferma come prima), 'stop' = l'operatore vuole fermare tutto, 'retry' = riprovare (ha toccato o ha detto skip)."""
+    if not _operator_available(autopilot) or help_state["n"] >= MAX_HELP_REQUESTS:
+        return "unavailable"
+    help_state["n"] += 1
+    log.warning("Chiedo aiuto all'operatore (%d/%d): %s", help_state["n"], MAX_HELP_REQUESTS, reason)
+    try:
+        action = autopilot.hitl_strategy.ask_for_help(device_id, reason, getattr(autopilot, "_current_bet", None))
+    except (EOFError, KeyboardInterrupt):
+        return "stop"
+    if not isinstance(action, str):
+        return "unavailable"
+    return "stop" if action == "stop" else "retry"
+
+
+def _ask_to_reconnect(autopilot, log, help_state: dict) -> str:
+    """Telefono che non risponde: aspetta l'operatore (INVIO = riprova, 'stop' = ferma)."""
+    if not _operator_available(autopilot) or help_state["n"] >= MAX_HELP_REQUESTS:
+        return "unavailable"
+    help_state["n"] += 1
+    try:
+        answer = input("\nIl telefono non risponde (scollegato o ADB bloccato?). Ricollegalo e premi INVIO per "
+                       "riprovare, oppure scrivi 'stop': ").strip().lower()
+    except (EOFError, OSError, KeyboardInterrupt):
+        return "unavailable"
+    return "stop" if answer == "stop" else "retry"
+
+
+def _recheck_bet(autopilot, device_id: str, log) -> bool:
+    """Dopo un aiuto dell'operatore la puntata puo' essere cambiata: si rilegge e si riverifica."""
+    recheck = autopilot.set_min_bet(device_id)
+    if recheck.success and recheck.data.min_bet_verified:
+        log.info("Puntata riverificata: %s EUR.", recheck.data.final_bet)
+        return True
+    reason = recheck.data.aborted_reason if recheck.success else recheck.error_code
+    log.error("Impossibile riverificare la puntata (%s).", reason)
+    return False
 
 
 def _log_phase(autopilot, label: str, seconds: float, log) -> None:
@@ -159,12 +205,18 @@ def play_session(
     phase_started = time.monotonic()
     bet_result = autopilot.set_min_bet(device_id)
     _log_phase(autopilot, "Puntata minima", time.monotonic() - phase_started, log)
-    if not bet_result.success or not bet_result.data.min_bet_verified:
+    help_state = {"n": 0}
+    while not bet_result.success or not bet_result.data.min_bet_verified:
         reason = bet_result.data.aborted_reason if bet_result.success else bet_result.error_code
         log.error(
             "Impossibile verificare la puntata minima (%s): %s", reason,
             BET_FAILURE_MESSAGES.get(reason, "mi fermo senza spinnare."),
         )
+        if reason != "HITL_STOP" and _ask_operator(
+            autopilot, device_id, f"Non riesco a verificare la puntata minima ({reason}).", log, help_state,
+        ) == "retry":
+            bet_result = autopilot.set_min_bet(device_id)
+            continue
         return SlotSessionResult(
             Decimal("0.00"), 0, failed=True, stop_reason="BET_NOT_VERIFIED", bet_aborted_reason=reason,
             target=target,
@@ -198,6 +250,9 @@ def play_session(
             log.error("spin() fallito: %s (%s)", spin_result.error, spin_result.error_code)
             if _looks_disconnected(spin_result):
                 log.error("Il telefono non risponde (scollegato o ADB bloccato?): ricollegalo e rilancia.")
+                if _ask_to_reconnect(autopilot, log, help_state) == "retry":
+                    spin_index -= 1
+                    continue
             return SlotSessionResult(total_played, spin_index, failed=True, stop_reason="SPIN_ERROR", target=target)
         if spin_result.data.bet_understated:
             log.error(
@@ -235,6 +290,15 @@ def play_session(
                     "(rilancia: il punto sbagliato viene ricordato solo per la sessione).",
                     consecutive_no_effect,
                 )
+                verdict = _ask_operator(
+                    autopilot, device_id,
+                    f"{consecutive_no_effect} spin senza addebito: il pulsante spin non risponde (forse un menu o un "
+                    f"pop-up copre il gioco).", log, help_state,
+                )
+                if verdict == "retry" and _recheck_bet(autopilot, device_id, log):
+                    consecutive_no_effect = 0
+                    spin_index -= 1
+                    continue
                 failed, stop_reason = True, "NO_EFFECT"
                 break
         else:
@@ -279,6 +343,15 @@ def play_session(
                     continue
                 _busy_diagnostics(autopilot, device_id, "occupato_scaduto", log, None)
                 log.warning("Lo schermo e' rimasto occupato per oltre %d s: mi fermo.", MAX_BUSY_WAIT_SECONDS)
+                verdict = _ask_operator(
+                    autopilot, device_id,
+                    f"lo schermo risulta occupato da oltre {MAX_BUSY_WAIT_SECONDS} s (vincita, bonus o pop-up?).",
+                    log, help_state,
+                )
+                if verdict == "retry" and _recheck_bet(autopilot, device_id, log):
+                    busy_since, busy_asked = None, False
+                    spin_index -= 1
+                    continue
                 failed, stop_reason = True, "BUSY_TIMEOUT"
             else:
                 log.warning("Spin bloccato da un'invariante di sicurezza: %s", spin_result.data.violated_invariant)

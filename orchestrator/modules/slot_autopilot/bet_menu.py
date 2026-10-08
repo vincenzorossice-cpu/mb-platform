@@ -16,6 +16,9 @@ from orchestrator.modules.slot_autopilot.verifier import ActionVerifier, Expecta
 logger = logging.getLogger(__name__)
 
 _MENU_TOGGLE = "bet_menu_toggle"
+_MENU_CLOSE = "bet_menu_close"   # punto che chiude il menu (spesso: fuori dal riquadro), insegnato dall'operatore
+_ALL_BUT_MEMORY = ("ocr_anchor", "spatial_heuristic", "template", "gpt", "hitl")
+_ALL_BUT_OPERATOR = ("profile", "memory", "ocr_anchor", "spatial_heuristic", "template", "gpt")
 # Un testo che e' SOLO un importo (opz. con simbolo di valuta): la cella di
 # un menu puntata. Le etichette come "PUNTATA €0,10" non lo sono.
 _STANDALONE_AMOUNT = re.compile(r"^\s*(€|\$)?\s*\d[\d.,]*\s*(€|\$|EUR)?\s*$", re.IGNORECASE)
@@ -135,7 +138,7 @@ class BetMenuSelector:
         self.locator.save_verified_candidate(
             _MENU_TOGGLE, toggle, slot_name, context.screen_width, context.screen_height,
         )
-        return self._select_from_open(device_id, opened, context_provider, toggle)
+        return self._select_from_open(device_id, opened, context_provider, toggle, slot_name, allow_operator)
 
     def _memory_dir(self) -> str:
         directory = getattr(self.locator, "memory_dir", None)
@@ -164,7 +167,7 @@ class BetMenuSelector:
             toggle = LocateCandidate(
                 x=int(toggle_xy[0]), y=int(toggle_xy[1]), confidence=1.0, strategy_name="hitl", verified=True,
             )
-        result = self._select_from_open(device_id, context, context_provider, toggle)
+        result = self._select_from_open(device_id, context, context_provider, toggle, slot_name, True)
         if result.success and toggle is not None:
             self.locator.save_verified_candidate(
                 _MENU_TOGGLE, toggle, slot_name, context.screen_width, context.screen_height,
@@ -173,6 +176,7 @@ class BetMenuSelector:
 
     def _select_from_open(
         self, device_id: str, opened, context_provider: Callable[[], Result], toggle: Optional[LocateCandidate],
+        slot_name: str = "", allow_operator: bool = True,
     ) -> Result[MenuSelection]:
         cells = menu_amounts(opened.text_boxes)
         if not _looks_like_menu(cells):
@@ -192,15 +196,10 @@ class BetMenuSelector:
             return Result.fail("Cannot read the screen after selecting the bet", "MENU_CONTEXT_ERROR")
         if self._menu_still_open(opened, after):
             logger.info("bet menu: ancora aperto dopo la selezione, lo richiudo")
-            if toggle is None:
-                located = self.locator.locate(_MENU_TOGGLE, after, exclude_strategies=("hitl",))
-                toggle = located.data if located.success else None
-            if toggle is None:
-                return Result.fail("The menu is still open and its icon is unknown", "MENU_CLOSE_UNKNOWN")
-            self._close(device_id, toggle)
-            after = self._fresh(context_provider)
-            if after is None:
-                return Result.fail("Cannot read the screen after closing the menu", "MENU_CONTEXT_ERROR")
+            closed = self._close_menu(device_id, slot_name, opened, after, toggle, context_provider, allow_operator)
+            if not closed.success:
+                return Result.fail(closed.error, closed.error_code)
+            after = closed.data
 
         bet = after.slot_ocr_state.get("posta")
         if bet is None:
@@ -256,6 +255,59 @@ class BetMenuSelector:
                 break          # niente di piu' basso: il minimo e' quello gia' visto
             opened, cells = fresh, fresh_cells
         return opened, cells
+
+    def _close_menu(
+        self, device_id: str, slot_name: str, opened, after, toggle, context_provider, allow_operator: bool,
+    ) -> Result:
+        """Chiude il menu rimasto aperto, in quest'ordine: il punto ricordato per la slot, l'icona che lo ha
+        aperto, l'operatore (che indica dove toccare; il punto viene ricordato). Dopo ogni tentativo si
+        RICONTROLLA che si sia chiuso. Result con lo schermo aggiornato."""
+        memo = self.locator.locate(_MENU_CLOSE, after, exclude_strategies=_ALL_BUT_MEMORY)
+        if memo.success:
+            self.verifier.verified_tap(device_id, memo.data.x, memo.data.y, Expectation(kind="screen_changed"))
+            fresh = self._fresh(context_provider)
+            if fresh is None:
+                return Result.fail("Cannot read the screen after closing the menu", "MENU_CONTEXT_ERROR")
+            after = fresh
+            if not self._menu_still_open(opened, after):
+                return Result.ok(after)
+            logger.warning("bet menu: il punto ricordato per chiudere il menu non e' servito: lo dimentico.")
+            forget_autopilot_element(slot_name, _MENU_CLOSE, self._memory_dir())
+
+        if toggle is None:
+            located = self.locator.locate(_MENU_TOGGLE, after, exclude_strategies=("hitl",))
+            toggle = located.data if located.success else None
+        if toggle is not None:
+            self._close(device_id, toggle)
+            fresh = self._fresh(context_provider)
+            if fresh is None:
+                return Result.fail("Cannot read the screen after closing the menu", "MENU_CONTEXT_ERROR")
+            after = fresh
+            if not self._menu_still_open(opened, after):
+                return Result.ok(after)
+            logger.warning("bet menu: l'icona non ha chiuso il menu.")
+
+        if allow_operator:
+            helped = self.locator.locate(_MENU_CLOSE, after, exclude_strategies=_ALL_BUT_OPERATOR)
+            if helped.error_code == "HITL_STOP_REQUESTED":
+                return Result.fail("The operator asked to stop while the bet menu was open", "MENU_STUCK")
+            tap = (helped.data.x, helped.data.y) if helped.success else self.locator.last_hitl_tap()
+            if isinstance(tap, tuple):
+                fresh = self._fresh(context_provider)
+                if fresh is None:
+                    return Result.fail("Cannot read the screen after closing the menu", "MENU_CONTEXT_ERROR")
+                after = fresh
+                if not self._menu_still_open(opened, after):
+                    self.locator.save_verified_candidate(
+                        _MENU_CLOSE,
+                        LocateCandidate(x=int(tap[0]), y=int(tap[1]), confidence=1.0, strategy_name="hitl", verified=True),
+                        slot_name, after.screen_width, after.screen_height,
+                    )
+                    logger.info("bet menu: l'operatore ha chiuso il menu toccando (%d,%d): lo ricordo.", tap[0], tap[1])
+                    return Result.ok(after)
+        if toggle is None:
+            return Result.fail("The menu is still open and its icon is unknown", "MENU_CLOSE_UNKNOWN")
+        return Result.ok(after)    # come prima: si prosegue e sara' la lettura della puntata a dire se va bene
 
     @staticmethod
     def _menu_still_open(opened, after) -> bool:

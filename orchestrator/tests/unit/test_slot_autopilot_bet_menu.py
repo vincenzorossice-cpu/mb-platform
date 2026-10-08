@@ -67,6 +67,9 @@ def _selector(strategy="memory", trusted=True):
     locator.locate.return_value = Result.ok(
         LocateCandidate(x=540, y=2088, confidence=0.9, strategy_name=strategy))
     locator.is_trusted_strategy.return_value = trusted
+    # Il punto "chiudi menu" ricordato non esiste: tutto il resto risponde col valore di return_value.
+    locator.locate.side_effect = lambda name, *a, **k: (
+        Result.fail("no", "ELEMENT_NOT_LOCATABLE") if name == "bet_menu_close" else locator.locate.return_value)
     verifier = MagicMock()
     verifier.verified_tap.return_value = _tap(True)
     return BetMenuSelector(locator, verifier), locator, verifier

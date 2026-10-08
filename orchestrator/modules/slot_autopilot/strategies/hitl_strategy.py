@@ -40,7 +40,7 @@ class HITLStrategy(LocatorStrategy):
         if self.describer is not None:
             action, _data, _confirmed_min_bet, tapped_coords = handle_precise_hitl_escalation(
                 self.screen_reader, self.ocr_reader, self.touch_injector,
-                context.device_id, current_bet, known_min_bet, self.describer.locate_described, **({"element": "spin"} if element_name == "spin" else {}),
+                context.device_id, current_bet, known_min_bet, self.describer.locate_described, **({"element": element_name} if element_name in ("spin", "bet_menu_close") else {}),
             )
         else:
             action, _data, _confirmed_min_bet, tapped_coords = handle_hitl_escalation(
@@ -67,3 +67,21 @@ class HITLStrategy(LocatorStrategy):
                 x=x, y=y, confidence=1.0, strategy_name=self.name, verified=True,
             ))
         return Result.fail(f"Unexpected HITL outcome: {action}", "HITL_UNEXPECTED_OUTCOME")
+
+    def ask_for_help(self, device_id: str, reason: str, current_bet=None) -> str:
+        """Chiede all'operatore (terminale) di sbloccare la sessione spiegando il problema. Ritorna l'esito:
+        "stop", "skip" (riprova da solo), "resolved"/"hint"/"spin_confirmed"/"info" (ha toccato qualcosa)."""
+        self.interventions += 1
+        self.element_name = "stuck"
+        if self.describer is not None:
+            action, _data, _min_bet, tapped = handle_precise_hitl_escalation(
+                self.screen_reader, self.ocr_reader, self.touch_injector, device_id, current_bet, None,
+                self.describer.locate_described, reason=reason,
+            )
+        else:
+            action, _data, _min_bet, tapped = handle_hitl_escalation(
+                self.screen_reader, self.ocr_reader, self.touch_injector, device_id, current_bet, None,
+            )
+        self.last_tap = tuple(tapped) if tapped is not None else None
+        self.last_action = action
+        return str(action)
