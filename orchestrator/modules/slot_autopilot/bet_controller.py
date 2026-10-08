@@ -81,8 +81,23 @@ class BetController:
         self.screen_recovery = screen_recovery
         # None = nessun supervisore: si passa direttamente all'operatore (storico).
         self.supervisor = supervisor
+        # slot -> puntata minima verificata in QUESTA sessione: ripetere la verifica (es. dopo un aiuto
+        # dell'operatore) non deve riaprire il menu se la puntata e' gia' a quel valore o sotto.
+        self._session_min = {}
 
     def set_min_bet(
+        self, device_id: str, slot_name: str, episode_id: str,
+        context_provider: Callable[[], Result],
+    ) -> Result[BetResult]:
+        result = self._set_min_bet(device_id, slot_name, episode_id, context_provider)
+        if result.success and result.data.min_bet_verified and result.data.final_bet is not None:
+            known = self._session_min.get(slot_name)
+            self._session_min[slot_name] = (
+                result.data.final_bet if known is None else min(known, result.data.final_bet)
+            )
+        return result
+
+    def _set_min_bet(
         self, device_id: str, slot_name: str, episode_id: str,
         context_provider: Callable[[], Result],
     ) -> Result[BetResult]:
@@ -108,6 +123,18 @@ class BetController:
             "set_min_bet: puntata iniziale=%s, riscontro fidato=%s, minimo ricordato=%s",
             starting_bet, trusted_min_bet, remembered_min,
         )
+
+        session_min = self._session_min.get(slot_name)
+        if session_min is not None and starting_bet is not None and starting_bet <= session_min:
+            logger.info(
+                "set_min_bet: puntata %s gia' al minimo verificato in questa sessione (%s): nessun tocco.",
+                starting_bet, session_min,
+            )
+            return Result.ok(BetResult(
+                slot_name=slot_name, starting_bet=starting_bet, final_bet=starting_bet,
+                min_bet_verified=True, attempts=0, strategy_sequence=[],
+                aborted_reason=None, outcome="unchanged_already_min",
+            ))
 
         if starting_bet is None:
             # Senza la puntata leggibile nessun tocco e' verificabile: e' quando un tocco alla cieca

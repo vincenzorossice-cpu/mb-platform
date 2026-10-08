@@ -285,8 +285,9 @@ class GPTDecisionClient(DecisionEngineClientInterface):
         ):
             # Risposta vuota/non JSON (tipico di un modello che ha speso i token nel ragionamento): un solo
             # nuovo tentativo con il doppio dei token.
-            logger.warning("Risposta non valida da %s: riprovo con %s token.", self.model, max_tokens * 2)
-            result = self._create_completion_once(messages, max_tokens * 2, purpose)
+            retry_tokens = min(max_tokens * 2, 1200)
+            logger.warning("Risposta non valida da %s: riprovo con %s token.", self.model, retry_tokens)
+            result = self._create_completion_once(messages, retry_tokens, purpose)
         return result
 
     def _create_completion_once(self, messages: list, max_tokens: int = None, purpose: str = "decisione") -> Result[dict]:
@@ -306,6 +307,9 @@ class GPTDecisionClient(DecisionEngineClientInterface):
             return Result.fail(f"{self.model} non raggiungibile: {exc}", self.GPT_DECISION_UNREACHABLE)
         except openai.APIStatusError as exc:
             self._record_failure(f"http_{exc.status_code}", purpose, started)
+            text = str(exc).lower()
+            if exc.status_code == 400 and ("max_tokens" in text or "output limit" in text):
+                return Result.fail(f"Token insufficienti per {self.model}: {exc}", self.GPT_DECISION_PARSE_ERROR)
             return Result.fail(f"HTTP {exc.status_code} da OpenAI: {exc}", self.GPT_DECISION_HTTP_ERROR)
         except openai.OpenAIError as exc:
             self._record_failure("errore_openai", purpose, started)

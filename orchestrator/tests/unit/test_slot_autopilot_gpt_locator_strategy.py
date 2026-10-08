@@ -198,7 +198,8 @@ class TestIconRefinement:
         json.dumps(["A1"]),
     ])
     def test_invalid_first_grid_step_fails_without_falling_back_to_the_coarse_cell(self, real_context, coarse):
-        gpt_client = _client(Result.ok(_answers(target_region="middle-left")), coarse)
+        # Una risposta non JSON viene riprovata una volta (token doppi): la stessa risposta due volte = fallimento.
+        gpt_client = _client(Result.ok(_answers(target_region="middle-left")), coarse, coarse)
 
         result = GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
 
@@ -346,7 +347,7 @@ class TestNotVisibleIsNotAGuess:
         assert any("non vede l'elemento" in r.getMessage() for r in caplog.records)
 
     def test_an_unreadable_answer_at_the_zoomed_step_still_keeps_the_fine_cell(self, real_context):
-        gpt_client = _client(None, _cell_answer("B6"), _cell_answer("C4"), "not json")
+        gpt_client = _client(None, _cell_answer("B6"), _cell_answer("C4"), "not json", "not json")
 
         result = GPTLocatorStrategy(gpt_client).locate("bet_minus", real_context)
 

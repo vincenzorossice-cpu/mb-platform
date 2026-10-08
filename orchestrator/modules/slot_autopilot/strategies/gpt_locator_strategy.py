@@ -152,6 +152,11 @@ def _avoid_note(rejected_positions: list, width: int, height: int, avoid_zones: 
     return note
 
 
+_GRID_MAX_TOKENS = 250
+_GRID_MAX_TOKENS_REASONING = 500   # i modelli gpt-6 ragionano: con pochi token non arrivano alla risposta
+_GRID_MAX_TOKENS_CAP = 1200
+
+
 class GPTLocatorStrategy(LocatorStrategy):
     """Sesta scelta, fallback verso GPT-4o-mini Vision: usata solo se
     registrata nella catena (AutoPilotConfig.enable_gpt_fallback=False la
@@ -267,21 +272,35 @@ class GPTLocatorStrategy(LocatorStrategy):
                 {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}},
             ]},
         ]
-        started = time.monotonic()
-        try:
-            response = call_with_rate_limit_retry(lambda: create_with_param_fallback(
-                self.gpt_client.client.chat.completions.create,
-                dict(model=self.gpt_client.model, messages=messages,
-                     response_format={"type": "json_object"}, temperature=0.1, max_tokens=250),
-            ))
-            self._record_usage(response, "griglia icone", time.monotonic() - started)
-            data = json.loads(response.choices[0].message.content)
-        except openai.OpenAIError as exc:
-            logger.warning("'%s' (%s): errore OpenAI: %s", element_name, stage, exc)
-            self._api_unavailable = True
-            return None
-        except (json.JSONDecodeError, IndexError, AttributeError, TypeError) as exc:
-            logger.warning("'%s' (%s): risposta GPT non valida: %s", element_name, stage, exc)
+        data = None
+        base = _GRID_MAX_TOKENS_REASONING if str(getattr(self.gpt_client, "model", "")).startswith("gpt-6") else _GRID_MAX_TOKENS
+        for attempt, max_tokens in enumerate((base, min(base * 2, _GRID_MAX_TOKENS_CAP))):
+            started = time.monotonic()
+            try:
+                response = call_with_rate_limit_retry(lambda: create_with_param_fallback(
+                    self.gpt_client.client.chat.completions.create,
+                    dict(model=self.gpt_client.model, messages=messages,
+                         response_format={"type": "json_object"}, temperature=0.1, max_tokens=max_tokens),
+                ))
+                self._record_usage(response, "griglia icone", time.monotonic() - started)
+                data = json.loads(response.choices[0].message.content)
+                break
+            except openai.OpenAIError as exc:
+                text = str(exc).lower()
+                if attempt == 0 and ("max_tokens" in text or "output limit" in text):
+                    # Il modello ha speso i token nel ragionamento: non e' un guasto dell'API, si riprova con piu' token.
+                    logger.warning("'%s' (%s): token insufficienti (%d): riprovo con piu' token.", element_name, stage, max_tokens)
+                    continue
+                logger.warning("'%s' (%s): errore OpenAI: %s", element_name, stage, exc)
+                self._api_unavailable = True
+                return None
+            except (json.JSONDecodeError, IndexError, AttributeError, TypeError) as exc:
+                if attempt == 0:
+                    logger.warning("'%s' (%s): risposta GPT vuota/non valida (%s): riprovo con piu' token.", element_name, stage, exc)
+                    continue
+                logger.warning("'%s' (%s): risposta GPT non valida: %s", element_name, stage, exc)
+                return None
+        if data is None:
             return None
 
         cell = data.get("cell") if isinstance(data, dict) else None

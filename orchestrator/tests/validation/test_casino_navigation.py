@@ -32,10 +32,19 @@ _SLOT_RULES = (
 )
 
 
-def build_goal(promo_name: str, slot_name: str, already_active: "bool | None" = None) -> str:
+_SLOT_RULES_STOP_AT_PROVA = (
+    "Non toccare mai il box o il titolo del gioco nella lobby (apre la slot reale). "
+    "Rispondi 'done' APPENA hai toccato 'Prova' e il gioco comincia a caricarsi: le schermate di benvenuto, di "
+    "schermo intero e 'Continua' le gestisce il sistema. Non giocare nessuno spin."
+)
+
+
+def build_goal(promo_name: str, slot_name: str, already_active: "bool | None" = None, stop_at_prova: bool = False) -> str:
     """already_active: None = il goal copre entrambi i casi (promo nuova o gia' attiva); True = la promo e' gia'
     attiva (cercarla in 'Promozioni attivate', nessuna attivazione ne' messaggio da verificare); False = promo
-    da attivare, con la verifica del messaggio di conferma."""
+    da attivare, con la verifica del messaggio di conferma. stop_at_prova: 'done' subito dopo il tocco su 'Prova'
+    (le schermate d'ingresso della slot le supera il chiamante)."""
+    rules = _SLOT_RULES_STOP_AT_PROVA if stop_at_prova else _SLOT_RULES
     if already_active is True:
         return (
             f"Percorso in ordine, una fase alla volta. "
@@ -45,7 +54,7 @@ def build_goal(promo_name: str, slot_name: str, already_active: "bool | None" = 
             f"correttamente': e' gia' attiva. Trova la slot '{slot_name}' (il suo nome sottolineato nel testo "
             f"della promo) e tocca il suo nome. "
             f"FASE 3: nella pagina della slot tocca 'Prova' (modalita' demo, for fun), MAI 'Gioca'. "
-            + _SLOT_RULES
+            + rules
         )
     if already_active is False:
         return (
@@ -57,7 +66,7 @@ def build_goal(promo_name: str, slot_name: str, already_active: "bool | None" = 
             f"FASE 4: trova la slot '{slot_name}' e tocca il suo nome. "
             f"FASE 5: nella pagina della slot tocca 'Prova' (modalita' demo, for fun), MAI 'Gioca'. "
             f"Dopo l'attivazione preferisci la pagina della promozione: il nome sottolineato della slot. "
-            + _SLOT_RULES
+            + rules
         )
     return (
         f"Percorso in ordine, una fase alla volta. "
@@ -70,7 +79,7 @@ def build_goal(promo_name: str, slot_name: str, already_active: "bool | None" = 
         f"non serve). "
         f"FASE 4: trova la slot '{slot_name}' (il suo nome sottolineato nella pagina della promo) e tocca il suo nome. "
         f"FASE 5: nella pagina della slot tocca 'Prova' (modalita' demo, for fun), MAI 'Gioca'. "
-        + _SLOT_RULES
+        + rules
     )
 
 

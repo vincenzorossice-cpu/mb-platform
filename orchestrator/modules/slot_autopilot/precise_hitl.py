@@ -24,6 +24,15 @@ _TAP_INSTRUCTION = re.compile(
     r"scegli|usa|vai|press|tap|click|open|close|select|choose)\b",
     re.IGNORECASE,
 )
+# "tocca fuori dal riquadro / in un punto qualsiasi": non e' un elemento da cercare ma uno sfondo da toccare.
+_OUTSIDE_TAP = re.compile(
+    r"\b(fuori|outside|qualsiasi\s+punto|qualunque\s+punto|ovunque|dappertutto|anywhere|any\s+point)\b", re.IGNORECASE,
+)
+_OUTSIDE_DESCRIPTION = (
+    "an empty or dimmed background point OUTSIDE the open menu panel, far from any button, icon or text"
+)
+# Se la vista non lo trova: punti in alto (fuori da un pannello ancorato in basso), provati uno per volta.
+_OUTSIDE_FALLBACK_POINTS = ((0.5, 0.15), (0.2, 0.12), (0.8, 0.22))
 _VALUE_DESCRIPTION = re.compile(
     r"\d+[.,]\d+|\b(pi[uù]'?\s+(basso|bassa|alto|alta|piccolo|piccola|grande)|minim\w*|massim\w*|"
     r"lowest|highest|smallest|largest)\b",
@@ -47,6 +56,7 @@ def handle_precise_hitl_escalation(
     ritorna il punto da tappare. Se non trova nulla, si ripiega sul vecchio
     interprete a parole chiave (grossolano ma mai peggio di prima)."""
     confirmed_min_bet: Optional[float] = None
+    outside_attempts = 0
     while True:
         extra = ({"element": element} if element in ("spin", "bet_menu_close") else {})
         if reason:
@@ -81,11 +91,17 @@ def handle_precise_hitl_escalation(
             pre_tap_state = ocr_reader.read_slot_state(shot.data)
             width, height = get_image_dimensions(shot.data)
 
-            point = _describe_safely(describe, description, LocateContext(
+            outside = bool(_OUTSIDE_TAP.search(description))
+            point = _describe_safely(describe, _OUTSIDE_DESCRIPTION if outside else description, LocateContext(
                 device_id=device_id, slot_name="operator", screenshot_path=shot.data,
                 screen_width=width, screen_height=height,
                 raw_texts=pre_tap_state.get("raw_texts", []),
             ))
+            if point is None and outside and outside_attempts < len(_OUTSIDE_FALLBACK_POINTS):
+                fx, fy = _OUTSIDE_FALLBACK_POINTS[outside_attempts]
+                outside_attempts += 1
+                point = (round(width * fx), round(height * fy))
+                print(f"Non ho trovato lo sfondo con la vista: provo un punto in alto ({point[0]},{point[1]}).")
             if point is not None:
                 print(f"Ho trovato '{description}' a ({point[0]},{point[1]}): tocco li'.")
             elif _VALUE_DESCRIPTION.search(description):

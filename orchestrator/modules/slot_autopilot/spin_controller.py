@@ -8,6 +8,7 @@ from decimal import Decimal
 from typing import Callable, Optional
 
 from orchestrator.core.result import Result
+from orchestrator.modules.provider_profile.autopilot_memory import forget_autopilot_element
 from orchestrator.modules.slot_autopilot.config import AutoPilotConfig
 from orchestrator.modules.slot_autopilot.locator import ElementLocator
 from orchestrator.modules.slot_autopilot.value_parser import parse_amount
@@ -72,6 +73,7 @@ class SpinController:
         # Fino a quando (monotonic) il prossimo spin puo' saltare il controllo di calma: lo spin precedente e'
         # finito senza vincita, lo schermo fermo e' recente.
         self._calm_skip_deadline = 0.0
+        self._dead_spin_points = {}        # slot -> ((x, y), volte di fila) tocchi che non hanno mai addebitato
 
     def spin(
         self, device_id: str, slot_name: str, episode_id: str, spin_index: int,
@@ -321,6 +323,7 @@ class SpinController:
                 if tap_result.data.verified:
                     verified = True
                     self.locator.record_success(candidate.strategy_name, _ELEMENT)
+                    self._dead_spin_points.pop(slot_name, None)
                     break
                 if (
                     self.config.spin_calm_check and tap_result.data.outcome == "unexpected_change"
@@ -343,9 +346,11 @@ class SpinController:
                     else:
                         logger.warning(
                             "spin %d: schermo cambiato ma nessun addebito dopo l'attesa: non ritocco "
-                            "(potrebbe essere un'animazione); il prossimo spin riparte da uno schermo fermo.",
-                            spin_index,
+                            "(potrebbe essere un'animazione); il prossimo spin riparte da uno schermo fermo. "
+                            "Tocco a (%d,%d) via '%s'.",
+                            spin_index, candidate.x, candidate.y, candidate.strategy_name,
                         )
+                        self._note_dead_point(slot_name, candidate, spin_index)
                     break
                 if not self.locator.is_trusted_strategy(candidate.strategy_name):
                     # Coordinata indovinata (es. da GPT) che non fa partire lo spin:
@@ -446,6 +451,26 @@ class SpinController:
             screenshot_after=screenshot_after, state_after=state_after, bet_understated=bet_understated,
             timings=timings, button_status=button_status,
         ))
+
+    def _note_dead_point(self, slot_name: str, candidate, spin_index: int) -> None:
+        """Il tocco ha cambiato lo schermo senza addebitare. Una volta puo' essere un'animazione; la seconda volta
+        di fila sullo stesso punto ricordato e' un punto sbagliato (es. una cella della puntata che apre il menu):
+        lo si dimentica e lo si scarta, cosi' il giro dopo si rilocalizza invece di ripetere lo stesso errore."""
+        if candidate.strategy_name != "memory":
+            return
+        point = (candidate.x, candidate.y)
+        previous, count = self._dead_spin_points.get(slot_name, (None, 0))
+        count = count + 1 if previous == point else 1
+        self._dead_spin_points[slot_name] = (point, count)
+        if count < 2:
+            return
+        logger.warning(
+            "spin %d: il punto ricordato (%d,%d) non ha mai addebitato per %d volte di fila: lo dimentico e lo scarto.",
+            spin_index, point[0], point[1], count,
+        )
+        forget_autopilot_element(slot_name, _ELEMENT, self.config.slot_memory_dir)
+        self.locator.reject_position(_ELEMENT, point[0], point[1])
+        self._dead_spin_points.pop(slot_name, None)
 
     def _reread_balance(self, context_provider) -> Optional[Decimal]:
         result = context_provider()

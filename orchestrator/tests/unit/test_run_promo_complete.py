@@ -50,6 +50,9 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(script.model_metrics, "start_run", lambda *a, **k: "run")
     exits = []
     monkeypatch.setattr(script, "exit_slot", lambda *a, **k: exits.append(1))
+    from orchestrator.modules.slot_autopilot.slot_intro import IntroOutcome
+    monkeypatch.setattr(script, "build_slot_intro", lambda autopilot: SimpleNamespace(
+        run=lambda device, slot: Result.ok(IntroOutcome(rounds=1, taps=0, ready=True))))
     return SimpleNamespace(autopilot=autopilot, metrics=played, exits=exits, tmp=tmp_path)
 
 

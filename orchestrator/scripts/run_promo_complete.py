@@ -16,6 +16,7 @@ from decimal import Decimal
 
 from orchestrator.core import model_metrics
 from orchestrator.core.result import Result
+from orchestrator.modules.slot_autopilot.slot_intro import build_slot_intro
 from orchestrator.scripts import run_autopilot
 from orchestrator.tests.validation import test_casino_navigation as nav_script
 
@@ -97,7 +98,9 @@ def navigate_to_slot(args, navigation_client, screen_reader, touch_injector) -> 
     opened = book_navigator.open_chrome(args.device, args.url)
     if not opened.success:
         return Result.fail(f"impossibile aprire Chrome: {opened.error}", opened.error_code)
-    goal = nav_script.build_goal(args.promo_name, args.slot_name, nav_script.already_active_mode(args))
+    goal = nav_script.build_goal(
+        args.promo_name, args.slot_name, nav_script.already_active_mode(args), stop_at_prova=True,
+    )
     logger.info("Goal: %s", goal)
     result = navigator.navigate(args.device, goal=goal, book=args.book, demo_mode=True, vision_mode=True)
     for entry in navigator.last_history:
@@ -127,6 +130,19 @@ def exit_slot(screen_reader, touch_injector, device_id: str, sleep=time.sleep) -
     except Exception as exc:
         logger.warning("Uscita dalla slot non riuscita: %s", exc)
         return Result.fail(str(exc), "EXIT_ERROR")
+
+
+def _ask_intro_help(autopilot, args) -> str:
+    """Intro non superata: prima di giocare si chiede all'operatore (se c'e')."""
+    hitl = getattr(autopilot, "hitl_strategy", None)
+    ask = getattr(hitl, "ask_for_help", None)
+    if not callable(ask) or not isinstance(getattr(hitl, "interventions", None), int):
+        return "continue"
+    try:
+        return "stop" if ask(args.device, "le schermate d'ingresso della slot (benvenuto, schermo intero, Continua) "
+                                          "non si superano da sole.") == "stop" else "continue"
+    except (EOFError, KeyboardInterrupt):
+        return "stop"
 
 
 def run(args) -> int:
@@ -164,6 +180,15 @@ def run(args) -> int:
         else:
             logger.info("Navigazione completata in %d passi (%.0f s): slot aperta in demo, passo al gioco.",
                         nav.data, nav_seconds)
+            intro = build_slot_intro(autopilot).run(args.device, args.slot_name)
+            if not intro.success:
+                logger.warning("Schermate d'ingresso non superate (%s): %s", intro.error_code, intro.error)
+                asked = _ask_intro_help(autopilot, args)
+                if asked == "stop":
+                    raise KeyboardInterrupt
+            else:
+                logger.info("Schermate d'ingresso superate: %d giri, %d tocchi, %d nuove ricordate.",
+                            intro.data.rounds, intro.data.taps, intro.data.learned)
             logger.info("=== FASE GIOCO: %s, target %s EUR ===", args.slot_name, args.target)
             started = time.monotonic()
             session = play_session(autopilot, args.device, args.slot_name, Decimal(str(args.target)),
