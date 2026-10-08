@@ -549,7 +549,7 @@ def read_ocr_state(screen_reader: ScreenReader, ocr_reader: SlotOCRReader, devic
     return ocr_reader.read_slot_state(ss.data)
 
 
-def ask_human_help(current_bet: Optional[float], min_bet: Optional[float]) -> tuple:
+def ask_human_help(current_bet: Optional[float], min_bet: Optional[float], element: str = "bet_minus") -> tuple:
     """Chiede aiuto all'operatore via terminale quando il sistema non riesce
     ad abbassare la posta da solo dopo troppi tentativi. Non mostra lo
     screenshot: quello lo vede solo GPT-4o-mini via Vision API, non serve
@@ -564,12 +564,14 @@ def ask_human_help(current_bet: Optional[float], min_bet: Optional[float]) -> tu
     """
     bet_str = f"{current_bet:.2f}" if current_bet is not None else "unknown"
     min_bet_str = f"{min_bet:.2f} EUR" if min_bet is not None else "non ancora nota"
+    spin = element == "spin"
     print(f"\n{'='*60}")
-    print("HITL: Non riesco ad abbassare la puntata.")
+    print("HITL: Non trovo il pulsante dello SPIN." if spin else "HITL: Non riesco ad abbassare la puntata.")
     print(f"Puntata attuale: {bet_str} EUR | Minimo: {min_bet_str}")
     print(f"{'='*60}")
 
-    print("\nCosa devo tappare per abbassare la puntata?")
+    print("\nDove devo tappare per far girare i rulli (pulsante SPIN)?" if spin
+          else "\nCosa devo tappare per abbassare la puntata?")
     print("Opzioni:")
     print("  - Descrivi l'elemento (es. 'tappa sulle monete in alto')")
     print("  - Dai le coordinate (es. '540,600')")

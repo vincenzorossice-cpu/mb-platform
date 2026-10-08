@@ -39,6 +39,8 @@ _BET_VIA_MENU_FLAG = "bet_via_menu"
 # una cella che si evidenzia cambia poco. Serve a non scambiare per "menu aperto" una schermata di gioco
 # che mostra anch'essa una riga di puntate.
 _MENU_STILL_OPEN_DIFF = 0.08
+_EDGE_FRACTION = 0.18   # una cella piu' bassa vicino al bordo sinistro: la fila puo' continuare fuori schermo
+_MAX_REVEAL_SWIPES = 3
 _SETTLE_SECONDS = 1.5   # pausa prima di rileggere una puntata non leggibile (animazione di chiusura)
 
 
@@ -179,6 +181,7 @@ class BetMenuSelector:
             logger.info("bet menu: aperto, %d importi isolati: non e' una lista selezionabile, lo lascio aperto", len(cells))
             return Result.fail("The open menu is not a list of selectable bets", "MENU_OPEN_NOT_A_LIST")
 
+        opened, cells = self._reveal_lower_cells(device_id, opened, cells, context_provider)
         lowest, (cell_x, cell_y) = min(cells, key=lambda item: item[0])
         logger.info("bet menu: valori letti %s, tocco il piu' basso %s a (%d,%d)",
                     sorted({v for v, _ in cells}), lowest, cell_x, cell_y)
@@ -224,6 +227,35 @@ class BetMenuSelector:
             final_bet=Decimal(str(bet)), lowest_listed=lowest,
             toggle_strategy=toggle.strategy_name if toggle is not None else "hitl",
         ))
+
+    def _reveal_lower_cells(self, device_id: str, opened, cells: list, context_provider) -> tuple:
+        """La fila di celle puo' scorrere in orizzontale con le puntate piu' basse nascoste a sinistra. Se la cella
+        piu' bassa visibile e' la prima a sinistra ed e' vicina al bordo, si scorre verso destra (il contenuto
+        va a destra) e si rileggono le celle, finche' non compare niente di piu' basso (al massimo 3 volte).
+        Una fila tutta visibile non viene toccata."""
+        injector = getattr(self.verifier, "touch_injector", None)
+        swipe = getattr(injector, "swipe", None)
+        width = getattr(opened, "screen_width", None)
+        if not callable(swipe) or not isinstance(width, int) or width <= 0:
+            return opened, cells
+        for _ in range(_MAX_REVEAL_SWIPES):
+            lowest, (low_x, low_y) = min(cells, key=lambda item: item[0])
+            leftmost_x = min(position[0] for _, position in cells)
+            if low_x != leftmost_x or low_x > width * _EDGE_FRACTION:
+                break
+            logger.info("bet menu: la cella piu' bassa (%s) e' al bordo sinistro: scorro la fila per vedere se ce ne sono altre.", lowest)
+            moved = swipe(device_id, int(width * 0.25), low_y, int(width * 0.85), low_y, 500)
+            if not getattr(moved, "success", False):
+                break
+            time.sleep(_SETTLE_SECONDS)
+            fresh = self._fresh(context_provider)
+            if fresh is None:
+                break
+            fresh_cells = menu_amounts(fresh.text_boxes)
+            if not _looks_like_menu(fresh_cells) or min(v for v, _ in fresh_cells) >= lowest:
+                break          # niente di piu' basso: il minimo e' quello gia' visto
+            opened, cells = fresh, fresh_cells
+        return opened, cells
 
     @staticmethod
     def _menu_still_open(opened, after) -> bool:

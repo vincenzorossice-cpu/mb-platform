@@ -35,7 +35,7 @@ class SpinResult:
     win_amount: Optional[Decimal]
     verified: bool
     attempts: int
-    outcome: str  # "success" | "blocked" | "no_effect" | "error"
+    outcome: str  # "success" | "blocked" | "no_effect" | "error" | "operator_action" (l'operatore ha toccato altro: non e' uno spin)
     violated_invariant: Optional[str] = None  # "MIN_BET_NOT_VERIFIED" | "INSUFFICIENT_BALANCE" | "UNSAFE_SCREEN_STATE"
     # Quale controllo ha bloccato (solo per UNSAFE_SCREEN_STATE): "schermo non fermo" | "saldo/puntata non leggibili"
     blocked_detail: Optional[str] = None
@@ -239,6 +239,26 @@ class SpinController:
             if balance_after is None:
                 balance_after = balance_before
             win_amount = self._read_amount(final_context, "vincita") if final_context else None
+            hitl_action = self.locator.last_hitl_action() if candidate.strategy_name == "hitl" else None
+            if isinstance(hitl_action, str) and (
+                hitl_action != "spin_confirmed" or not balance_after_read or balance_after == balance_before
+            ):
+                # L'operatore ha toccato qualcosa che NON ha speso (es. ha abbassato la puntata): non e' uno spin,
+                # non si conta il giocato e quel punto non diventa il pulsante spin.
+                logger.warning(
+                    "spin %d: l'intervento dell'operatore (%s) non e' uno spin (saldo %s -> %s): non lo conto e non "
+                    "ricordo quel punto come pulsante spin.", spin_index, hitl_action, balance_before, balance_after,
+                )
+                self._log_step(
+                    episode_id, spin_index, slot_name, device_id, candidate.strategy_name,
+                    (candidate.x, candidate.y), balance_before, balance_after,
+                    outcome="operator_action", notes=hitl_action,
+                )
+                return Result.ok(SpinResult(
+                    slot_name=slot_name, spin_index=spin_index, bet_amount=expected_bet,
+                    balance_before=balance_before, balance_after=balance_after, win_amount=None,
+                    verified=False, attempts=0, outcome="operator_action", strategy_name=candidate.strategy_name,
+                ))
         else:
             verified = False
             balance_after = balance_before

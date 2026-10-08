@@ -8,6 +8,7 @@ logger = logging.getLogger(__name__)
 
 # Spin senza effetto di fila dopo i quali ci si ferma (invece di consumare max_steps).
 MAX_CONSECUTIVE_NO_EFFECT_SPINS = 3
+MAX_OPERATOR_ACTIONS = 3   # interventi dell'operatore senza spin prima di fermarsi
 # Schermo non libero dopo uno spin (vincita/bonus/animazione lunga): si aspetta invece di
 # chiudere la sessione, fino a questo tempo.
 MAX_BUSY_WAIT_SECONDS = 120
@@ -48,6 +49,11 @@ class SlotSessionResult:
     def target_reached(self) -> bool:
         """Il giocato ha raggiunto il target senza arresti di sicurezza."""
         return not self.failed and self.stop_reason is None and self.total_played >= self.target
+
+
+def _looks_disconnected(result) -> bool:
+    text = f"{getattr(result, 'error', '')} {getattr(result, 'error_code', '')}".lower()
+    return any(word in text for word in ("adb_timeout", "device_offline", "screenshot file not created", "no devices"))
 
 
 def _log_phase(autopilot, label: str, seconds: float, log) -> None:
@@ -171,6 +177,7 @@ def play_session(
     total_played = Decimal("0.00")
     spin_index = 0
     consecutive_no_effect = 0
+    operator_actions = 0
     stop_reason = None
     failed = False
     busy_since = None
@@ -189,6 +196,8 @@ def play_session(
         seconds = time.monotonic() - started
         if not spin_result.success:
             log.error("spin() fallito: %s (%s)", spin_result.error, spin_result.error_code)
+            if _looks_disconnected(spin_result):
+                log.error("Il telefono non risponde (scollegato o ADB bloccato?): ricollegalo e rilancia.")
             return SlotSessionResult(total_played, spin_index, failed=True, stop_reason="SPIN_ERROR", target=target)
         if spin_result.data.bet_understated:
             log.error(
@@ -197,6 +206,24 @@ def play_session(
             )
             failed, stop_reason = True, "BET_UNDERSTATED"
             break
+        if spin_result.data.outcome == "operator_action":
+            # L'operatore ha toccato altro (es. la puntata): non e' uno spin. La puntata puo' essere cambiata:
+            # si rilegge e si riverifica prima di proseguire.
+            operator_actions += 1
+            spin_index -= 1
+            if operator_actions > MAX_OPERATOR_ACTIONS:
+                log.error("Troppi interventi dell'operatore senza uno spin: mi fermo.")
+                failed, stop_reason = True, "BLOCKED"
+                break
+            log.info("Intervento dell'operatore senza spin: ricontrollo la puntata prima di continuare.")
+            recheck = autopilot.set_min_bet(device_id)
+            if not recheck.success or not recheck.data.min_bet_verified:
+                reason = recheck.data.aborted_reason if recheck.success else recheck.error_code
+                log.error("Impossibile riverificare la puntata (%s): mi fermo senza spinnare.", reason)
+                failed, stop_reason = True, "BET_NOT_VERIFIED"
+                break
+            log.info("Puntata riverificata: %s EUR.", recheck.data.final_bet)
+            continue
         if spin_result.data.outcome != "blocked":
             busy_since = None
             busy_asked = False

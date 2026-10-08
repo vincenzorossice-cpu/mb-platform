@@ -34,7 +34,7 @@ _VALUE_DESCRIPTION = re.compile(
 def handle_precise_hitl_escalation(
     screen_reader, ocr_reader, touch_injector, device_id: str,
     current_bet: Optional[float], min_bet: Optional[float],
-    describe: Callable[[str, LocateContext], Optional[tuple]],
+    describe: Callable[[str, LocateContext], Optional[tuple]], element: str = "",
 ) -> tuple:
     """Stesso contratto di handle_hitl_escalation (test_slot_autonomous.py, mai
     modificato): ("stop"|"skip"|"resolved"|"spin_confirmed"|"hint", dati,
@@ -48,7 +48,8 @@ def handle_precise_hitl_escalation(
     interprete a parole chiave (grossolano ma mai peggio di prima)."""
     confirmed_min_bet: Optional[float] = None
     while True:
-        outcome = ask_human_help(current_bet, min_bet)
+        outcome = (ask_human_help(current_bet, min_bet, element="spin") if element == "spin"
+                   else ask_human_help(current_bet, min_bet))
 
         if outcome[0] == "stop":
             return ("stop", None, confirmed_min_bet, None)

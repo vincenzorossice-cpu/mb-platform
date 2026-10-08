@@ -163,6 +163,22 @@ class TouchInjector(TouchInjectorInterface):
         except Exception as e:
             return Result.fail(f"Scroll error: {e}", "SCROLL_FAILED")
 
+    def swipe(self, device_id: str, x1: int, y1: int, x2: int, y2: int, duration_ms: int = 400) -> Result[bool]:
+        """Swipe tra due punti qualsiasi (es. far scorrere una fila di celle)."""
+        try:
+            result = subprocess.run(
+                ["adb", "-s", device_id, "shell", "input", "swipe",
+                 str(int(x1)), str(int(y1)), str(int(x2)), str(int(y2)), str(int(duration_ms))],
+                capture_output=True, text=True, timeout=self.adb_timeout,
+            )
+            if result.returncode != 0:
+                return Result.fail(f"ADB swipe failed: {result.stderr}", "SCROLL_FAILED")
+            return Result.ok(True)
+        except subprocess.TimeoutExpired:
+            return Result.fail("ADB timeout during swipe", "ADB_TIMEOUT")
+        except Exception as e:
+            return Result.fail(f"Swipe error: {e}", "SCROLL_FAILED")
+
     # --------------------------------------------------------
     # PUBLIC: navigate_to
     # --------------------------------------------------------

@@ -26,17 +26,21 @@ class HITLStrategy(LocatorStrategy):
         # Ultimo punto tappato su indicazione dell'operatore (anche quando l'esito e' solo un
         # "hint": e' il punto che ha cambiato lo schermo, es. l'icona che apre un menu).
         self.last_tap = None
+        # Esito dell'ultimo intervento: "resolved" (la puntata e' scesa), "spin_confirmed" (il saldo e' sceso
+        # dopo uno spin chiesto dall'operatore), "hint", "skip"...: solo "spin_confirmed" e' uno spin vero.
+        self.last_action = None
         self.interventions = 0   # quante volte e' stato chiamato l'operatore (per il riepilogo di fine sessione)
 
     def locate(self, element_name: str, context: LocateContext) -> Result[LocateCandidate]:
         self.interventions += 1
+        self.element_name = element_name
         current_bet = context.slot_ocr_state.get("posta")
         known_min_bet = context.profile.known_min_bet if context.profile else None
 
         if self.describer is not None:
             action, _data, _confirmed_min_bet, tapped_coords = handle_precise_hitl_escalation(
                 self.screen_reader, self.ocr_reader, self.touch_injector,
-                context.device_id, current_bet, known_min_bet, self.describer.locate_described,
+                context.device_id, current_bet, known_min_bet, self.describer.locate_described, **({"element": "spin"} if element_name == "spin" else {}),
             )
         else:
             action, _data, _confirmed_min_bet, tapped_coords = handle_hitl_escalation(
@@ -45,6 +49,7 @@ class HITLStrategy(LocatorStrategy):
             )
 
         self.last_tap = tuple(tapped_coords) if tapped_coords is not None else None
+        self.last_action = action
 
         if action == "stop":
             return Result.fail("Operator requested stop", "HITL_STOP_REQUESTED")

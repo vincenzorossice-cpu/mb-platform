@@ -213,6 +213,12 @@ class ElementLocator:
         tap = getattr(hitl, "last_tap", None)
         return tap if isinstance(tap, tuple) else None
 
+    def last_hitl_action(self):
+        """Esito dell'ultimo intervento dell'operatore ("resolved", "spin_confirmed", "hint"...) o None."""
+        hitl = self.strategies.get("hitl")
+        action = getattr(hitl, "last_action", None)
+        return action if isinstance(action, str) else None
+
     def is_trusted_strategy(self, strategy_name: str) -> bool:
         """Una fonte gia' curata/verificata a monte (profile/memory/hitl) che
         smette di far progredire un valore e' proprio la firma di un plateau
