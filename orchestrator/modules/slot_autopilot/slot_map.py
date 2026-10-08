@@ -7,8 +7,10 @@ successive usano le coordinate salvate senza chiamare GPT. Le mappe sono locali 
 import json
 import logging
 import os
+import shutil
 import tempfile
-from dataclasses import asdict, dataclass, field
+import time
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -55,17 +57,30 @@ class SlotMap:
     exit_point: Optional[Point] = None
     explored_at: str = ""
     method: str = "sol"                             # sol | operator
+    spin_pending: bool = False                      # soldi veri: punto di Sol non ancora provato, lo conferma il 1o spin
 
     def key(self) -> str:
         return f"{self.screen[0]}x{self.screen[1]}"
 
     def is_usable(self) -> bool:
-        """Minimo per giocare: il pulsante spin verificato. Il menu puntata c'e' o la puntata si cambia con +/-."""
-        if self.spin is None or not self.spin.verified:
+        """Minimo per giocare: il pulsante spin verificato (o in attesa di conferma col primo spin vero, soldi veri)."""
+        if self.spin is None or not (self.spin.verified or self.spin_pending):
             return False
         if self.bet_menu_type == "plus_minus":
             return self.bet_minus is not None
         return True
+
+    def summary(self) -> str:
+        """Una riga leggibile di cosa sa la mappa (per la console)."""
+        spin = "mancante" if self.spin is None else (
+            f"({self.spin.x},{self.spin.y}) " + ("verificato" if self.spin.verified else "da confermare col primo spin"))
+        menu = "nessuno (puntata con +/-)" if self.bet_menu_type == "plus_minus" else (
+            "non mappato" if self.bet_menu_open is None else
+            f"{self.bet_menu_type} ({self.bet_menu_open.x},{self.bet_menu_open.y})")
+        close = "?" if self.close_point is None and self.close_method == "other" else (
+            self.close_method + ("" if self.close_point is None else f" ({self.close_point.x},{self.close_point.y})"))
+        minimum = "?" if self.min_bet is None else f"{self.min_bet}{' dimostrato' if self.min_bet_proven else ''}"
+        return f"spin {spin}; menu puntata {menu}; chiusura {close}; minimo {minimum}"
 
     def to_dict(self) -> dict:
         data = asdict(self)
@@ -93,6 +108,7 @@ class SlotMap:
                 min_bet_proven=bool(data.get("min_bet_proven", False)),
                 exit_point=Point.parse(data["exit_point"]) if data.get("exit_point") else None,
                 explored_at=str(data.get("explored_at", "")), method=str(data.get("method", "sol")),
+                spin_pending=bool(data.get("spin_pending", False)),
             )
         except (KeyError, TypeError, ValueError):
             return None
@@ -202,3 +218,28 @@ class SlotMemory:
             if slot_map.min_bet_proven:
                 save_autopilot_value(slot, "min_bet_trusted", slot_map.min_bet, self.memory_dir)
         return Result.ok(seeded)
+
+    # ---- reset con copia di sicurezza -------------------------------------------------------------------------
+    _SLOT_FILE_SUFFIXES = (".slot_map.json", ".autopilot.json", ".json", ".spin_button.json", ".intro.json")
+
+    def reset(self, slot_name: str) -> Result[list]:
+        """Sposta (non cancella) tutti i file di memoria di QUESTA slot in `<memory_dir>/_backup/<data-ora>/`:
+        la slot riparte da zero e si puo' rimettere tutto a mano. Le altre slot non si toccano."""
+        slug = _slugify(slot_name)
+        backup = os.path.join(self.memory_dir, "_backup", time.strftime("%Y%m%d_%H%M%S"))
+        moved, seen = [], set()
+        for directory in (self.memory_dir, "slot_memory"):
+            for suffix in self._SLOT_FILE_SUFFIXES:
+                path = os.path.join(directory, slug + suffix)
+                key = os.path.abspath(path)
+                if key in seen or not os.path.isfile(path):
+                    continue
+                seen.add(key)
+                try:
+                    os.makedirs(backup, exist_ok=True)
+                    target = os.path.join(backup, os.path.basename(path))
+                    shutil.move(path, target)
+                    moved.append(target)
+                except OSError as exc:
+                    return Result.fail(f"memoria non spostata ({path}): {exc}", "SLOT_MEMORY_RESET_FAILED")
+        return Result.ok(moved)

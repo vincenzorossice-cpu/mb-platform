@@ -36,9 +36,32 @@ class SlotSetup:
         self.gpt_client = gpt_client
         self.status: Optional[str] = None
         self.reexplorations = 0
+        self._outcomes = {}       # (dispositivo, slot) -> esito di prepare: la seconda chiamata non rifa' niente
+        self._maps = {}           # slot -> ultima mappa nota (per confirm_spin senza altri screenshot)
 
     # ---- API ---------------------------------------------------------------------------------------------------
     def prepare(self, device_id: str, slot_name: str) -> Result[SetupOutcome]:
+        """Idempotente per (dispositivo, slot): la prima chiamata carica o esplora, le altre ritornano l'esito."""
+        key = (device_id, slot_name)
+        if key in self._outcomes:
+            return self._outcomes[key]
+        outcome = self._prepare(device_id, slot_name)
+        if outcome.success:
+            self._outcomes[key] = outcome
+        return outcome
+
+    def confirm_spin(self, device_id: str, slot_name: str) -> Result[bool]:
+        """Soldi veri: il primo spin vero ha addebitato, quindi il punto di Sol e' verificato. Salva la mappa."""
+        slot_map = self._maps.get(slot_name)
+        if slot_map is None or not slot_map.spin_pending or slot_map.spin is None:
+            return Result.ok(False)
+        slot_map.spin.verified, slot_map.spin_pending = True, False
+        saved = self.memory.save(slot_map)
+        if saved.success:
+            logger.info("Slot memory: lo spin di '%s' e' confermato dal primo spin vero: mappa verificata.", slot_name)
+        return Result.ok(True) if saved.success else Result.fail(saved.error, saved.error_code)
+
+    def _prepare(self, device_id: str, slot_name: str) -> Result[SetupOutcome]:
         size = self._screen_size(device_id)
         if size is None:
             return Result.fail("schermo non leggibile", "SETUP_SCREENSHOT_FAILED")
@@ -49,9 +72,11 @@ class SlotSetup:
                 slot_map.min_bet, slot_map.min_bet_proven = str(self.known_min_bet), True
                 self.memory.save(slot_map)
             self.memory.apply_to_memory(slot_map)
+            self._maps[slot_name] = slot_map
             self.status = USED
             logger.info("Slot memory: mappa di '%s' trovata (esplorata il %s): uso le coordinate salvate, nessuna "
                         "chiamata GPT per orientarmi.", slot_name, slot_map.explored_at[:10] or "?")
+            logger.info("Slot memory: %s.", slot_map.summary())
             return Result.ok(SetupOutcome(USED, 0, slot_map))
         return self._explore(device_id, slot_name, size, base=None, only=None)
 
@@ -64,6 +89,7 @@ class SlotSetup:
         loaded = self.memory.load(slot_name, size)
         outcome = self._explore(device_id, slot_name, size, base=loaded.data if loaded.success else None, only=element)
         self.reexplorations += 1
+        self._outcomes = {k: v for k, v in self._outcomes.items() if k[1] != slot_name}
         return Result.ok(True) if outcome.success and outcome.data.slot_map is not None else Result.fail(
             outcome.error if not outcome.success else "ri-esplorazione senza mappa", "SETUP_REEXPLORE_FAILED")
 
@@ -85,10 +111,12 @@ class SlotSetup:
         if not saved.success:
             logger.warning("Slot memory: mappa non salvata (%s).", saved.error)
         self.memory.apply_to_memory(explored.data)
+        self._maps[slot_name] = explored.data
         self.status = EXPLORED
-        logger.info("Slot memory: ESPLORATA '%s' con %d chiamate (spin %s, menu puntata %s, chiusura %s).",
-                    slot_name, calls, "ok" if explored.data.spin else "?", explored.data.bet_menu_type,
-                    explored.data.close_method)
+        logger.info("Slot memory: ESPLORATA '%s' con %d chiamate.", slot_name, calls)
+        logger.info("Slot memory: %s.", explored.data.summary())
+        for note in getattr(self.explorer, "last_notes", []) or []:
+            logger.warning("Slot memory: %s", note)
         return Result.ok(SetupOutcome(EXPLORED, calls, explored.data))
 
     def _calls(self) -> int:

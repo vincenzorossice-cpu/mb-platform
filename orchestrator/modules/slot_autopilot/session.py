@@ -301,6 +301,7 @@ def play_session(
         if not prepared_map.success:
             log.warning("Slot memory: preparazione non riuscita (%s): proseguo come prima.", prepared_map.error_code)
     reexplored = {"spin": False, "bet_menu": False}
+    spin_confirmed = False
 
     log.info("Verifica puntata minima in corso...")
     phase_started = time.monotonic()
@@ -477,6 +478,9 @@ def play_session(
             consecutive_no_effect = 0
         if spin_result.data.outcome == "success" and spin_result.data.bet_amount:
             total_played += spin_result.data.bet_amount
+            if slot_setup is not None and not spin_confirmed:
+                spin_confirmed = True
+                slot_setup.confirm_spin(device_id, slot_name)      # soldi veri: il 1o spin vero conferma lo spin della mappa
             correction = _check_bet_window(recent_spins, spin_result.data, autopilot, device_id, log)
             if correction:
                 total_played -= correction

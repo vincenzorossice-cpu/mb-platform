@@ -16,6 +16,7 @@ from decimal import Decimal
 
 from orchestrator.core import model_metrics
 from orchestrator.core.result import Result
+from orchestrator.modules.slot_autopilot.session import _setup_of
 from orchestrator.modules.slot_autopilot.slot_intro import build_slot_intro
 from orchestrator.scripts import run_autopilot
 from orchestrator.tests.validation import test_casino_navigation as nav_script
@@ -45,6 +46,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--no-gpt", action="store_true")
     parser.add_argument("--min-bet", type=float, default=None,
                         help="Puntata minima NOTA della slot (EUR): vale come minimo dimostrato e ripara la memoria.")
+    parser.add_argument("--reset-slot-memory", action="store_true",
+                        help="Prima di partire sposta in slot_memory/_backup/ la memoria di questa slot (riparte da zero).")
     parser.add_argument("--nav-direct", action="store_true",
                         help="Navigazione: un punto diretto di Sol al posto della griglia icone (la griglia resta come ripiego).")
     parser.add_argument("--no-hitl", action="store_true", help="Niente operatore da terminale: se serve aiuto ci si ferma.")
@@ -144,6 +147,20 @@ def exit_slot(screen_reader, touch_injector, device_id: str, sleep=time.sleep) -
         return Result.fail(str(exc), "EXIT_ERROR")
 
 
+def _prepare_slot_map(autopilot, args) -> None:
+    """Mappa della slot PRIMA di giocare (dopo navigazione e intro): trovata -> coordinate salvate, zero GPT;
+    assente -> la esplora Sol e la salva. play_session richiama prepare(): e' idempotente, non rifa' nulla."""
+    setup = _setup_of(autopilot)
+    if setup is None:
+        logger.warning("Slot memory NON attiva (GPT spento o SLOT_MAP=0): uso il motore classico, senza mappa.")
+        return
+    logger.info("Slot memory: preparo la slot '%s' (minimo dichiarato: %s).", args.slot_name,
+                args.min_bet if args.min_bet is not None else "nessuno")
+    outcome = setup.prepare(args.device, args.slot_name)
+    if not outcome.success:
+        logger.warning("Slot memory: preparazione non riuscita (%s): %s", outcome.error_code, outcome.error)
+
+
 def make_reenter(args, navigation_client, autopilot):
     """Rientro nella slot dopo che il sito ci ha cacciati (sessione scaduta, pagina di errore): si riparte dall'URL
     del sito, non da "indietro". La promo ormai e' attiva: promo -> nome della slot -> "Prova", poi le intro."""
@@ -184,6 +201,9 @@ def run(args) -> int:
     logger.info("Log unico (navigazione + gioco): %s", log_path)
     run_id = model_metrics.start_run("promo_completa", args.slot_name.replace(" ", "_"))
 
+    if getattr(args, "reset_slot_memory", False):
+        run_autopilot._reset_slot_memory(args.slot_name)
+
     # Fail-fast: chiave rifiutata o configurazione invalida prima di spendere la navigazione.
     build = run_autopilot.build_autopilot_for(
         device_id=args.device, slot_name=args.slot_name, target=args.target, max_steps=args.max_steps,
@@ -220,6 +240,7 @@ def run(args) -> int:
             else:
                 logger.info("Schermate d'ingresso superate: %d giri, %d tocchi, %d nuove ricordate.",
                             intro.data.rounds, intro.data.taps, intro.data.learned)
+            _prepare_slot_map(autopilot, args)
             logger.info("=== FASE GIOCO: %s, target %s EUR ===", args.slot_name, args.target)
             started = time.monotonic()
             session = play_session(autopilot, args.device, args.slot_name, Decimal(str(args.target)),

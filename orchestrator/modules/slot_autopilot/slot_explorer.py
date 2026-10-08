@@ -118,29 +118,32 @@ class SlotExplorer:
         if overview.get("bet_menu_is_open_now") is True:
             self.last_notes.append("il menu puntata risulta gia' aperto: non lo mappo")
             return
-        opened_path = None
-        if open_point is not None:
-            changed, _, opened_path = self._tap_changes(device_id, open_point)
-            if not changed:
-                open_point, opened_path = None, None
-        if open_point is None and self.describe is not None:
-            fallback = self._describe(closed_path, size,
-                                      "the icon or control that opens the bet amount selection menu")
-            if fallback is not None:
-                candidate = Point(int(fallback[0]), int(fallback[1]), "trovato con la ricerca a griglia")
+        candidates = [open_point] if open_point is not None else []
+        tried_grid = False
+        while True:
+            for candidate in candidates:
                 changed, _, opened_path = self._tap_changes(device_id, candidate)
-                if changed:
-                    open_point = candidate
-        if open_point is None or opened_path is None:
-            self.last_notes.append("non riesco ad aprire il menu puntata")
-            return
-        open_point.verified = True
-        smap.bet_menu_open = open_point
-
-        menu = self._ask(opened_path, _MENU_SYSTEM, "Describe the open bet menu and how to close it.")
-        menu_type = (menu or {}).get("menu_type")
-        smap.bet_menu_type = menu_type if menu_type in BET_MENU_TYPES else "other"
-        self._close_menu(device_id, smap, closed_path, (menu or {}).get("close"))
+                if not changed or opened_path is None:
+                    continue
+                menu = self._ask(opened_path, _MENU_SYSTEM, "Describe the open bet menu and how to close it.")
+                # "Verificato" = si e' aperto davvero un elenco di puntate (non una schermata qualsiasi).
+                if menu and menu.get("lowest_visible_bet"):
+                    candidate.verified = True
+                    smap.bet_menu_open = candidate
+                    menu_type = menu.get("menu_type")
+                    smap.bet_menu_type = menu_type if menu_type in BET_MENU_TYPES else "other"
+                    self._close_menu(device_id, smap, closed_path, menu.get("close"))
+                    return
+                self.last_notes.append(f"il tocco su ({candidate.x},{candidate.y}) non apre un menu di puntate")
+                self._tap_changes(device_id, candidate)          # si annulla (stesso tocco: apre/chiude)
+            if tried_grid or self.describe is None:
+                break
+            tried_grid = True
+            fallback = self._describe(closed_path, size, "the icon or control that opens the bet amount selection menu")
+            if fallback is None:
+                break
+            candidates = [Point(int(fallback[0]), int(fallback[1]), "trovato con la ricerca a griglia")]
+        self.last_notes.append("non riesco ad aprire il menu puntata")
 
     def _close_menu(self, device_id: str, smap: SlotMap, closed_path: str, close: Optional[dict]) -> None:
         """Prova il metodo di chiusura indicato da Sol e poi il tocco sulla stessa icona; si salva solo cio' che
@@ -166,10 +169,17 @@ class SlotExplorer:
 
     # ---- spin --------------------------------------------------------------------------------------------------
     def _map_spin(self, device_id: str, smap: SlotMap, overview: dict, demo: bool) -> None:
-        if not demo:
-            self.last_notes.append("soldi veri: non tocco lo spin per verificarlo")
-            return
         point = self._point(overview.get("spin"), smap.screen)
+        if not demo:
+            # Soldi veri: nessuno spin di prova a pagamento. Il punto di Sol resta "in attesa" e lo conferma il
+            # primo spin vero della sessione (che si gioca comunque, alla puntata minima).
+            if point is not None:
+                point.verified = False
+                point.description = (point.description or "spin") + " (da confermare col primo spin)"
+                smap.spin, smap.spin_pending = point, True
+            else:
+                self.last_notes.append("Sol non ha indicato lo spin")
+            return
         for attempt in range(2):
             if point is None:
                 break
@@ -184,7 +194,7 @@ class SlotExplorer:
             if spent or (changed and (balance_before is None or balance_after is None)):
                 point.verified = True
                 point.description = (point.description or "spin") + (" (addebito visto)" if spent else " (schermo cambiato)")
-                smap.spin = point
+                smap.spin, smap.spin_pending = point, False
                 self._wait_still(device_id)
                 return
             point = None

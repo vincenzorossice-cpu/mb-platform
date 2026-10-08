@@ -59,7 +59,12 @@ logger = logging.getLogger(__name__)
 
 # Loggers i cui messaggi INFO restano anche sulla console (progresso e eventi chiave);
 # tutto il resto va solo su file (a meno che non sia un avviso/errore).
-_CONSOLE_INFO_LOGGERS = ("__main__", "orchestrator.scripts.run_autopilot")
+_CONSOLE_INFO_LOGGERS = (
+    "__main__", "orchestrator.scripts.run_autopilot",
+    # "Learn once, remember forever": mappa trovata/esplorata, intro superate, verifiche (prima erano solo nel file)
+    "orchestrator.modules.slot_autopilot.slot_setup", "orchestrator.modules.slot_autopilot.slot_explorer",
+    "orchestrator.modules.slot_autopilot.slot_intro",
+)
 _HARMLESS_WARNING_PATTERNS = (".*pin_memory.*", ".*quantize_per_tensor.*")
 
 
@@ -238,6 +243,14 @@ def build_autopilot_for(
     return Result.ok(autopilot)
 
 
+def _reset_slot_memory(slot_name: str) -> None:
+    moved = SlotMemory("slot_memory").reset(slot_name)
+    if moved.success:
+        logger.info("Memoria della slot '%s' spostata in backup (%d file): riparto da zero.", slot_name, len(moved.data))
+    else:
+        logger.error("Reset della memoria non riuscito: %s", moved.error)
+
+
 def _run_session(autopilot: SlotAutoPilot, args: argparse.Namespace) -> int:
     """Una sessione da riga di comando: il ciclo vero sta in play_session (condiviso con CasinoFlow)."""
     model_metrics.start_run("slot_autopilot", args.slot.replace(" ", "_"))
@@ -285,6 +298,8 @@ def _parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--require-profile", action="store_true", help="Rifiuta le slot senza profilo in provider_profiles/.")
     parser.add_argument("--log-dir", default="logs", help="Cartella del file di log completo (default: logs).")
     parser.add_argument("--no-hitl", action="store_true", help="Disabilita il fallback HITL da terminale.")
+    parser.add_argument("--reset-slot-memory", action="store_true",
+                        help="Prima di partire sposta in slot_memory/_backup/ la memoria di questa slot (riparte da zero).")
     parser.add_argument("--min-bet", type=float, default=None,
                         help="Puntata minima NOTA della slot (EUR): vale come minimo dimostrato e ripara la memoria.")
     return parser.parse_args(argv)
@@ -295,6 +310,8 @@ def main() -> None:
     log_path = _configure_logging(getattr(args, "log_dir", "logs"), args.slot)
     logger.info("Dettaglio completo su file: %s", log_path)
 
+    if getattr(args, "reset_slot_memory", False):
+        _reset_slot_memory(args.slot)
     build_result = build_autopilot(args)
     if not build_result.success:
         logger.error("Impossibile inizializzare SlotAutoPilot: %s (%s)", build_result.error, build_result.error_code)

@@ -27,3 +27,4 @@ logs/
 slot_memory/*.slot_map.json
 slot_memory/*.intro.json
 slot_memory/*.spin_button.json
+slot_memory/_backup/

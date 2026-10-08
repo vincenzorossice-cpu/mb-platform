@@ -112,8 +112,8 @@ class FakePhone:
         self.taps.append((x, y))
         if self.state == "closed" and abs(x - 60) < 15 and abs(y - 380) < 15 and self.menu_opens:
             self.state = "menu"
-        elif self.state == "menu" and y < 100:
-            self.state = "closed"
+        elif self.state == "menu" and (y < 100 or (abs(x - 60) < 15 and abs(y - 380) < 15)):
+            self.state = "closed"                      # tocco fuori dal pannello, oppure stessa icona (toggle)
         elif self.state == "closed" and abs(x - 100) < 15 and abs(y - 360) < 15:
             self.state = "spun" if self.spin_charges else "closed"
         return Result.ok(True)
@@ -176,13 +176,24 @@ class TestSlotExplorer:
 
         assert result.success and describe.call_count == 1 and result.data.bet_menu_open.x == 60
 
-    def test_with_real_money_the_spin_is_not_touched_and_no_map_comes_out(self, tmp_path):
+    def test_with_real_money_the_spin_is_not_touched_and_the_map_keeps_it_pending(self, tmp_path):
         explorer, phone, _ = self._explorer(tmp_path)
 
         result = explorer.explore("d", "Wrap", demo=False)
 
-        assert not result.success and result.error_code == "EXPLORE_INCOMPLETE"
-        assert (100, 360) not in phone.taps
+        assert result.success and result.data.spin_pending and not result.data.spin.verified
+        assert (100, 360) not in phone.taps                      # nessuno spin di prova a pagamento
+        assert result.data.bet_menu_open.verified                # il resto (gratis) e' stato mappato e verificato
+
+    def test_a_menu_that_opens_something_else_is_not_saved_as_the_bet_menu(self, tmp_path):
+        phone = FakePhone(tmp_path)
+        gpt = _sol(OVERVIEW, {"menu_type": "other", "lowest_visible_bet": None, "close": None})
+        explorer = SlotExplorer(gpt, phone, phone, ocr_reader=phone, describe=None, sleep=lambda s: None)
+
+        smap = explorer.explore("d", "Wrap", demo=True).data
+
+        assert smap.bet_menu_open is None
+        assert any("non apre un menu di puntate" in note for note in explorer.last_notes)
 
     def test_a_spin_that_does_not_charge_is_not_saved(self, tmp_path):
         explorer, _, _ = self._explorer(tmp_path, phone=FakePhone(tmp_path, spin_charges=False))
