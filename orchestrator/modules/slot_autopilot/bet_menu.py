@@ -98,6 +98,7 @@ class BetMenuSelector:
         # scroll_probe: prima di scegliere si prova a scorrere la fila di celle (le puntate basse possono essere fuori
         # schermo). Spento di default: lo accende la radice di composizione.
         self.scroll_probe = scroll_probe
+        self._dead_toggles = {}
         self.locator = locator
         self.verifier = verifier
         # Opzionale: se la puntata riletta dopo la scelta non e' leggibile o non torna, Sol guarda lo schermo
@@ -126,6 +127,7 @@ class BetMenuSelector:
                 self.locator.record_failure(toggle.strategy_name, _MENU_TOGGLE)
             if toggle_tap.success and toggle_tap.data.outcome == "unexpected_change":
                 return self._undo_wrong_toggle(device_id, slot_name, toggle, toggle_tap.data, context_provider)
+            self._note_dead_toggle(slot_name, toggle)
             return Result.fail("Opening the bet menu had no visible effect", "MENU_TOGGLE_NO_EFFECT")
         opened = self._fresh(context_provider)
         if opened is None:
@@ -143,10 +145,25 @@ class BetMenuSelector:
                 self.locator.record_failure(toggle.strategy_name, _MENU_TOGGLE)
             return self._undo_wrong_toggle(device_id, slot_name, toggle, toggle_tap.data, context_provider)
         self.locator.record_success(toggle.strategy_name, _MENU_TOGGLE)
+        self._dead_toggles.pop(slot_name, None)
         self.locator.save_verified_candidate(
             _MENU_TOGGLE, toggle, slot_name, context.screen_width, context.screen_height,
         )
         return self._select_from_open(device_id, opened, context_provider, toggle, slot_name, allow_operator)
+
+    def _note_dead_toggle(self, slot_name: str, toggle) -> None:
+        """Un'icona ricordata che non apre il menu per la seconda volta di fila e' un punto sbagliato: si dimentica."""
+        if toggle.strategy_name != "memory":
+            return
+        previous, count = self._dead_toggles.get(slot_name, (None, 0))
+        count = count + 1 if previous == (toggle.x, toggle.y) else 1
+        self._dead_toggles[slot_name] = ((toggle.x, toggle.y), count)
+        if count >= 2:
+            logger.warning("bet menu: l'icona ricordata (%d,%d) non apre il menu per %d volte di fila: la dimentico.",
+                           toggle.x, toggle.y, count)
+            forget_autopilot_element(slot_name, _MENU_TOGGLE, self._memory_dir())
+            self.locator.reject_position(_MENU_TOGGLE, toggle.x, toggle.y)
+            self._dead_toggles.pop(slot_name, None)
 
     def _memory_dir(self) -> str:
         directory = getattr(self.locator, "memory_dir", None)
@@ -309,6 +326,24 @@ class BetMenuSelector:
             logger.info("bet menu: la fila di celle non scorre: quello che si vede e' tutto l'elenco.")
         proven = not progressed_any
         return shown[0], shown[1], proven
+
+    def ensure_closed(self, device_id: str, slot_name: str, context_provider: Callable[[], Result]) -> bool:
+        """Dopo aver cambiato la puntata: se Sol vede ancora un pannello aperto lo si chiude (punto ricordato ->
+        icona -> operatore, e il punto che chiude viene ricordato). True se c'era da chiudere e si e' chiuso."""
+        check = getattr(self.supervisor, "check_menu_open", None)
+        if not callable(check):
+            return False
+        verdict = check(device_id)
+        if verdict != "open":
+            return False
+        logger.info("bet menu: Sol vede ancora un pannello aperto dopo la scelta della puntata: lo chiudo.")
+        current = self._fresh(context_provider)
+        if current is None:
+            return False
+        closed = self._close_menu(device_id, slot_name, current, current, None, context_provider, True)
+        if not closed.success:
+            logger.warning("bet menu: pannello rimasto aperto (%s).", closed.error_code)
+        return closed.success
 
     def _close_menu(
         self, device_id: str, slot_name: str, opened, after, toggle, context_provider, allow_operator: bool,

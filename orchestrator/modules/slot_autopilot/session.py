@@ -11,6 +11,7 @@ MAX_CONSECUTIVE_NO_EFFECT_SPINS = 3
 MAX_HELP_REQUESTS = 5       # richieste di aiuto all'operatore per sessione prima di fermarsi
 MAX_REENTRIES = 3             # rientri nella slot per sessione (sessione scaduta, pagina di errore)
 LOST_CHECK_AFTER_SECONDS = 15  # schermo occupato da cosi' tanto: prima di aspettare oltre si controlla che la slot ci sia
+LOST_CHECK_UNREADABLE_SECONDS = 8   # idem quando il saldo non si legge proprio (slot chiusa, lobby)
 BET_WINDOW = 4                 # spin consecutivi per accorgersi che la puntata creduta e' troppo alta
 BET_WINDOW_RATIO = Decimal("0.6")
 MAX_OPERATOR_ACTIONS = 3   # interventi dell'operatore senza spin prima di fermarsi
@@ -123,6 +124,21 @@ def _log_capture_stats(autopilot, log) -> None:
         if calls > 0:
             log.info("Screenshot ADB (modo %s): %d in %.0f s, %.2f s a scatto.",
                      getattr(autopilot.screen_reader, "capture_mode", "?"), calls, seconds, seconds / calls)
+    except Exception:
+        pass
+
+
+def _log_arrow_stats(autopilot, log) -> None:
+    """Una riga per capire dalla console se la freccia dello spin lavora o se si aspetta lo schermo fermo."""
+    try:
+        stats = autopilot.spin_controller.arrow_stats
+        spins = int(stats["spins"])
+        if spins > 0:
+            log.info(
+                "Freccia spin: riferimento %s, %d spin chiusi dalla freccia, %d dallo schermo fermo, %.1f scatti di "
+                "attesa per spin.", "SI" if stats["with_reference"] else "NO", int(stats["arrow"]),
+                int(stats["still"]), stats["shots"] / spins,
+            )
     except Exception:
         pass
 
@@ -432,7 +448,10 @@ def play_session(
                     )
                     _busy_diagnostics(autopilot, device_id, "occupato_inizio", log, "schermo_occupato")
                 waited = time.monotonic() - busy_since
-                if waited >= LOST_CHECK_AFTER_SECONDS and not lost_checked and reenter is not None:
+                lost_after = (LOST_CHECK_UNREADABLE_SECONDS
+                              if "non leggibil" in str(getattr(spin_result.data, "blocked_detail", None) or "")
+                              else LOST_CHECK_AFTER_SECONDS)
+                if waited >= lost_after and not lost_checked and reenter is not None:
                     lost_checked = True
                     if _check_lost(autopilot, device_id) == "lost" and try_reenter(
                         f"schermo occupato da {waited:.0f} s e la slot non e' piu' sullo schermo",
@@ -485,6 +504,13 @@ def play_session(
                     continue
                 failed, stop_reason = True, "BUSY_TIMEOUT"
             else:
+                if _check_lost(autopilot, device_id) == "lost" and try_reenter(
+                    f"spin bloccato ({spin_result.data.violated_invariant}) e la slot non e' piu' sullo schermo",
+                ):
+                    consecutive_no_effect, busy_since, busy_asked, lost_checked = 0, None, False, False
+                    recent_spins.clear()
+                    spin_index -= 1
+                    continue
                 log.warning("Spin bloccato da un'invariante di sicurezza: %s", spin_result.data.violated_invariant)
                 stop_reason = "BLOCKED"
             break
@@ -493,6 +519,7 @@ def play_session(
     if averages is not None:
         log.info("%s", timing_summary_line(averages, len([t for t in collected_timings if isinstance(t, dict)])))
     _log_capture_stats(autopilot, log)
+    _log_arrow_stats(autopilot, log)
 
     initial_balance, final_balance = autopilot.get_balance_summary()
     net = None

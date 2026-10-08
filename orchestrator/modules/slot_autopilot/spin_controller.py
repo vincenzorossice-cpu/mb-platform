@@ -76,6 +76,7 @@ class SpinController:
         # Opzionale: lost_check(device) -> 'in_game' | 'lost' | 'unknown' (SlotSupervisor.check_in_game). Se il pulsante
         # spin non si trova, prima dell'operatore si controlla che la slot sia ancora sullo schermo.
         self.lost_check = None
+        self.arrow_stats = {"arrow": 0, "still": 0, "with_reference": False, "shots": 0, "spins": 0}
         self._dead_spin_points = {}        # slot -> ((x, y), volte di fila) tocchi che non hanno mai addebitato
 
     def spin(
@@ -396,6 +397,11 @@ class SpinController:
             else:
                 button_status = "NON appreso: lo screenshot 'occupato' dopo il tocco non e' stato raccolto"
                 logger.warning("pulsante spin: %s", button_status)
+        if verified:
+            self.arrow_stats["spins"] += 1
+            self.arrow_stats["shots"] += wait_captures
+            self.arrow_stats["arrow" if ended_ready else "still"] += 1
+            self.arrow_stats["with_reference"] = self.arrow_stats["with_reference"] or ready_check is not None
         if verified and ended_ready:
             # La freccia e' tornata: se il prossimo spin parte subito non serve controllare di nuovo.
             self._calm_skip_deadline = time.monotonic() + self.config.spin_calm_skip_max_age_seconds
@@ -584,7 +590,11 @@ class SpinController:
     def _check_invariants(self, min_bet_verified, balance_before, expected_bet, context, force: bool = False) -> Optional[str]:
         if not min_bet_verified:
             return "MIN_BET_NOT_VERIFIED"
-        if balance_before is None or expected_bet is None or balance_before < expected_bet:
+        if balance_before is None:
+            # Saldo non leggibile (slot chiusa, lobby, pagina di errore): non e' "saldo insufficiente". Passa dal
+            # percorso "schermo occupato", che controlla se si e' ancora nella slot e, se no, rientra.
+            return "UNSAFE_SCREEN_STATE"
+        if expected_bet is None or balance_before < expected_bet:
             return "INSUFFICIENT_BALANCE"
         if not force and classify_screen_state(context.slot_ocr_state) != "idle":
             return "UNSAFE_SCREEN_STATE"

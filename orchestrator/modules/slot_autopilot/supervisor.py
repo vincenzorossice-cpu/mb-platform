@@ -70,7 +70,7 @@ class SlotSupervisor:
         self, gpt_client, screen_reader, touch_injector,
         describe: Optional[Callable[[str, LocateContext], Optional[tuple]]] = None,
         max_calls: int = 6, max_interventions: int = 3, settle_seconds: float = _SETTLE_SECONDS,
-        max_lost_checks: int = 6,
+        max_lost_checks: int = 6, max_menu_checks: int = 4,
     ):
         self.gpt_client = gpt_client
         self.screen_reader = screen_reader
@@ -83,11 +83,14 @@ class SlotSupervisor:
         self.interventions = 0
         self.max_lost_checks = max_lost_checks
         self.lost_checks = 0
+        self.max_menu_checks = max_menu_checks
+        self.menu_checks = 0
 
     def reset(self) -> None:
         self.calls = 0
         self.interventions = 0
         self.lost_checks = 0
+        self.menu_checks = 0
 
     def observe(self, screenshot_path: str, goal: str = "", use_budget: bool = True) -> Optional[Observation]:
         """Una chiamata al modello decisionale sullo screenshot; None se il budget e' finito o la risposta manca.
@@ -180,6 +183,23 @@ class SlotSupervisor:
         if observation is None or observation.in_game is None:
             return "unknown"
         return "in_game" if observation.in_game else "lost"
+
+    def check_menu_open(self, device_id: str) -> str:
+        """Un menu/pannello (puntata, impostazioni) copre ancora il gioco? 'open' | 'closed' | 'unknown'. Ha un budget
+        proprio e non consuma quello delle altre osservazioni."""
+        if self.menu_checks >= self.max_menu_checks:
+            return "unknown"
+        self.menu_checks += 1
+        path = self._screenshot(device_id)
+        if path is None:
+            return "unknown"
+        observation = self.observe(
+            path, "the player just changed the bet: is a bet-selection menu or any other panel still open over the "
+                  "game?", use_budget=False,
+        )
+        if observation is None:
+            return "unknown"
+        return "open" if observation.screen_state == "modal" else "closed"
 
     def check_ready(self, device_id: str) -> str:
         """Lo schermo risulta 'occupato' al controllo locale: Sol dice se il gioco e' in realta' pronto.

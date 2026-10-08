@@ -104,6 +104,13 @@ class BetController:
             result.data.min_bet_verified = False
             result.data.aborted_reason = "ABOVE_KNOWN_MIN"
             result.data.outcome = "aborted"
+        if result.success and result.data.min_bet_verified and (result.data.attempts or result.data.strategy_sequence):
+            # Qualcosa e' stato toccato (menu, discesa, operatore): un pannello puo' essere rimasto aperto.
+            try:
+                if self.menu_selector is not None:
+                    self.menu_selector.ensure_closed(device_id, slot_name, context_provider)
+            except Exception as exc:    # il controllo non deve mai rompere la verifica della puntata
+                logger.warning("set_min_bet: controllo del pannello aperto fallito: %s", exc)
         if result.success and result.data.min_bet_verified and result.data.final_bet is not None:
             known = self._session_min.get(slot_name)
             self._session_min[slot_name] = (
