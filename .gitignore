@@ -22,3 +22,8 @@ write_live_*.py
 logs/
 .env
 .env
+
+# Mappe delle slot apprese (locali a ogni PC, non nel repo)
+slot_memory/*.slot_map.json
+slot_memory/*.intro.json
+slot_memory/*.spin_button.json

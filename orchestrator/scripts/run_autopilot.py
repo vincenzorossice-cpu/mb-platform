@@ -41,6 +41,9 @@ from orchestrator.modules.slot_autopilot.strategies.profile_strategy import Prof
 from orchestrator.modules.slot_autopilot.strategies.spatial_heuristic_strategy import SpatialHeuristicStrategy
 from orchestrator.modules.slot_autopilot.strategies.template_strategy import TemplateStrategy
 from orchestrator.modules.slot_autopilot.screen_recovery import ScreenRecovery
+from orchestrator.modules.slot_autopilot.slot_explorer import SlotExplorer
+from orchestrator.modules.slot_autopilot.slot_map import SlotMemory
+from orchestrator.modules.slot_autopilot.slot_setup import SlotSetup
 from orchestrator.modules.slot_autopilot.session import (
     BET_FAILURE_MESSAGES as _BET_FAILURE_MESSAGES,
     progress_line as _progress_line,
@@ -124,6 +127,7 @@ def build_autopilot(args: argparse.Namespace) -> Result[SlotAutoPilot]:
 def build_autopilot_for(
     device_id: str, slot_name: str, target, max_steps: int = 500, enable_gpt: bool = True,
     enable_hitl: bool = True, live: bool = False, require_profile: bool = False, known_min_bet=None,
+    explore_demo: bool = True,
 ) -> Result[SlotAutoPilot]:
     """Unico punto del progetto dove queste classi concrete vengono
     istanziate direttamente: ogni modulo a monte le riceve per DI. Usato dalla riga di comando
@@ -215,6 +219,17 @@ def build_autopilot_for(
         bet_controller=bet_controller, spin_controller=spin_controller, step_logger=step_logger,
         profile_builder=ProfileBuilder(profiles_dir=config.profiles_dir, memory_dir=config.slot_memory_dir),
     )
+    if gpt_client is not None and "gpt" in strategies and os.environ.get("SLOT_MAP", "1").strip().lower() not in ("0", "false", "no"):
+        # "Learn once, remember forever": mappa verificata della slot (Sol la esplora la prima volta, poi zero GPT).
+        # explore_demo: l'esplorazione puo' toccare lo spin per verificarlo (solo in demo, mai con soldi veri).
+        autopilot_explorer = SlotExplorer(
+            gpt_client, screen_reader, touch_injector, ocr_reader=ocr_reader,
+            describe=strategies["gpt"].locate_described,
+        )
+        autopilot.slot_setup = SlotSetup(
+            SlotMemory(config.slot_memory_dir), autopilot_explorer, screen_reader,
+            known_min_bet=config.known_min_bet, demo=explore_demo, gpt_client=gpt_client,
+        )
     if supervisor is not None:
         spin_controller.lost_check = supervisor.check_in_game
     autopilot.gpt_client = gpt_client   # per il riepilogo dei costi a fine sessione

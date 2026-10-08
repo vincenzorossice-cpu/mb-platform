@@ -143,6 +143,36 @@ def _log_arrow_stats(autopilot, log) -> None:
         pass
 
 
+def _setup_of(autopilot):
+    """L'oggetto SlotSetup dell'autopilot, solo se e' uno vero (stato testo o None)."""
+    setup = getattr(autopilot, "slot_setup", None)
+    if setup is None or not callable(getattr(setup, "prepare", None)):
+        return None
+    return setup if isinstance(getattr(setup, "status", "?"), (str, type(None))) else None
+
+
+def _log_slot_memory(autopilot, log) -> None:
+    """Riga di diagnosi: la slot era gia' mappata (zero GPT per orientarsi) o e' stata esplorata, e quanto e' costato GPT."""
+    try:
+        setup = _setup_of(autopilot)
+        status = setup.status if setup is not None else None
+        client = getattr(autopilot, "gpt_client", None)
+        usage = getattr(client, "_usage", None)
+        calls = sum(int(entry["calls"]) for entry in usage.values()) if isinstance(usage, dict) else None
+        costs = [entry["cost"] for entry in usage.values()] if isinstance(usage, dict) else []
+        if status:
+            log.info("Slot memory: %s.", status + (" (slot gia' mappata)" if status == "USATA" else ""))
+        if calls is not None:
+            if calls == 0:
+                log.info("Costo GPT del gioco: $0 (zero chiamate)%s.", " - slot mappata" if status == "USATA" else "")
+            else:
+                known = [c for c in costs if c is not None]
+                log.info("Costo GPT del gioco: ~$%.4f (%d chiamate)%s.", sum(known), calls,
+                         "" if len(known) == len(costs) else " (parziale: prezzo di un modello ignoto)")
+    except Exception:
+        pass
+
+
 def _ask_if_ready(autopilot, device_id: str) -> str:
     diagnose = getattr(autopilot, "diagnose_busy", None)
     if not callable(diagnose):
@@ -265,6 +295,13 @@ def play_session(
     log.info("Preparazione completata.")
     _log_phase(autopilot, "Preparazione", time.monotonic() - phase_started, log)
 
+    slot_setup = _setup_of(autopilot)
+    if slot_setup is not None:
+        prepared_map = slot_setup.prepare(device_id, slot_name)
+        if not prepared_map.success:
+            log.warning("Slot memory: preparazione non riuscita (%s): proseguo come prima.", prepared_map.error_code)
+    reexplored = {"spin": False, "bet_menu": False}
+
     log.info("Verifica puntata minima in corso...")
     phase_started = time.monotonic()
     bet_result = autopilot.set_min_bet(device_id)
@@ -276,6 +313,12 @@ def play_session(
             "Impossibile verificare la puntata minima (%s): %s", reason,
             BET_FAILURE_MESSAGES.get(reason, "mi fermo senza spinnare."),
         )
+        if slot_setup is not None and reason != "HITL_STOP" and not reexplored["bet_menu"]:
+            reexplored["bet_menu"] = True
+            log.warning("Slot memory: la puntata non si imposta con la mappa salvata: rifaccio l'esplorazione del menu.")
+            if slot_setup.reexplore(device_id, slot_name, "bet_menu").success:
+                bet_result = autopilot.set_min_bet(device_id)
+                continue
         if reason != "HITL_STOP" and _ask_operator(
             autopilot, device_id, f"Non riesco a verificare la puntata minima ({reason}).", log, help_state,
         ) == "retry":
@@ -412,6 +455,13 @@ def play_session(
                     recent_spins.clear()
                     spin_index -= 1
                     continue
+                if slot_setup is not None and not reexplored["spin"]:
+                    reexplored["spin"] = True
+                    log.warning("Slot memory: lo spin salvato non addebita: rifaccio l'esplorazione del pulsante.")
+                    if slot_setup.reexplore(device_id, slot_name, "spin").success:
+                        consecutive_no_effect = 0
+                        spin_index -= 1
+                        continue
                 verdict = _ask_operator(
                     autopilot, device_id,
                     f"{consecutive_no_effect} spin senza addebito: il pulsante spin non risponde (forse un menu o un "
@@ -520,6 +570,7 @@ def play_session(
         log.info("%s", timing_summary_line(averages, len([t for t in collected_timings if isinstance(t, dict)])))
     _log_capture_stats(autopilot, log)
     _log_arrow_stats(autopilot, log)
+    _log_slot_memory(autopilot, log)
 
     initial_balance, final_balance = autopilot.get_balance_summary()
     net = None

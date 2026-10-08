@@ -45,6 +45,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--no-gpt", action="store_true")
     parser.add_argument("--min-bet", type=float, default=None,
                         help="Puntata minima NOTA della slot (EUR): vale come minimo dimostrato e ripara la memoria.")
+    parser.add_argument("--nav-direct", action="store_true",
+                        help="Navigazione: un punto diretto di Sol al posto della griglia icone (la griglia resta come ripiego).")
     parser.add_argument("--no-hitl", action="store_true", help="Niente operatore da terminale: se serve aiuto ci si ferma.")
     parser.add_argument("--no-save-steps", action="store_true")
     parser.add_argument("--log-dir", default="logs")
@@ -91,9 +93,14 @@ def navigate_to_slot(args, navigation_client, screen_reader, touch_injector) -> 
     steps_dir = os.path.join(args.log_dir, f"promo_complete_{stamp}")
     step_saver = None if args.no_save_steps else nav_script.make_step_saver(steps_dir)
     book_navigator = BookNavigator(screen_reader=screen_reader, touch_injector=touch_injector)
+    nav_stats = {"direct": 0, "grid": 0}
+    nav_refiner = build_region_refiner(navigation_client)
+    if getattr(args, "nav_direct", False):
+        from orchestrator.modules.screen_navigator.direct_point import build_direct_refiner
+        nav_refiner = build_direct_refiner(navigation_client, nav_refiner, nav_stats)
     navigator = ScreenNavigator(
         screen_reader=screen_reader, touch_injector=touch_injector, decision_engine_client=navigation_client,
-        region_refiner=build_region_refiner(navigation_client), max_steps=args.max_steps, step_observer=step_saver,
+        region_refiner=nav_refiner, max_steps=args.max_steps, step_observer=step_saver,
         app_guard=lambda device: book_navigator.is_app_in_front(device, nav_script.CHROME_PACKAGE),
         app_restore=lambda device: book_navigator.bring_to_front(device, nav_script.CHROME_PACKAGE),
     )
@@ -107,6 +114,9 @@ def navigate_to_slot(args, navigation_client, screen_reader, touch_injector) -> 
     result = navigator.navigate(args.device, goal=goal, book=args.book, demo_mode=True, vision_mode=True)
     for entry in navigator.last_history:
         logger.info("  %2s. %s -> %s", entry["step"], entry["action"], entry["target"])
+    if getattr(args, "nav_direct", False):
+        logger.info("Navigazione: %d punti diretti di Sol, %d ricerche a griglia (ripiego).",
+                    nav_stats["direct"], nav_stats["grid"])
     if not result.success:
         return Result.fail(result.error, result.error_code)
     return Result.ok(len(navigator.last_history))
