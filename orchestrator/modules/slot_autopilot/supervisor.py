@@ -21,7 +21,8 @@ _SYSTEM_PROMPT = (
     "You supervise an automatic player of a slot machine game on an Android phone. You see ONE screenshot. "
     "Answer ONLY with JSON: "
     '{"screen_state": "' + "|".join(_SCREEN_STATES) + '", "credit_text": <string|null>, "bet_text": <string|null>, '
-    '"action": "none|close", "target_description": <string|null>, "spin_ready": <true|false>, "reasoning": <short string>}. '
+    '"action": "none|close", "target_description": <string|null>, "spin_ready": <true|false>, "in_game": <true|false>, '
+    '"reasoning": <short string>}. '
     "screen_state: idle = reels stopped and nothing covers the game; modal = a menu/popup/panel covers part of the "
     "game (bet selection menu, settings, info, paytable); spinning; win_presentation; loading; intro; error; other. "
     "credit_text = the player's balance/credit; bet_text = the current TOTAL bet of one spin. COPY each amount exactly "
@@ -32,7 +33,10 @@ _SYSTEM_PROMPT = (
     "then target_description = the close control (for example 'the X at the top right of the panel'). Otherwise "
     "'none'. spin_ready = true if the spin button is visible and the game is waiting for the player, EVEN IF a win "
     "overlay, a big win number or an animation is shown over the reels; false during a spin in progress, a bonus / "
-    "free-spins feature, a loading screen or an open menu. NEVER suggest spinning or tapping the spin button."
+    "free-spins feature, a loading screen or an open menu. in_game = true if the slot game itself (reels, spin "
+    "button) is on screen, even with a menu or overlay over it; false if the screen shows instead a 'session "
+    "expired' / disconnected / timeout message, the casino lobby or any other website page, a login page or a "
+    "browser error page. NEVER suggest spinning or tapping the spin button."
 )
 
 
@@ -45,6 +49,7 @@ class Observation:
     target_description: Optional[str]
     reasoning: str
     spin_ready: Optional[bool] = None
+    in_game: Optional[bool] = None
 
 
 @dataclass
@@ -65,6 +70,7 @@ class SlotSupervisor:
         self, gpt_client, screen_reader, touch_injector,
         describe: Optional[Callable[[str, LocateContext], Optional[tuple]]] = None,
         max_calls: int = 6, max_interventions: int = 3, settle_seconds: float = _SETTLE_SECONDS,
+        max_lost_checks: int = 6,
     ):
         self.gpt_client = gpt_client
         self.screen_reader = screen_reader
@@ -75,17 +81,22 @@ class SlotSupervisor:
         self.settle_seconds = settle_seconds
         self.calls = 0
         self.interventions = 0
+        self.max_lost_checks = max_lost_checks
+        self.lost_checks = 0
 
     def reset(self) -> None:
         self.calls = 0
         self.interventions = 0
+        self.lost_checks = 0
 
-    def observe(self, screenshot_path: str, goal: str = "") -> Optional[Observation]:
-        """Una chiamata al modello decisionale sullo screenshot; None se il budget e' finito o la risposta manca."""
-        if self.calls >= self.max_calls:
-            logger.warning("supervisore: budget di %d chiamate esaurito.", self.max_calls)
-            return None
-        self.calls += 1
+    def observe(self, screenshot_path: str, goal: str = "", use_budget: bool = True) -> Optional[Observation]:
+        """Una chiamata al modello decisionale sullo screenshot; None se il budget e' finito o la risposta manca.
+        use_budget=False: la chiamata ha un budget proprio (vedi check_in_game)."""
+        if use_budget:
+            if self.calls >= self.max_calls:
+                logger.warning("supervisore: budget di %d chiamate esaurito.", self.max_calls)
+                return None
+            self.calls += 1
         try:
             encoded = _encode_reduced(screenshot_path)
         except OSError as exc:
@@ -114,6 +125,7 @@ class SlotSupervisor:
             screen_state=state, bet=bet, credit=credit, action=action,
             target_description=data.get("target_description") or None, reasoning=str(data.get("reasoning") or ""),
             spin_ready=data.get("spin_ready") if isinstance(data.get("spin_ready"), bool) else None,
+            in_game=data.get("in_game") if isinstance(data.get("in_game"), bool) else None,
         )
         logger.info("supervisore: stato=%s puntata=%s saldo=%s pronto_allo_spin=%s azione=%s (%s)", state, bet, credit,
                     observation.spin_ready, action, observation.reasoning)
@@ -152,6 +164,23 @@ class SlotSupervisor:
             return Assist("at_min", observation.bet)
         return Assist("nothing", observation.bet)
 
+    def check_in_game(self, device_id: str) -> str:
+        """La slot e' ancora sullo schermo? 'in_game', 'lost' (sessione scaduta, lobby, pagina di errore o del sito:
+        bisogna rientrare) o 'unknown' (nessuna risposta o budget proprio finito). Non consuma il budget di osserva."""
+        if self.lost_checks >= self.max_lost_checks:
+            return "unknown"
+        self.lost_checks += 1
+        path = self._screenshot(device_id)
+        if path is None:
+            return "unknown"
+        observation = self.observe(
+            path, "is the slot game still on screen, or has the session expired / has the player been thrown out "
+                  "(error page, lobby, website page, login)?", use_budget=False,
+        )
+        if observation is None or observation.in_game is None:
+            return "unknown"
+        return "in_game" if observation.in_game else "lost"
+
     def check_ready(self, device_id: str) -> str:
         """Lo schermo risulta 'occupato' al controllo locale: Sol dice se il gioco e' in realta' pronto.
         'ready' = pulsante spin visibile e gioco in attesa (anche con overlay di vincita); 'closed' = chiuso un
@@ -168,6 +197,8 @@ class SlotSupervisor:
         )
         if observation is None:
             return "unknown"
+        if observation.in_game is False:
+            return "lost"
         if observation.action == "close" and observation.target_description:
             return "closed" if self._close(device_id, observation.target_description, path) else "busy"
         if observation.spin_ready is True and observation.screen_state in ("idle", "win_presentation", "other"):

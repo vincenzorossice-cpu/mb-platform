@@ -211,6 +211,8 @@ def build_autopilot_for(
         bet_controller=bet_controller, spin_controller=spin_controller, step_logger=step_logger,
         profile_builder=ProfileBuilder(profiles_dir=config.profiles_dir, memory_dir=config.slot_memory_dir),
     )
+    if supervisor is not None:
+        spin_controller.lost_check = supervisor.check_in_game
     autopilot.gpt_client = gpt_client   # per il riepilogo dei costi a fine sessione
     autopilot.hitl_strategy = strategies.get("hitl")
     autopilot.supervisor = supervisor

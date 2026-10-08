@@ -9,6 +9,10 @@ logger = logging.getLogger(__name__)
 # Spin senza effetto di fila dopo i quali ci si ferma (invece di consumare max_steps).
 MAX_CONSECUTIVE_NO_EFFECT_SPINS = 3
 MAX_HELP_REQUESTS = 5       # richieste di aiuto all'operatore per sessione prima di fermarsi
+MAX_REENTRIES = 3             # rientri nella slot per sessione (sessione scaduta, pagina di errore)
+LOST_CHECK_AFTER_SECONDS = 15  # schermo occupato da cosi' tanto: prima di aspettare oltre si controlla che la slot ci sia
+BET_WINDOW = 4                 # spin consecutivi per accorgersi che la puntata creduta e' troppo alta
+BET_WINDOW_RATIO = Decimal("0.6")
 MAX_OPERATOR_ACTIONS = 3   # interventi dell'operatore senza spin prima di fermarsi
 # Schermo non libero dopo uno spin (vincita/bonus/animazione lunga): si aspetta invece di
 # chiudere la sessione, fino a questo tempo.
@@ -45,6 +49,8 @@ class SlotSessionResult:
     target: Decimal = Decimal("0.00")
     # Media per fase (secondi) degli spin riusciti: calma, tocco, attesa, lettura, altro, totale (None se nessuno).
     avg_timings: Optional[dict] = None
+    reentries: int = 0                   # quante volte si e' rientrati nella slot dopo che ci ha cacciato
+    net: Optional[Decimal] = None        # netto vinto/perso sommato su tutti gli ingressi (il saldo demo si ripristina)
 
     @property
     def target_reached(self) -> bool:
@@ -185,12 +191,54 @@ def timing_summary_line(averages: dict, spins: int) -> str:
     )
 
 
+def _check_lost(autopilot, device_id: str) -> str:
+    """Sol dice se la slot e' ancora sullo schermo: 'in_game' | 'lost' | 'unknown' (senza supervisore: unknown)."""
+    check = getattr(getattr(autopilot, "supervisor", None), "check_in_game", None)
+    if not callable(check):
+        return "unknown"
+    try:
+        verdict = check(device_id)
+    except Exception:
+        return "unknown"
+    return verdict if isinstance(verdict, str) else "unknown"
+
+
+def _check_bet_window(recent: list, spin, autopilot, device_id: str, log) -> Decimal:
+    """Puntata creduta piu' alta di quella vera: se in BET_WINDOW spin di fila il calo massimo di saldo e' sotto il
+    60% della puntata creduta (una puntata persa darebbe un calo pari alla puntata), si rilegge la puntata dallo
+    schermo. Ritorna l'importo da togliere dal giocato (0 se la puntata era giusta)."""
+    if spin.balance_before is None or spin.balance_after is None or not spin.bet_amount:
+        recent.clear()
+        return Decimal("0")
+    recent.append((spin.balance_before - spin.balance_after, spin.bet_amount))
+    del recent[:-BET_WINDOW]
+    if len(recent) < BET_WINDOW or len({bet for _, bet in recent}) != 1:
+        return Decimal("0")
+    believed = recent[-1][1]
+    if max(drop for drop, _ in recent) >= believed * BET_WINDOW_RATIO:
+        return Decimal("0")
+    recent.clear()
+    log.warning(
+        "Il saldo scende di molto meno della puntata creduta (%s) in %d spin di fila: rileggo la puntata.",
+        believed, BET_WINDOW,
+    )
+    recheck = autopilot.set_min_bet(device_id)
+    real = recheck.data.final_bet if recheck.success and recheck.data.min_bet_verified else None
+    if real is None or real >= believed:
+        log.info("Puntata riletta: %s (nessuna correzione).", real)
+        return Decimal("0")
+    log.warning("La puntata vera e' %s, non %s: correggo il giocato degli ultimi %d spin.", real, believed, BET_WINDOW)
+    return (believed - real) * BET_WINDOW
+
+
 def play_session(
     autopilot, device_id: str, slot_name: str, target: Decimal, max_steps: int, log: logging.Logger = None,
+    reenter=None,
 ) -> SlotSessionResult:
     """Prepara la slot, porta la puntata al minimo VERIFICATO e gioca fino al target (o a un arresto di
     sicurezza). E' il ciclo usato sia da run_autopilot sia da CasinoFlow. `log` permette a chi chiama di
-    tenere i propri messaggi (filtri della console compresi)."""
+    tenere i propri messaggi (filtri della console compresi). `reenter(device) -> Result`, se dato, riporta
+    dentro la slot quando il sito ci ha cacciati (sessione scaduta, pagina di errore): il giocato prosegue."""
     log = log or logger
     log.info("Preparazione: profilo '%s', dispositivo %s...", slot_name, device_id)
     phase_started = time.monotonic()
@@ -237,6 +285,48 @@ def play_session(
     force_next = False
     collected_timings = []
     button_status_shown = False
+    reentry = {"n": 0, "net": Decimal("0")}
+    recent_spins = []          # (calo di saldo, puntata creduta) degli ultimi spin riusciti
+    lost_checked = False
+    try:
+        first_initial = autopilot.get_balance_summary()[0]
+    except Exception:
+        first_initial = None
+
+    def try_reenter(reason: str) -> bool:
+        """Il sito ci ha cacciati: si rientra dalla navigazione, si ripristina la puntata e si prosegue con lo
+        stesso giocato. Il saldo del segmento finito entra nel netto (in demo rientrando il saldo si ripristina)."""
+        if reenter is None:
+            return False
+        while reentry["n"] < MAX_REENTRIES:
+            reentry["n"] += 1
+            log.warning("RIENTRO %d/%d nella slot: %s", reentry["n"], MAX_REENTRIES, reason)
+            try:
+                initial, final = autopilot.get_balance_summary()
+                if initial is not None and final is not None:
+                    reentry["net"] += final - initial
+            except Exception:
+                pass
+            rejoined = reenter(device_id)
+            prepared = autopilot.prepare(device_id) if rejoined.success else rejoined
+            if rejoined.success and prepared.success:
+                forget = getattr(getattr(autopilot, "bet_controller", None), "forget_session_min", None)
+                if callable(forget):
+                    forget(slot_name)
+                bet = autopilot.set_min_bet(device_id)
+                if bet.success and bet.data.min_bet_verified:
+                    log.info("Rientrato nella slot: puntata %s EUR, riprendo dal giocato %s.",
+                             bet.data.final_bet, total_played)
+                    return True
+                log.error("Rientrato ma non riesco a verificare la puntata minima.")
+            else:
+                log.error("Rientro nella slot non riuscito: %s", rejoined.error if not rejoined.success else prepared.error)
+            if _ask_operator(autopilot, device_id, "non riesco a rientrare nella slot e a riprendere.", log,
+                             help_state) != "retry":
+                return False
+        log.error("Rientri esauriti (%d): mi fermo.", MAX_REENTRIES)
+        return False
+
     while total_played < target and spin_index < max_steps:
         spin_index += 1
         started = time.monotonic()
@@ -279,9 +369,18 @@ def play_session(
                 break
             log.info("Puntata riverificata: %s EUR.", recheck.data.final_bet)
             continue
+        if spin_result.data.outcome == "slot_lost":
+            if try_reenter("il pulsante spin non c'e' e la slot non e' piu' sullo schermo"):
+                consecutive_no_effect, busy_since, busy_asked, lost_checked = 0, None, False, False
+                recent_spins.clear()
+                spin_index -= 1
+                continue
+            failed, stop_reason = True, "SLOT_LOST"
+            break
         if spin_result.data.outcome != "blocked":
             busy_since = None
             busy_asked = False
+            lost_checked = False
         if spin_result.data.outcome == "no_effect":
             consecutive_no_effect += 1
             if consecutive_no_effect >= MAX_CONSECUTIVE_NO_EFFECT_SPINS:
@@ -290,6 +389,13 @@ def play_session(
                     "(rilancia: il punto sbagliato viene ricordato solo per la sessione).",
                     consecutive_no_effect,
                 )
+                if _check_lost(autopilot, device_id) == "lost" and try_reenter(
+                    f"{consecutive_no_effect} spin senza addebito e la slot non e' piu' sullo schermo",
+                ):
+                    consecutive_no_effect, busy_since, busy_asked, lost_checked = 0, None, False, False
+                    recent_spins.clear()
+                    spin_index -= 1
+                    continue
                 verdict = _ask_operator(
                     autopilot, device_id,
                     f"{consecutive_no_effect} spin senza addebito: il pulsante spin non risponde (forse un menu o un "
@@ -305,6 +411,10 @@ def play_session(
             consecutive_no_effect = 0
         if spin_result.data.outcome == "success" and spin_result.data.bet_amount:
             total_played += spin_result.data.bet_amount
+            correction = _check_bet_window(recent_spins, spin_result.data, autopilot, device_id, log)
+            if correction:
+                total_played -= correction
+                log.warning("Giocato corretto di -%s EUR: ora %s.", correction, total_played)
             collected_timings.append(getattr(spin_result.data, "timings", None))
             status = getattr(spin_result.data, "button_status", None)
             if isinstance(status, str) and not button_status_shown:
@@ -322,9 +432,23 @@ def play_session(
                     )
                     _busy_diagnostics(autopilot, device_id, "occupato_inizio", log, "schermo_occupato")
                 waited = time.monotonic() - busy_since
+                if waited >= LOST_CHECK_AFTER_SECONDS and not lost_checked and reenter is not None:
+                    lost_checked = True
+                    if _check_lost(autopilot, device_id) == "lost" and try_reenter(
+                        f"schermo occupato da {waited:.0f} s e la slot non e' piu' sullo schermo",
+                    ):
+                        consecutive_no_effect, busy_since, busy_asked, lost_checked = 0, None, False, False
+                        recent_spins.clear()
+                        spin_index -= 1
+                        continue
                 if waited >= BUSY_ASK_AFTER_SECONDS and not busy_asked:
                     busy_asked = True
                     verdict = _ask_if_ready(autopilot, device_id)
+                    if verdict == "lost" and try_reenter("Sol: la slot non e' piu' sullo schermo"):
+                        consecutive_no_effect, busy_since, busy_asked, lost_checked = 0, None, False, False
+                        recent_spins.clear()
+                        spin_index -= 1
+                        continue
                     if verdict == "ready":
                         log.info("Sol: il gioco e' pronto (overlay/animazione sui rulli): provo uno spin.")
                         _log_event("schermo_occupato_risolto_da_sol")
@@ -343,6 +467,13 @@ def play_session(
                     continue
                 _busy_diagnostics(autopilot, device_id, "occupato_scaduto", log, None)
                 log.warning("Lo schermo e' rimasto occupato per oltre %d s: mi fermo.", MAX_BUSY_WAIT_SECONDS)
+                if _check_lost(autopilot, device_id) == "lost" and try_reenter(
+                    "lo schermo e' occupato da troppo e la slot non e' piu' sullo schermo",
+                ):
+                    consecutive_no_effect, busy_since, busy_asked, lost_checked = 0, None, False, False
+                    recent_spins.clear()
+                    spin_index -= 1
+                    continue
                 verdict = _ask_operator(
                     autopilot, device_id,
                     f"lo schermo risulta occupato da oltre {MAX_BUSY_WAIT_SECONDS} s (vincita, bonus o pop-up?).",
@@ -364,13 +495,22 @@ def play_session(
     _log_capture_stats(autopilot, log)
 
     initial_balance, final_balance = autopilot.get_balance_summary()
+    net = None
     if initial_balance is not None and final_balance is not None:
-        net = final_balance - initial_balance
-        log.info(
-            "Riepilogo: saldo iniziale=%s, saldo finale=%s, netto=%s EUR",
-            initial_balance, final_balance, net,
-        )
+        net = reentry["net"] + final_balance - initial_balance
+        if reentry["n"]:
+            initial_balance = first_initial if first_initial is not None else initial_balance
+            log.info(
+                "Riepilogo: %d rientri nella slot, netto totale=%s EUR (somma dei netti di ogni ingresso: in demo il "
+                "saldo si ripristina quando si rientra).", reentry["n"], net,
+            )
+        else:
+            log.info(
+                "Riepilogo: saldo iniziale=%s, saldo finale=%s, netto=%s EUR",
+                initial_balance, final_balance, net,
+            )
     return SlotSessionResult(
         total_played, spin_index, failed=failed, stop_reason=stop_reason,
         initial_balance=initial_balance, final_balance=final_balance, target=target, avg_timings=averages,
+        reentries=reentry["n"], net=net,
     )

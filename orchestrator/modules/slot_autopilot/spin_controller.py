@@ -36,7 +36,7 @@ class SpinResult:
     win_amount: Optional[Decimal]
     verified: bool
     attempts: int
-    outcome: str  # "success" | "blocked" | "no_effect" | "error" | "operator_action" (l'operatore ha toccato altro: non e' uno spin)
+    outcome: str  # "success" | "blocked" | "no_effect" | "error" | "operator_action" (non e' uno spin) | "slot_lost"
     violated_invariant: Optional[str] = None  # "MIN_BET_NOT_VERIFIED" | "INSUFFICIENT_BALANCE" | "UNSAFE_SCREEN_STATE"
     # Quale controllo ha bloccato (solo per UNSAFE_SCREEN_STATE): "schermo non fermo" | "saldo/puntata non leggibili"
     blocked_detail: Optional[str] = None
@@ -73,6 +73,9 @@ class SpinController:
         # Fino a quando (monotonic) il prossimo spin puo' saltare il controllo di calma: lo spin precedente e'
         # finito senza vincita, lo schermo fermo e' recente.
         self._calm_skip_deadline = 0.0
+        # Opzionale: lost_check(device) -> 'in_game' | 'lost' | 'unknown' (SlotSupervisor.check_in_game). Se il pulsante
+        # spin non si trova, prima dell'operatore si controlla che la slot sia ancora sullo schermo.
+        self.lost_check = None
         self._dead_spin_points = {}        # slot -> ((x, y), volte di fila) tocchi che non hanno mai addebitato
 
     def spin(
@@ -113,7 +116,23 @@ class SpinController:
                 blocked_detail="saldo/puntata non leggibili" if violated == "UNSAFE_SCREEN_STATE" else None,
             ))
 
-        locate_result = self.locator.locate(_ELEMENT, context)
+        if callable(self.lost_check):
+            locate_result = self.locator.locate(_ELEMENT, context, exclude_strategies=("hitl",))
+            if not locate_result.success and self.lost_check(device_id) == "lost":
+                logger.warning("spin %d: il pulsante spin non c'e' e la slot non e' piu' sullo schermo.", spin_index)
+                self._log_step(
+                    episode_id, spin_index, slot_name, device_id, None, None,
+                    balance_before, balance_before, outcome="slot_lost",
+                )
+                return Result.ok(SpinResult(
+                    slot_name=slot_name, spin_index=spin_index, bet_amount=expected_bet,
+                    balance_before=balance_before, balance_after=balance_before, win_amount=None,
+                    verified=False, attempts=0, outcome="slot_lost",
+                ))
+            if not locate_result.success:
+                locate_result = self.locator.locate(_ELEMENT, context)   # ora anche l'operatore
+        else:
+            locate_result = self.locator.locate(_ELEMENT, context)
         if not locate_result.success:
             self._log_step(
                 episode_id, spin_index, slot_name, device_id, None, None,

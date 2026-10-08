@@ -85,6 +85,10 @@ class BetController:
         # dell'operatore) non deve riaprire il menu se la puntata e' gia' a quel valore o sotto.
         self._session_min = {}
 
+    def forget_session_min(self, slot_name: str) -> None:
+        """Dopo un rientro nella slot la puntata torna quella di partenza: il minimo verificato non vale piu'."""
+        self._session_min.pop(slot_name, None)
+
     def set_min_bet(
         self, device_id: str, slot_name: str, episode_id: str,
         context_provider: Callable[[], Result],

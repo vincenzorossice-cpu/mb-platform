@@ -132,6 +132,25 @@ def exit_slot(screen_reader, touch_injector, device_id: str, sleep=time.sleep) -
         return Result.fail(str(exc), "EXIT_ERROR")
 
 
+def make_reenter(args, navigation_client, autopilot):
+    """Rientro nella slot dopo che il sito ci ha cacciati (sessione scaduta, pagina di errore): si riparte dall'URL
+    del sito, non da "indietro". La promo ormai e' attiva: promo -> nome della slot -> "Prova", poi le intro."""
+    import copy
+
+    def reenter(device_id: str) -> Result[bool]:
+        rejoin_args = copy.copy(args)
+        rejoin_args.already_active, rejoin_args.not_active = True, False
+        nav = navigate_to_slot(rejoin_args, navigation_client, autopilot.screen_reader, autopilot.touch_injector)
+        if not nav.success:
+            return Result.fail(f"navigazione di rientro fallita: {nav.error}", nav.error_code)
+        intro = build_slot_intro(autopilot).run(device_id, args.slot_name)
+        if not intro.success:
+            return Result.fail(f"intro di rientro non superate: {intro.error}", intro.error_code)
+        return Result.ok(True)
+
+    return reenter
+
+
 def _ask_intro_help(autopilot, args) -> str:
     """Intro non superata: prima di giocare si chiede all'operatore (se c'e')."""
     hitl = getattr(autopilot, "hitl_strategy", None)
@@ -192,7 +211,8 @@ def run(args) -> int:
             logger.info("=== FASE GIOCO: %s, target %s EUR ===", args.slot_name, args.target)
             started = time.monotonic()
             session = play_session(autopilot, args.device, args.slot_name, Decimal(str(args.target)),
-                                   args.max_steps, log=logger)
+                                   args.max_steps, log=logger,
+                                   reenter=make_reenter(args, navigation_client, autopilot))
             play_seconds = time.monotonic() - started
             stop = session.stop_reason
             exit_code = 1 if session.failed else 0
@@ -211,9 +231,10 @@ def run(args) -> int:
                 logger.info("%s", client.usage_summary())
         logger.info("%s", cost_line(navigation_client, play_client))
         logger.info(
-            "ESITO: navigazione %s, spin %s, giocato %s EUR, stop=%s; tempi: navigazione %.0f s, gioco %.0f s; "
-            "interventi operatore: %d", "ok" if nav_ok else "FALLITA", getattr(session, "spins", 0),
-            getattr(session, "total_played", 0), stop, nav_seconds, play_seconds, getattr(hitl, "interventions", 0),
+            "ESITO: navigazione %s, spin %s, giocato %s EUR, rientri %s, stop=%s; tempi: navigazione %.0f s, gioco "
+            "%.0f s; interventi operatore: %d", "ok" if nav_ok else "FALLITA", getattr(session, "spins", 0),
+            getattr(session, "total_played", 0), getattr(session, "reentries", 0), stop, nav_seconds, play_seconds,
+            getattr(hitl, "interventions", 0),
         )
         try:
             nav_cost, play_cost = total_cost(navigation_client), total_cost(play_client)
