@@ -997,9 +997,11 @@ class TestFasterDescent:
 
 
 class TestRememberedMinimum:
-    def _run(self, taps, start="2.00", strategy="memory", trusted=True, remembered=None, **config):
+    def _run(self, taps, start="2.00", strategy="memory", trusted=True, remembered=None, proven=True, **config):
         if remembered is not None:
             save_autopilot_value("pirots5", "min_bet", remembered, "slot_memory")
+            if proven:
+                save_autopilot_value("pirots5", "min_bet_trusted", remembered, "slot_memory")   # minimo dimostrato
         locator = _locator_mock()
         locator.locate.return_value = _ok_candidate(strategy)
         locator.is_trusted_strategy.return_value = trusted
@@ -1012,11 +1014,17 @@ class TestRememberedMinimum:
     def test_already_at_the_remembered_minimum_one_idle_tap_verifies_it(self):
         data, verifier = self._run([_flat(0.1)], start="0.10", remembered="0.1")
 
+        # Minimo DIMOSTRATO e puntata letta uguale: nessun tocco serve (come con un profilo verificato).
         assert data.min_bet_verified and data.outcome == "unchanged_already_min"
-        assert verifier.verified_tap.call_count == 1
+        assert verifier.verified_tap.call_count == 0
+
+    def test_a_remembered_hint_alone_does_not_skip_the_check(self):
+        data, verifier = self._run([_flat(0.1)] * 3, start="0.10", remembered="0.1", proven=False)
+
+        assert verifier.verified_tap.call_count >= 1
 
     def test_the_remembered_minimum_needs_a_trusted_coordinate(self):
-        data, verifier = self._run([_flat(0.1)] * 3, start="0.10", strategy="gpt", trusted=False, remembered="0.1")
+        data, verifier = self._run([_flat(0.1)] * 3, start="0.10", strategy="gpt", trusted=False, remembered="0.1", proven=False)
 
         assert not data.min_bet_verified and data.aborted_reason == "NO_DECREASE_OBSERVED"
         assert verifier.verified_tap.call_count == 3
@@ -1185,8 +1193,9 @@ class TestFloorProbe:
         assert verifier.verified_tap.call_count == 3
 
         save_autopilot_value("pirots5", "min_bet", "0.1", "slot_memory")
+        save_autopilot_value("pirots5", "min_bet_trusted", "0.1", "slot_memory")   # minimo dimostrato
         data, verifier, _ = self._run([_flat(0.1)])
-        assert data.min_bet_verified and verifier.verified_tap.call_count == 1
+        assert data.min_bet_verified and verifier.verified_tap.call_count == 0     # minimo dimostrato: nessun tocco
 
     def test_the_probe_runs_at_most_once(self):
         data, verifier, _ = self._run([_flat(0.1), _flat(0.1)] + [_flat(0.1)] * 5)
@@ -1260,6 +1269,7 @@ class TestRunSizing:
 
     def test_the_run_uses_the_single_tap_step_and_the_remembered_minimum(self):
         save_autopilot_value("pirots5", "min_bet", "0.1", "slot_memory")
+        save_autopilot_value("pirots5", "min_bet_trusted", "0.1", "slot_memory")   # minimo dimostrato
         locator = _locator_mock()
         locator.locate.return_value = _ok_candidate("memory")
         locator.is_trusted_strategy.return_value = True
@@ -1325,6 +1335,7 @@ class TestMinimumMustBeProven:
 
     def test_a_remembered_minimum_needs_no_probe(self):
         save_autopilot_value("pirots5", "min_bet", "1.0", "slot_memory")
+        save_autopilot_value("pirots5", "min_bet_trusted", "1.0", "slot_memory")   # minimo dimostrato
         taps = [_decrease(2.0, 1.0), _flat(1.0)]
 
         data, verifier, _ = self._run(taps, strategy="memory", trusted_for=("memory",))

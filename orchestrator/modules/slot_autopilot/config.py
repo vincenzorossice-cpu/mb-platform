@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from decimal import Decimal
+from typing import Optional
 
 from orchestrator.core.result import Result
 
@@ -76,6 +77,8 @@ class AutoPilotConfig:
     dataset_dir: str = "dataset"
     profiles_dir: str = "provider_profiles"
     slot_memory_dir: str = "slot_memory"
+    # Puntata minima della slot dichiarata dall'operatore (--min-bet): vale come minimo dimostrato.
+    known_min_bet: Optional[Decimal] = None
     dry_run: bool = False
 
     def validate(self) -> Result["AutoPilotConfig"]:
@@ -83,6 +86,8 @@ class AutoPilotConfig:
             return Result.fail("target_played_amount must be > 0", "CONFIG_INVALID")
         if self.max_steps <= 0:
             return Result.fail("max_steps must be > 0", "CONFIG_INVALID")
+        if self.known_min_bet is not None and self.known_min_bet <= 0:
+            return Result.fail("known_min_bet must be > 0", "CONFIG_INVALID")
         if self.adb_timeout <= 0:
             return Result.fail("adb_timeout must be > 0", "CONFIG_INVALID")
         if self.tap_settle_seconds <= 0:

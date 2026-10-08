@@ -6,7 +6,9 @@ from decimal import Decimal
 from typing import Callable, Optional
 
 from orchestrator.core.result import Result
-from orchestrator.modules.provider_profile.autopilot_memory import forget_autopilot_element, load_autopilot_flag
+from orchestrator.modules.provider_profile.autopilot_memory import (
+    forget_autopilot_element, load_autopilot_flag, save_autopilot_flag,
+)
 from orchestrator.modules.slot_autopilot.frame_diff import diff_score
 from orchestrator.modules.slot_autopilot.locator import ElementLocator
 from orchestrator.modules.slot_autopilot.strategies.base import LocateCandidate
@@ -42,8 +44,9 @@ _BET_VIA_MENU_FLAG = "bet_via_menu"
 # una cella che si evidenzia cambia poco. Serve a non scambiare per "menu aperto" una schermata di gioco
 # che mostra anch'essa una riga di puntate.
 _MENU_STILL_OPEN_DIFF = 0.08
-_EDGE_FRACTION = 0.18   # una cella piu' bassa vicino al bordo sinistro: la fila puo' continuare fuori schermo
-_MAX_REVEAL_SWIPES = 3
+_MAX_REVEAL_SWIPES = 3   # passaggi per direzione
+_ROW_STATIC_FLAG = "bet_row_static"   # la fila di celle non scorre: quello che si vede e' tutto l'elenco
+_SWIPE_MS = 700
 _SETTLE_SECONDS = 1.5   # pausa prima di rileggere una puntata non leggibile (animazione di chiusura)
 
 
@@ -52,6 +55,7 @@ class MenuSelection:
     final_bet: Decimal
     lowest_listed: Decimal
     toggle_strategy: str
+    proven: bool = False   # nessuna puntata piu' bassa su nessun lato: e' davvero il minimo, non solo il piu' basso visibile
 
 
 def menu_amounts(text_boxes: list) -> list:
@@ -89,7 +93,11 @@ class BetMenuSelector:
     e' una lista (es. righe con pulsanti -/+) lo lascia aperto e fallisce con
     MENU_OPEN_NOT_A_LIST: lo gestisce il chiamante con i pulsanti meno."""
 
-    def __init__(self, locator: ElementLocator, verifier: ActionVerifier, screen_recovery=None, supervisor=None):
+    def __init__(self, locator: ElementLocator, verifier: ActionVerifier, screen_recovery=None, supervisor=None,
+                 scroll_probe: bool = False):
+        # scroll_probe: prima di scegliere si prova a scorrere la fila di celle (le puntate basse possono essere fuori
+        # schermo). Spento di default: lo accende la radice di composizione.
+        self.scroll_probe = scroll_probe
         self.locator = locator
         self.verifier = verifier
         # Opzionale: se la puntata riletta dopo la scelta non e' leggibile o non torna, Sol guarda lo schermo
@@ -185,7 +193,7 @@ class BetMenuSelector:
             logger.info("bet menu: aperto, %d importi isolati: non e' una lista selezionabile, lo lascio aperto", len(cells))
             return Result.fail("The open menu is not a list of selectable bets", "MENU_OPEN_NOT_A_LIST")
 
-        opened, cells = self._reveal_lower_cells(device_id, opened, cells, context_provider)
+        opened, cells, proven = self._reveal_lower_cells(device_id, slot_name, opened, cells, context_provider)
         lowest, (cell_x, cell_y) = min(cells, key=lambda item: item[0])
         logger.info("bet menu: valori letti %s, tocco il piu' basso %s a (%d,%d)",
                     sorted({v for v, _ in cells}), lowest, cell_x, cell_y)
@@ -224,37 +232,83 @@ class BetMenuSelector:
             )
         return Result.ok(MenuSelection(
             final_bet=Decimal(str(bet)), lowest_listed=lowest,
-            toggle_strategy=toggle.strategy_name if toggle is not None else "hitl",
+            toggle_strategy=toggle.strategy_name if toggle is not None else "hitl", proven=proven,
         ))
 
-    def _reveal_lower_cells(self, device_id: str, opened, cells: list, context_provider) -> tuple:
-        """La fila di celle puo' scorrere in orizzontale con le puntate piu' basse nascoste a sinistra. Se la cella
-        piu' bassa visibile e' la prima a sinistra ed e' vicina al bordo, si scorre verso destra (il contenuto
-        va a destra) e si rileggono le celle, finche' non compare niente di piu' basso (al massimo 3 volte).
-        Una fila tutta visibile non viene toccata."""
+    def _reveal_lower_cells(self, device_id: str, slot_name: str, opened, cells: list, context_provider) -> tuple:
+        """(contesto, celle, dimostrato). La fila di celle puo' scorrere in orizzontale con le puntate piu' basse fuori
+        schermo (o tagliate al bordo, e allora l'OCR non le legge). Si prova a scorrere a SINISTRA e, se la minima
+        non scende, a DESTRA, fino a 3 passaggi per direzione con una rilettura dopo ognuno; si continua nella
+        direzione che abbassa la minima. 'Dimostrato' = in nessuna direzione compare qualcosa di piu' basso (o la
+        fila non si muove affatto): solo allora il piu' basso visto e' il minimo vero. Una fila che non scorre si
+        ricorda (`bet_row_static`) e non viene piu' provata."""
         injector = getattr(self.verifier, "touch_injector", None)
         swipe = getattr(injector, "swipe", None)
         width = getattr(opened, "screen_width", None)
-        if not callable(swipe) or not isinstance(width, int) or width <= 0:
-            return opened, cells
-        for _ in range(_MAX_REVEAL_SWIPES):
-            lowest, (low_x, low_y) = min(cells, key=lambda item: item[0])
-            leftmost_x = min(position[0] for _, position in cells)
-            if low_x != leftmost_x or low_x > width * _EDGE_FRACTION:
+        if not self.scroll_probe or not callable(swipe) or not isinstance(width, int) or width <= 0:
+            return opened, cells, False
+        if load_autopilot_flag(slot_name, _ROW_STATIC_FLAG, self._memory_dir()):
+            return opened, cells, True
+
+        row_y = int(sorted(position[1] for _, position in cells)[len(cells) // 2])
+        best_min = min(value for value, _ in cells)
+        shown = (opened, cells)            # cosa mostra lo schermo adesso
+        origin_values = {value for value, _ in cells}
+        progressed_any = changed_any = False
+        last_back = "right"
+        for direction, back in (("left", "right"), ("right", "left")):
+            steps = 0
+            progressed = False
+            last_back = back
+            while steps < _MAX_REVEAL_SWIPES:
+                a, b = (0.85, 0.25) if direction == "left" else (0.25, 0.85)
+                moved = swipe(device_id, int(width * a), row_y, int(width * b), row_y, _SWIPE_MS)
+                if not getattr(moved, "success", False):
+                    break
+                time.sleep(_SETTLE_SECONDS)
+                fresh = self._fresh(context_provider)
+                if fresh is None:
+                    break
+                steps += 1
+                fresh_cells = menu_amounts(fresh.text_boxes)
+                if not _looks_like_menu(fresh_cells):
+                    break
+                values = {value for value, _ in fresh_cells}
+                logger.info("bet menu: scorro a %s (passaggio %d): valori %s (minima finora %s)",
+                            direction, steps, sorted(values), best_min)
+                changed_any = changed_any or values != origin_values
+                shown = (fresh, fresh_cells)
+                if min(values) < best_min:
+                    best_min = min(values)
+                    progressed = progressed_any = True
+                    continue
                 break
-            logger.info("bet menu: la cella piu' bassa (%s) e' al bordo sinistro: scorro la fila per vedere se ce ne sono altre.", lowest)
-            moved = swipe(device_id, int(width * 0.25), low_y, int(width * 0.85), low_y, 500)
-            if not getattr(moved, "success", False):
-                break
+            if progressed:
+                break                       # trovata una minima piu' bassa: si ferma qui
+            if steps and {v for v, _ in shown[1]} != origin_values:
+                for _ in range(steps):      # si torna dove si era, poi si prova l'altra direzione
+                    swipe(device_id, int(width * (0.25 if back == "right" else 0.85)), row_y,
+                          int(width * (0.85 if back == "right" else 0.25)), row_y, _SWIPE_MS)
+                time.sleep(_SETTLE_SECONDS)
+        if not changed_any:
+            shown = (opened, cells)          # la fila non si e' mossa: lo schermo e' quello di partenza
+        elif min(value for value, _ in shown[1]) > best_min:
+            # L'ultimo passaggio ha superato la minima trovata: un passo indietro e si rilegge.
+            swipe(device_id, int(width * (0.25 if last_back == "right" else 0.85)), row_y,
+                  int(width * (0.85 if last_back == "right" else 0.25)), row_y, _SWIPE_MS)
             time.sleep(_SETTLE_SECONDS)
             fresh = self._fresh(context_provider)
-            if fresh is None:
-                break
-            fresh_cells = menu_amounts(fresh.text_boxes)
-            if not _looks_like_menu(fresh_cells) or min(v for v, _ in fresh_cells) >= lowest:
-                break          # niente di piu' basso: il minimo e' quello gia' visto
-            opened, cells = fresh, fresh_cells
-        return opened, cells
+            if fresh is not None and _looks_like_menu(menu_amounts(fresh.text_boxes)):
+                shown = (fresh, menu_amounts(fresh.text_boxes))
+        elif not progressed_any and shown[0] is not opened:
+            fresh = self._fresh(context_provider)    # tornati all'origine: si rilegge la fila
+            if fresh is not None and _looks_like_menu(menu_amounts(fresh.text_boxes)):
+                shown = (fresh, menu_amounts(fresh.text_boxes))
+        if not changed_any:
+            save_autopilot_flag(slot_name, _ROW_STATIC_FLAG, True, self._memory_dir())
+            logger.info("bet menu: la fila di celle non scorre: quello che si vede e' tutto l'elenco.")
+        proven = not progressed_any
+        return shown[0], shown[1], proven
 
     def _close_menu(
         self, device_id: str, slot_name: str, opened, after, toggle, context_provider, allow_operator: bool,

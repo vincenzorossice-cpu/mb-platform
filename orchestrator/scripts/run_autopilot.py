@@ -117,12 +117,13 @@ def build_autopilot(args: argparse.Namespace) -> Result[SlotAutoPilot]:
         device_id=args.device, slot_name=args.slot, target=args.target, max_steps=args.max_steps,
         enable_gpt=not args.no_gpt, enable_hitl=not args.no_hitl, live=getattr(args, "live", False),
         require_profile=getattr(args, "require_profile", False),
+        known_min_bet=getattr(args, "min_bet", None),
     )
 
 
 def build_autopilot_for(
     device_id: str, slot_name: str, target, max_steps: int = 500, enable_gpt: bool = True,
-    enable_hitl: bool = True, live: bool = False, require_profile: bool = False,
+    enable_hitl: bool = True, live: bool = False, require_profile: bool = False, known_min_bet=None,
 ) -> Result[SlotAutoPilot]:
     """Unico punto del progetto dove queste classi concrete vengono
     istanziate direttamente: ogni modulo a monte le riceve per DI. Usato dalla riga di comando
@@ -135,6 +136,7 @@ def build_autopilot_for(
         # impararlo (vedi ProfileBuilder). --require-profile ripristina il
         # blocco per chi vuole solo slot gia' curate.
         require_profile=require_profile,
+        known_min_bet=Decimal(str(known_min_bet)) if known_min_bet is not None else None,
     )
     config_result = config.validate()
     if not config_result.success:
@@ -198,7 +200,9 @@ def build_autopilot_for(
     screen_recovery = ScreenRecovery(locator, verifier, config)
     bet_controller = BetController(
         locator, verifier, step_logger, config,
-        menu_selector=BetMenuSelector(locator, verifier, screen_recovery=screen_recovery, supervisor=supervisor),
+        menu_selector=BetMenuSelector(
+            locator, verifier, screen_recovery=screen_recovery, supervisor=supervisor, scroll_probe=True,
+        ),
         screen_recovery=screen_recovery, supervisor=supervisor,
     )
     spin_controller = SpinController(
@@ -266,6 +270,8 @@ def _parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--require-profile", action="store_true", help="Rifiuta le slot senza profilo in provider_profiles/.")
     parser.add_argument("--log-dir", default="logs", help="Cartella del file di log completo (default: logs).")
     parser.add_argument("--no-hitl", action="store_true", help="Disabilita il fallback HITL da terminale.")
+    parser.add_argument("--min-bet", type=float, default=None,
+                        help="Puntata minima NOTA della slot (EUR): vale come minimo dimostrato e ripara la memoria.")
     return parser.parse_args(argv)
 
 

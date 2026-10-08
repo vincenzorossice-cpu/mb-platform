@@ -43,6 +43,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     activation.add_argument("--not-active", action="store_true")
     parser.add_argument("--live", action="store_true", help="Disattiva il dry-run dell'autopilot.")
     parser.add_argument("--no-gpt", action="store_true")
+    parser.add_argument("--min-bet", type=float, default=None,
+                        help="Puntata minima NOTA della slot (EUR): vale come minimo dimostrato e ripara la memoria.")
     parser.add_argument("--no-hitl", action="store_true", help="Niente operatore da terminale: se serve aiuto ci si ferma.")
     parser.add_argument("--no-save-steps", action="store_true")
     parser.add_argument("--log-dir", default="logs")
@@ -175,7 +177,7 @@ def run(args) -> int:
     # Fail-fast: chiave rifiutata o configurazione invalida prima di spendere la navigazione.
     build = run_autopilot.build_autopilot_for(
         device_id=args.device, slot_name=args.slot_name, target=args.target, max_steps=args.max_steps,
-        enable_gpt=not args.no_gpt, enable_hitl=not args.no_hitl, live=args.live,
+        enable_gpt=not args.no_gpt, enable_hitl=not args.no_hitl, live=args.live, known_min_bet=args.min_bet,
     )
     if not build.success:
         logger.error("Impossibile inizializzare SlotAutoPilot: %s (%s)", build.error, build.error_code)

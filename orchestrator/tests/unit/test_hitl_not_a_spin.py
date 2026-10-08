@@ -130,45 +130,75 @@ class TestScrollableBetRow:
     def _fast(self, monkeypatch):
         monkeypatch.setattr("orchestrator.modules.slot_autopilot.bet_menu.time.sleep", lambda s: None)
 
-    def _selector(self):
+    def _selector(self, tmp_path, probe=True):
         locator = MagicMock()
         locator.is_trusted_strategy.return_value = True
+        locator.memory_dir = str(tmp_path)
         verifier = MagicMock()
         verifier.verified_tap.return_value = _tap(True)
         verifier.touch_injector.swipe.return_value = Result.ok(True)
-        return BetMenuSelector(locator, verifier), verifier
+        return BetMenuSelector(locator, verifier, scroll_probe=probe), verifier
 
-    CUT = [_box("1,00", 100, 1975), _box("1,40", 300, 1975), _box("2,00", 500, 1975), _box("3,00", 700, 1975)]
-    MORE = [_box("0,40", 100, 1975), _box("0,50", 300, 1975), _box("1,00", 500, 1975), _box("1,40", 700, 1975)]
+    CUT = [_box("1,00", 300, 1975), _box("1,40", 500, 1975), _box("2,00", 700, 1975), _box("3,00", 900, 1975)]
+    LEFT = [_box("0,40", 300, 1975), _box("0,50", 500, 1975), _box("1,00", 700, 1975), _box("1,40", 900, 1975)]
+    FAR = [_box("0,20", 300, 1975), _box("0,40", 500, 1975), _box("0,50", 700, 1975), _box("1,00", 900, 1975)]
 
-    def test_a_row_cut_at_the_left_edge_is_scrolled_and_the_true_lowest_is_chosen(self):
-        selector, verifier = self._selector()
-        provider = _provider(_context(self.MORE), _context(self.MORE), _context(MAIN_BOXES, posta=0.40))
+    def test_a_low_cell_hidden_in_one_direction_is_found(self, tmp_path):
+        selector, verifier = self._selector(tmp_path)
+        provider = _provider(_context(self.LEFT), _context(self.FAR), _context(self.FAR), _context(MAIN_BOXES, posta=0.20))
 
         result = selector.select_from_open_menu("dev", "wrap", _context(self.CUT), provider)
 
-        assert result.success and result.data.final_bet == Decimal("0.40")
-        assert verifier.touch_injector.swipe.call_count == 2   # il secondo non rivela niente di piu' basso: si ferma
-        assert verifier.verified_tap.call_args_list[0].args[1:3] == (100, 1975)
+        assert result.success and result.data.final_bet == Decimal("0.20")
+        assert verifier.verified_tap.call_args_list[0].args[1:3] == (300, 1975)
+        first = verifier.touch_injector.swipe.call_args_list[0].args
+        assert first[1] > first[3]                       # il primo gesto e' verso SINISTRA
 
-    def test_a_row_that_starts_far_from_the_edge_is_not_touched(self):
-        selector, verifier = self._selector()
-        full = [_box("0,10", 300, 1975), _box("0,20", 500, 1975), _box("0,50", 700, 1975), _box("1,00", 900, 1975)]
-        provider = _provider(_context(MAIN_BOXES, posta=0.10))
+    def test_a_low_cell_hidden_on_the_other_side_is_found_too(self, tmp_path):
+        selector, verifier = self._selector(tmp_path)
+        # a sinistra non scende e si torna indietro; a destra compare 0.20
+        provider = _provider(_context(self.CUT), _context(self.FAR), _context(self.FAR), _context(MAIN_BOXES, posta=0.20))
+        # il primo passaggio a sinistra mostra solo valori piu' alti (CUT senza 1,00)
+        higher = [_box("1,40", 300, 1975), _box("2,00", 500, 1975), _box("3,00", 700, 1975), _box("5,00", 900, 1975)]
+        provider = _provider(_context(higher), _context(self.CUT), _context(self.FAR), _context(self.FAR),
+                             _context(MAIN_BOXES, posta=0.20))
 
-        result = selector.select_from_open_menu("dev", "wrap", _context(full), provider)
+        result = selector.select_from_open_menu("dev", "wrap", _context(self.CUT), provider)
 
-        assert result.success
+        assert result.success and result.data.final_bet == Decimal("0.20")
+        directions = [c.args[1] > c.args[3] for c in verifier.touch_injector.swipe.call_args_list]
+        assert directions[0] is True and False in directions            # prima sinistra, poi destra
+
+    def test_a_row_that_does_not_move_is_proven_and_never_probed_again(self, tmp_path):
+        selector, verifier = self._selector(tmp_path)
+        provider = _provider(_context(self.CUT), _context(self.CUT), _context(MAIN_BOXES, posta=1.00))
+
+        first = selector.select_from_open_menu("dev", "wrap", _context(self.CUT), provider)
+
+        assert first.success and first.data.proven
+        swipes_first = verifier.touch_injector.swipe.call_count
+        assert swipes_first == 2                                         # una per direzione, nessun annullamento
+
+        provider = _provider(_context(MAIN_BOXES, posta=1.00))
+        second = selector.select_from_open_menu("dev", "wrap", _context(self.CUT), provider)
+
+        assert second.success and second.data.proven
+        assert verifier.touch_injector.swipe.call_count == swipes_first  # ricordato: nessun altro gesto
+
+    def test_a_lower_cell_found_is_not_proof_of_the_minimum(self, tmp_path):
+        selector, _ = self._selector(tmp_path)
+        provider = _provider(_context(self.LEFT), _context(self.LEFT), _context(MAIN_BOXES, posta=0.40))
+
+        result = selector.select_from_open_menu("dev", "wrap", _context(self.CUT), provider)
+
+        assert result.success and result.data.final_bet == Decimal("0.40") and not result.data.proven
+
+    def test_probe_is_off_by_default(self, tmp_path):
+        selector, verifier = self._selector(tmp_path, probe=False)
+        provider = _provider(_context(MAIN_BOXES, posta=1.00))
+
+        assert selector.select_from_open_menu("dev", "wrap", _context(self.CUT), provider).success
         verifier.touch_injector.swipe.assert_not_called()
-
-    def test_scrolling_stops_when_nothing_lower_appears(self):
-        selector, verifier = self._selector()
-        provider = _provider(_context(self.CUT), _context(MAIN_BOXES, posta=1.00))
-
-        result = selector.select_from_open_menu("dev", "wrap", _context(self.CUT), provider)
-
-        assert result.success and result.data.final_bet == Decimal("1.00")
-        assert verifier.touch_injector.swipe.call_count == 1
 
 
 # ---- "mai fermarsi da soli": chiede all'operatore -------------------------------------------------------------
