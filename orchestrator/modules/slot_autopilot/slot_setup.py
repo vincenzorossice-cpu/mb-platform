@@ -8,6 +8,7 @@ from typing import Optional
 from PIL import Image
 
 from orchestrator.core.result import Result
+from orchestrator.modules.provider_profile.autopilot_memory import load_autopilot_value
 from orchestrator.modules.slot_autopilot.slot_explorer import SlotExplorer
 from orchestrator.modules.slot_autopilot.slot_map import SlotMap, SlotMemory
 
@@ -49,6 +50,25 @@ class SlotSetup:
         if outcome.success:
             self._outcomes[key] = outcome
         return outcome
+
+    def learn_bet_menu(self, device_id: str, slot_name: str) -> Result[bool]:
+        """Dopo il primo minimo impostato: il verso di scorrimento che il carosello ha richiesto (appreso dal motore
+        della puntata) entra nella mappa, cosi' la volta dopo si parte da li'."""
+        slot_map = self._maps.get(slot_name)
+        direction = load_autopilot_value(slot_name, "bet_row_direction", self.memory.memory_dir)
+        if slot_map is None or direction not in ("left", "right") or slot_map.bet_scroll_direction == direction:
+            return Result.ok(False)
+        slot_map.bet_scroll_direction = direction
+        saved = self.memory.save(slot_map)
+        return Result.ok(True) if saved.success else Result.fail(saved.error, saved.error_code)
+
+    def reseed(self, slot_name: str) -> bool:
+        """Dopo un rientro: rimette in memoria le coordinate della mappa (alcune possono essere state dimenticate o
+        sovrascritte durante la sessione)."""
+        slot_map = self._maps.get(slot_name)
+        if slot_map is None:
+            return False
+        return self.memory.apply_to_memory(slot_map).success
 
     def confirm_spin(self, device_id: str, slot_name: str) -> Result[bool]:
         """Soldi veri: il primo spin vero ha addebitato, quindi il punto di Sol e' verificato. Salva la mappa."""

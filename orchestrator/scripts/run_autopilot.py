@@ -236,6 +236,12 @@ def build_autopilot_for(
             known_min_bet=config.known_min_bet, demo=explore_demo, gpt_client=gpt_client,
         )
     if supervisor is not None:
+        local_ocr = getattr(ocr_reader, "ocr", ocr_reader)      # lettore locale: la sonda non costa GPT
+
+        def balance_probe(device: str) -> bool:
+            shot = screen_reader._screenshot(device)
+            return bool(shot.success and local_ocr.read_slot_state(shot.data).get("saldo") is not None)
+        supervisor.balance_probe = balance_probe
         spin_controller.lost_check = supervisor.check_in_game
     autopilot.gpt_client = gpt_client   # per il riepilogo dei costi a fine sessione
     autopilot.hitl_strategy = strategies.get("hitl")

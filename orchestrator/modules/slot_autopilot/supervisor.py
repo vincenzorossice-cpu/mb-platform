@@ -70,7 +70,8 @@ class SlotSupervisor:
         self, gpt_client, screen_reader, touch_injector,
         describe: Optional[Callable[[str, LocateContext], Optional[tuple]]] = None,
         max_calls: int = 6, max_interventions: int = 3, settle_seconds: float = _SETTLE_SECONDS,
-        max_lost_checks: int = 6, max_menu_checks: int = 4,
+        max_lost_checks: int = 6, max_menu_checks: int = 4, balance_probe: Optional[Callable[[str], bool]] = None,
+        probe_pause_seconds: float = 3.0,
     ):
         self.gpt_client = gpt_client
         self.screen_reader = screen_reader
@@ -84,6 +85,10 @@ class SlotSupervisor:
         self.max_lost_checks = max_lost_checks
         self.lost_checks = 0
         self.max_menu_checks = max_menu_checks
+        # Sonda locale (nessun GPT): True se il saldo della slot si legge ancora. Sol da solo non basta per dire "persa":
+        # una schermata di bonus o di vincita puo' sembrargli fuori dal gioco, e rientrare butterebbe fuori una slot viva.
+        self.balance_probe = balance_probe
+        self.probe_pause_seconds = probe_pause_seconds
         self.menu_checks = 0
 
     def reset(self) -> None:
@@ -167,6 +172,23 @@ class SlotSupervisor:
             return Assist("at_min", observation.bet)
         return Assist("nothing", observation.bet)
 
+    def _really_lost(self, device_id: str) -> bool:
+        """Sol dice "persa": si conferma solo se il saldo NON si legge, due volte a distanza di qualche secondo."""
+        if self.balance_probe is None:
+            return True
+        for attempt in range(2):
+            try:
+                if self.balance_probe(device_id):
+                    logger.info("supervisore: Sol dice che la slot e' persa ma il saldo e' leggibile: la slot e' ancora "
+                                "attiva (bonus o animazione), non rientro.")
+                    return False
+            except Exception as exc:    # la sonda non deve mai rompere la sessione
+                logger.warning("supervisore: sonda del saldo fallita: %s", exc)
+                return True
+            if attempt == 0:
+                time.sleep(self.probe_pause_seconds)
+        return True
+
     def check_in_game(self, device_id: str) -> str:
         """La slot e' ancora sullo schermo? 'in_game', 'lost' (sessione scaduta, lobby, pagina di errore o del sito:
         bisogna rientrare) o 'unknown' (nessuna risposta o budget proprio finito). Non consuma il budget di osserva."""
@@ -182,7 +204,9 @@ class SlotSupervisor:
         )
         if observation is None or observation.in_game is None:
             return "unknown"
-        return "in_game" if observation.in_game else "lost"
+        if observation.in_game:
+            return "in_game"
+        return "lost" if self._really_lost(device_id) else "in_game"
 
     def check_menu_open(self, device_id: str) -> str:
         """Un menu/pannello (puntata, impostazioni) copre ancora il gioco? 'open' | 'closed' | 'unknown'. Ha un budget
@@ -217,7 +241,7 @@ class SlotSupervisor:
         )
         if observation is None:
             return "unknown"
-        if observation.in_game is False:
+        if observation.in_game is False and self._really_lost(device_id):
             return "lost"
         if observation.action == "close" and observation.target_description:
             return "closed" if self._close(device_id, observation.target_description, path) else "busy"

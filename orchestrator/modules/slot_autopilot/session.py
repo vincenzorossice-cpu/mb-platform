@@ -14,6 +14,8 @@ LOST_CHECK_AFTER_SECONDS = 15  # schermo occupato da cosi' tanto: prima di aspet
 LOST_CHECK_UNREADABLE_SECONDS = 8   # idem quando il saldo non si legge proprio (slot chiusa, lobby)
 BET_WINDOW = 4                 # spin consecutivi per accorgersi che la puntata creduta e' troppo alta
 BET_WINDOW_RATIO = Decimal("0.6")
+BONUS_SETTLE_SECONDS = 2.0      # dopo un evento bonus si aspetta che il saldo si stabilizzi
+MAX_BONUS_EVENTS = 5           # eventi bonus di fila prima di chiedere all'operatore
 MAX_OPERATOR_ACTIONS = 3   # interventi dell'operatore senza spin prima di fermarsi
 # Schermo non libero dopo uno spin (vincita/bonus/animazione lunga): si aspetta invece di
 # chiudere la sessione, fino a questo tempo.
@@ -302,6 +304,7 @@ def play_session(
             log.warning("Slot memory: preparazione non riuscita (%s): proseguo come prima.", prepared_map.error_code)
     reexplored = {"spin": False, "bet_menu": False}
     spin_confirmed = False
+    bonus_streak = 0
 
     log.info("Verifica puntata minima in corso...")
     phase_started = time.monotonic()
@@ -333,6 +336,8 @@ def play_session(
         "Puntata minima verificata: %s EUR (outcome=%s, tentativi=%d)",
         bet_result.data.final_bet, bet_result.data.outcome, bet_result.data.attempts,
     )
+    if slot_setup is not None:
+        slot_setup.learn_bet_menu(device_id, slot_name)
 
     total_played = Decimal("0.00")
     spin_index = 0
@@ -353,9 +358,30 @@ def play_session(
     except Exception:
         first_initial = None
 
+    def set_bet_after_reentry() -> bool:
+        """Dentro la slot ma la puntata e' tornata quella di partenza: si abbassa SENZA rinavigare. Con il minimo
+        dichiarato e la puntata gia' al minimo non si tocca nulla (scorciatoia di BetController)."""
+        bet = autopilot.set_min_bet(device_id)
+        while not (bet.success and bet.data.min_bet_verified):
+            reason = bet.data.aborted_reason if bet.success else bet.error_code
+            log.error("Rientrato, ma non riesco a verificare la puntata minima (%s).", reason)
+            if slot_setup is not None and not reexplored["bet_menu"]:
+                reexplored["bet_menu"] = True
+                log.warning("Slot memory: rifaccio l'esplorazione del menu puntata dopo il rientro.")
+                if slot_setup.reexplore(device_id, slot_name, "bet_menu").success:
+                    bet = autopilot.set_min_bet(device_id)
+                    continue
+            if _ask_operator(autopilot, device_id, "non riesco a impostare la puntata dopo il rientro nella slot.",
+                             log, help_state) != "retry":
+                return False
+            bet = autopilot.set_min_bet(device_id)
+        log.info("Rientrato nella slot: puntata %s EUR, riprendo dal giocato %s.", bet.data.final_bet, total_played)
+        return True
+
     def try_reenter(reason: str) -> bool:
         """Il sito ci ha cacciati: si rientra dalla navigazione, si ripristina la puntata e si prosegue con lo
-        stesso giocato. Il saldo del segmento finito entra nel netto (in demo rientrando il saldo si ripristina)."""
+        stesso giocato. Il saldo del segmento finito entra nel netto (in demo rientrando il saldo si ripristina).
+        Un errore di PUNTATA dopo il rientro non fa rinavigare: la slot e' gia' aperta."""
         if reenter is None:
             return False
         while reentry["n"] < MAX_REENTRIES:
@@ -370,19 +396,14 @@ def play_session(
             rejoined = reenter(device_id)
             prepared = autopilot.prepare(device_id) if rejoined.success else rejoined
             if rejoined.success and prepared.success:
+                if slot_setup is not None:
+                    slot_setup.reseed(slot_name)         # punti dimenticati nel frattempo tornano dalla mappa
                 forget = getattr(getattr(autopilot, "bet_controller", None), "forget_session_min", None)
                 if callable(forget):
                     forget(slot_name)
-                bet = autopilot.set_min_bet(device_id)
-                if bet.success and bet.data.min_bet_verified:
-                    log.info("Rientrato nella slot: puntata %s EUR, riprendo dal giocato %s.",
-                             bet.data.final_bet, total_played)
-                    return True
-                log.error("Rientrato ma non riesco a verificare la puntata minima.")
-            else:
-                log.error("Rientro nella slot non riuscito: %s", rejoined.error if not rejoined.success else prepared.error)
-            if _ask_operator(autopilot, device_id, "non riesco a rientrare nella slot e a riprendere.", log,
-                             help_state) != "retry":
+                return set_bet_after_reentry()
+            log.error("Rientro nella slot non riuscito: %s", rejoined.error if not rejoined.success else prepared.error)
+            if _ask_operator(autopilot, device_id, "non riesco a rientrare nella slot.", log, help_state) != "retry":
                 return False
         log.error("Rientri esauriti (%d): mi fermo.", MAX_REENTRIES)
         return False
@@ -429,6 +450,20 @@ def play_session(
                 break
             log.info("Puntata riverificata: %s EUR.", recheck.data.final_bet)
             continue
+        if spin_result.data.outcome == "bonus_event":
+            bonus_streak += 1
+            spin_index -= 1                    # non e' uno spin: non consuma max_steps, non entra nel giocato
+            if bonus_streak >= MAX_BONUS_EVENTS:
+                if _ask_operator(autopilot, device_id, f"{bonus_streak} accrediti bonus di fila senza spin veri: cosa "
+                                 "succede sullo schermo?", log, help_state) == "retry":
+                    bonus_streak = 0
+                    continue
+                failed, stop_reason = True, "BLOCKED"
+                break
+            time.sleep(BONUS_SETTLE_SECONDS)
+            continue
+        if spin_result.data.outcome == "success":
+            bonus_streak = 0
         if spin_result.data.outcome == "slot_lost":
             if try_reenter("il pulsante spin non c'e' e la slot non e' piu' sullo schermo"):
                 consecutive_no_effect, busy_since, busy_asked, lost_checked = 0, None, False, False

@@ -372,6 +372,7 @@ class BetController:
                         logger.info("set_min_bet: l'operatore ha aperto un menu con una lista di puntate: scelgo la piu' bassa.")
                         selection = self.menu_selector.select_from_open_menu(
                             device_id, slot_name, context, context_provider, operator_tap,
+                            target=self._trusted_min(slot_name),
                         )
                         if selection.success:
                             return self._menu_result(
@@ -969,6 +970,7 @@ class BetController:
         catena normale, fino all'operatore)."""
         result = self.menu_selector.select_lowest(
             device_id, slot_name, context, context_provider, allow_operator=allow_operator,
+            target=self._trusted_min(slot_name),
         )
         if not result.success:
             logger.warning("set_min_bet: menu puntata non riuscito (%s): %s", result.error_code, result.error)

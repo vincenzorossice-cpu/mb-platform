@@ -36,7 +36,7 @@ class SpinResult:
     win_amount: Optional[Decimal]
     verified: bool
     attempts: int
-    outcome: str  # "success" | "blocked" | "no_effect" | "error" | "operator_action" (non e' uno spin) | "slot_lost"
+    outcome: str  # "success" | "blocked" | "no_effect" | "error" | "operator_action" (non e' uno spin) | "slot_lost" | "bonus_event" (accredito, non uno spin)
     violated_invariant: Optional[str] = None  # "MIN_BET_NOT_VERIFIED" | "INSUFFICIENT_BALANCE" | "UNSAFE_SCREEN_STATE"
     # Quale controllo ha bloccato (solo per UNSAFE_SCREEN_STATE): "schermo non fermo" | "saldo/puntata non leggibili"
     blocked_detail: Optional[str] = None
@@ -77,6 +77,7 @@ class SpinController:
         # spin non si trova, prima dell'operatore si controlla che la slot sia ancora sullo schermo.
         self.lost_check = None
         self.arrow_stats = {"arrow": 0, "still": 0, "with_reference": False, "shots": 0, "spins": 0}
+        self._anomaly = {}                 # slot -> True dopo "schermo cambiato senza addebito" (animazione/bonus in corso?)
         self._dead_spin_points = {}        # slot -> ((x, y), volte di fila) tocchi che non hanno mai addebitato
 
     def spin(
@@ -371,6 +372,7 @@ class SpinController:
                             spin_index, candidate.x, candidate.y, candidate.strategy_name,
                         )
                         self._note_dead_point(slot_name, candidate, spin_index)
+                        self._anomaly[slot_name] = True
                     break
                 if not self.locator.is_trusted_strategy(candidate.strategy_name):
                     # Coordinata indovinata (es. da GPT) che non fa partire lo spin:
@@ -386,6 +388,26 @@ class SpinController:
                     break
 
         outcome = "success" if verified else "no_effect"
+        if outcome == "success" and balance_after_read and balance_before is not None:
+            if balance_after < balance_before:
+                self._anomaly.pop(slot_name, None)          # un addebito vero: si torna alla normalita'
+            elif balance_after > balance_before and self._anomaly.get(slot_name):
+                # Saldo SALITO subito dopo un'anomalia e senza alcun addebito visto: l'accredito di un bonus o di
+                # un'animazione in corso, non uno spin pagato. Non si conta (nel dubbio meno giocato, mai di piu').
+                logger.info(
+                    "spin %d: Evento bonus: saldo salito %s -> %s dopo un'anomalia, senza addebito: non contato come spin.",
+                    spin_index, balance_before, balance_after,
+                )
+                self._calm_skip_deadline = 0.0
+                self._log_step(
+                    episode_id, spin_index, slot_name, device_id, candidate.strategy_name,
+                    (candidate.x, candidate.y), balance_before, balance_after, outcome="bonus_event",
+                )
+                return Result.ok(SpinResult(
+                    slot_name=slot_name, spin_index=spin_index, bet_amount=expected_bet,
+                    balance_before=balance_before, balance_after=balance_after, win_amount=None,
+                    verified=False, attempts=attempts, outcome="bonus_event",
+                ))
         button_status = None
         if verified and learning_button:
             if busy_sample.get("path"):

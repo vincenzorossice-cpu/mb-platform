@@ -7,7 +7,7 @@ from typing import Callable, Optional
 
 from orchestrator.core.result import Result
 from orchestrator.modules.provider_profile.autopilot_memory import (
-    forget_autopilot_element, load_autopilot_flag, save_autopilot_flag,
+    forget_autopilot_element, load_autopilot_flag, load_autopilot_value, save_autopilot_flag, save_autopilot_value,
 )
 from orchestrator.modules.slot_autopilot.frame_diff import diff_score
 from orchestrator.modules.slot_autopilot.locator import ElementLocator
@@ -47,6 +47,8 @@ _MENU_STILL_OPEN_DIFF = 0.08
 _MAX_REVEAL_SWIPES = 3   # passaggi per direzione
 _ROW_STATIC_FLAG = "bet_row_static"   # la fila di celle non scorre: quello che si vede e' tutto l'elenco
 _SWIPE_MS = 700
+_ROW_DIRECTION_VALUE = "bet_row_direction"   # verso dello scorrimento che ha abbassato la minima (appreso)
+_MAX_PICK_ATTEMPTS = 3   # tocco -> verifica -> correzione: in un carosello la fila si ricentra dopo il tocco
 _SETTLE_SECONDS = 1.5   # pausa prima di rileggere una puntata non leggibile (animazione di chiusura)
 
 
@@ -109,8 +111,9 @@ class BetMenuSelector:
 
     def select_lowest(
         self, device_id: str, slot_name: str, context, context_provider: Callable[[], Result],
-        allow_operator: bool = True,
+        allow_operator: bool = True, target: Optional[Decimal] = None,
     ) -> Result[MenuSelection]:
+        # target: la puntata cercata (minimo dichiarato/dimostrato); senza, la piu' bassa letta.
         # allow_operator=False: se l'icona non si trova da sola NON si chiama l'operatore (il
         # chiamante lo fara' dopo, con la sua domanda e non una sull'icona del menu).
         toggle_result = self.locator.locate(
@@ -149,7 +152,7 @@ class BetMenuSelector:
         self.locator.save_verified_candidate(
             _MENU_TOGGLE, toggle, slot_name, context.screen_width, context.screen_height,
         )
-        return self._select_from_open(device_id, opened, context_provider, toggle, slot_name, allow_operator)
+        return self._select_from_open(device_id, opened, context_provider, toggle, slot_name, allow_operator, target)
 
     def _note_dead_toggle(self, slot_name: str, toggle) -> None:
         """Un'icona ricordata che non apre il menu per la seconda volta di fila e' un punto sbagliato: si dimentica."""
@@ -182,7 +185,7 @@ class BetMenuSelector:
 
     def select_from_open_menu(
         self, device_id: str, slot_name: str, context, context_provider: Callable[[], Result],
-        toggle_xy: Optional[tuple] = None,
+        toggle_xy: Optional[tuple] = None, target: Optional[Decimal] = None,
     ) -> Result[MenuSelection]:
         """Il menu e' GIA' aperto (l'ha aperto l'operatore): sceglie la puntata piu' bassa della lista.
         `toggle_xy` e' il punto che l'operatore ha fatto tappare per aprirlo: se la selezione riesce
@@ -192,7 +195,7 @@ class BetMenuSelector:
             toggle = LocateCandidate(
                 x=int(toggle_xy[0]), y=int(toggle_xy[1]), confidence=1.0, strategy_name="hitl", verified=True,
             )
-        result = self._select_from_open(device_id, context, context_provider, toggle, slot_name, True)
+        result = self._select_from_open(device_id, context, context_provider, toggle, slot_name, True, target)
         if result.success and toggle is not None:
             self.locator.save_verified_candidate(
                 _MENU_TOGGLE, toggle, slot_name, context.screen_width, context.screen_height,
@@ -201,7 +204,7 @@ class BetMenuSelector:
 
     def _select_from_open(
         self, device_id: str, opened, context_provider: Callable[[], Result], toggle: Optional[LocateCandidate],
-        slot_name: str = "", allow_operator: bool = True,
+        slot_name: str = "", allow_operator: bool = True, target: Optional[Decimal] = None,
     ) -> Result[MenuSelection]:
         cells = menu_amounts(opened.text_boxes)
         if not _looks_like_menu(cells):
@@ -211,14 +214,32 @@ class BetMenuSelector:
             return Result.fail("The open menu is not a list of selectable bets", "MENU_OPEN_NOT_A_LIST")
 
         opened, cells, proven = self._reveal_lower_cells(device_id, slot_name, opened, cells, context_provider)
-        lowest, (cell_x, cell_y) = min(cells, key=lambda item: item[0])
-        logger.info("bet menu: valori letti %s, tocco il piu' basso %s a (%d,%d)",
-                    sorted({v for v, _ in cells}), lowest, cell_x, cell_y)
-        self.verifier.verified_tap(device_id, cell_x, cell_y, Expectation(kind="screen_changed"))
+        wanted_cells = [item for item in cells if target is not None and item[0] == target]
+        lowest, (cell_x, cell_y) = wanted_cells[0] if wanted_cells else min(cells, key=lambda item: item[0])
+        logger.info("bet menu: valori letti %s, cerco %s%s: tocco a (%d,%d)", sorted({v for v, _ in cells}), lowest,
+                    " (puntata dichiarata)" if wanted_cells else " (la piu' bassa letta)", cell_x, cell_y)
+        after = None
+        for attempt in range(_MAX_PICK_ATTEMPTS):
+            self.verifier.verified_tap(device_id, cell_x, cell_y, Expectation(kind="screen_changed"))
+            after = self._fresh(context_provider)
+            if after is None:
+                return Result.fail("Cannot read the screen after selecting the bet", "MENU_CONTEXT_ERROR")
+            seen = after.slot_ocr_state.get("posta")
+            if seen is not None and Decimal(str(seen)) == lowest:
+                break
+            # In un carosello la fila si ricentra dopo il tocco e le celle si spostano: si rilegge la fila e si
+            # tocca la cella che mostra il valore cercato (non un punto vecchio).
+            moved_cells = menu_amounts(after.text_boxes)
+            again = [item for item in moved_cells if item[0] == lowest]
+            if not _looks_like_menu(moved_cells) or not again:
+                break
+            new_x, new_y = again[0][1]
+            if seen is None and abs(new_x - cell_x) < 10 and abs(new_y - cell_y) < 10:
+                break                                   # stessa cella e puntata illeggibile: ritoccare non serve
+            logger.info("bet menu: dopo il tocco la puntata e' %s e non %s (la fila si e' spostata): ritocco la cella "
+                        "giusta a (%d,%d), tentativo %d/%d.", seen, lowest, new_x, new_y, attempt + 2, _MAX_PICK_ATTEMPTS)
+            cell_x, cell_y = new_x, new_y
 
-        after = self._fresh(context_provider)
-        if after is None:
-            return Result.fail("Cannot read the screen after selecting the bet", "MENU_CONTEXT_ERROR")
         if self._menu_still_open(opened, after):
             logger.info("bet menu: ancora aperto dopo la selezione, lo richiudo")
             closed = self._close_menu(device_id, slot_name, opened, after, toggle, context_provider, allow_operator)
@@ -273,7 +294,9 @@ class BetMenuSelector:
         origin_values = {value for value, _ in cells}
         progressed_any = changed_any = False
         last_back = "right"
-        for direction, back in (("left", "right"), ("right", "left")):
+        remembered = load_autopilot_value(slot_name, _ROW_DIRECTION_VALUE, self._memory_dir())
+        order = (("right", "left"), ("left", "right")) if remembered == "right" else (("left", "right"), ("right", "left"))
+        for direction, back in order:
             steps = 0
             progressed = False
             last_back = back
@@ -301,6 +324,7 @@ class BetMenuSelector:
                     continue
                 break
             if progressed:
+                save_autopilot_value(slot_name, _ROW_DIRECTION_VALUE, direction, self._memory_dir())
                 break                       # trovata una minima piu' bassa: si ferma qui
             if steps and {v for v, _ in shown[1]} != origin_values:
                 for _ in range(steps):      # si torna dove si era, poi si prova l'altra direzione
