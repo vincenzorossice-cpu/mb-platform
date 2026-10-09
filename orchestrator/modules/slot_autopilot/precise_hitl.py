@@ -145,7 +145,9 @@ def handle_precise_hitl_escalation(
         pre_tap_balance = pre_tap_state.get("saldo")
         new_balance = ocr_state.get("saldo")
         if new_balance is not None and pre_tap_balance is not None and new_balance < pre_tap_balance:
-            if description and any(kw in description.lower() for kw in _SPIN_INTENT_KEYWORDS):
+            if element == "spin" or (description and any(kw in description.lower() for kw in _SPIN_INTENT_KEYWORDS)):
+                # Si stava cercando proprio lo spin: un calo di saldo e' lo spin confermato, con qualunque parola
+                # l'operatore abbia indicato il pulsante (altrimenti si richiederebbe e si spinerebbe due volte).
                 print(f"Spin eseguito su richiesta esplicita dell'operatore: saldo {pre_tap_balance} -> {new_balance}.")
                 if new_bet is not None:
                     current_bet = new_bet

@@ -52,6 +52,9 @@ class SpinResult:
     state_after: Optional[dict] = None
     # Il saldo e' sceso di molto piu' della puntata creduta: la puntata reale e' piu' alta.
     bet_understated: bool = False
+    # Il tocco ha cambiato lo schermo ma non c'e' stato addebito (bonus intro, free spin, animazione): chi chiama non
+    # deve toccare di nuovo lo spin finche' non ha capito cosa succede.
+    anomaly: bool = False
 
 
 class SpinController:
@@ -77,6 +80,9 @@ class SpinController:
         # spin non si trova, prima dell'operatore si controlla che la slot sia ancora sullo schermo.
         self.lost_check = None
         self.arrow_stats = {"arrow": 0, "still": 0, "with_reference": False, "shots": 0, "spins": 0}
+        self._worked_points = {}           # slot -> punti dello spin che hanno gia' addebitato (mai da dimenticare)
+        # Opzionale: verified_spin_point(slot) -> (x, y) | None, il punto dello spin verificato nella mappa.
+        self.verified_spin_point = None
         self._anomaly = {}                 # slot -> True dopo "schermo cambiato senza addebito" (animazione/bonus in corso?)
         self._dead_spin_points = {}        # slot -> ((x, y), volte di fila) tocchi che non hanno mai addebitato
 
@@ -244,6 +250,7 @@ class SpinController:
         tap_seconds = wait_seconds = read_seconds = 0.0
         wait_captures = 0
         ended_ready = False
+        anomaly = False
         last_wait_seconds = None
         busy_sample = {}
         screenshot_after = None
@@ -373,6 +380,7 @@ class SpinController:
                         )
                         self._note_dead_point(slot_name, candidate, spin_index)
                         self._anomaly[slot_name] = True
+                        anomaly = True
                     break
                 if not self.locator.is_trusted_strategy(candidate.strategy_name):
                     # Coordinata indovinata (es. da GPT) che non fa partire lo spin:
@@ -391,6 +399,7 @@ class SpinController:
         if outcome == "success" and balance_after_read and balance_before is not None:
             if balance_after < balance_before:
                 self._anomaly.pop(slot_name, None)          # un addebito vero: si torna alla normalita'
+                self._worked_points.setdefault(slot_name, set()).add((candidate.x, candidate.y))
             elif balance_after > balance_before and self._anomaly.get(slot_name):
                 # Saldo SALITO subito dopo un'anomalia e senza alcun addebito visto: l'accredito di un bonus o di
                 # un'animazione in corso, non uno spin pagato. Non si conta (nel dubbio meno giocato, mai di piu').
@@ -420,6 +429,7 @@ class SpinController:
                 button_status = "NON appreso: lo screenshot 'occupato' dopo il tocco non e' stato raccolto"
                 logger.warning("pulsante spin: %s", button_status)
         if verified:
+            self._worked_points.setdefault(slot_name, set()).add((candidate.x, candidate.y))
             self.arrow_stats["spins"] += 1
             self.arrow_stats["shots"] += wait_captures
             self.arrow_stats["arrow" if ended_ready else "still"] += 1
@@ -496,8 +506,21 @@ class SpinController:
             verified=verified, attempts=attempts, outcome=outcome,
             accounting_anomaly=accounting_anomaly, strategy_name=candidate.strategy_name,
             screenshot_after=screenshot_after, state_after=state_after, bet_understated=bet_understated,
-            timings=timings, button_status=button_status,
+            timings=timings, button_status=button_status, anomaly=anomaly,
         ))
+
+    def clear_anomaly(self, slot_name: str) -> None:
+        """Dopo che il vigile ha chiarito la situazione (bonus finito): si riparte da zero sulle anomalie."""
+        self._anomaly.pop(slot_name, None)
+        self._dead_spin_points.pop(slot_name, None)
+
+    def _is_protected_point(self, slot_name: str, point: tuple) -> bool:
+        """Un punto che ha gia' addebitato o che la mappa dice verificato non e' mai 'sbagliato': un tocco senza
+        addebito li' e' un'anomalia (bonus, free spin, animazione), non un punto da dimenticare."""
+        if any(abs(point[0] - x) < 60 and abs(point[1] - y) < 60 for x, y in self._worked_points.get(slot_name, ())):
+            return True
+        known = self.verified_spin_point(slot_name) if callable(self.verified_spin_point) else None
+        return bool(known) and abs(point[0] - known[0]) < 60 and abs(point[1] - known[1]) < 60
 
     def _note_dead_point(self, slot_name: str, candidate, spin_index: int) -> None:
         """Il tocco ha cambiato lo schermo senza addebitare. Una volta puo' essere un'animazione; la seconda volta
@@ -506,6 +529,10 @@ class SpinController:
         if candidate.strategy_name != "memory":
             return
         point = (candidate.x, candidate.y)
+        if self._is_protected_point(slot_name, point):
+            logger.info("spin %d: il punto (%d,%d) ha gia' funzionato (o e' verificato nella mappa): un tocco senza "
+                        "addebito e' un'anomalia (bonus/animazione), non lo dimentico.", spin_index, point[0], point[1])
+            return
         previous, count = self._dead_spin_points.get(slot_name, (None, 0))
         count = count + 1 if previous == point else 1
         self._dead_spin_points[slot_name] = (point, count)

@@ -51,6 +51,35 @@ class SlotSetup:
             self._outcomes[key] = outcome
         return outcome
 
+    def verified_spin_point(self, slot_name: str) -> Optional[tuple]:
+        """Punto dello spin verificato nella mappa (None se non c'e' o e' ancora in attesa di conferma)."""
+        slot_map = self._maps.get(slot_name)
+        if slot_map is None or slot_map.spin is None or not slot_map.spin.verified:
+            return None
+        return slot_map.spin.x, slot_map.spin.y
+
+    def spin_point(self, slot_name: str) -> Optional[tuple]:
+        """Punto dello spin noto per la slot, verificato o in attesa di conferma (soldi veri)."""
+        slot_map = self._maps.get(slot_name)
+        return (slot_map.spin.x, slot_map.spin.y) if slot_map is not None and slot_map.spin is not None else None
+
+    def notes(self, slot_name: str) -> list:
+        slot_map = self._maps.get(slot_name)
+        return list(slot_map.notes or []) if slot_map is not None else []
+
+    def add_note(self, slot_name: str, text: str) -> Result[bool]:
+        """Una regola appresa per la slot (es. come gestire un bonus): nella mappa, senza doppioni, max 10."""
+        slot_map = self._maps.get(slot_name)
+        text = " ".join(str(text).split())[:300]
+        if slot_map is None or not text:
+            return Result.ok(False)
+        notes = list(slot_map.notes or [])
+        if text in notes:
+            return Result.ok(False)
+        slot_map.notes = (notes + [text])[-10:]
+        saved = self.memory.save(slot_map)
+        return Result.ok(True) if saved.success else Result.fail(saved.error, saved.error_code)
+
     def learn_bet_menu(self, device_id: str, slot_name: str) -> Result[bool]:
         """Dopo il primo minimo impostato: il verso di scorrimento che il carosello ha richiesto (appreso dal motore
         della puntata) entra nella mappa, cosi' la volta dopo si parte da li'."""

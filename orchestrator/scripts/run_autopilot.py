@@ -44,6 +44,7 @@ from orchestrator.modules.slot_autopilot.screen_recovery import ScreenRecovery
 from orchestrator.modules.slot_autopilot.slot_explorer import SlotExplorer
 from orchestrator.modules.slot_autopilot.slot_map import SlotMemory
 from orchestrator.modules.slot_autopilot.slot_setup import SlotSetup
+from orchestrator.modules.slot_autopilot.slot_warden import SlotWarden
 from orchestrator.modules.slot_autopilot.session import (
     BET_FAILURE_MESSAGES as _BET_FAILURE_MESSAGES,
     progress_line as _progress_line,
@@ -235,6 +236,36 @@ def build_autopilot_for(
             SlotMemory(config.slot_memory_dir), autopilot_explorer, screen_reader,
             known_min_bet=config.known_min_bet, demo=explore_demo, gpt_client=gpt_client,
         )
+    if gpt_client is not None and "gpt" in strategies:
+        slot_setup_obj = getattr(autopilot, "slot_setup", None)
+
+        def warden_spin_point(slot: str):
+            known = slot_setup_obj.spin_point(slot) if slot_setup_obj is not None else None
+            if known:
+                return known
+            from orchestrator.modules.slot_autopilot.strategies.base import LocateContext
+            found = strategies["memory"].locate("spin", LocateContext(
+                device_id="", slot_name=slot, screenshot_path="", screen_width=0, screen_height=0))
+            return (found.data.x, found.data.y) if found.success else None
+
+        def warden_ready_probe(slot: str, path: str):
+            point = warden_spin_point(slot)
+            if point is None:
+                return None
+            from PIL import Image
+            with Image.open(path) as image:
+                size = image.size
+            return spin_controller.button.classify(slot, size, path, int(point[0]), int(point[1]))
+
+        autopilot.warden = SlotWarden(
+            gpt_client, screen_reader, touch_injector, warden_spin_point,
+            describe=strategies["gpt"].locate_described, ready_probe=warden_ready_probe,
+            notes=slot_setup_obj.notes if slot_setup_obj is not None else None,
+            add_note=slot_setup_obj.add_note if slot_setup_obj is not None else None,
+            ask_text=input if enable_hitl else None,
+        )
+        if slot_setup_obj is not None:
+            spin_controller.verified_spin_point = slot_setup_obj.verified_spin_point
     if supervisor is not None:
         local_ocr = getattr(ocr_reader, "ocr", ocr_reader)      # lettore locale: la sonda non costa GPT
 

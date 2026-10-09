@@ -17,6 +17,7 @@ BET_WINDOW_RATIO = Decimal("0.6")
 BONUS_SETTLE_SECONDS = 2.0      # dopo un evento bonus si aspetta che il saldo si stabilizzi
 MAX_BONUS_EVENTS = 5           # eventi bonus di fila prima di chiedere all'operatore
 MAX_UNDERSTATED_RECHECKS = 2    # riletture della puntata per sessione prima di fermarsi con BET_UNDERSTATED
+WARDEN_BUSY_SECONDS = 20        # schermo occupato da cosi' tanto: lo guarda il vigile (Sol)
 MAX_OPERATOR_ACTIONS = 3   # interventi dell'operatore senza spin prima di fermarsi
 # Schermo non libero dopo uno spin (vincita/bonus/animazione lunga): si aspetta invece di
 # chiudere la sessione, fino a questo tempo.
@@ -152,6 +153,14 @@ def _setup_of(autopilot):
     if setup is None or not callable(getattr(setup, "prepare", None)):
         return None
     return setup if isinstance(getattr(setup, "status", "?"), (str, type(None))) else None
+
+
+def _warden_of(autopilot):
+    """Il vigile dell'autopilot, solo se e' uno vero."""
+    warden = getattr(autopilot, "warden", None)
+    if warden is None or not callable(getattr(warden, "handle", None)):
+        return None
+    return warden if isinstance(getattr(warden, "calls", None), int) else None
 
 
 def _log_slot_memory(autopilot, log) -> None:
@@ -304,6 +313,9 @@ def play_session(
         if not prepared_map.success:
             log.warning("Slot memory: preparazione non riuscita (%s): proseguo come prima.", prepared_map.error_code)
     reexplored = {"spin": False, "bet_menu": False}
+    warden = _warden_of(autopilot)
+    events = []                # ultimi eventi di spin (per il vigile)
+    warden_asked_busy = False
     spin_confirmed = False
     bonus_streak = 0
     understated_rechecks = 0
@@ -359,6 +371,18 @@ def play_session(
         first_initial = autopilot.get_balance_summary()[0]
     except Exception:
         first_initial = None
+
+    def incident(trigger: str) -> str:
+        """Il vigile (Sol, poi l'operatore in testo libero) chiarisce cosa succede. 'none' = nessun vigile; 'resume' =
+        si puo' tornare a giocare; 'stop' = l'operatore vuole fermarsi; 'give_up' = nessuno l'ha risolto."""
+        if warden is None:
+            return "none"
+        verdict = warden.handle(device_id, slot_name, trigger, list(events))
+        if verdict == "resume":
+            clear = getattr(getattr(autopilot, "spin_controller", None), "clear_anomaly", None)
+            if callable(clear):
+                clear(slot_name)
+        return verdict
 
     def set_bet_after_reentry() -> bool:
         """Dentro la slot ma la puntata e' tornata quella di partenza: si abbassa SENZA rinavigare. Con il minimo
@@ -427,6 +451,19 @@ def play_session(
                     spin_index -= 1
                     continue
             return SlotSessionResult(total_played, spin_index, failed=True, stop_reason="SPIN_ERROR", target=target)
+        events.append(f"spin {spin_index}: {spin_result.data.outcome}, saldo {spin_result.data.balance_before} -> "
+                      f"{spin_result.data.balance_after}")
+        del events[:-20]
+        if getattr(spin_result.data, "anomaly", False):
+            verdict = incident("il tocco sullo spin ha cambiato lo schermo senza addebito (bonus, free spin o animazione?)")
+            if verdict == "resume":
+                consecutive_no_effect, busy_since, busy_asked, lost_checked, bonus_streak = 0, None, False, False, 0
+                recent_spins.clear()
+                spin_index -= 1
+                continue
+            if verdict == "stop":
+                failed, stop_reason = True, "OPERATOR_STOP"
+                break
         if spin_result.data.bet_understated:
             believed = spin_result.data.bet_amount
             drop = None
@@ -473,6 +510,15 @@ def play_session(
             log.info("Puntata riverificata: %s EUR.", recheck.data.final_bet)
             continue
         if spin_result.data.outcome == "bonus_event":
+            verdict = incident("il saldo e' salito subito dopo un'anomalia, senza addebito (accredito di un bonus?)")
+            if verdict == "resume":
+                consecutive_no_effect, busy_since, busy_asked, lost_checked, bonus_streak = 0, None, False, False, 0
+                recent_spins.clear()
+                spin_index -= 1
+                continue
+            if verdict == "stop":
+                failed, stop_reason = True, "OPERATOR_STOP"
+                break
             bonus_streak += 1
             spin_index -= 1                    # non e' uno spin: non consuma max_steps, non entra nel giocato
             if bonus_streak >= MAX_BONUS_EVENTS:
@@ -498,6 +544,7 @@ def play_session(
             busy_since = None
             busy_asked = False
             lost_checked = False
+            warden_asked_busy = False
         if spin_result.data.outcome == "no_effect":
             consecutive_no_effect += 1
             if consecutive_no_effect >= MAX_CONSECUTIVE_NO_EFFECT_SPINS:
@@ -513,6 +560,15 @@ def play_session(
                     recent_spins.clear()
                     spin_index -= 1
                     continue
+                verdict = incident(f"{consecutive_no_effect} spin di fila senza addebito")
+                if verdict == "resume":
+                    consecutive_no_effect, busy_since, busy_asked, lost_checked, bonus_streak = 0, None, False, False, 0
+                    recent_spins.clear()
+                    spin_index -= 1
+                    continue
+                if verdict == "stop":
+                    failed, stop_reason = True, "OPERATOR_STOP"
+                    break
                 if slot_setup is not None and not reexplored["spin"]:
                     reexplored["spin"] = True
                     log.warning("Slot memory: lo spin salvato non addebita: rifaccio l'esplorazione del pulsante.")
@@ -571,6 +627,17 @@ def play_session(
                         recent_spins.clear()
                         spin_index -= 1
                         continue
+                if warden is not None and waited >= WARDEN_BUSY_SECONDS and not warden_asked_busy:
+                    warden_asked_busy = True
+                    verdict = incident(f"schermo occupato da {waited:.0f} s")
+                    if verdict == "resume":
+                        consecutive_no_effect, busy_since, busy_asked, lost_checked, bonus_streak = 0, None, False, False, 0
+                        warden_asked_busy = False
+                        spin_index -= 1
+                        continue
+                    if verdict == "stop":
+                        failed, stop_reason = True, "OPERATOR_STOP"
+                        break
                 if waited >= BUSY_ASK_AFTER_SECONDS and not busy_asked:
                     busy_asked = True
                     verdict = _ask_if_ready(autopilot, device_id)
@@ -632,6 +699,8 @@ def play_session(
     _log_capture_stats(autopilot, log)
     _log_arrow_stats(autopilot, log)
     _log_slot_memory(autopilot, log)
+    if warden is not None and getattr(warden, "incidents", 0):
+        log.info("%s", warden.summary())
 
     initial_balance, final_balance = autopilot.get_balance_summary()
     net = None

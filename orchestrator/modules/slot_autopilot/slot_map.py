@@ -59,6 +59,7 @@ class SlotMap:
     method: str = "sol"                             # sol | operator
     bet_menu_panel: Optional[tuple] = None         # (alto, basso) del pannello del menu, frazioni dell'altezza
     bet_scroll_direction: Optional[str] = None     # verso (left|right) che mostra le puntate piu' basse nel carosello
+    notes: Optional[list] = None                    # regole apprese per la slot (es. come gestire un bonus), max 10
     spin_pending: bool = False                      # soldi veri: punto di Sol non ancora provato, lo conferma il 1o spin
 
     def key(self) -> str:
@@ -112,6 +113,7 @@ class SlotMap:
                 explored_at=str(data.get("explored_at", "")), method=str(data.get("method", "sol")),
                 spin_pending=bool(data.get("spin_pending", False)),
                 bet_menu_panel=_parse_panel(data.get("bet_menu_panel")),
+                notes=[str(n) for n in data["notes"]][:10] if isinstance(data.get("notes"), list) else None,
                 bet_scroll_direction=data.get("bet_scroll_direction") if data.get("bet_scroll_direction") in ("left", "right") else None,
             )
         except (KeyError, TypeError, ValueError):
