@@ -23,7 +23,7 @@ _TRUSTED_STRATEGIES = {"profile", "memory", "hitl"}
 # fallisce con uno di questi, il chiamante deve poterli distinguere (es. uno
 # stop esplicito e' definitivo, un hint no) - non vanno annegati nel generico
 # ELEMENT_NOT_LOCATABLE.
-_HITL_OUTCOME_CODES = {"HITL_STOP_REQUESTED", "HITL_SKIPPED", "HITL_HINT_ONLY", "HITL_NO_COORDS", "HITL_INFO_ONLY"}
+_HITL_OUTCOME_CODES = {"HITL_STOP_REQUESTED", "HITL_SKIPPED", "HITL_HINT_ONLY", "HITL_NO_COORDS", "HITL_INFO_ONLY", "HITL_READY_STATEMENT"}
 
 
 # Un candidato non fidato piu' vicino di cosi' a un punto scartato e' lo stesso

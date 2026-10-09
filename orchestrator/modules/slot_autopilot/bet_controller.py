@@ -26,6 +26,7 @@ from orchestrator.modules.step_logger.interface import StepLoggerInterface, Step
 logger = logging.getLogger(__name__)
 
 _ELEMENT = "bet_minus"
+_MIN_TOLERANCE = Decimal("0.01")
 _MENU_TOGGLE_ELEMENT = "bet_menu_toggle"
 _PLUS_ELEMENT = "bet_plus"
 _SPIN_ELEMENT = "spin"
@@ -248,6 +249,7 @@ class BetController:
         money_moved_events = 0
         spin_zone_done = False
         unavailable_streak = 0
+        same_ask_streak = 0  # richieste identiche di fila con la puntata gia' uguale al minimo mostrato
 
         while attempts < self.config.max_bet_lower_attempts:
             attempts += 1
@@ -316,6 +318,25 @@ class BetController:
                         slot_name, episode_id, device_id, starting_bet, final_bet,
                         strategy_sequence + ["hitl"], attempts, any_decrease_seen, by_operator=True,
                     )
+                if locate_result.error_code == "HITL_READY_STATEMENT":
+                    # "e' gia' chiuso / puoi spinnare": nessun tocco. Si rilegge lo schermo: la puntata viene dalla
+                    # lettura fresca, mai da quella di prima del menu.
+                    fresh = context_provider()
+                    if fresh.success:
+                        context = fresh.data
+                    fresh_bet = self._read_bet(context)
+                    shown_min = self._shown_min(context, remembered_min)
+                    if fresh_bet is not None:
+                        current_bet = fresh_bet
+                    if fresh_bet is not None and shown_min is not None and fresh_bet <= shown_min + _MIN_TOLERANCE:
+                        logger.info("Puntata gia' al minimo (%s), proseguo con gli spin (operatore: pronto).", fresh_bet)
+                        return self._supervisor_confirmed_min(
+                            slot_name, episode_id, device_id, starting_bet, fresh_bet,
+                            strategy_sequence + ["hitl"], attempts, any_decrease_seen, by_operator=True,
+                        )
+                    logger.info("set_min_bet: l'operatore dice 'pronto' ma la puntata fresca e' %s (minimo %s): continuo.",
+                                fresh_bet, shown_min)
+                    continue
                 if locate_result.error_code == "HITL_STOP_REQUESTED":
                     logger.warning("set_min_bet: l'operatore ha chiesto di fermarsi, abort=HITL_STOP")
                     self._log_step(
@@ -361,6 +382,22 @@ class BetController:
                 refreshed = context_provider()
                 if refreshed.success:
                     context = refreshed.data
+                if locate_result.error_code == "HITL_SKIPPED":
+                    fresh_bet = self._read_bet(context)
+                    shown_min = self._shown_min(context, remembered_min)
+                    if fresh_bet is not None:
+                        current_bet = fresh_bet
+                    if fresh_bet is not None and shown_min is not None and fresh_bet <= shown_min + _MIN_TOLERANCE:
+                        same_ask_streak += 1
+                    else:
+                        same_ask_streak = 0
+                    if same_ask_streak >= 2:
+                        logger.warning("Puntata gia' al minimo ma il sistema non lo riconosce, forzo skip "
+                                       "(puntata %s, minimo %s).", fresh_bet, shown_min)
+                        return self._supervisor_confirmed_min(
+                            slot_name, episode_id, device_id, starting_bet, fresh_bet,
+                            strategy_sequence + ["hitl"], attempts, any_decrease_seen, by_operator=True, trusted=False,
+                        )
                 if locate_result.error_code == "HITL_HINT_ONLY" and refreshed.success:
                     # L'operatore ha toccato qualcosa e lo schermo e' cambiato: e' una schermata nuova,
                     # gli errori di prima non valgono, e va guardato COSA e' successo.
@@ -1061,14 +1098,14 @@ class BetController:
 
     def _supervisor_confirmed_min(
         self, slot_name, episode_id, device_id, starting_bet, final_bet, strategy_sequence, attempts,
-        any_decrease_seen, by_operator: bool = False,
+        any_decrease_seen, by_operator: bool = False, trusted: Optional[bool] = None,
     ) -> Result[BetResult]:
         """La puntata e' al minimo per riscontro di Sol (valore letto <= minimo noto) o dell'operatore."""
         sequence = list(strategy_sequence)
         if "supervisor" not in sequence and not by_operator:
             sequence.append("supervisor")
         if final_bet is not None:
-            self._remember_min(slot_name, final_bet, trusted=by_operator)
+            self._remember_min(slot_name, final_bet, trusted=by_operator if trusted is None else trusted)
         logger.info("set_min_bet: puntata minima confermata (%s) senza altri tocchi: %s.",
                     "operatore" if by_operator else "supervisore", final_bet)
         self._log_step(
@@ -1080,6 +1117,14 @@ class BetController:
             min_bet_verified=True, attempts=attempts, strategy_sequence=sequence,
             aborted_reason=None, outcome="min_bet_confirmed" if any_decrease_seen else "unchanged_already_min",
         ))
+
+    def _shown_min(self, context, remembered_min: Optional[Decimal]) -> Optional[Decimal]:
+        """Il minimo che l'operatore vede nel terminale: profilo (anche non verificato), provato o ricordato."""
+        values = [v for v in (self._known_min(context), remembered_min) if v is not None]
+        profile = context.profile if context else None
+        if profile is not None and profile.known_min_bet is not None:
+            values.append(Decimal(str(profile.known_min_bet)))
+        return min(values) if values else None
 
     def _read_bet(self, context) -> Optional[Decimal]:
         value = context.slot_ocr_state.get("posta") if context else None

@@ -33,6 +33,12 @@ _OUTSIDE_DESCRIPTION = (
 )
 # Se la vista non lo trova: punti in alto (fuori da un pannello ancorato in basso), provati uno per volta.
 _OUTSIDE_FALLBACK_POINTS = ((0.5, 0.15), (0.2, 0.12), (0.8, 0.22))
+# "e' gia' chiuso", "puoi spinnare", "vai": uno stato o un via libera, non un punto da toccare.
+_READY_STATEMENT = re.compile(
+    r"(gi[aà]'?\s+chiuso|(e'|è|si\s+e')\s+chiuso|puoi\s+(spinn\w*|giocare|partire)|si\s+pu[oò]\s+spinn\w*|"
+    r"^\s*(vai|pronto|ok\s+vai)\s*[.!]*\s*$)",
+    re.IGNORECASE,
+)
 _VALUE_DESCRIPTION = re.compile(
     r"\d+[.,]\d+|\b(pi[uù]'?\s+(basso|bassa|alto|alta|piccolo|piccola|grande)|minim\w*|massim\w*|"
     r"lowest|highest|smallest|largest)\b",
@@ -75,6 +81,9 @@ def handle_precise_hitl_escalation(
             print(f"Eseguo il tap suggerito dall'operatore: ({x},{y})")
         else:
             description = outcome[1]
+            if element != "spin" and _READY_STATEMENT.search(description):
+                print("Operatore dice che e' pronto: non tocco nulla, rileggo io schermo e puntata.")
+                return ("ready", description, current_bet, None)
             if _looks_like_min_bet_confirmation(description):
                 if not _TAP_INSTRUCTION.search(description):
                     # Una frase di stato, non un'istruzione: niente da cercare e da toccare.

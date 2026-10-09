@@ -57,6 +57,8 @@ class HITLStrategy(LocatorStrategy):
             return Result.fail("Operator requested skip", "HITL_SKIPPED")
         if action == "info":
             return Result.fail(f"Operator statement, no tap: {_data}", "HITL_INFO_ONLY")
+        if action == "ready":
+            return Result.fail(f"Operator says ready, no tap: {_data}", "HITL_READY_STATEMENT")
         if action == "hint":
             return Result.fail(f"Operator hint only, no tap: {_data}", "HITL_HINT_ONLY")
         if action in ("resolved", "spin_confirmed"):
