@@ -62,6 +62,9 @@ class AutoPilotConfig:
     spin_button_detection: bool = True
     # Dopo il tocco non si scatta nei primi secondi (durata appresa dagli spin normali precedenti): meno screenshot.
     spin_smart_wait: bool = True
+    # Senza freccia utilizzabile l'attesa dopo il tocco confronta solo la zona dei rulli (frazioni x1,y1,x2,y2 dello
+    # schermo): contatori di jackpot e barra del saldo non stanno mai fermi. None = schermo intero (comportamento storico).
+    spin_wait_region: Optional[tuple] = (0.05, 0.22, 0.95, 0.68)
     spin_skip_calm_after_loss: bool = True
     spin_calm_skip_max_age_seconds: float = 2.0
     # Attesa casuale dopo ogni tocco dell'autopilot (min, max): niente pausa "umana" da 0,3-1,5 s.

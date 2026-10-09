@@ -36,6 +36,7 @@ class SlotSetup:
         self.demo = demo
         self.gpt_client = gpt_client
         self.status: Optional[str] = None
+        self.button = None        # SpinButtonState (collegato dalla radice di composizione)
         self.reexplorations = 0
         self._outcomes = {}       # (dispositivo, slot) -> esito di prepare: la seconda chiamata non rifa' niente
         self._maps = {}           # slot -> ultima mappa nota (per confirm_spin senza altri screenshot)
@@ -102,6 +103,31 @@ class SlotSetup:
         saved = self.memory.save(slot_map)
         return Result.ok(True) if saved.success else Result.fail(saved.error, saved.error_code)
 
+    FREE_SPINS_NOTE = ("This game has free spins rounds: during them the balance does not drop when a spin starts and the "
+                       "spin button may need to be pressed for every free spin.")
+
+    def mark_free_spins(self, slot_name: str) -> Result[bool]:
+        """La slot ha giri gratuiti: si ricorda nella mappa (e come nota per il vigile)."""
+        slot_map = self._maps.get(slot_name)
+        if slot_map is None or slot_map.has_free_spins:
+            return Result.ok(False)
+        slot_map.has_free_spins = True
+        slot_map.notes = (list(slot_map.notes or []) + [self.FREE_SPINS_NOTE])[-10:] \
+            if self.FREE_SPINS_NOTE not in (slot_map.notes or []) else slot_map.notes
+        saved = self.memory.save(slot_map)
+        return Result.ok(True) if saved.success else Result.fail(saved.error, saved.error_code)
+
+    def learn_spin_method(self, slot_name: str, method: Optional[str]) -> Result[bool]:
+        """Quale segnale ha funzionato per capire che lo spin e' finito (freccia, colore, luminosita', disegno, o il
+        confronto della zona dei rulli): nella mappa, cosi' le run successive non rifanno i tentativi."""
+        slot_map = self._maps.get(slot_name)
+        if slot_map is None or method not in ("arrow", "color", "luminance", "patch", "frame_zone") \
+                or slot_map.spin_ready_method == method:
+            return Result.ok(False)
+        slot_map.spin_ready_method = method
+        saved = self.memory.save(slot_map)
+        return Result.ok(True) if saved.success else Result.fail(saved.error, saved.error_code)
+
     def reseed(self, slot_name: str) -> bool:
         """Dopo un rientro: rimette in memoria le coordinate della mappa (alcune possono essere state dimenticate o
         sovrascritte durante la sessione)."""
@@ -133,6 +159,8 @@ class SlotSetup:
                 self.memory.save(slot_map)
             self.memory.apply_to_memory(slot_map)
             self._maps[slot_name] = slot_map
+            if slot_map.spin_ready_method == "frame_zone" and self.button is not None:
+                self.button.mark_unusable(slot_name, size)   # niente piu' i 3 tentativi falliti di apprendimento
             self.status = USED
             logger.info("Slot memory: mappa di '%s' trovata (esplorata il %s): uso le coordinate salvate, nessuna "
                         "chiamata GPT per orientarmi.", slot_name, slot_map.explored_at[:10] or "?")

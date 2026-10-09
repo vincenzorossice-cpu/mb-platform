@@ -126,7 +126,7 @@ class ActionVerifier:
         self, device_id: str, x: int, y: int, expectation: Expectation,
         screenshot_before: Optional[str] = None, state_before: Optional[dict] = None,
         region_hint: Optional[tuple] = None, ready_check=None, on_after_tap=None, initial_wait: float = 0.0,
-        typical_duration: float = 0.0,
+        typical_duration: float = 0.0, wait_region: Optional[tuple] = None,
     ) -> Result[TapOutcome]:
         """`region_hint` (x1,y1,x2,y2): lettura OCR rapida "dopo" solo su quella fascia
         (saldo/puntata); se li' mancano saldo o puntata si rilegge lo stesso screenshot
@@ -136,11 +136,13 @@ class ActionVerifier:
         dopo il tocco (serve ad apprendere come appare il pulsante durante l'animazione).
         `initial_wait`: secondi senza scattare dopo il tocco (l'animazione c'e' di sicuro).
         `typical_duration`: durata tipica di uno spin normale: un frame con la freccia dopo l'85% di questo tempo e'
-        gia' la fine (non servono due)."""
+        gia' la fine (non servono due).
+        `wait_region` (x1,y1,x2,y2): senza freccia utilizzabile l'attesa dello schermo fermo confronta solo quella zona
+        (i rulli) invece dello schermo intero, dove contatori e ticker non stanno mai fermi."""
         try:
             return self._verified_tap(
                 device_id, x, y, expectation, screenshot_before, state_before, region_hint, ready_check, on_after_tap,
-                initial_wait, typical_duration,
+                initial_wait, typical_duration, wait_region,
             )
         except Exception as exc:
             return Result.fail(f"Unexpected error during verified_tap: {exc}", "VERIFICATION_ERROR")
@@ -227,7 +229,7 @@ class ActionVerifier:
         self, device_id: str, x: int, y: int, expectation: Expectation,
         screenshot_before: Optional[str] = None, state_before: Optional[dict] = None,
         region_hint: Optional[tuple] = None, ready_check=None, on_after_tap=None, initial_wait: float = 0.0,
-        typical_duration: float = 0.0,
+        typical_duration: float = 0.0, wait_region: Optional[tuple] = None,
     ) -> Result[TapOutcome]:
         # Se il chiamante ha gia' una lettura fresca dello STESSO schermo (presa
         # un istante prima, senza nulla in mezzo che lo cambi), riusarla evita
@@ -259,7 +261,7 @@ class ActionVerifier:
 
         wait_started = time.monotonic()
         wait_result, ended_ready = self._wait_after_tap(
-            device_id, expectation, ready_check, wait_started, initial_wait, typical_duration,
+            device_id, expectation, ready_check, wait_started, initial_wait, typical_duration, wait_region,
         )
         if not wait_result.success:
             return Result.fail(wait_result.error, wait_result.error_code)
@@ -326,7 +328,7 @@ class ActionVerifier:
 
     def _wait_after_tap(
         self, device_id: str, expectation: Expectation, ready_check, tap_moment: float, initial_wait: float = 0.0,
-        typical_duration: float = 0.0,
+        typical_duration: float = 0.0, wait_region: Optional[tuple] = None,
     ) -> tuple:
         """(Result[StabilityResult], ended_ready). Con ready_check utilizzabile l'attesa finisce al ritorno della
         freccia dello spin (2 screenshot di fila, non prima di _MIN_SECONDS_BEFORE_READY dal tocco); se la
@@ -363,7 +365,7 @@ class ActionVerifier:
             max_wait_seconds=self.config.frame_diff_max_wait_seconds,
             poll_interval=self.config.frame_diff_poll_interval,
             stable_threshold=self.config.frame_diff_stable_threshold,
-            region=expectation.region,
+            region=wait_region or expectation.region,
         ), False
 
     def wait_until_button_ready(self, device_id: str, ready_check, max_wait_seconds: float) -> Optional[Result[CalmResult]]:

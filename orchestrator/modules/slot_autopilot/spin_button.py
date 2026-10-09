@@ -28,6 +28,12 @@ _CELL_MIN_FRACTION = 0.25  # una cella 32x32 e' "accesa" se almeno il 25% dei su
 _MIN_ARROW_CELLS = 15      # sotto, il pulsante "pronto" non ha una freccia riconoscibile
 _MAX_BUSY_SIMILARITY = 0.6 # pronto/occupato troppo simili: non distinguibili
 _MAX_LEARNING_ATTEMPTS = 3
+# Altri indizi quando la freccia non sparisce durante l'animazione (colore, luminosita', disegno del pulsante).
+_FEAT_GRID = 4
+_COLOR_MIN_DISTANCE = 28.0     # distanza CROMATICA media (colore senza luminosita') tra pulsante pronto e occupato
+_LUMINANCE_MIN_DIFF = 22.0     # differenza di luminanza (quando il colore e' quasi uguale)
+_PATCH_MIN_DIFF = 18.0         # differenza media della griglia 4x4 in grigi (spinner, overlay sopra il pulsante)
+_FEATURE_MARGIN = 0.5          # "pronto" solo entro mezza separazione dal riferimento pronto e oltre dall'occupato
 
 
 def button_mask(
@@ -48,6 +54,35 @@ def button_mask(
     bright = ((brightness >= luma) & (spread <= spread_max)).astype(np.uint8) * 255
     small = np.asarray(Image.fromarray(bright).resize((_GRID, _GRID), Image.BOX)) / 255.0
     return small >= _CELL_MIN_FRACTION
+
+
+def button_features(screenshot_path: str, x: int, y: int, half: int = HALF_PX) -> Optional[dict]:
+    """Colore medio, luminanza media e griglia 4x4 in grigi del pulsante (zona centrale del ritaglio)."""
+    try:
+        with Image.open(screenshot_path) as image:
+            box = (max(0, int(x) - half), max(0, int(y) - half),
+                   min(image.width, int(x) + half), min(image.height, int(y) + half))
+            if box[2] <= box[0] or box[3] <= box[1]:
+                return None
+            crop = image.convert("RGB").crop(box)
+    except OSError:
+        return None
+    arr = np.asarray(crop).astype(np.float64)
+    h, w = arr.shape[:2]
+    center = arr[int(h * 0.2):max(int(h * 0.8), int(h * 0.2) + 1), int(w * 0.2):max(int(w * 0.8), int(w * 0.2) + 1)]
+    rgb = center.mean(axis=(0, 1))
+    luma = float(0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2])
+    grid = np.asarray(crop.convert("L").resize((_FEAT_GRID, _FEAT_GRID), Image.BOX)).astype(np.float64).flatten()
+    chroma = [float(v - luma) for v in rgb]                  # il colore senza la luminosita'
+    return {"rgb": [float(v) for v in rgb], "luma": luma, "chroma": chroma, "grid": [float(v) for v in grid]}
+
+
+def feature_distance(method: str, a: dict, b: dict) -> float:
+    if method == "color":      # solo la parte cromatica: una variazione di sola luminosita' e' un altro metodo
+        return float(np.linalg.norm(np.array(a["chroma"]) - np.array(b["chroma"])))
+    if method == "luminance":
+        return abs(float(a["luma"]) - float(b["luma"]))
+    return float(np.mean(np.abs(np.array(a["grid"]) - np.array(b["grid"]))))      # patch
 
 
 def similarity(a: np.ndarray, b: np.ndarray) -> float:
@@ -73,6 +108,10 @@ class SpinButtonReference:
     busy_similarity: float
     luma: int = _BRIGHT_LUMA
     spread_max: int = _WHITE_SPREAD
+    method: str = "arrow"        # arrow | color | luminance | patch
+    idle_feat: Optional[dict] = None
+    busy_feat: Optional[dict] = None
+    sep: float = 0.0
 
 
 class SpinButtonState:
@@ -118,7 +157,15 @@ class SpinButtonState:
         reference = None
         data = self._load_raw(slot_name)
         try:
-            if data.get("usable") and tuple(data.get("screen", ())) == tuple(screen_size):
+            if data.get("usable") and tuple(data.get("screen", ())) == tuple(screen_size) \
+                    and data.get("method", "arrow") != "arrow":
+                empty = np.zeros((_GRID, _GRID), dtype=bool)
+                reference = SpinButtonReference(
+                    idle=empty, busy=empty, screen=tuple(screen_size), threshold=0.0, busy_similarity=0.0,
+                    method=str(data["method"]), idle_feat=data["idle_feat"], busy_feat=data["busy_feat"],
+                    sep=float(data["sep"]),
+                )
+            elif data.get("usable") and tuple(data.get("screen", ())) == tuple(screen_size):
                 reference = SpinButtonReference(
                     idle=_from_rows(data["idle"]), busy=_from_rows(data["busy"]), screen=tuple(screen_size),
                     threshold=float(data["threshold"]), busy_similarity=float(data["busy_similarity"]),
@@ -142,6 +189,18 @@ class SpinButtonState:
         reference = self.reference(slot_name, screen_size)
         if reference is None:
             return None
+        if reference.method != "arrow":
+            features = button_features(screenshot_path, x, y)
+            if features is None:
+                return None
+            to_idle = feature_distance(reference.method, features, reference.idle_feat)
+            to_busy = feature_distance(reference.method, features, reference.busy_feat)
+            half = reference.sep * _FEATURE_MARGIN
+            state = True if (to_idle < half and to_busy > half) else False if (to_busy < half and to_idle > half) else None
+            logger.info("pulsante spin (%s): distanza da 'pronto' %.1f, da 'occupato' %.1f (separazione %.1f) -> %s",
+                        reference.method, to_idle, to_busy, reference.sep,
+                        "PRONTO" if state else "occupato" if state is False else "incerto")
+            return state
         mask = button_mask(screenshot_path, x, y, luma=reference.luma, spread_max=reference.spread_max)
         if mask is None:
             logger.warning("pulsante spin: ritaglio illeggibile (%s): classificazione impossibile.", screenshot_path)
@@ -176,9 +235,20 @@ class SpinButtonState:
             if sim <= _MAX_BUSY_SIMILARITY:
                 break                     # separazione sufficiente: parametri scelti
         separable = best is not None and best[0] <= _MAX_BUSY_SIMILARITY
-        gave_up = (not separable) and attempts >= _MAX_LEARNING_ATTEMPTS
+        alternative = None if separable else self._alternative(idle_path, busy_path, x, y)
+        usable = separable or alternative is not None
+        gave_up = (not usable) and attempts >= _MAX_LEARNING_ATTEMPTS
         record = {"screen": list(screen_size), "center": [int(x), int(y)], "attempts": attempts,
-                  "usable": bool(separable), "gave_up": gave_up}
+                  "usable": bool(usable), "gave_up": gave_up}
+        if alternative is not None:
+            method, idle_feat, busy_feat, sep = alternative
+            record.update({"method": method, "idle_feat": idle_feat, "busy_feat": busy_feat, "sep": sep})
+            self.last_status[slot_name] = f"appreso con il metodo '{method}' (separazione {sep:.1f}): la freccia non sparisce"
+            self._write(slot_name, record)
+            self._cache.pop((slot_name, tuple(screen_size)), None)
+            self._dump_debug(idle_path, busy_path, x, y)
+            logger.info("pulsante spin: apprendimento %d: %s", attempts, self.last_status[slot_name])
+            return "learned"
         if separable:
             sim, luma, spread_max, idle, busy = best
             record.update({"idle": _to_rows(idle), "busy": _to_rows(busy), "busy_similarity": sim,
@@ -199,6 +269,40 @@ class SpinButtonState:
         if separable:
             return "learned"
         return "unusable" if gave_up else "retry"
+
+    def _alternative(self, idle_path: str, busy_path: str, x: int, y: int) -> Optional[tuple]:
+        """La freccia non separa pronto e occupato: si prova il colore, poi la luminanza, poi il disegno del pulsante.
+        Ritorna (metodo, caratteristiche pronto, caratteristiche occupato, separazione) o None."""
+        idle, busy = button_features(idle_path, x, y), button_features(busy_path, x, y)
+        if idle is None or busy is None:
+            return None
+        color = feature_distance("color", idle, busy)
+        if color >= _COLOR_MIN_DISTANCE:
+            return "color", idle, busy, color
+        luminance = feature_distance("luminance", idle, busy)
+        if luminance >= _LUMINANCE_MIN_DIFF:
+            return "luminance", idle, busy, luminance
+        patch = feature_distance("patch", idle, busy)
+        if patch >= _PATCH_MIN_DIFF:
+            return "patch", idle, busy, patch
+        return None
+
+    def method(self, slot_name: str) -> Optional[str]:
+        """Come si capisce che lo spin e' finito per questa slot: 'arrow' | 'color' | 'luminance' | 'patch', oppure
+        'frame_zone' (nessun indizio sul pulsante: confronto della zona dei rulli); None se non si sa ancora."""
+        data = self._load_raw(slot_name)
+        if data.get("usable"):
+            return str(data.get("method", "arrow"))
+        return "frame_zone" if data.get("gave_up") else None
+
+    def mark_unusable(self, slot_name: str, screen_size: tuple) -> None:
+        """La mappa dice che su questa slot il pulsante non si distingue: niente tentativi di apprendimento (a meno che
+        non ci sia gia' un riferimento utilizzabile)."""
+        if self.reference(slot_name, screen_size) is not None:
+            return
+        self._write(slot_name, {"screen": list(screen_size), "attempts": _MAX_LEARNING_ATTEMPTS, "usable": False,
+                                "gave_up": True})
+        self._cache.pop((slot_name, tuple(screen_size)), None)
 
     def status(self, slot_name: str) -> Optional[str]:
         return self.last_status.get(slot_name)

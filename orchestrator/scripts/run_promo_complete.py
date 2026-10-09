@@ -264,9 +264,10 @@ def run(args) -> int:
                 logger.info("%s", client.usage_summary())
         logger.info("%s", cost_line(navigation_client, play_client))
         logger.info(
-            "ESITO: navigazione %s, spin %s, giocato %s EUR, rientri %s, stop=%s; tempi: navigazione %.0f s, gioco "
+            "ESITO: navigazione %s, spin %s, giocato %s EUR, free spin %s (non contati), rientri %s, stop=%s; tempi: navigazione %.0f s, gioco "
             "%.0f s; interventi operatore: %d", "ok" if nav_ok else "FALLITA", getattr(session, "spins", 0),
-            getattr(session, "total_played", 0), getattr(session, "reentries", 0), stop, nav_seconds, play_seconds,
+            getattr(session, "total_played", 0), getattr(session, "free_spins", 0), getattr(session, "reentries", 0), stop,
+            nav_seconds, play_seconds,
             getattr(hitl, "interventions", 0),
         )
         try:

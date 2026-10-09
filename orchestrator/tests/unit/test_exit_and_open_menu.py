@@ -173,4 +173,4 @@ def test_arrow_diagnosis_line(caplog):
     with caplog.at_level(logging.INFO):
         session._log_arrow_stats(autopilot, logging.getLogger("x"))
 
-    assert "riferimento SI" in caplog.text and "7 spin chiusi dalla freccia" in caplog.text and "2.5" in caplog.text
+    assert "riferimento SI" in caplog.text and "7 spin chiusi dal pulsante" in caplog.text and "2.5" in caplog.text

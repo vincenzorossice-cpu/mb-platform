@@ -18,6 +18,8 @@ BONUS_SETTLE_SECONDS = 2.0      # dopo un evento bonus si aspetta che il saldo s
 MAX_BONUS_EVENTS = 5           # eventi bonus di fila prima di chiedere all'operatore
 MAX_UNDERSTATED_RECHECKS = 2    # riletture della puntata per sessione prima di fermarsi con BET_UNDERSTATED
 WARDEN_BUSY_SECONDS = 20        # schermo occupato da cosi' tanto: lo guarda il vigile (Sol)
+MAX_FREE_RUN = 15               # free spin consecutivi prima di richiamare Sol (tetto di sicurezza)
+FREE_IDLE_SECONDS = 25.0        # secondi senza cambiamenti in free spin prima di richiamare Sol
 MAX_OPERATOR_ACTIONS = 3   # interventi dell'operatore senza spin prima di fermarsi
 # Schermo non libero dopo uno spin (vincita/bonus/animazione lunga): si aspetta invece di
 # chiudere la sessione, fino a questo tempo.
@@ -54,6 +56,7 @@ class SlotSessionResult:
     target: Decimal = Decimal("0.00")
     # Media per fase (secondi) degli spin riusciti: calma, tocco, attesa, lettura, altro, totale (None se nessuno).
     avg_timings: Optional[dict] = None
+    free_spins: int = 0                  # free spin giocati (NON entrano nel giocato)
     reentries: int = 0                   # quante volte si e' rientrati nella slot dopo che ci ha cacciato
     net: Optional[Decimal] = None        # netto vinto/perso sommato su tutti gli ingressi (il saldo demo si ripristina)
 
@@ -138,9 +141,16 @@ def _log_arrow_stats(autopilot, log) -> None:
         stats = autopilot.spin_controller.arrow_stats
         spins = int(stats["spins"])
         if spins > 0:
+            method = None
+            try:
+                button = autopilot.spin_controller.button
+                method = button.method(autopilot.config.slot_name)
+            except Exception:
+                method = None
             log.info(
-                "Freccia spin: riferimento %s, %d spin chiusi dalla freccia, %d dallo schermo fermo, %.1f scatti di "
-                "attesa per spin.", "SI" if stats["with_reference"] else "NO", int(stats["arrow"]),
+                "Freccia spin: riferimento %s%s, %d spin chiusi dal pulsante, %d dallo schermo fermo, %.1f scatti di "
+                "attesa per spin.", "SI" if stats["with_reference"] else "NO",
+                f" (metodo {method})" if isinstance(method, str) else "", int(stats["arrow"]),
                 int(stats["still"]), stats["shots"] / spins,
             )
     except Exception:
@@ -317,6 +327,7 @@ def play_session(
     events = []                # ultimi eventi di spin (per il vigile)
     warden_asked_busy = False
     spin_confirmed = False
+    method_saved = False
     bonus_streak = 0
     understated_rechecks = 0
 
@@ -371,6 +382,30 @@ def play_session(
         first_initial = autopilot.get_balance_summary()[0]
     except Exception:
         first_initial = None
+
+    fs = {"on": False, "done": 0, "run": 0, "start": None, "last": 0.0, "total": 0}
+
+    def fs_enter(balance, counted: bool) -> None:
+        """Sol ha confermato i free spin (indizi visivi): da qui si prosegue con controlli locali, senza chiamarlo a
+        ogni giro gratuito. I free spin NON entrano nel giocato: hanno un contatore a parte."""
+        if not fs["on"]:
+            fs.update(on=True, done=0, run=0, start=balance)
+            log.warning("Free spin confermati da Sol: non contano nel giocato; continuo con controlli locali senza "
+                        "richiamare Sol a ogni giro.")
+            if slot_setup is not None:
+                slot_setup.mark_free_spins(slot_name)
+        if counted:
+            fs["done"] += 1
+            fs["run"] += 1
+        fs["last"] = time.monotonic()
+
+    def fs_exit(balance_now) -> None:
+        if not fs["on"]:
+            return
+        log.info("Free spin terminati: %d spin gratis giocati, saldo passato da %s a %s, riprendo gioco normale.",
+                 fs["done"], fs["start"], balance_now)
+        fs["total"] += fs["done"]
+        fs.update(on=False, done=0, run=0, start=None)
 
     def incident(trigger: str) -> str:
         """Il vigile (Sol, poi l'operatore in testo libero) chiarisce cosa succede. 'none' = nessun vigile; 'resume' =
@@ -454,11 +489,56 @@ def play_session(
         events.append(f"spin {spin_index}: {spin_result.data.outcome}, saldo {spin_result.data.balance_before} -> "
                       f"{spin_result.data.balance_after}")
         del events[:-20]
-        if getattr(spin_result.data, "anomaly", False):
+        data = spin_result.data
+        bal_before, bal_after = data.balance_before, data.balance_after
+        debited = (data.outcome == "success" and bal_before is not None and bal_after is not None
+                   and bal_after < bal_before)
+        if fs["on"]:
+            if debited:
+                fs_exit(bal_after)                       # un addebito vero: i free spin sono finiti
+            elif getattr(data, "anomaly", False) or data.outcome in ("bonus_event", "success"):
+                fs_enter(None, counted=True)             # un free spin (anche se il saldo sale per un premio)
+                spin_index -= 1
+                if fs["run"] >= MAX_FREE_RUN:
+                    verdict = incident(f"{fs['run']} free spin consecutivi: sono ancora in corso?")
+                    if verdict == "free_spins":
+                        fs["run"] = 0
+                    elif verdict == "stop":
+                        failed, stop_reason = True, "OPERATOR_STOP"
+                        break
+                    else:
+                        fs_exit(bal_after)
+                continue
+            elif data.outcome == "no_effect":
+                if time.monotonic() - fs["last"] >= FREE_IDLE_SECONDS:
+                    verdict = incident(f"{FREE_IDLE_SECONDS:.0f} s senza cambiamenti durante i free spin: sono finiti?")
+                    if verdict == "free_spins":
+                        fs["last"] = time.monotonic()
+                    elif verdict == "stop":
+                        failed, stop_reason = True, "OPERATOR_STOP"
+                        break
+                    else:
+                        fs_exit(bal_after)
+                spin_index -= 1
+                time.sleep(2.0)
+                continue
+        if getattr(data, "anomaly", False):
             verdict = incident("il tocco sullo spin ha cambiato lo schermo senza addebito (bonus, free spin o animazione?)")
+            if verdict == "free_spins":
+                fs_enter(bal_before, counted=True)
+                spin_index -= 1
+                consecutive_no_effect, busy_since, busy_asked, lost_checked, bonus_streak = 0, None, False, False, 0
+                continue
             if verdict == "resume":
                 consecutive_no_effect, busy_since, busy_asked, lost_checked, bonus_streak = 0, None, False, False, 0
                 recent_spins.clear()
+                if bal_before is not None and bal_after is not None and bal_before == bal_after and data.bet_amount:
+                    # Caso B: Sol non vede indizi di free spin e il saldo e' identico = vincita pari alla puntata:
+                    # e' uno spin normale e conta nel giocato.
+                    total_played += data.bet_amount
+                    log.info("Spin %d con vincita pari alla puntata (saldo invariato %s): contato nel giocato (%s).",
+                             spin_index, bal_after, total_played)
+                    continue
                 spin_index -= 1
                 continue
             if verdict == "stop":
@@ -509,6 +589,11 @@ def play_session(
             continue
         if spin_result.data.outcome == "bonus_event":
             verdict = incident("il saldo e' salito subito dopo un'anomalia, senza addebito (accredito di un bonus?)")
+            if verdict == "free_spins":
+                fs_enter(bal_before, counted=True)
+                spin_index -= 1
+                consecutive_no_effect, busy_since, busy_asked, lost_checked, bonus_streak = 0, None, False, False, 0
+                continue
             if verdict == "resume":
                 consecutive_no_effect, busy_since, busy_asked, lost_checked, bonus_streak = 0, None, False, False, 0
                 recent_spins.clear()
@@ -559,6 +644,11 @@ def play_session(
                     spin_index -= 1
                     continue
                 verdict = incident(f"{consecutive_no_effect} spin di fila senza addebito")
+                if verdict == "free_spins":
+                    fs_enter(bal_before, counted=False)
+                    consecutive_no_effect, busy_since, busy_asked, lost_checked, bonus_streak = 0, None, False, False, 0
+                    spin_index -= 1
+                    continue
                 if verdict == "resume":
                     consecutive_no_effect, busy_since, busy_asked, lost_checked, bonus_streak = 0, None, False, False, 0
                     recent_spins.clear()
@@ -592,7 +682,13 @@ def play_session(
             total_played += spin_result.data.bet_amount
             if slot_setup is not None and not spin_confirmed:
                 spin_confirmed = True
-                slot_setup.confirm_spin(device_id, slot_name)      # soldi veri: il 1o spin vero conferma lo spin della mappa
+                slot_setup.confirm_spin(device_id, slot_name)      # il 1o spin vero conferma lo spin della mappa
+            if slot_setup is not None and not method_saved:
+                button = getattr(getattr(autopilot, "spin_controller", None), "button", None)
+                method = button.method(slot_name) if callable(getattr(button, "method", None)) else None
+                if isinstance(method, str):
+                    method_saved = True
+                    slot_setup.learn_spin_method(slot_name, method)   # come si capisce che lo spin e' finito: nella mappa
             correction = _check_bet_window(recent_spins, spin_result.data, autopilot, device_id, log)
             if correction:
                 total_played -= correction
@@ -629,6 +725,12 @@ def play_session(
                 if warden is not None and waited >= WARDEN_BUSY_SECONDS and not warden_asked_busy:
                     warden_asked_busy = True
                     verdict = incident(f"schermo occupato da {waited:.0f} s")
+                    if verdict == "free_spins":
+                        fs_enter(None, counted=False)
+                        consecutive_no_effect, busy_since, busy_asked, lost_checked, bonus_streak = 0, None, False, False, 0
+                        warden_asked_busy = False
+                        spin_index -= 1
+                        continue
                     if verdict == "resume":
                         consecutive_no_effect, busy_since, busy_asked, lost_checked, bonus_streak = 0, None, False, False, 0
                         warden_asked_busy = False
@@ -691,6 +793,7 @@ def play_session(
                 log.warning("Spin bloccato da un'invariante di sicurezza: %s", spin_result.data.violated_invariant)
                 stop_reason = "BLOCKED"
             break
+    fs_exit(autopilot.get_balance_summary()[1] if fs["on"] else None)
     log.info("Sessione conclusa: %s/%s EUR giocati in %d spin.", total_played, target, spin_index)
     averages = average_timings(collected_timings)
     if averages is not None:
@@ -719,5 +822,5 @@ def play_session(
     return SlotSessionResult(
         total_played, spin_index, failed=failed, stop_reason=stop_reason,
         initial_balance=initial_balance, final_balance=final_balance, target=target, avg_timings=averages,
-        reentries=reentry["n"], net=net,
+        reentries=reentry["n"], net=net, free_spins=fs["total"],
     )

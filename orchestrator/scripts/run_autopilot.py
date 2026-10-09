@@ -236,6 +236,7 @@ def build_autopilot_for(
             SlotMemory(config.slot_memory_dir), autopilot_explorer, screen_reader,
             known_min_bet=config.known_min_bet, demo=explore_demo, gpt_client=gpt_client,
         )
+        autopilot.slot_setup.button = spin_controller.button       # per ricordare/azzerare il metodo dello spin
     if gpt_client is not None and "gpt" in strategies:
         slot_setup_obj = getattr(autopilot, "slot_setup", None)
 

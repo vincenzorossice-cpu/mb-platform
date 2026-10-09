@@ -19,8 +19,8 @@ from orchestrator.modules.slot_ocr.vision_reader import _encode_reduced
 logger = logging.getLogger(__name__)
 
 _PURPOSE = "vigile"
-_SITUATIONS = ("normal", "bonus_intro", "bonus_running", "bonus_finished", "win_overlay", "popup", "menu_open",
-               "lost", "unknown")
+_SITUATIONS = ("normal", "bonus_intro", "bonus_running", "bonus_finished", "free_spins", "win_overlay", "popup",
+               "menu_open", "lost", "unknown")
 _ACTIONS = ("wait", "tap_spin", "tap_described", "resume", "ask_operator", "stop")
 _FORBIDDEN_WORDS = ("acquista", "buy", "compra", "gamble", "raddoppia", "double", "esci", "exit", "home", "puntata",
                     "bet", "cassa", "deposit", "deposito", "menu", "impostazioni", "settings")
@@ -35,10 +35,14 @@ _SYSTEM = (
     "You are the supervisor ('vigile') of an automatic player of a slot machine game on an Android phone. The player "
     "just noticed something unusual and asks you what is going on. You see ONE screenshot plus context. Answer ONLY "
     "with JSON: "
-    '{"situation": "normal|bonus_intro|bonus_running|bonus_finished|win_overlay|popup|menu_open|lost|unknown", '
+    '{"situation": "normal|bonus_intro|bonus_running|bonus_finished|free_spins|win_overlay|popup|menu_open|lost|unknown", '
     '"action": "wait|tap_spin|tap_described|resume|ask_operator|stop", "wait_seconds": number, '
     '"target_description": string|null, "explanation": short string, "confidence": number 0-1, '
     '"learn": string|null}. '
+    "free_spins = the game is INSIDE a free spins / free games round. Say free_spins ONLY if you SEE such indicators: a "
+    "'Free Spins: N' or 'Free Games: N' counter, the words FREE SPINS / FREE GAMES on screen, or a clearly different "
+    "bonus background or theme. If you see NO such indicator the game is normal: a normal spin whose win equals the bet "
+    "leaves the balance unchanged, so answer situation 'normal' with action 'resume'. "
     "Rules: free spins and bonus rounds usually play BY THEMSELVES: while they run use action 'wait' and do NOT tap. "
     "Some bonuses show an intro that asks the player to press the spin button (or a Start/Continue button) to begin: "
     "then use 'tap_spin' (the player knows where the spin button is) or 'tap_described' with the exact control to "
@@ -91,7 +95,7 @@ class SlotWarden:
     def __init__(self, gpt_client, screen_reader, touch_injector, spin_point: Callable, describe: Optional[Callable] = None,
                  ready_probe: Optional[Callable] = None, notes: Optional[Callable] = None,
                  add_note: Optional[Callable] = None, ask_text: Callable[[str], str] = input,
-                 sleep: Callable[[float], None] = time.sleep, max_calls: int = 30, max_calls_per_incident: int = 12,
+                 sleep: Callable[[float], None] = time.sleep, max_calls: int = 50, max_calls_per_incident: int = 25,
                  max_operator_turns: int = 6, bonus_timeout_seconds: float = 360.0):
         self.gpt_client = gpt_client
         self.screen_reader = screen_reader
@@ -111,6 +115,7 @@ class SlotWarden:
         self.incidents = 0
         self.bonus_events = 0
         self.bonus_seconds = 0.0
+        self.free_spin_confirmations = 0
 
     # ---- ingresso -------------------------------------------------------------------------------------------------
     def handle(self, device_id: str, slot_name: str, trigger: str, history: Optional[list] = None) -> str:
@@ -141,6 +146,11 @@ class SlotWarden:
                 continue
             logger.info("Vigile: %s -> %s (%s) fiducia %.2f", decision.situation, decision.action,
                         decision.explanation, decision.confidence)
+            if decision.situation == "free_spins":
+                # Free spin confermati da Sol (indizi visivi): la sessione entra nella modalita' free spin e prosegue con
+                # controlli locali, senza richiamare Sol a ogni giro gratuito.
+                self.free_spin_confirmations += 1
+                return "free_spins"
             if decision.learn:
                 learned = decision.learn
             if decision.situation in ("bonus_intro", "bonus_running") and not in_bonus:
@@ -327,4 +337,4 @@ class SlotWarden:
 
     def summary(self) -> str:
         return (f"Vigile: {self.incidents} interventi, {self.calls} chiamate a Sol, {self.bonus_events} bonus gestiti "
-                f"({self.bonus_seconds:.0f} s di attesa)")
+                f"({self.bonus_seconds:.0f} s di attesa), {self.free_spin_confirmations} conferme di free spin")

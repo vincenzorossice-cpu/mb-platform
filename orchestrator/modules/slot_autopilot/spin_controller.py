@@ -313,6 +313,10 @@ class SpinController:
                     extra["typical_duration"] = typical
                 if ready_check is not None:
                     extra["ready_check"] = ready_check
+                else:
+                    wait_region = self._wait_region(context)
+                    if wait_region is not None:
+                        extra["wait_region"] = wait_region      # senza freccia: si guardano i rulli, non lo schermo intero
                 if learning_button and attempts == 1:
                     extra["on_after_tap"] = lambda: self._sample_busy_button(device_id, busy_sample)
                 tap_result = self.verifier.verified_tap(
@@ -598,6 +602,14 @@ class SpinController:
             return
         history.append(seconds)
         del history[:-5]
+
+    def _wait_region(self, context) -> Optional[tuple]:
+        fractions = getattr(self.config, "spin_wait_region", None)
+        width, height = getattr(context, "screen_width", 0), getattr(context, "screen_height", 0)
+        if not fractions or not width or not height:
+            return None
+        x1, y1, x2, y2 = fractions
+        return int(width * x1), int(height * y1), int(width * x2), int(height * y2)
 
     def _typical_duration(self, slot_name: str) -> float:
         """Mediana delle durate normali recenti (0 finche' non ce ne sono almeno 2)."""
