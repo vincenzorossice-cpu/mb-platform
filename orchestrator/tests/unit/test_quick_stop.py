@@ -116,7 +116,7 @@ class TestTheTestOnTheFirstSpin:
         with caplog.at_level(logging.INFO):
             _spin(controller)
 
-        assert state.calls == [(False, "tocco ignorato")] and "ignorato" in caplog.text
+        assert state.calls == [] and "riprovo al prossimo spin con 0.3 s" in caplog.text      # niente DISABILITATO al primo no
 
     def test_an_unreadable_balance_is_inconclusive_and_nothing_is_saved(self, tmp_path, caplog):
         state = QuickState()
@@ -264,3 +264,109 @@ class TestMapAndDiagnosis:
         session.play_session(autopilot, "d", "slot", Decimal("0.40"), 30)
 
         assert flags[0] is False and flags[1] is True                             # sospeso appena entrati nei free spin
+
+
+# ---- secondo tocco back-to-back, delay configurabile, riprova a 0.3 s ------------------------------------------------
+
+def _traced(controller, verifier, monkeypatch):
+    """Registro ordinato di tocchi, attese e screenshot; il tempo finto avanza con le attese."""
+    events, clock = [], [0.0]
+    original_verified = verifier.verified_tap
+    verifier.verified_tap = lambda *a, **k: (events.append(("tap", clock[0])), original_verified(*a, **k))[1]
+    original_tap = verifier.touch_injector.tap_coordinates
+    verifier.touch_injector.tap_coordinates = lambda d, x, y: (events.append(("tap", clock[0])), original_tap(d, x, y))[1]
+    original_shot = verifier.screen_reader._screenshot
+    verifier.screen_reader._screenshot = lambda d: (events.append(("shot", clock[0])), original_shot(d))[1]
+
+    def fake_sleep(seconds):
+        events.append(("sleep", seconds))
+        clock[0] += seconds
+    monkeypatch.setattr("orchestrator.modules.slot_autopilot.spin_controller.time.sleep", fake_sleep)
+    monkeypatch.setattr("orchestrator.modules.slot_autopilot.spin_controller.time.monotonic", lambda: clock[0])
+    controller.button = MagicMock()
+    controller.button.reference.return_value = None
+    controller.button.needs_learning.return_value = True
+    controller._sample_busy_button = lambda d, h: events.append(("busy_sample", clock[0]))
+    return events
+
+
+class TestBackToBackTaps:
+    def test_tap_sleep_tap_and_only_then_the_screenshots(self, tmp_path, monkeypatch):
+        controller, verifier = _controller(tmp_path, QuickState(), balance_mid="9.90")
+        events = _traced(controller, verifier, monkeypatch)
+
+        _spin(controller)
+
+        kinds = [e[0] for e in events]
+        first_tap, second_tap = (i for i, k in enumerate(kinds) if k == "tap")
+        assert kinds[first_tap + 1:second_tap] == ["sleep"] and events[first_tap + 1][1] == pytest.approx(0.5)
+        assert kinds[second_tap + 1:].count("shot") == 2 and "shot" not in kinds[:second_tap]
+
+    def test_nothing_runs_between_the_two_taps_even_while_learning_the_button(self, tmp_path, monkeypatch):
+        controller, verifier = _controller(tmp_path, QuickState(), balance_mid="9.90")
+        events = _traced(controller, verifier, monkeypatch)
+
+        _spin(controller)
+
+        kinds = [e[0] for e in events]
+        first_tap = kinds.index("tap")
+        second_tap = kinds.index("tap", first_tap + 1)
+        assert set(kinds[first_tap + 1:second_tap]) == {"sleep"}           # niente shot, niente busy_sample
+
+    def test_the_gap_between_the_taps_is_under_a_second(self, tmp_path, monkeypatch):
+        controller, verifier = _controller(tmp_path, QuickState(), balance_mid="9.90")
+        events = _traced(controller, verifier, monkeypatch)
+
+        _spin(controller)
+
+        taps = [e[1] for e in events if e[0] == "tap"]
+        assert taps[1] - taps[0] < 1.0
+
+    def test_a_late_second_tap_proves_nothing(self, tmp_path, monkeypatch, caplog):
+        state = QuickState()
+        controller, verifier = _controller(tmp_path, state, balance_mid="9.90")
+        _traced(controller, verifier, monkeypatch)
+        monkeypatch.setattr("orchestrator.modules.slot_autopilot.spin_controller.quick_stop_delay", lambda: 1.4)
+
+        with caplog.at_level(logging.INFO):
+            _spin(controller)
+
+        assert state.calls == [] and "NON CONCLUSIVO (secondo tocco arrivato dopo" in caplog.text
+
+
+class TestDelayAndRetry:
+    def test_the_delay_comes_from_the_environment(self, monkeypatch):
+        from orchestrator.modules.slot_autopilot.config import quick_stop_delay
+        assert quick_stop_delay() == 0.5
+        monkeypatch.setenv("QUICK_STOP_DELAY", "0.8")
+        assert quick_stop_delay() == 0.8
+        for bad in ("abc", "0", "9"):
+            monkeypatch.setenv("QUICK_STOP_DELAY", bad)
+            assert quick_stop_delay() == 0.5
+
+    def test_ignored_at_half_a_second_retries_at_0_3_then_disables(self, tmp_path, monkeypatch, caplog):
+        state = QuickState()
+        controller, verifier = _controller(tmp_path, state, balance_mid="9.90", moving=True)
+        events = _traced(controller, verifier, monkeypatch)
+
+        with caplog.at_level(logging.INFO):
+            _spin(controller, 1)
+            assert state.calls == []                                   # niente salvato dopo il primo "ignorato"
+            verifier._shot_iter = iter(verifier.shots)
+            events.clear()
+            _spin(controller, 2)
+
+        assert events[[e[0] for e in events].index("sleep")][1] == pytest.approx(0.3)
+        assert state.calls == [(False, "tocco ignorato (0.5 s e 0.3 s)")]
+        verifier._shot_iter = iter(verifier.shots)
+        events.clear()
+        _spin(controller, 3)
+        assert [e[0] for e in events].count("tap") == 1          # disabilitato: un solo tocco, nessun secondo
+
+    def test_a_double_spin_does_not_retry(self, tmp_path):
+        state = QuickState()
+        controller, _ = _controller(tmp_path, state, balance_mid="9.80", balance_after="9.80")
+
+        _spin(controller)
+
+        assert state.calls == [(False, "doppio spin")] and not controller._quick_retry

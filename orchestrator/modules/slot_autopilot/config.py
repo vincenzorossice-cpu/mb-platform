@@ -1,8 +1,24 @@
+import os
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Optional
 
 from orchestrator.core.result import Result
+
+# Quick Stop: secondi tra la FINE del primo tocco sullo spin e l'inizio del secondo (nessuna altra operazione in mezzo).
+QUICK_STOP_DELAY = 0.5
+QUICK_STOP_RETRY_DELAY = 0.3     # se il test a QUICK_STOP_DELAY e' "ignorato": un'unica riprova, piu' veloce
+QUICK_STOP_MAX_GAP = 1.0         # oltre, il secondo tocco e' troppo tardivo e il test non prova nulla
+
+
+def quick_stop_delay() -> float:
+    """QUICK_STOP_DELAY (env) o 0.5; valori non numerici o fuori da 0.1-1.5 -> default."""
+    raw = os.environ.get("QUICK_STOP_DELAY", "").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return QUICK_STOP_DELAY
+    return value if 0.1 <= value <= 1.5 else QUICK_STOP_DELAY
 
 
 @dataclass

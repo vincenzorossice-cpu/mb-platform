@@ -9,7 +9,9 @@ from typing import Callable, Optional
 
 from orchestrator.core.result import Result
 from orchestrator.modules.provider_profile.autopilot_memory import forget_autopilot_element
-from orchestrator.modules.slot_autopilot.config import AutoPilotConfig
+from orchestrator.modules.slot_autopilot.config import (
+    QUICK_STOP_MAX_GAP, QUICK_STOP_RETRY_DELAY, AutoPilotConfig, quick_stop_delay,
+)
 from orchestrator.modules.slot_autopilot.frame_diff import diff_score
 from orchestrator.modules.slot_autopilot.locator import ElementLocator
 from orchestrator.modules.slot_autopilot.value_parser import parse_amount
@@ -22,9 +24,8 @@ _ELEMENT = "spin"
 _MAX_NORMAL_DURATION_SECONDS = 20.0   # oltre, e' un bonus/feature: non conta per la durata tipica
 _MAX_FIRST_SAMPLE_SECONDS = 12.0      # primi campioni: sopra e' quasi certamente una vincita/bonus
 _MAX_INITIAL_WAIT_SECONDS = 8.0
-_QUICK_FIRST_DELAY = 1.5       # secondi dal primo tocco al secondo (Quick Stop)
 _QUICK_USE_WAIT = 1.5         # attesa dopo il secondo tocco quando si usa il Quick Stop
-_QUICK_TEST_WAIT = 2.0        # nel test: attesa dopo il secondo tocco prima di guardare saldo e rulli
+_QUICK_TEST_WAIT = 1.5        # nel test: attesa dopo il secondo tocco prima di guardare saldo e rulli
 _BUSY_SAMPLE_DELAY_SECONDS = 1.0  # quanto dopo il tocco si campiona il pulsante "occupato"
 _SPIN_ZONE_HALF_PX = 160          # quadrato di ~320 px attorno al pulsante spin
 _BOTTOM_STRIP_FRACTION = 0.12     # ultimo 12% dell'altezza: saldo, puntata, vincita
@@ -89,6 +90,9 @@ class SpinController:
         self.quick_stop_state = None
         self.quick_stop_suspended = False           # la sessione lo sospende durante i free spin
         self._quick_seen_slots = set()              # il test si fa solo al primo spin della sessione
+        self._quick_retry = set()                   # slot il cui test a QUICK_STOP_DELAY e' "ignorato": riprova a 0.3 s
+        self._quick_retrying = set()                # slot con la riprova a 0.3 s in corso (una sola volta)
+        self._quick_delay_used = {}                 # slot -> delay con cui il Quick Stop e' stato provato con successo
         self.quick_stats = {"state": "untested", "reason": "", "spins": 0, "seconds": 0.0}
         self._worked_points = {}           # slot -> punti dello spin che hanno gia' addebitato (mai da dimenticare)
         # Opzionale: verified_spin_point(slot) -> (x, y) | None, il punto dello spin verificato nella mappa.
@@ -333,10 +337,12 @@ class SpinController:
                 if attempts == 1 and (learning_button or quick_mode != "off"):
                     def after_tap(_learn=learning_button, _mode=quick_mode, _x=candidate.x, _y=candidate.y):
                         tapped_at = time.monotonic()
-                        if _learn:
-                            self._sample_busy_button(device_id, busy_sample)
                         if _mode != "off":
-                            self._quick_second_tap(device_id, _x, _y, _mode, tapped_at, context, quick)
+                            # Back-to-back: nessuno screenshot/OCR/campione tra i due tocchi (il campione "occupato"
+                            # della freccia si salta in questo spin: ci pensano gli spin normali).
+                            self._quick_second_tap(device_id, _x, _y, _mode, tapped_at, slot_name, quick)
+                        elif _learn:
+                            self._sample_busy_button(device_id, busy_sample)
                     extra["on_after_tap"] = after_tap
                     if quick_mode == "use":
                         extra["skip_wait"] = True       # niente attesa dello schermo fermo: un solo screenshot
@@ -456,6 +462,9 @@ class SpinController:
                     context.screenshot_path, busy_sample["path"],
                 )
                 button_status = self.button.status(slot_name)
+            elif quick_mode != "off":
+                logger.info("pulsante spin: campione 'occupato' saltato in questo spin (Quick Stop back-to-back): "
+                            "lo apprendo da uno spin normale.")
             else:
                 button_status = "NON appreso: lo screenshot 'occupato' dopo il tocco non e' stato raccolto"
                 logger.warning("pulsante spin: %s", button_status)
@@ -558,14 +567,29 @@ class SpinController:
         if known is False:
             self.quick_stats.update(state="disabled", reason=self.quick_stats["reason"] or "gia' provato: non funziona")
             return "off"
-        return "test" if first_spin else "off"
+        if slot_name in self._quick_retry:
+            self._quick_retry.discard(slot_name)
+            self._quick_retrying.add(slot_name)
+            return "test"
+        if first_spin:
+            return "test"
+        return "off"
 
-    def _quick_second_tap(self, device_id: str, x: int, y: int, mode: str, tapped_at: float, context, holder: dict) -> None:
-        """Dopo il primo tocco: a 1.5 s dal tocco il secondo (tentativo di Quick Stop). Nel test si raccolgono due
-        screenshot a ~3.5 s (e il saldo da quello di t=3.5 s, prima delle vincite); nell'uso si aspetta 1.5 s."""
-        time.sleep(max(0.0, _QUICK_FIRST_DELAY - (time.monotonic() - tapped_at)))
+    def _quick_delay_for(self, slot_name: str, mode: str) -> float:
+        if mode == "test" and slot_name in self._quick_retrying:
+            return QUICK_STOP_RETRY_DELAY
+        return self._quick_delay_used.get(slot_name, quick_stop_delay())
+
+    def _quick_second_tap(self, device_id: str, x: int, y: int, mode: str, tapped_at: float, slot_name: str,
+                          holder: dict) -> None:
+        """Dopo il primo tocco: dopo il delay (0.5 s di default, 0.3 s nella riprova) il secondo, senza nient'altro in
+        mezzo. Poi, nel test, due screenshot (il saldo da quello di ~1.5 s dopo, prima delle vincite); nell'uso 1.5 s."""
+        delay = self._quick_delay_for(slot_name, mode)
+        time.sleep(max(0.0, delay - (time.monotonic() - tapped_at)))
         self.verifier.touch_injector.tap_coordinates(device_id, int(x), int(y))
-        holder["second_tap"] = True
+        gap = time.monotonic() - tapped_at
+        holder.update(second_tap=True, gap=gap, delay=delay)
+        logger.info("Quick Stop: intervallo tra i tocchi %.2f s (delay %.1f s).", gap, delay)
         if mode == "use":
             time.sleep(_QUICK_USE_WAIT)
             return
@@ -591,9 +615,15 @@ class SpinController:
                 self._set_quick(slot_name, False, "doppio addebito rilevato")
                 return True
             return False
-        # ---- test (primo spin) ----
+        # ---- test (primo spin, o riprova a 0.3 s) ----
+        retrying = slot_name in self._quick_retrying
+        self._quick_retrying.discard(slot_name)
         if not holder.get("second_tap") or not holder.get("s1"):
             logger.info("Quick Stop test: NON CONCLUSIVO (secondo tocco o screenshot mancanti): riprovo alla prossima sessione.")
+            return False
+        gap = holder.get("gap")
+        if gap is not None and gap > QUICK_STOP_MAX_GAP:
+            logger.warning("Quick Stop test: NON CONCLUSIVO (secondo tocco arrivato dopo %.1f s): riprovo.", gap)
             return False
         mid = self._balance_from_image(holder["s1"])
         if mid is None:
@@ -608,10 +638,17 @@ class SpinController:
             still = holder.get("s2") is not None and self._reels_still(holder["s1"], holder["s2"])
             if still:
                 logger.info("Quick Stop test: ABILITATO (saldo sceso 1x, animazione saltata).")
+                self._quick_delay_used[slot_name] = holder.get("delay", quick_stop_delay())
                 self._set_quick(slot_name, True, "animazione saltata dal secondo tocco")
+            elif not retrying:
+                # Ignorato a QUICK_STOP_DELAY: nulla viene salvato, al prossimo spin si riprova una volta a 0.3 s.
+                self._quick_retry.add(slot_name)
+                logger.info("Quick Stop test: ignorato con delay %.1f s, riprovo al prossimo spin con %.1f s.",
+                            holder.get("delay", 0.0), QUICK_STOP_RETRY_DELAY)
             else:
-                logger.info("Quick Stop test: DISABILITATO (ignorato: i rulli erano ancora in movimento).")
-                self._set_quick(slot_name, False, "tocco ignorato")
+                logger.info("Quick Stop test: DISABILITATO (ignorato: i rulli erano ancora in movimento, anche a %.1f s).",
+                            QUICK_STOP_RETRY_DELAY)
+                self._set_quick(slot_name, False, "tocco ignorato (0.5 s e 0.3 s)")
             return False
         logger.info("Quick Stop test: NON CONCLUSIVO (nessun addebito visto a t=3.5 s): riprovo alla prossima sessione.")
         return False
