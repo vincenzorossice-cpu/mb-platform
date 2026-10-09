@@ -178,55 +178,23 @@ class SlotExplorer:
         self.last_notes.append("non ho verificato come si chiude il menu puntata")
 
     # ---- spin --------------------------------------------------------------------------------------------------
-    def _map_spin(self, device_id: str, smap: SlotMap, overview: dict, demo: bool) -> None:
+    def _map_spin(self, device_id: str, smap: SlotMap, overview: dict, demo: bool = True) -> None:
+        """Il punto dello spin di Sol resta "in attesa" (spin_pending): l'esploratore NON lo tocca mai, ne' in demo ne'
+        con soldi veri. A puntata di default (spesso 1 EUR) uno spin di verifica spenderebbe piu' del minimo; lo
+        confermera' il primo spin VERO della sessione, che parte dopo set_min_bet, cioe' gia' alla puntata minima."""
         point = self._point(overview.get("spin"), smap.screen)
-        if not demo:
-            # Soldi veri: nessuno spin di prova a pagamento. Il punto di Sol resta "in attesa" e lo conferma il
-            # primo spin vero della sessione (che si gioca comunque, alla puntata minima).
-            if point is not None:
-                point.verified = False
-                point.description = (point.description or "spin") + " (da confermare col primo spin)"
-                smap.spin, smap.spin_pending = point, True
-            else:
-                self.last_notes.append("Sol non ha indicato lo spin")
+        if point is None and self.describe is not None:
+            shot = self._screenshot(device_id)
+            found = self._describe(shot[0], smap.screen,
+                                   "the main SPIN button (round button with circular arrows) that starts a spin") if shot else None
+            if found is not None:
+                point = Point(int(found[0]), int(found[1]), "trovato con la ricerca a griglia")
+        if point is None:
+            self.last_notes.append("Sol non ha indicato lo spin")
             return
-        for attempt in range(2):
-            if point is None:
-                break
-            before = self._screenshot(device_id)
-            balance_before = self._balance(before[0]) if before else None
-            self.touch_injector.tap_coordinates(device_id, point.x, point.y)
-            self.sleep(_SETTLE_SECONDS * 2)
-            after = self._screenshot(device_id)
-            balance_after = self._balance(after[0]) if after else None
-            changed = bool(before and after and self._changed(before[0], after[0]))
-            spent = balance_before is not None and balance_after is not None and balance_after < balance_before
-            if spent or (changed and (balance_before is None or balance_after is None)):
-                point.verified = True
-                point.description = (point.description or "spin") + (" (addebito visto)" if spent else " (schermo cambiato)")
-                smap.spin, smap.spin_pending = point, False
-                self._wait_still(device_id)
-                return
-            point = None
-            if attempt == 0 and self.describe is not None and before:
-                found = self._describe(before[0], smap.screen,
-                                       "the main SPIN button (round button with circular arrows) that starts a spin")
-                if found is not None:
-                    point = Point(int(found[0]), int(found[1]), "trovato con la ricerca a griglia")
-        self.last_notes.append("lo spin indicato non ha addebitato")
-
-    def _wait_still(self, device_id: str) -> None:
-        """Aspetta che l'animazione dello spin finisca (due screenshot di fila uguali) prima di proseguire."""
-        deadline = time.monotonic() + _STILL_MAX_SECONDS
-        previous = self._screenshot(device_id)
-        while time.monotonic() < deadline:
-            self.sleep(1.0)
-            current = self._screenshot(device_id)
-            if previous and current:
-                diff = diff_score(previous[0], current[0])
-                if diff.success and diff.data < 0.005:
-                    return
-            previous = current
+        point.verified = False
+        point.description = (point.description or "spin") + " (da confermare col primo spin)"
+        smap.spin, smap.spin_pending = point, True
 
     # ---- strumenti ---------------------------------------------------------------------------------------------
     def _screenshot(self, device_id: str):

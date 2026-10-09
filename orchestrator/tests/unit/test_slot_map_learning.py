@@ -153,11 +153,12 @@ class TestSlotExplorer:
         result = explorer.explore("d", "Wrap", demo=True)
 
         smap = result.data
-        assert result.success and smap.spin.verified and smap.spin.x == 100 and smap.spin.y == 360
+        assert result.success and smap.spin_pending and not smap.spin.verified and smap.spin.x == 100 and smap.spin.y == 360
         assert smap.bet_menu_open.verified and smap.bet_menu_type == "carousel"
         assert smap.close_method == "tap_outside" and smap.close_point.verified
         assert smap.exit_point is not None and not smap.exit_point.verified          # Esci non si tocca
         assert (25 * 200 // 1000, 25) not in phone.taps and sum(gpt._usage_by_purpose.values()) == 2
+        assert (100, 360) not in phone.taps                      # lo spin non si tocca mai a puntata di default
 
     def test_a_declared_minimum_is_stored_as_proven(self, tmp_path):
         explorer, _, _ = self._explorer(tmp_path)
@@ -195,10 +196,12 @@ class TestSlotExplorer:
         assert smap.bet_menu_open is None
         assert any("non apre un menu di puntate" in note for note in explorer.last_notes)
 
-    def test_a_spin_that_does_not_charge_is_not_saved(self, tmp_path):
-        explorer, _, _ = self._explorer(tmp_path, phone=FakePhone(tmp_path, spin_charges=False))
+    def test_the_spin_is_never_verified_by_the_explorer_even_if_it_would_not_charge(self, tmp_path):
+        explorer, phone, _ = self._explorer(tmp_path, phone=FakePhone(tmp_path, spin_charges=False))
 
-        assert explorer.explore("d", "Wrap", demo=True).error_code == "EXPLORE_INCOMPLETE"
+        result = explorer.explore("d", "Wrap", demo=True)
+
+        assert result.success and result.data.spin_pending and (100, 360) not in phone.taps
 
 
 # ---- 3. SlotSetup: mappa -> zero GPT; niente mappa -> esplora; tap che fallisce -> ri-esplora -------------------

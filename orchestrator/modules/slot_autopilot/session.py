@@ -351,7 +351,7 @@ def play_session(
         bet_result.data.final_bet, bet_result.data.outcome, bet_result.data.attempts,
     )
     if slot_setup is not None:
-        slot_setup.learn_bet_menu(device_id, slot_name)
+        slot_setup.learn_bet_menu(device_id, slot_name, bet_result.data.final_bet)
 
     total_played = Decimal("0.00")
     spin_index = 0
@@ -471,15 +471,13 @@ def play_session(
                 drop = spin_result.data.balance_before - spin_result.data.balance_after
             if understated_rechecks < MAX_UNDERSTATED_RECHECKS:
                 # Il saldo scende piu' della puntata creduta: la puntata a schermo e' cambiata (es. un tocco ha colpito
-                # una cella). Si rilegge e si riporta al minimo; questo spin vale quanto il calo osservato (mai piu'
-                # della puntata reale: una vincita puo' solo ridurlo) e si prosegue.
+                # una cella, o uno spin e' partito prima di abbassarla). Si rilegge e si riporta al minimo e si prosegue.
                 understated_rechecks += 1
                 log.warning(
                     "La puntata reale e' piu' alta di %s (calo di saldo %s): rileggo e riporto la puntata al minimo "
                     "(%d/%d).", believed, drop, understated_rechecks, MAX_UNDERSTATED_RECHECKS,
                 )
-                if drop is not None and drop > 0:
-                    total_played += drop
+                # Questo spin NON entra nel giocato: non era alla puntata minima (stima prudente).
                 recheck = autopilot.set_min_bet(device_id)
                 recent_spins.clear()
                 if recheck.success and recheck.data.min_bet_verified:
@@ -573,6 +571,7 @@ def play_session(
                     reexplored["spin"] = True
                     log.warning("Slot memory: lo spin salvato non addebita: rifaccio l'esplorazione del pulsante.")
                     if slot_setup.reexplore(device_id, slot_name, "spin").success:
+                        spin_confirmed = False          # il nuovo punto lo conferma il prossimo spin vero
                         consecutive_no_effect = 0
                         spin_index -= 1
                         continue

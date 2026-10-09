@@ -80,14 +80,25 @@ class SlotSetup:
         saved = self.memory.save(slot_map)
         return Result.ok(True) if saved.success else Result.fail(saved.error, saved.error_code)
 
-    def learn_bet_menu(self, device_id: str, slot_name: str) -> Result[bool]:
-        """Dopo il primo minimo impostato: il verso di scorrimento che il carosello ha richiesto (appreso dal motore
-        della puntata) entra nella mappa, cosi' la volta dopo si parte da li'."""
+    def learn_bet_menu(self, device_id: str, slot_name: str, final_bet=None) -> Result[bool]:
+        """Dopo il primo minimo impostato dal motore della puntata: nella mappa entrano il verso di scorrimento del
+        carosello e il MINIMO (provato se il motore l'ha dimostrato: `min_bet_trusted`; altrimenti solo la puntata
+        raggiunta, come suggerimento). Le run successive lo caricano senza cercarlo."""
         slot_map = self._maps.get(slot_name)
-        direction = load_autopilot_value(slot_name, "bet_row_direction", self.memory.memory_dir)
-        if slot_map is None or direction not in ("left", "right") or slot_map.bet_scroll_direction == direction:
+        if slot_map is None:
             return Result.ok(False)
-        slot_map.bet_scroll_direction = direction
+        changed = False
+        direction = load_autopilot_value(slot_name, "bet_row_direction", self.memory.memory_dir)
+        if direction in ("left", "right") and slot_map.bet_scroll_direction != direction:
+            slot_map.bet_scroll_direction, changed = direction, True
+        trusted = load_autopilot_value(slot_name, "min_bet_trusted", self.memory.memory_dir)
+        if trusted:
+            if slot_map.min_bet != str(trusted) or not slot_map.min_bet_proven:
+                slot_map.min_bet, slot_map.min_bet_proven, changed = str(trusted), True, True
+        elif final_bet is not None and slot_map.min_bet is None:
+            slot_map.min_bet, slot_map.min_bet_proven, changed = str(final_bet), False, True
+        if not changed:
+            return Result.ok(False)
         saved = self.memory.save(slot_map)
         return Result.ok(True) if saved.success else Result.fail(saved.error, saved.error_code)
 

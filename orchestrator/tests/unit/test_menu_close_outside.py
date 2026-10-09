@@ -203,14 +203,14 @@ def _autopilot(spins):
 
 class TestSessionRecoversFromAWrongBet:
     def test_the_first_understated_spin_rereads_the_bet_and_the_session_goes_on(self):
-        autopilot = _autopilot([_spin(1), _spin(2, understated=True, after="99.60"), _spin(3), _spin(4)])
+        autopilot = _autopilot([_spin(1), _spin(2, understated=True, after="99.60"), _spin(3), _spin(4), _spin(5)])
 
         result = session.play_session(autopilot, "d", "slot", Decimal("0.80"), 30)
 
         assert not result.failed
         assert autopilot.set_min_bet.call_count == 2                     # iniziale + riverifica
-        # spin 1 = 0.20, spin 2 = il calo reale 0.40, spin 3 = 0.20: target 0.80 raggiunto a 3 spin
-        assert result.total_played == Decimal("0.80") and result.spins == 3
+        # lo spin anomalo (2) NON entra nel giocato: contano i 4 spin giusti = 0.80, in 5 giri
+        assert result.total_played == Decimal("0.80") and result.spins == 5
 
     def test_after_two_rechecks_the_third_wrong_bet_stops(self):
         autopilot = _autopilot([_spin(i, understated=True, after="99.60") for i in range(1, 6)])
