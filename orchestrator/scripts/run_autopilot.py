@@ -267,6 +267,7 @@ def build_autopilot_for(
         )
         if slot_setup_obj is not None:
             spin_controller.verified_spin_point = slot_setup_obj.verified_spin_point
+            spin_controller.quick_stop_state = slot_setup_obj          # Quick Stop: esito provato e ricordato nella mappa
     if supervisor is not None:
         local_ocr = getattr(ocr_reader, "ocr", ocr_reader)      # lettore locale: la sonda non costa GPT
 

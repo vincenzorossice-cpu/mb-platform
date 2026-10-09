@@ -195,6 +195,25 @@ def _log_slot_memory(autopilot, log) -> None:
         pass
 
 
+def _log_quick_stats(autopilot, log) -> None:
+    """Una riga sul Quick Stop: abilitato (quanti spin rapidi e a quanti secondi), disabilitato (perche') o non testato."""
+    try:
+        stats = autopilot.spin_controller.quick_stats
+        state = stats["state"]
+        if not isinstance(state, str):
+            return
+        if state == "enabled":
+            spins = int(stats["spins"])
+            detail = f" ({spins} spin rapidi, ~{stats['seconds'] / spins:.1f} s l'uno)" if spins else ""
+            log.info("Quick Stop: ABILITATO%s.", detail)
+        elif state == "disabled":
+            log.info("Quick Stop: DISABILITATO (%s).", stats["reason"] or "non funziona su questa slot")
+        else:
+            log.info("Quick Stop: NON TESTATO.")
+    except Exception:
+        pass
+
+
 def _ask_if_ready(autopilot, device_id: str) -> str:
     diagnose = getattr(autopilot, "diagnose_busy", None)
     if not callable(diagnose):
@@ -472,6 +491,9 @@ def play_session(
     while total_played < target and spin_index < max_steps:
         spin_index += 1
         started = time.monotonic()
+        controller = getattr(autopilot, "spin_controller", None)
+        if controller is not None and isinstance(getattr(controller, "quick_stop_suspended", None), bool):
+            controller.quick_stop_suspended = fs["on"]          # niente secondo tocco durante i free spin
         if force_next:
             force_next = False
             spin_result = autopilot.spin(device_id, spin_index, force=True)   # Sol: il gioco e' pronto
@@ -801,6 +823,7 @@ def play_session(
     _log_capture_stats(autopilot, log)
     _log_arrow_stats(autopilot, log)
     _log_slot_memory(autopilot, log)
+    _log_quick_stats(autopilot, log)
     if warden is not None and getattr(warden, "incidents", 0):
         log.info("%s", warden.summary())
 

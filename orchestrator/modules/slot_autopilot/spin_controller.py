@@ -10,6 +10,7 @@ from typing import Callable, Optional
 from orchestrator.core.result import Result
 from orchestrator.modules.provider_profile.autopilot_memory import forget_autopilot_element
 from orchestrator.modules.slot_autopilot.config import AutoPilotConfig
+from orchestrator.modules.slot_autopilot.frame_diff import diff_score
 from orchestrator.modules.slot_autopilot.locator import ElementLocator
 from orchestrator.modules.slot_autopilot.value_parser import parse_amount
 from orchestrator.modules.slot_autopilot.verifier import ActionVerifier, Expectation, classify_screen_state
@@ -21,6 +22,9 @@ _ELEMENT = "spin"
 _MAX_NORMAL_DURATION_SECONDS = 20.0   # oltre, e' un bonus/feature: non conta per la durata tipica
 _MAX_FIRST_SAMPLE_SECONDS = 12.0      # primi campioni: sopra e' quasi certamente una vincita/bonus
 _MAX_INITIAL_WAIT_SECONDS = 8.0
+_QUICK_FIRST_DELAY = 1.5       # secondi dal primo tocco al secondo (Quick Stop)
+_QUICK_USE_WAIT = 1.5         # attesa dopo il secondo tocco quando si usa il Quick Stop
+_QUICK_TEST_WAIT = 2.0        # nel test: attesa dopo il secondo tocco prima di guardare saldo e rulli
 _BUSY_SAMPLE_DELAY_SECONDS = 1.0  # quanto dopo il tocco si campiona il pulsante "occupato"
 _SPIN_ZONE_HALF_PX = 160          # quadrato di ~320 px attorno al pulsante spin
 _BOTTOM_STRIP_FRACTION = 0.12     # ultimo 12% dell'altezza: saldo, puntata, vincita
@@ -80,6 +84,12 @@ class SpinController:
         # spin non si trova, prima dell'operatore si controlla che la slot sia ancora sullo schermo.
         self.lost_check = None
         self.arrow_stats = {"arrow": 0, "still": 0, "with_reference": False, "shots": 0, "spins": 0}
+        # Quick Stop (secondo tocco sullo spin per fermare l'animazione). quick_stop_state: oggetto con
+        # quick_stop(slot) -> True/False/None e set_quick_stop(slot, abilitato, motivo) (SlotSetup). Senza, e' spento.
+        self.quick_stop_state = None
+        self.quick_stop_suspended = False           # la sessione lo sospende durante i free spin
+        self._quick_seen_slots = set()              # il test si fa solo al primo spin della sessione
+        self.quick_stats = {"state": "untested", "reason": "", "spins": 0, "seconds": 0.0}
         self._worked_points = {}           # slot -> punti dello spin che hanno gia' addebitato (mai da dimenticare)
         # Opzionale: verified_spin_point(slot) -> (x, y) | None, il punto dello spin verificato nella mappa.
         self.verified_spin_point = None
@@ -256,6 +266,7 @@ class SpinController:
         screenshot_after = None
         state_after = None
         balance_after_read = False   # False: balance_after e' solo il valore "prima" usato come ripiego
+        quick_mode = "off"
         if candidate.verified:
             # Ramo HITL: nessun verified_tap di mezzo (l'operatore ha gia'
             # tappato e verificato), quindi nessun TapOutcome da cui leggere
@@ -293,6 +304,8 @@ class SpinController:
             verified = False
             balance_after = balance_before
             win_amount = None
+            quick_mode = self._quick_mode(slot_name, force, candidate)
+            quick = {}
             for _ in range(self.config.max_spin_attempts_per_step):
                 attempts += 1
                 # "balance_changed", non "balance_decrease": una vincita puo'
@@ -317,8 +330,16 @@ class SpinController:
                     wait_region = self._wait_region(context)
                     if wait_region is not None:
                         extra["wait_region"] = wait_region      # senza freccia: si guardano i rulli, non lo schermo intero
-                if learning_button and attempts == 1:
-                    extra["on_after_tap"] = lambda: self._sample_busy_button(device_id, busy_sample)
+                if attempts == 1 and (learning_button or quick_mode != "off"):
+                    def after_tap(_learn=learning_button, _mode=quick_mode, _x=candidate.x, _y=candidate.y):
+                        tapped_at = time.monotonic()
+                        if _learn:
+                            self._sample_busy_button(device_id, busy_sample)
+                        if _mode != "off":
+                            self._quick_second_tap(device_id, _x, _y, _mode, tapped_at, context, quick)
+                    extra["on_after_tap"] = after_tap
+                    if quick_mode == "use":
+                        extra["skip_wait"] = True       # niente attesa dello schermo fermo: un solo screenshot
                 tap_result = self.verifier.verified_tap(
                     device_id, candidate.x, candidate.y,
                     Expectation(kind="balance_changed"),
@@ -400,6 +421,12 @@ class SpinController:
                     break
 
         outcome = "success" if verified else "no_effect"
+        quick_explained = False
+        if not candidate.verified and quick_mode != "off":
+            quick_explained = self._quick_conclude(
+                slot_name, quick_mode, quick, balance_before, balance_after if balance_after_read else None,
+                expected_bet, started,
+            )
         if outcome == "success" and balance_after_read and balance_before is not None:
             if balance_after < balance_before:
                 self._anomaly.pop(slot_name, None)          # un addebito vero: si torna alla normalita'
@@ -448,7 +475,8 @@ class SpinController:
             self.locator.save_verified_candidate(
                 _ELEMENT, candidate, slot_name, context.screen_width, context.screen_height,
             )
-        bet_understated = outcome == "success" and self._bet_understated(balance_before, balance_after, expected_bet)
+        bet_understated = (outcome == "success" and not quick_explained
+                           and self._bet_understated(balance_before, balance_after, expected_bet))
         if bet_understated:
             # Una sola lettura sbagliata (cifre perse) non deve fermare la sessione: si rilegge il saldo.
             second = self._reread_balance(context_provider)
@@ -481,7 +509,7 @@ class SpinController:
                 spin_index, balance_before - balance_after, expected_bet,
             )
         accounting_anomaly = None   # il controllo per spin sulla vincita letta e' stato tolto: vedi sopra
-        if outcome == "success" and not force and last_wait_seconds is not None:
+        if outcome == "success" and not force and last_wait_seconds is not None and quick_mode == "off":
             self._record_duration(
                 slot_name, last_wait_seconds, had_win=win_amount is not None and win_amount >= Decimal("0.01"),
             )
@@ -512,6 +540,111 @@ class SpinController:
             screenshot_after=screenshot_after, state_after=state_after, bet_understated=bet_understated,
             timings=timings, button_status=button_status, anomaly=anomaly,
         ))
+
+    # ---- Quick Stop ------------------------------------------------------------------------------------------
+    def _quick_mode(self, slot_name: str, force: bool, candidate) -> str:
+        """'off' | 'test' (primo spin della sessione, mai provato) | 'use' (provato e funzionante)."""
+        state = self.quick_stop_state
+        if (state is None or force or candidate.verified or self.quick_stop_suspended
+                or os.environ.get("QUICK_STOP", "1").strip().lower() in ("0", "false", "no")
+                or self._anomaly.get(slot_name)):
+            return "off"
+        known = state.quick_stop(slot_name)
+        first_spin = slot_name not in self._quick_seen_slots
+        self._quick_seen_slots.add(slot_name)
+        if known is True:
+            self.quick_stats["state"] = "enabled"
+            return "use"
+        if known is False:
+            self.quick_stats.update(state="disabled", reason=self.quick_stats["reason"] or "gia' provato: non funziona")
+            return "off"
+        return "test" if first_spin else "off"
+
+    def _quick_second_tap(self, device_id: str, x: int, y: int, mode: str, tapped_at: float, context, holder: dict) -> None:
+        """Dopo il primo tocco: a 1.5 s dal tocco il secondo (tentativo di Quick Stop). Nel test si raccolgono due
+        screenshot a ~3.5 s (e il saldo da quello di t=3.5 s, prima delle vincite); nell'uso si aspetta 1.5 s."""
+        time.sleep(max(0.0, _QUICK_FIRST_DELAY - (time.monotonic() - tapped_at)))
+        self.verifier.touch_injector.tap_coordinates(device_id, int(x), int(y))
+        holder["second_tap"] = True
+        if mode == "use":
+            time.sleep(_QUICK_USE_WAIT)
+            return
+        time.sleep(_QUICK_TEST_WAIT)
+        shots = []
+        for _ in range(2):
+            shot = self.verifier.screen_reader._screenshot(device_id)
+            shots.append(shot.data if shot.success else None)
+        holder["s1"], holder["s2"] = shots
+
+    def _quick_conclude(self, slot_name: str, mode: str, holder: dict, balance_before, balance_after, bet,
+                        started: float) -> bool:
+        """Esito del test (primo spin) o controllo dell'uso. True se il calo di saldo e' spiegato dal Quick Stop (doppio
+        spin): chi chiama non lo tratta come "puntata sbagliata"."""
+        if bet is None or bet <= 0 or balance_before is None:
+            return False
+        if mode == "use":
+            self.quick_stats["spins"] += 1
+            self.quick_stats["seconds"] += time.monotonic() - started
+            if balance_after is not None and self._bet_understated(balance_before, balance_after, bet):
+                logger.warning("Quick Stop disabilitato: doppio addebito rilevato (saldo %s -> %s con puntata %s).",
+                               balance_before, balance_after, bet)
+                self._set_quick(slot_name, False, "doppio addebito rilevato")
+                return True
+            return False
+        # ---- test (primo spin) ----
+        if not holder.get("second_tap") or not holder.get("s1"):
+            logger.info("Quick Stop test: NON CONCLUSIVO (secondo tocco o screenshot mancanti): riprovo alla prossima sessione.")
+            return False
+        mid = self._balance_from_image(holder["s1"])
+        if mid is None:
+            logger.info("Quick Stop test: NON CONCLUSIVO (saldo illeggibile a t=3.5 s): riprovo alla prossima sessione.")
+            return False
+        drop = balance_before - mid
+        if drop >= bet * Decimal("1.75"):
+            logger.warning("Quick Stop test: DISABILITATO (doppio spin: saldo sceso %s con puntata %s).", drop, bet)
+            self._set_quick(slot_name, False, "doppio spin")
+            return True
+        if drop >= bet * Decimal("0.75"):
+            still = holder.get("s2") is not None and self._reels_still(holder["s1"], holder["s2"])
+            if still:
+                logger.info("Quick Stop test: ABILITATO (saldo sceso 1x, animazione saltata).")
+                self._set_quick(slot_name, True, "animazione saltata dal secondo tocco")
+            else:
+                logger.info("Quick Stop test: DISABILITATO (ignorato: i rulli erano ancora in movimento).")
+                self._set_quick(slot_name, False, "tocco ignorato")
+            return False
+        logger.info("Quick Stop test: NON CONCLUSIVO (nessun addebito visto a t=3.5 s): riprovo alla prossima sessione.")
+        return False
+
+    def _set_quick(self, slot_name: str, enabled: bool, reason: str) -> None:
+        self.quick_stats.update(state="enabled" if enabled else "disabled", reason=reason)
+        try:
+            self.quick_stop_state.set_quick_stop(slot_name, enabled, reason)
+        except Exception as exc:   # ricordare l'esito non deve mai rompere lo spin
+            logger.warning("Quick Stop: esito non salvato: %s", exc)
+
+    def _balance_from_image(self, path: str):
+        try:
+            value = self.verifier.ocr_reader.read_slot_state(path).get("saldo")
+        except Exception:
+            return None
+        parsed = parse_amount(str(value)) if value is not None else None
+        return parsed.data if parsed is not None and parsed.success else None
+
+    def _reels_still(self, first: str, second: str) -> bool:
+        region = None
+        try:
+            from PIL import Image
+            with Image.open(first) as image:
+                width, height = image.size
+            fractions = getattr(self.config, "spin_wait_region", None)
+            if fractions:
+                x1, y1, x2, y2 = fractions
+                region = (int(width * x1), int(height * y1), int(width * x2), int(height * y2))
+        except OSError:
+            region = None
+        diff = diff_score(first, second, region)
+        return bool(diff.success and diff.data < self.config.frame_diff_stable_threshold)
 
     def clear_anomaly(self, slot_name: str) -> None:
         """Dopo che il vigile ha chiarito la situazione (bonus finito): si riparte da zero sulle anomalie."""

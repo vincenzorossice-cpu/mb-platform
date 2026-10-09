@@ -59,6 +59,9 @@ class SlotMap:
     method: str = "sol"                             # sol | operator
     bet_menu_panel: Optional[tuple] = None         # (alto, basso) del pannello del menu, frazioni dell'altezza
     bet_scroll_direction: Optional[str] = None     # verso (left|right) che mostra le puntate piu' basse nel carosello
+    quick_stop: Optional[bool] = None               # secondo tocco sullo spin ferma l'animazione? (None = non testato)
+    quick_stop_tested: bool = False
+    quick_stop_reason: str = ""
     has_free_spins: bool = False                    # il gioco ha giri gratuiti (il saldo non scende durante)
     spin_ready_method: Optional[str] = None         # arrow | color | luminance | patch | frame_zone
     notes: Optional[list] = None                    # regole apprese per la slot (es. come gestire un bonus), max 10
@@ -117,6 +120,9 @@ class SlotMap:
                 bet_menu_panel=_parse_panel(data.get("bet_menu_panel")),
                 notes=[str(n) for n in data["notes"]][:10] if isinstance(data.get("notes"), list) else None,
                 has_free_spins=bool(data.get("has_free_spins", False)),
+                quick_stop=data.get("quick_stop") if isinstance(data.get("quick_stop"), bool) else None,
+                quick_stop_tested=bool(data.get("quick_stop_tested", False)),
+                quick_stop_reason=str(data.get("quick_stop_reason", "")),
                 spin_ready_method=data.get("spin_ready_method") if data.get("spin_ready_method") in (
                     "arrow", "color", "luminance", "patch", "frame_zone") else None,
                 bet_scroll_direction=data.get("bet_scroll_direction") if data.get("bet_scroll_direction") in ("left", "right") else None,

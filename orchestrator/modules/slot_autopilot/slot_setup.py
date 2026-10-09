@@ -106,6 +106,19 @@ class SlotSetup:
     FREE_SPINS_NOTE = ("This game has free spins rounds: during them the balance does not drop when a spin starts and the "
                        "spin button may need to be pressed for every free spin.")
 
+    def quick_stop(self, slot_name: str) -> Optional[bool]:
+        """True/False se il Quick Stop e' gia' stato provato su questa slot, None se non testato."""
+        slot_map = self._maps.get(slot_name)
+        return slot_map.quick_stop if slot_map is not None and slot_map.quick_stop_tested else None
+
+    def set_quick_stop(self, slot_name: str, enabled: bool, reason: str) -> Result[bool]:
+        slot_map = self._maps.get(slot_name)
+        if slot_map is None:
+            return Result.ok(False)
+        slot_map.quick_stop, slot_map.quick_stop_tested, slot_map.quick_stop_reason = bool(enabled), True, reason[:120]
+        saved = self.memory.save(slot_map)
+        return Result.ok(True) if saved.success else Result.fail(saved.error, saved.error_code)
+
     def mark_free_spins(self, slot_name: str) -> Result[bool]:
         """La slot ha giri gratuiti: si ricorda nella mappa (e come nota per il vigile)."""
         slot_map = self._maps.get(slot_name)
