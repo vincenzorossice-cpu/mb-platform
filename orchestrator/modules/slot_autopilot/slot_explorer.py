@@ -10,6 +10,7 @@ from PIL import Image
 
 from orchestrator.core.result import Result
 from orchestrator.modules.slot_autopilot.frame_diff import diff_score
+from orchestrator.modules.slot_autopilot.menu_geometry import is_inside, outside_point, panel_bounds
 from orchestrator.modules.slot_autopilot.slot_map import BET_MENU_TYPES, CLOSE_METHODS, Point, SlotMap, now_iso
 from orchestrator.modules.slot_autopilot.strategies.base import LocateContext
 from orchestrator.modules.slot_ocr.vision_reader import _encode_reduced
@@ -132,7 +133,7 @@ class SlotExplorer:
                     smap.bet_menu_open = candidate
                     menu_type = menu.get("menu_type")
                     smap.bet_menu_type = menu_type if menu_type in BET_MENU_TYPES else "other"
-                    self._close_menu(device_id, smap, closed_path, menu.get("close"))
+                    self._close_menu(device_id, smap, closed_path, menu.get("close"), opened_path)
                     return
                 self.last_notes.append(f"il tocco su ({candidate.x},{candidate.y}) non apre un menu di puntate")
                 self._tap_changes(device_id, candidate)          # si annulla (stesso tocco: apre/chiude)
@@ -145,15 +146,24 @@ class SlotExplorer:
             candidates = [Point(int(fallback[0]), int(fallback[1]), "trovato con la ricerca a griglia")]
         self.last_notes.append("non riesco ad aprire il menu puntata")
 
-    def _close_menu(self, device_id: str, smap: SlotMap, closed_path: str, close: Optional[dict]) -> None:
-        """Prova il metodo di chiusura indicato da Sol e poi il tocco sulla stessa icona; si salva solo cio' che
-        porta davvero lo schermo come prima dell'apertura."""
+    def _close_menu(self, device_id: str, smap: SlotMap, closed_path: str, close: Optional[dict],
+                    opened_path: Optional[str] = None) -> None:
+        """Chiude il menu e salva COME. Ogni tocco di chiusura cade FUORI dal pannello (un tocco dentro seleziona una
+        cella): prima il punto calcolato dai bounds del pannello, poi quello suggerito da Sol, poi l'icona di
+        apertura solo se e' fuori dal pannello (a menu aperto di solito e' coperta). Si salva solo cio' che riporta
+        lo schermo com'era prima dell'apertura."""
+        width, height = smap.screen
+        bounds = panel_bounds(opened_path) if opened_path else None
+        if bounds is not None:
+            smap.bet_menu_panel = (bounds[0] / height, bounds[1] / height)
         attempts = []
+        computed = outside_point(bounds, smap.screen)
+        attempts.append(("tap_outside", Point(computed[0], computed[1], "fuori dal pannello (calcolato)")))
         method = (close or {}).get("method")
-        close_point = self._point(close, smap.screen)
-        if close_point is not None:
-            attempts.append((method if method in CLOSE_METHODS else "other", close_point))
-        if smap.bet_menu_open is not None and method != "toggle":
+        sol_point = self._point(close, smap.screen)
+        if sol_point is not None and not is_inside((sol_point.x, sol_point.y), bounds):
+            attempts.append((method if method in CLOSE_METHODS else "other", sol_point))
+        if smap.bet_menu_open is not None and not is_inside((smap.bet_menu_open.x, smap.bet_menu_open.y), bounds):
             attempts.append(("toggle", smap.bet_menu_open))
         for name, point in attempts:
             _, _, after_path = self._tap_changes(device_id, point)

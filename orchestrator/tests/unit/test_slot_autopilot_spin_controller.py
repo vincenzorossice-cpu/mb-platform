@@ -238,13 +238,13 @@ class TestCleanSpins:
         locator = MagicMock()
         locator.locate.return_value = _candidate()
         verifier = MagicMock()
-        verifier.verified_tap.return_value = _tap_outcome(True, balance_after=Decimal("9.80"))
+        verifier.verified_tap.return_value = _tap_outcome(True, balance_after=Decimal("9.90"))
         controller, _, _, _ = _controller(locator=locator, verifier=verifier)
         context_provider = MagicMock(return_value=_context_result(Decimal("10.00")))
 
         result = controller.spin("dev", "pirots5", "ep1", 1, context_provider, True, Decimal("0.10"))
         assert result.success
-        assert result.data.balance_after == Decimal("9.80")
+        assert result.data.balance_after == Decimal("9.90")
         assert context_provider.call_count == 1
 
 
@@ -523,11 +523,13 @@ class TestBetUnderstated:
     def test_a_normal_drop_or_a_win_is_not_flagged(self):
         assert not self._spin("99.90").bet_understated
         assert not self._spin("100.40").bet_understated
-        assert not self._spin("99.85", win=Decimal("0.05")).bet_understated
+        assert not self._spin("99.95", win=Decimal("0.05")).bet_understated      # perso 0.10, vinto 0.05
 
-    def test_two_bets_worth_of_drop_is_the_limit(self):
-        assert not self._spin("99.80").bet_understated       # esattamente 2 x 0.10
-        assert self._spin("99.70").bet_understated           # 3 x 0.10
+    def test_the_limit_is_the_bet_plus_a_quarter_of_margin(self):
+        # puntata creduta 0.10: limite 0.10 + 0.01 (tolleranza) + 0.025 (margine) = 0.135
+        assert not self._spin("99.87").bet_understated       # calo 0.13
+        assert self._spin("99.86").bet_understated           # calo 0.14
+        assert self._spin("99.80").bet_understated           # 2 x 0.10: prima passava inosservato
 
     def test_unreadable_balance_is_not_flagged(self):
         locator = MagicMock()

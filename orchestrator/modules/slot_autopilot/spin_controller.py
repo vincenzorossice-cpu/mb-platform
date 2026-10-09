@@ -526,11 +526,13 @@ class SpinController:
         return self._read_amount(result.data, "saldo")
 
     def _bet_understated(self, balance_before, balance_after, bet) -> bool:
-        """Una vincita puo' solo RIDURRE il calo di saldo: se il saldo scende di piu' del doppio
-        della puntata creduta (piu' la tolleranza), quella puntata non puo' essere giusta."""
+        """Una vincita puo' solo RIDURRE il calo di saldo: se il saldo scende di piu' della puntata creduta
+        (piu' la tolleranza e un margine del 25%, minimo 0.02), quella puntata non puo' essere giusta. Con il
+        vecchio limite del doppio, 0.40 giocato con 0.20 creduto passava inosservato."""
         if balance_before is None or balance_after is None or bet is None or bet <= 0:
             return False
-        return (balance_before - balance_after) > 2 * bet + self.config.accounting_tolerance
+        margin = max(bet * Decimal("0.25"), Decimal("0.02"))
+        return (balance_before - balance_after) > bet + self.config.accounting_tolerance + margin
 
     def _settle_after_unexpected(self, device_id: str, outcome, context_provider, balance_before):
         """(saldo, screenshot, stato) dopo l'attesa se il saldo e' SCESO (c'e' stato un addebito: lo spin e'

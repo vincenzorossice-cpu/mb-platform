@@ -92,7 +92,7 @@ class TestSelectLowest:
         assert taps == [(540, 2088), (200, 1000)]   # toggle, poi la cella 0,10
         locator.save_verified_candidate.assert_called_once()
 
-    def test_menu_left_open_after_selection_is_closed_with_the_same_toggle(self):
+    def test_menu_left_open_after_selection_is_closed_by_tapping_outside_the_panel(self):
         selector, _, verifier = _selector()
         provider = _provider(_context(MENU_BOXES), _context(MENU_BOXES, posta=0.10), _context(MAIN_BOXES, posta=0.10))
 
@@ -100,7 +100,7 @@ class TestSelectLowest:
 
         assert result.success
         taps = [call.args[1:3] for call in verifier.verified_tap.call_args_list]
-        assert taps == [(540, 2088), (200, 1000), (540, 2088)]
+        assert taps == [(540, 2088), (200, 1000), (540, 720)]   # chiusura: tocco FUORI dal pannello, mai l'icona (coperta)
 
     def test_toggle_without_effect_fails_and_records_the_failure_for_untrusted_sources(self):
         selector, locator, verifier = _selector(strategy="gpt", trusted=False)
@@ -132,12 +132,14 @@ class TestSelectLowest:
         assert verifier.verified_tap.call_count == 1   # nessun tocco sui campi dei valori
 
     def test_bet_not_matching_the_selected_value_is_not_confirmed(self):
-        selector, _, _ = _selector()
-        provider = _provider(_context(MENU_BOXES), _context(MAIN_BOXES, posta=2.0))
+        selector, _, verifier = _selector()
+        # 3 tentativi (apri, scegli, rileggi, richiudi se serve): sempre puntata 2.0 invece di 0.10
+        provider = _provider(*([_context(MENU_BOXES), _context(MAIN_BOXES, posta=2.0), _context(MAIN_BOXES, posta=2.0)] * 3))
 
         result = selector.select_lowest("dev", "bigbass", _context(MAIN_BOXES, posta=2.0), provider)
 
         assert result.error_code == "MENU_SELECTION_NOT_CONFIRMED"
+        assert verifier.verified_tap.call_count == 6                  # (icona + cella) x 3 tentativi, poi all'operatore
 
     def test_toggle_not_locatable_fails(self):
         selector, locator, _ = _selector()
@@ -231,24 +233,24 @@ class TestSelectFromOpenMenu:
         assert result.error_code == "MENU_OPEN_NOT_A_LIST"
         verifier.verified_tap.assert_not_called()
 
-    def test_menu_still_open_is_closed_with_the_operator_toggle(self):
+    def test_menu_still_open_is_closed_by_tapping_outside_the_panel_even_with_the_operator_toggle_known(self):
         selector, _, verifier = _selector()
         provider = _provider(_context(MENU_BOXES), _context(MAIN_BOXES, posta=0.10))
 
         result = selector.select_from_open_menu("dev", "shining", _context(MENU_BOXES), provider, (788, 1775))
 
         assert result.success
-        assert [call.args[1:3] for call in verifier.verified_tap.call_args_list] == [(200, 1000), (788, 1775)]
+        # la cella, poi un tocco FUORI dal pannello: l'icona (788,1775) a menu aperto e' coperta e non si tocca
+        assert [call.args[1:3] for call in verifier.verified_tap.call_args_list] == [(200, 1000), (540, 720)]
 
-    def test_still_open_with_an_unknown_toggle_fails_instead_of_guessing(self):
+    def test_still_open_with_an_unknown_toggle_still_closes_with_a_point_outside(self):
         selector, locator, _ = _selector()
         locator.locate.return_value = Result.fail("no", "ELEMENT_NOT_LOCATABLE")
 
-        result = selector.select_from_open_menu(
-            "dev", "shining", _context(MENU_BOXES), _provider(_context(MENU_BOXES)), None,
-        )
+        provider = _provider(_context(MENU_BOXES), _context(MAIN_BOXES, posta=0.10))
+        result = selector.select_from_open_menu("dev", "shining", _context(MENU_BOXES), provider, None)
 
-        assert result.error_code == "MENU_CLOSE_UNKNOWN"
+        assert result.success and result.data.final_bet == Decimal("0.10")
 
 
 class TestSelectLowestWithoutOperator:
@@ -344,7 +346,7 @@ class TestMenuClosedOrStillOpen:
         assert result.success and result.data.final_bet == Decimal("0.10")
         assert [call.args[1:3] for call in verifier.verified_tap.call_args_list] == [(200, 1000)]   # nessun tocco sull'icona
 
-    def test_a_menu_that_barely_changed_is_closed_with_the_icon(self, tmp_path):
+    def test_a_menu_that_barely_changed_is_closed_by_tapping_outside_the_panel(self, tmp_path):
         selector, _, verifier = _selector()
         shot = self._shot(tmp_path, "same.png", "white")
         menu = dataclasses.replace(_context(MENU_BOXES), screenshot_path=shot)
@@ -356,7 +358,7 @@ class TestMenuClosedOrStillOpen:
         result = selector.select_from_open_menu("dev", "shining", menu, _provider(still_open, closed), (788, 1775))
 
         assert result.success
-        assert [call.args[1:3] for call in verifier.verified_tap.call_args_list] == [(200, 1000), (788, 1775)]
+        assert [call.args[1:3] for call in verifier.verified_tap.call_args_list] == [(200, 1000), (540, 720)]
 
 
 class TestUnreadableBetAfterSelection:

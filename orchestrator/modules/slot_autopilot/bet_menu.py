@@ -10,6 +10,9 @@ from orchestrator.modules.provider_profile.autopilot_memory import (
     forget_autopilot_element, load_autopilot_flag, load_autopilot_value, save_autopilot_flag, save_autopilot_value,
 )
 from orchestrator.modules.slot_autopilot.frame_diff import diff_score
+from orchestrator.modules.slot_autopilot.menu_geometry import (
+    bounds_from_fractions, is_inside, outside_point, panel_bounds,
+)
 from orchestrator.modules.slot_autopilot.locator import ElementLocator
 from orchestrator.modules.slot_autopilot.strategies.base import LocateCandidate
 from orchestrator.modules.slot_autopilot.value_parser import parse_amount
@@ -47,6 +50,9 @@ _MENU_STILL_OPEN_DIFF = 0.08
 _MAX_REVEAL_SWIPES = 3   # passaggi per direzione
 _ROW_STATIC_FLAG = "bet_row_static"   # la fila di celle non scorre: quello che si vede e' tutto l'elenco
 _SWIPE_MS = 700
+_PANEL_VALUE = "bet_menu_panel"                 # "alto,basso" come frazioni dell'altezza (dalla mappa)
+_CLOSE_VIA_TOGGLE_FLAG = "bet_menu_close_via_toggle"   # la mappa ha verificato che la stessa icona chiude il menu
+_MAX_CLOSE_RETRIES = 3
 _ROW_DIRECTION_VALUE = "bet_row_direction"   # verso dello scorrimento che ha abbassato la minima (appreso)
 _MAX_PICK_ATTEMPTS = 3   # tocco -> verifica -> correzione: in un carosello la fila si ricentra dopo il tocco
 _SETTLE_SECONDS = 1.5   # pausa prima di rileggere una puntata non leggibile (animazione di chiusura)
@@ -110,6 +116,30 @@ class BetMenuSelector:
         self.screen_recovery = screen_recovery
 
     def select_lowest(
+        self, device_id: str, slot_name: str, context, context_provider: Callable[[], Result],
+        allow_operator: bool = True, target: Optional[Decimal] = None,
+    ) -> Result[MenuSelection]:
+        """Sceglie la puntata dal menu e chiude. Se dopo la chiusura la puntata e' cambiata (un tocco ha colpito una
+        cella) richiude il pannello se serve, lo riapre e riseleziona: al massimo 3 tentativi, poi l'errore passa a
+        chi chiama (operatore)."""
+        result = None
+        for attempt in range(1, _MAX_CLOSE_RETRIES + 1):
+            result = self._select_lowest_once(device_id, slot_name, context, context_provider, allow_operator, target)
+            if result.success or result.error_code != "MENU_SELECTION_NOT_CONFIRMED":
+                return result
+            logger.warning("bet menu: dopo la chiusura la puntata e' cambiata (%s): tentativo %d/%d, richiudo se serve, "
+                           "riapro e riseleziono.", result.error, attempt, _MAX_CLOSE_RETRIES)
+            self._close_if_left_open(device_id, slot_name, context_provider)
+        return result
+
+    def _close_if_left_open(self, device_id: str, slot_name: str, context_provider: Callable[[], Result]) -> None:
+        """Prima di riaprire: se il pannello e' ancora aperto lo si chiude toccando FUORI (mai l'icona, coperta)."""
+        current = self._fresh(context_provider)
+        if current is None or self._menu_bounds(current, slot_name, live_only=True) is None:
+            return
+        self._close_menu(device_id, slot_name, current, current, None, context_provider, False)
+
+    def _select_lowest_once(
         self, device_id: str, slot_name: str, context, context_provider: Callable[[], Result],
         allow_operator: bool = True, target: Optional[Decimal] = None,
     ) -> Result[MenuSelection]:
@@ -369,34 +399,84 @@ class BetMenuSelector:
             logger.warning("bet menu: pannello rimasto aperto (%s).", closed.error_code)
         return closed.success
 
+    def _menu_bounds(self, context, slot_name: str, live_only: bool = False) -> Optional[tuple]:
+        """(alto, basso) in pixel del pannello. Dallo screenshot con il menu aperto, ancorato alla riga delle celle
+        lette dall'OCR; altrimenti (se non e' live_only) dai bounds salvati nella mappa."""
+        cells = menu_amounts(getattr(context, "text_boxes", []) or [])
+        path = getattr(context, "screenshot_path", None)
+        if cells and path:
+            ys = sorted(position[1] for _, position in cells)
+            bounds = panel_bounds(path, ys[len(ys) // 2])
+            if bounds is not None:
+                return bounds
+        if live_only:
+            return None
+        raw = load_autopilot_value(slot_name, _PANEL_VALUE, self._memory_dir())
+        try:
+            top, bottom = (float(v) for v in str(raw).split(","))
+            return bounds_from_fractions((top, bottom), int(context.screen_height))
+        except (TypeError, ValueError, AttributeError):
+            return None
+
+    def _tap_and_check_closed(self, device_id: str, point: tuple, opened, context_provider):
+        """Tocca e ritorna (chiuso, schermo_dopo); schermo None se non si legge."""
+        self.verifier.verified_tap(device_id, int(point[0]), int(point[1]), Expectation(kind="screen_changed"))
+        fresh = self._fresh(context_provider)
+        if fresh is None:
+            return False, None
+        return not self._menu_still_open(opened, fresh), fresh
+
     def _close_menu(
         self, device_id: str, slot_name: str, opened, after, toggle, context_provider, allow_operator: bool,
     ) -> Result:
-        """Chiude il menu rimasto aperto, in quest'ordine: il punto ricordato per la slot, l'icona che lo ha
-        aperto, l'operatore (che indica dove toccare; il punto viene ricordato). Dopo ogni tentativo si
-        RICONTROLLA che si sia chiuso. Result con lo schermo aggiornato."""
+        """Chiude il menu rimasto aperto. Ogni tocco di chiusura cade FUORI dal pannello (un tocco dentro seleziona
+        una cella e cambia la puntata). Ordine: punto ricordato (se fuori dal pannello), punto calcolato fuori dal
+        pannello, icona SOLO se la mappa ha verificato che chiude, operatore. Dopo ogni tentativo si ricontrolla."""
+        size = (getattr(opened, "screen_width", 0), getattr(opened, "screen_height", 0))
+        bounds = self._menu_bounds(opened, slot_name) or self._menu_bounds(after, slot_name)
+
         memo = self.locator.locate(_MENU_CLOSE, after, exclude_strategies=_ALL_BUT_MEMORY)
         if memo.success:
-            self.verifier.verified_tap(device_id, memo.data.x, memo.data.y, Expectation(kind="screen_changed"))
-            fresh = self._fresh(context_provider)
+            if is_inside((memo.data.x, memo.data.y), bounds):
+                logger.warning("bet menu: il punto ricordato per chiudere (%d,%d) cade DENTRO il pannello: lo dimentico.",
+                               memo.data.x, memo.data.y)
+                forget_autopilot_element(slot_name, _MENU_CLOSE, self._memory_dir())
+            else:
+                closed, fresh = self._tap_and_check_closed(device_id, (memo.data.x, memo.data.y), opened, context_provider)
+                if fresh is None:
+                    return Result.fail("Cannot read the screen after closing the menu", "MENU_CONTEXT_ERROR")
+                after = fresh
+                if closed:
+                    return Result.ok(after)
+                logger.warning("bet menu: il punto ricordato per chiudere il menu non e' servito: lo dimentico.")
+                forget_autopilot_element(slot_name, _MENU_CLOSE, self._memory_dir())
+
+        if size[0] and size[1]:
+            point = outside_point(bounds, size)
+            logger.info("bet menu: chiudo toccando fuori dal pannello a (%d,%d) (pannello %s).", point[0], point[1],
+                        bounds if bounds is not None else "non trovato")
+            closed, fresh = self._tap_and_check_closed(device_id, point, opened, context_provider)
             if fresh is None:
                 return Result.fail("Cannot read the screen after closing the menu", "MENU_CONTEXT_ERROR")
             after = fresh
-            if not self._menu_still_open(opened, after):
+            if closed:
+                self.locator.save_verified_candidate(
+                    _MENU_CLOSE, LocateCandidate(x=point[0], y=point[1], confidence=1.0, strategy_name="computed", verified=True),
+                    slot_name, size[0], size[1],
+                )
                 return Result.ok(after)
-            logger.warning("bet menu: il punto ricordato per chiudere il menu non e' servito: lo dimentico.")
-            forget_autopilot_element(slot_name, _MENU_CLOSE, self._memory_dir())
+            logger.warning("bet menu: il tocco fuori dal pannello non ha chiuso il menu.")
 
         if toggle is None:
             located = self.locator.locate(_MENU_TOGGLE, after, exclude_strategies=("hitl",))
             toggle = located.data if located.success else None
-        if toggle is not None:
-            self._close(device_id, toggle)
-            fresh = self._fresh(context_provider)
+        if toggle is not None and load_autopilot_flag(slot_name, _CLOSE_VIA_TOGGLE_FLAG, self._memory_dir()) \
+                and not is_inside((toggle.x, toggle.y), bounds):
+            closed, fresh = self._tap_and_check_closed(device_id, (toggle.x, toggle.y), opened, context_provider)
             if fresh is None:
                 return Result.fail("Cannot read the screen after closing the menu", "MENU_CONTEXT_ERROR")
             after = fresh
-            if not self._menu_still_open(opened, after):
+            if closed:
                 return Result.ok(after)
             logger.warning("bet menu: l'icona non ha chiuso il menu.")
 
@@ -411,16 +491,18 @@ class BetMenuSelector:
                     return Result.fail("Cannot read the screen after closing the menu", "MENU_CONTEXT_ERROR")
                 after = fresh
                 if not self._menu_still_open(opened, after):
-                    self.locator.save_verified_candidate(
-                        _MENU_CLOSE,
-                        LocateCandidate(x=int(tap[0]), y=int(tap[1]), confidence=1.0, strategy_name="hitl", verified=True),
-                        slot_name, after.screen_width, after.screen_height,
-                    )
-                    logger.info("bet menu: l'operatore ha chiuso il menu toccando (%d,%d): lo ricordo.", tap[0], tap[1])
+                    if is_inside(tap, bounds):
+                        logger.warning("bet menu: il tocco dell'operatore (%d,%d) e' dentro il pannello: non lo ricordo "
+                                       "come punto di chiusura.", tap[0], tap[1])
+                    else:
+                        self.locator.save_verified_candidate(
+                            _MENU_CLOSE,
+                            LocateCandidate(x=int(tap[0]), y=int(tap[1]), confidence=1.0, strategy_name="hitl", verified=True),
+                            slot_name, after.screen_width, after.screen_height,
+                        )
+                        logger.info("bet menu: l'operatore ha chiuso il menu toccando (%d,%d): lo ricordo.", tap[0], tap[1])
                     return Result.ok(after)
-        if toggle is None:
-            return Result.fail("The menu is still open and its icon is unknown", "MENU_CLOSE_UNKNOWN")
-        return Result.ok(after)    # come prima: si prosegue e sara' la lettura della puntata a dire se va bene
+        return Result.ok(after)    # si prosegue: sara' la rilettura della puntata a dire se va bene
 
     @staticmethod
     def _menu_still_open(opened, after) -> bool:

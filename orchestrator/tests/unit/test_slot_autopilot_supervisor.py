@@ -189,7 +189,8 @@ class TestMenuSelectionWithSupervisor:
 
     def test_without_a_supervisor_the_misread_still_fails(self):
         selector = self._selector(None)
-        provider = MagicMock(side_effect=[Result.ok(_ctx(MENU)), Result.ok(_ctx([], posta=7181009.38))])
+        provider = MagicMock(side_effect=[Result.ok(_ctx(MENU)), Result.ok(_ctx([], posta=7181009.38)),
+                                          Result.ok(_ctx([], posta=7181009.38))] * 3)
 
         assert selector.select_lowest("dev", "s", _ctx([]), provider).error_code == "MENU_SELECTION_NOT_CONFIRMED"
 
@@ -197,7 +198,8 @@ class TestMenuSelectionWithSupervisor:
         supervisor = MagicMock()
         supervisor.read_bet.return_value = Decimal("0.50")
         selector = self._selector(supervisor)
-        provider = MagicMock(side_effect=[Result.ok(_ctx(MENU)), Result.ok(_ctx([], posta=7181009.38))])
+        provider = MagicMock(side_effect=[Result.ok(_ctx(MENU)), Result.ok(_ctx([], posta=7181009.38)),
+                                          Result.ok(_ctx([], posta=7181009.38))] * 3)
 
         assert selector.select_lowest("dev", "s", _ctx([]), provider).error_code == "MENU_SELECTION_NOT_CONFIRMED"
 

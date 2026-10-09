@@ -168,16 +168,18 @@ class TestSpinLoopStopsWithoutEffect:
         assert code == 1
         assert autopilot.spin.call_count == 3
 
-    def test_an_understated_bet_stops_the_session_after_one_spin(self):
+    def test_a_repeatedly_understated_bet_stops_the_session_after_two_rereads(self):
         from orchestrator.scripts.run_autopilot import _run_session
         autopilot = self._autopilot(["success"] * 5)
         results = list(autopilot.spin.side_effect)
-        results[0].data.bet_understated = True
+        for result in results[:3]:
+            result.data.bet_understated = True
         autopilot.spin.side_effect = iter(results)
 
         code = _run_session(autopilot, _args(target=30.0, max_steps=50))
 
-        assert code == 1 and autopilot.spin.call_count == 1
+        # le prime due volte la puntata viene riletta e si prosegue; alla terza ci si ferma
+        assert code == 1 and autopilot.spin.call_count == 3
 
     def test_a_successful_spin_resets_the_count(self):
         from orchestrator.scripts.run_autopilot import _run_session

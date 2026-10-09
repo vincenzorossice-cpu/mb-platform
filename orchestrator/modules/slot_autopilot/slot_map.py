@@ -57,6 +57,7 @@ class SlotMap:
     exit_point: Optional[Point] = None
     explored_at: str = ""
     method: str = "sol"                             # sol | operator
+    bet_menu_panel: Optional[tuple] = None         # (alto, basso) del pannello del menu, frazioni dell'altezza
     bet_scroll_direction: Optional[str] = None     # verso (left|right) che mostra le puntate piu' basse nel carosello
     spin_pending: bool = False                      # soldi veri: punto di Sol non ancora provato, lo conferma il 1o spin
 
@@ -110,10 +111,19 @@ class SlotMap:
                 exit_point=Point.parse(data["exit_point"]) if data.get("exit_point") else None,
                 explored_at=str(data.get("explored_at", "")), method=str(data.get("method", "sol")),
                 spin_pending=bool(data.get("spin_pending", False)),
+                bet_menu_panel=_parse_panel(data.get("bet_menu_panel")),
                 bet_scroll_direction=data.get("bet_scroll_direction") if data.get("bet_scroll_direction") in ("left", "right") else None,
             )
         except (KeyError, TypeError, ValueError):
             return None
+
+
+def _parse_panel(raw) -> Optional[tuple]:
+    try:
+        top, bottom = float(raw[0]), float(raw[1])
+        return (top, bottom) if 0 <= top < bottom <= 1 else None
+    except (TypeError, ValueError, IndexError, KeyError):
+        return None
 
 
 def now_iso() -> str:
@@ -215,6 +225,10 @@ class SlotMemory:
         save_autopilot_flag(slot, "bet_via_menu", via_menu, self.memory_dir)
         # Una lista tutta visibile (o un dropdown) non si scorre: la sonda di scorrimento non serve.
         save_autopilot_flag(slot, "bet_row_static", slot_map.bet_menu_type in ("list", "dropdown"), self.memory_dir)
+        if slot_map.bet_menu_panel:
+            save_autopilot_value(slot, "bet_menu_panel", f"{slot_map.bet_menu_panel[0]:.4f},{slot_map.bet_menu_panel[1]:.4f}",
+                                 self.memory_dir)
+        save_autopilot_flag(slot, "bet_menu_close_via_toggle", slot_map.close_method == "toggle", self.memory_dir)
         if slot_map.bet_scroll_direction:
             save_autopilot_value(slot, "bet_row_direction", slot_map.bet_scroll_direction, self.memory_dir)
         if slot_map.min_bet is not None:

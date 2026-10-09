@@ -16,6 +16,7 @@ BET_WINDOW = 4                 # spin consecutivi per accorgersi che la puntata 
 BET_WINDOW_RATIO = Decimal("0.6")
 BONUS_SETTLE_SECONDS = 2.0      # dopo un evento bonus si aspetta che il saldo si stabilizzi
 MAX_BONUS_EVENTS = 5           # eventi bonus di fila prima di chiedere all'operatore
+MAX_UNDERSTATED_RECHECKS = 2    # riletture della puntata per sessione prima di fermarsi con BET_UNDERSTATED
 MAX_OPERATOR_ACTIONS = 3   # interventi dell'operatore senza spin prima di fermarsi
 # Schermo non libero dopo uno spin (vincita/bonus/animazione lunga): si aspetta invece di
 # chiudere la sessione, fino a questo tempo.
@@ -305,6 +306,7 @@ def play_session(
     reexplored = {"spin": False, "bet_menu": False}
     spin_confirmed = False
     bonus_streak = 0
+    understated_rechecks = 0
 
     log.info("Verifica puntata minima in corso...")
     phase_started = time.monotonic()
@@ -426,9 +428,29 @@ def play_session(
                     continue
             return SlotSessionResult(total_played, spin_index, failed=True, stop_reason="SPIN_ERROR", target=target)
         if spin_result.data.bet_understated:
+            believed = spin_result.data.bet_amount
+            drop = None
+            if spin_result.data.balance_before is not None and spin_result.data.balance_after is not None:
+                drop = spin_result.data.balance_before - spin_result.data.balance_after
+            if understated_rechecks < MAX_UNDERSTATED_RECHECKS:
+                # Il saldo scende piu' della puntata creduta: la puntata a schermo e' cambiata (es. un tocco ha colpito
+                # una cella). Si rilegge e si riporta al minimo; questo spin vale quanto il calo osservato (mai piu'
+                # della puntata reale: una vincita puo' solo ridurlo) e si prosegue.
+                understated_rechecks += 1
+                log.warning(
+                    "La puntata reale e' piu' alta di %s (calo di saldo %s): rileggo e riporto la puntata al minimo "
+                    "(%d/%d).", believed, drop, understated_rechecks, MAX_UNDERSTATED_RECHECKS,
+                )
+                if drop is not None and drop > 0:
+                    total_played += drop
+                recheck = autopilot.set_min_bet(device_id)
+                recent_spins.clear()
+                if recheck.success and recheck.data.min_bet_verified:
+                    log.info("Puntata riportata a %s EUR: riprendo.", recheck.data.final_bet)
+                    continue
             log.error(
                 "La puntata reale sembra piu' alta di %s (il saldo e' sceso molto piu' del previsto): mi fermo.",
-                spin_result.data.bet_amount,
+                believed,
             )
             failed, stop_reason = True, "BET_UNDERSTATED"
             break

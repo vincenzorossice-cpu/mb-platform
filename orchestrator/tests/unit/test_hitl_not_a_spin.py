@@ -270,7 +270,7 @@ class TestAskTheOperatorInsteadOfStopping:
             win_amount=None, verified=True, attempts=1, outcome="success", bet_understated=True,
         ))
         hitl = _Hitl(["skip"])
-        autopilot = _stuck_autopilot([understated], hitl)
+        autopilot = _stuck_autopilot([understated] * 3, hitl)      # riletta 2 volte, alla terza ci si ferma
 
         result = play_session(autopilot, "dev", "slot", Decimal("5"), 20)
 

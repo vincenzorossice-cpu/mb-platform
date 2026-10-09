@@ -33,6 +33,12 @@ def _play(autopilot, target="0.30", max_steps=50):
     return play_session(autopilot, "dev", "slot", Decimal(target), max_steps)
 
 
+def _bet_unverified():
+    return Result.ok(BetResult(
+        slot_name="s", starting_bet=Decimal("2"), final_bet=None, min_bet_verified=False, attempts=1,
+        aborted_reason="NO_DECREASE_OBSERVED"))
+
+
 @pytest.fixture(autouse=True)
 def _no_sleep(monkeypatch):
     monkeypatch.setattr("orchestrator.modules.slot_autopilot.session.time.sleep", lambda seconds: None)
@@ -80,10 +86,29 @@ def test_three_spins_without_effect_stop_the_session():
     assert result.failed and result.stop_reason == "NO_EFFECT" and result.spins == 3
 
 
-def test_an_understated_bet_stops_the_session():
-    result = _play(_autopilot([_spin(understated=True), _spin()]), target="30")
+def test_an_understated_bet_is_reread_and_the_session_goes_on():
+    autopilot = _autopilot([_spin(understated=True), _spin(), _spin(), _spin()])
+
+    result = _play(autopilot, target="0.20")
+
+    assert not result.failed and autopilot.set_min_bet.call_count == 2        # iniziale + riverifica
+
+
+def test_an_understated_bet_that_cannot_be_reverified_stops_the_session():
+    autopilot = _autopilot([_spin(understated=True), _spin()])
+    autopilot.set_min_bet.side_effect = [autopilot.set_min_bet.return_value, _bet_unverified()]
+
+    result = _play(autopilot, target="30")
 
     assert result.failed and result.stop_reason == "BET_UNDERSTATED" and result.spins == 1
+
+
+def test_repeated_understated_bets_stop_after_two_rereads():
+    autopilot = _autopilot([_spin(understated=True) for _ in range(5)])
+
+    result = _play(autopilot, target="30")
+
+    assert result.failed and result.stop_reason == "BET_UNDERSTATED" and result.spins == 3
 
 
 def test_a_failing_spin_call_is_an_error():
