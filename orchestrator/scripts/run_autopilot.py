@@ -90,7 +90,10 @@ def _configure_logging(log_dir: str, slot_name: str) -> str:
     file_handler = logging.FileHandler(path, encoding="utf-8")
     file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     console = logging.StreamHandler()
-    console.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%H:%M:%S"))
+    # CONSOLE_LEVEL_TAG=1 (lo imposta multi_phone): "[WARNING]"/"[ERROR]" in console, per riconoscere gli allarmi.
+    tagged = os.environ.get("CONSOLE_LEVEL_TAG", "").strip().lower() in ("1", "true", "yes")
+    console.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s" if tagged else "%(asctime)s %(message)s", datefmt="%H:%M:%S"))
     console.addFilter(_ConsoleFilter())
     root.addHandler(file_handler)
     root.addHandler(console)
