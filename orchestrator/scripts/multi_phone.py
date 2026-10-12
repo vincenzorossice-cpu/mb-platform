@@ -167,6 +167,10 @@ def build_env(base: Optional[dict] = None, dotenv: Optional[dict] = None) -> dic
     for key, value in (dotenv if dotenv is not None else load_dotenv(PROJECT_ROOT / ".env")).items():
         env.setdefault(key, value)
     env.setdefault("GPT_MODEL", DEFAULT_MODEL)
+    if env.get("OCR_URL", "").strip():
+        # Con piu' telefoni anche le letture piccole (saldo/puntata dentro lo spin) vanno al server: altrimenti restano
+        # su EasyOCR CPU in ogni figlio. Se l'hai impostata tu, non si tocca.
+        env.setdefault("OCR_REMOTE_MIN_AREA", "0")
     env["CONSOLE_LEVEL_TAG"] = "1"          # i figli scrivono [WARNING]/[ERROR] in console: serve agli allarmi
     env["PYTHONUNBUFFERED"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"

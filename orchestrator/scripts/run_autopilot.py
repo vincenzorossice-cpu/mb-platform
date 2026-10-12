@@ -65,6 +65,7 @@ _CONSOLE_INFO_LOGGERS = (
     # "Learn once, remember forever": mappa trovata/esplorata, intro superate, verifiche (prima erano solo nel file)
     "orchestrator.modules.slot_autopilot.slot_setup", "orchestrator.modules.slot_autopilot.slot_explorer",
     "orchestrator.modules.slot_autopilot.slot_intro", "orchestrator.quick_stop",
+    "orchestrator.modules.slot_ocr.reader",
 )
 _HARMLESS_WARNING_PATTERNS = (".*pin_memory.*", ".*quantize_per_tensor.*")
 

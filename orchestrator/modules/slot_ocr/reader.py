@@ -95,6 +95,13 @@ class SlotOCRReader:
         except ValueError:
             self._remote_min_area = self._DEFAULT_REMOTE_MIN_AREA
         self.stats = {"calls": 0, "seconds": 0.0, "remote_calls": 0}   # letture fatte e secondi spesi
+        if self._ocr_url is None:
+            logger.info("SlotOCRReader: OCR locale (EasyOCR CPU)")
+        elif self._remote_min_area <= 0:
+            logger.info("SlotOCRReader: OCR remoto attivo (RunPod), nessun carico CPU locale")
+        else:
+            logger.info("SlotOCRReader: OCR remoto attivo (RunPod); letture piccole (< %.0f%% dello schermo) in locale: "
+                        "la CPU locale resta in uso", self._remote_min_area * 100)
         self._ocr = None
         self._last_screenshot_path = None
         self._last_raw_results = None

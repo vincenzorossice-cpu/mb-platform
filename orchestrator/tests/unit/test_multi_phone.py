@@ -269,3 +269,11 @@ class TestInterrupt:
         assert all(s.interrupted for s in results) and not any(s.failed for s in results)
         assert any("Ctrl+C" in l for l in out) and "interrotto" in mp.summary_line(results[0])
         assert results[0].spins == 1
+
+
+class TestOcrForManyPhones:
+    def test_with_a_server_all_reads_go_remote_unless_set_by_hand(self):
+        assert mp.build_env({"OCR_URL": "https://x"}, {})["OCR_REMOTE_MIN_AREA"] == "0"
+        assert mp.build_env({"OCR_URL": "https://x", "OCR_REMOTE_MIN_AREA": "0.3"}, {})["OCR_REMOTE_MIN_AREA"] == "0.3"
+        assert "OCR_REMOTE_MIN_AREA" not in mp.build_env({}, {})
+        assert "OCR_REMOTE_MIN_AREA" not in mp.build_env({"OCR_URL": "  "}, {})

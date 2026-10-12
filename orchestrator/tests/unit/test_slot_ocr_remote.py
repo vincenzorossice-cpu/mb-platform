@@ -215,3 +215,54 @@ class TestHybridReadings:
             reader.read_slot_state(shot)
 
         assert reader.stats["calls"] == 1 and reader.stats["remote_calls"] == 1 and reader.stats["seconds"] >= 0
+
+
+class TestAllReadingsRemote:
+    def test_threshold_zero_sends_even_a_small_band_to_the_server(self, shot):
+        reader = SlotOCRReader(ocr_url="https://x", remote_min_area=0)
+        reader.set_region((0, 2000, 1080, 2300))
+        reader._ocr = MagicMock()
+
+        with patch(POST, return_value=_response([_item("SALDO 5,00", 10, 10)])) as post:
+            reader.read_slot_state(shot)
+
+        post.assert_called_once()
+        reader._ocr.readtext.assert_not_called()
+
+    def test_threshold_zero_comes_from_the_environment(self, monkeypatch):
+        monkeypatch.setenv("OCR_REMOTE_MIN_AREA", "0")
+        assert SlotOCRReader(ocr_url="https://x")._remote_min_area == 0.0
+
+    def test_twelve_readers_never_load_easyocr(self, shot, monkeypatch):
+        import sys
+        import types
+        boom = types.ModuleType("easyocr")
+        boom.Reader = MagicMock(side_effect=AssertionError("EasyOCR locale caricato"))
+        monkeypatch.setitem(sys.modules, "easyocr", boom)
+        readers = [SlotOCRReader(ocr_url="https://x", remote_min_area=0) for _ in range(12)]
+
+        with patch(POST, return_value=_response([_item("SALDO 5,00", 10, 10)])):
+            for reader in readers:
+                reader.set_region((0, 2000, 1080, 2300))
+                assert reader.read_slot_state(shot)["saldo"] == 5.0
+
+        boom.Reader.assert_not_called()
+        assert all(r.stats["remote_calls"] == 1 for r in readers)
+
+
+class TestStartupLog:
+    def test_local(self, monkeypatch, caplog):
+        monkeypatch.delenv("OCR_URL", raising=False)
+        with caplog.at_level("INFO"):
+            SlotOCRReader()
+        assert "SlotOCRReader: OCR locale (EasyOCR CPU)" in caplog.text
+
+    def test_remote_everything(self, caplog):
+        with caplog.at_level("INFO"):
+            SlotOCRReader(ocr_url="https://x", remote_min_area=0)
+        assert "SlotOCRReader: OCR remoto attivo (RunPod), nessun carico CPU locale" in caplog.text
+
+    def test_remote_with_local_small_reads_says_so(self, caplog):
+        with caplog.at_level("INFO"):
+            SlotOCRReader(ocr_url="https://x")
+        assert "letture piccole (< 30% dello schermo) in locale" in caplog.text and "nessun carico" not in caplog.text

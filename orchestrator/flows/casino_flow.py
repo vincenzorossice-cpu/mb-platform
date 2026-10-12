@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -70,7 +71,7 @@ class CasinoFlow:
         self.touch_injector = touch_injector
         self.autopilot_factory = autopilot_factory
         self.slot_opener = slot_opener
-        self.ocr_reader = SlotOCRReader()
+        self.ocr_reader = SlotOCRReader(ocr_url=os.environ.get("OCR_URL"))
         self._stop_requested = False
         self._real_money_enabled = False
 
