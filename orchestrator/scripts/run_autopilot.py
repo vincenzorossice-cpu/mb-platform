@@ -262,12 +262,17 @@ def build_autopilot_for(
                 size = image.size
             return spin_controller.button.classify(slot, size, path, int(point[0]), int(point[1]))
 
+        def warden_popup_probe(path: str) -> bool:
+            from orchestrator.modules.slot_autopilot.slot_warden import is_win_popup
+            state = ocr_reader.read_slot_state(path)
+            return is_win_popup(" ".join(str(item[0]) for item in state.get("raw_texts", [])))
+
         autopilot.warden = SlotWarden(
             gpt_client, screen_reader, touch_injector, warden_spin_point,
             describe=strategies["gpt"].locate_described, ready_probe=warden_ready_probe,
             notes=slot_setup_obj.notes if slot_setup_obj is not None else None,
             add_note=slot_setup_obj.add_note if slot_setup_obj is not None else None,
-            ask_text=input if enable_hitl else None,
+            ask_text=input if enable_hitl else None, popup_probe=warden_popup_probe,
         )
         if slot_setup_obj is not None:
             spin_controller.verified_spin_point = slot_setup_obj.verified_spin_point

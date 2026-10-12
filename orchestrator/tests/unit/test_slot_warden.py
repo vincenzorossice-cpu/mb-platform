@@ -313,3 +313,88 @@ class TestSessionWithTheWarden:
             session.play_session(autopilot, "d", "slot", Decimal("0.20"), 30)
 
         assert "Vigile: finto" in caplog.text
+
+
+# ---- popup "CONGRATULAZIONI! HAI VINTO": tap al centro, senza cercare un elemento ---------------------------------------
+
+POPUP = "Il pannello centrale «CONGRATULAZIONI! HAI VINTO €17,15», con la scritta «PREMI OVUNQUE PER CONTINUARE...»"
+
+
+class TestWinPopup:
+    def test_the_popup_from_the_log_is_closed_with_a_tap_in_the_center_and_remembered(self, tmp_path, caplog):
+        gpt = _sol(_d("tap_described", "win_overlay", target_description=POPUP), _d("resume", "normal"))
+        describe = MagicMock(return_value=None)                       # "non trovo con precisione"
+        warden, phone, notes = _warden(tmp_path, gpt, describe=describe)
+
+        with caplog.at_level(logging.INFO):
+            verdict = warden.handle("d", "Wrap", "schermo occupato")
+
+        assert verdict == "resume" and phone.taps == [(50, 100)]       # centro dello screenshot (100x200)
+        describe.assert_not_called()
+        assert notes == ["popup_win_close: tap_center"]
+        assert "popup vincita rilevato, tap al centro per chiudere" in caplog.text
+
+    @pytest.mark.parametrize("phrase", ["CONGRATULAZIONI", "hai vinto 5 euro", "PREMI OVUNQUE", "TAP ANYWHERE",
+                                        "TAPPA OVUNQUE", "tap to continue"])
+    def test_every_phrase_is_recognised(self, phrase):
+        from orchestrator.modules.slot_autopilot.slot_warden import is_win_popup
+        assert is_win_popup(phrase) and is_win_popup(None, f"the screen says {phrase}")
+
+    def test_an_ordinary_button_still_goes_through_describe(self, tmp_path):
+        gpt = _sol(_d("tap_described", target_description="il pulsante Continua"), _d("resume", "normal"))
+        describe = MagicMock(return_value=(30, 40))
+        warden, phone, notes = _warden(tmp_path, gpt, describe=describe)
+
+        warden.handle("d", "Wrap", "t")
+
+        describe.assert_called_once()
+        assert phone.taps == [(30, 40)] and notes == []
+
+    def test_a_center_tap_that_changes_nothing_saves_no_rule_and_warns_sol(self, tmp_path):
+        gpt = _sol(_d("tap_described", "win_overlay", target_description=POPUP),
+                   _d("tap_described", "win_overlay", target_description=POPUP), _d("resume", "normal"))
+        warden, phone, notes = _warden(tmp_path, gpt, phone=Phone(tmp_path, change_on_tap=False),
+                                       describe=MagicMock(return_value=None))
+
+        warden.handle("d", "Wrap", "t")
+
+        assert notes == [] and gpt._create_completion.call_count >= 2
+        second_prompt = gpt._create_completion.call_args_list[1].args[0][1]["content"][0]["text"]
+        assert "did not close this popup" in second_prompt
+
+    def test_the_fast_lane_never_calls_sol_for_the_popup_itself(self, tmp_path):
+        gpt = _sol(_d("resume", "normal"))
+        probes = iter([True, False])
+        warden, phone, _ = _warden(tmp_path, gpt, notes=lambda slot: ["popup_win_close: tap_center"],
+                                   popup_probe=lambda path: next(probes))
+
+        assert warden.handle("d", "Wrap", "t") == "resume"
+        assert phone.taps == [(50, 100)] and gpt._create_completion.call_count == 1      # solo il "resume" finale
+
+    def test_a_false_probe_goes_to_sol_as_before(self, tmp_path):
+        gpt = _sol(_d("resume", "normal"))
+        warden, phone, _ = _warden(tmp_path, gpt, notes=lambda slot: ["popup_win_close: tap_center"],
+                                   popup_probe=lambda path: False)
+
+        assert warden.handle("d", "Wrap", "t") == "resume" and phone.taps == []
+
+    def test_the_fast_lane_is_capped_at_three_taps_then_sol_decides(self, tmp_path):
+        gpt = _sol(_d("resume", "normal"))
+        warden, phone, _ = _warden(tmp_path, gpt, notes=lambda slot: ["popup_win_close: tap_center"],
+                                   popup_probe=lambda path: True)
+
+        assert warden.handle("d", "Wrap", "t") == "resume" and len(phone.taps) == 3
+        assert warden.calls == 1                                           # le tre corsie veloci non pesano sul budget
+
+    def test_a_forbidden_description_is_never_tapped_even_with_tap_anywhere(self, tmp_path):
+        gpt = _sol(*[_d("tap_described", target_description="Acquista bonus - tap anywhere")] * 3)
+        warden, phone, notes = _warden(tmp_path, gpt, describe=MagicMock(return_value=(10, 10)), ask=lambda p: "stop")
+
+        assert warden.handle("d", "Wrap", "t") == "stop" and phone.taps == [] and notes == []
+
+    def test_an_unreadable_screenshot_size_falls_back_to_540_1200(self, tmp_path):
+        warden, phone, _ = _warden(tmp_path, _sol())
+        warden._size = lambda path: None
+
+        assert warden._close_win_popup("d", "Wrap", phone.paths[0], remembered=True) is True
+        assert phone.taps == [(540, 1200)]

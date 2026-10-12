@@ -30,6 +30,14 @@ _POLL_SECONDS = 3.0
 _STATIC_NEEDS_CLICK_SECONDS = 8.0
 _MIN_CONFIDENCE = 0.4
 _MAX_TOKENS = 700
+# Popup di vincita a tutto schermo ("CONGRATULAZIONI! HAI VINTO... PREMI OVUNQUE PER CONTINUARE"): non ha un bottone, si
+# chiude toccando ovunque. Il centro dello schermo e' sicuro: il popup copre tutto.
+_WIN_POPUP = re.compile(
+    r"congratulazioni|hai\s+vinto|premi\s+ovunque|tocca\s+ovunque|tappa\s+ovunque|tap\s+anywhere|"
+    r"tap\s+to\s+continue|press\s+anywhere|touch\s+anywhere", re.IGNORECASE)
+_POPUP_NOTE = "popup_win_close: tap_center"
+_FALLBACK_CENTER = (540, 1200)
+_MAX_FAST_TAPS = 3
 
 _SYSTEM = (
     "You are the supervisor ('vigile') of an automatic player of a slot machine game on an Android phone. The player "
@@ -83,6 +91,10 @@ def parse_decision(data) -> Optional[Decision]:
     )
 
 
+def is_win_popup(*texts: Optional[str]) -> bool:
+    return any(_WIN_POPUP.search(t or "") for t in texts)
+
+
 def is_forbidden_target(description: str) -> bool:
     text = (description or "").lower()
     return any(re.search(rf"\b{re.escape(word)}\b", text) for word in _FORBIDDEN_WORDS)
@@ -96,7 +108,8 @@ class SlotWarden:
                  ready_probe: Optional[Callable] = None, notes: Optional[Callable] = None,
                  add_note: Optional[Callable] = None, ask_text: Callable[[str], str] = input,
                  sleep: Callable[[float], None] = time.sleep, max_calls: int = 50, max_calls_per_incident: int = 25,
-                 max_operator_turns: int = 6, bonus_timeout_seconds: float = 360.0):
+                 max_operator_turns: int = 6, bonus_timeout_seconds: float = 360.0,
+                 popup_probe: Optional[Callable] = None):
         self.gpt_client = gpt_client
         self.screen_reader = screen_reader
         self.touch_injector = touch_injector
@@ -116,6 +129,8 @@ class SlotWarden:
         self.bonus_events = 0
         self.bonus_seconds = 0.0
         self.free_spin_confirmations = 0
+        self.popup_probe = popup_probe          # probe(path) -> True se lo schermo mostra un popup di vincita (OCR)
+        self._hint: Optional[str] = None        # avviso per la prossima chiamata a Sol
 
     # ---- ingresso -------------------------------------------------------------------------------------------------
     def handle(self, device_id: str, slot_name: str, trigger: str, history: Optional[list] = None) -> str:
@@ -127,6 +142,7 @@ class SlotWarden:
         waited = 0.0
         operator_text, operator_helped, learned = None, False, None
         in_bonus = False
+        fast_taps = 0
         while True:
             if incident_calls >= self.max_calls_per_incident or self.calls >= self.max_calls:
                 logger.warning("Vigile: budget di chiamate finito per questo episodio.")
@@ -134,6 +150,13 @@ class SlotWarden:
             shot = self._screenshot(device_id)
             if shot is None:
                 return "give_up"
+            if fast_taps < _MAX_FAST_TAPS and self._popup_remembered(slot_name) and self._popup_on_screen(shot[0]):
+                # Regola gia' appresa: nessuna chiamata a Sol, tap al centro e si riguarda.
+                fast_taps += 1
+                logger.info("Vigile: popup vincita rilevato, tap al centro per chiudere (regola ricordata, senza Sol).")
+                if self._close_win_popup(device_id, slot_name, shot[0], remembered=True):
+                    self.sleep(1.0)
+                    continue
             decision = self._assess(shot[0], slot_name, trigger, history or [], operator_text)
             self.calls += 1
             incident_calls += 1
@@ -198,6 +221,8 @@ class SlotWarden:
             if not description or is_forbidden_target(description):
                 logger.warning("Vigile: bersaglio non ammesso ('%s'): non tocco.", description)
                 return False
+            if is_win_popup(description, decision.explanation):
+                return self._close_win_popup(device_id, slot_name, before_path, remembered=False)
             if self.describe is None:
                 return False
             size = self._size(before_path)
@@ -215,6 +240,40 @@ class SlotWarden:
             return False
         diff = diff_score(before_path, after[0])
         return bool(diff.success and diff.data >= _CHANGED_DIFF)
+
+    def _popup_remembered(self, slot_name: str) -> bool:
+        if not callable(self.popup_probe) or not callable(self.notes):
+            return False
+        try:
+            return any(str(n).startswith(_POPUP_NOTE) for n in (self.notes(slot_name) or []))
+        except Exception:
+            return False
+
+    def _popup_on_screen(self, path: str) -> bool:
+        try:
+            return bool(self.popup_probe(path))
+        except Exception as exc:    # la corsia veloce e' un'ottimizzazione: se la sonda fallisce si va da Sol
+            logger.warning("Vigile: sonda del popup fallita: %s", exc)
+            return False
+
+    def _close_win_popup(self, device_id: str, slot_name: str, before_path: str, remembered: bool) -> bool:
+        """Tap al centro dello schermo (nessuna ricerca di un elemento). La regola si salva solo se lo schermo cambia."""
+        size = self._size(before_path)
+        point = (size[0] // 2, size[1] // 2) if size else _FALLBACK_CENTER
+        if not remembered:
+            logger.info("Vigile: popup vincita rilevato, tap al centro per chiudere")
+        self.touch_injector.tap_coordinates(device_id, int(point[0]), int(point[1]))
+        self.sleep(1.5)
+        after = self._screenshot(device_id)
+        diff = diff_score(before_path, after[0]) if after is not None else None
+        changed = bool(diff is not None and diff.success and diff.data >= _CHANGED_DIFF)
+        if changed:
+            if not remembered:
+                self._store_note(slot_name, _POPUP_NOTE)
+        else:
+            self._hint = "The tap in the center of the screen did not close this popup: do not repeat it, find another way."
+            logger.warning("Vigile: il tap al centro non ha chiuso il popup.")
+        return changed
 
     def _wait_locally(self, device_id: str, slot_name: str, seconds: float) -> float:
         """Attesa con controlli locali (nessun GPT): si esce prima se la freccia dello spin torna visibile o se lo
@@ -300,6 +359,9 @@ class SlotWarden:
             context.append("Recent events (oldest first): " + " | ".join(history[-8:]))
         if notes:
             context.append("Rules already learned about this game: " + " | ".join(notes))
+        if self._hint:
+            context.append(self._hint)
+            self._hint = None
         if operator_text:
             context.append(f"INSTRUCTION FROM THE HUMAN OPERATOR (follow it, it knows the game): {operator_text}")
         messages = [
