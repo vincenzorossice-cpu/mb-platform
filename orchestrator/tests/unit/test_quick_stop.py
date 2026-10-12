@@ -370,3 +370,58 @@ class TestDelayAndRetry:
         _spin(controller)
 
         assert state.calls == [(False, "doppio spin")] and not controller._quick_retry
+
+
+# ---- il Quick Stop non e' mai muto ---------------------------------------------------------------------------------
+
+class TestNeverSilent:
+    def test_the_first_spin_of_a_new_map_starts_the_test_and_confirms_the_spin_point(self, tmp_path, caplog):
+        memory = SlotMemory(str(tmp_path / "mem"))
+        setup = SlotSetup(memory, MagicMock(), MagicMock())
+        slot_map = _good_map()
+        slot_map.spin_pending = True
+        setup._maps["wrap"] = slot_map
+        controller, verifier = _controller(tmp_path, setup, balance_mid="9.90", moving=False)
+
+        with caplog.at_level(logging.INFO):
+            _spin(controller)
+
+        assert "Quick Stop test: AVVIO (primo spin" in caplog.text and "Quick Stop test: ABILITATO" in caplog.text
+        assert setup.quick_stop("wrap") is True and len(verifier.taps) == 2
+
+    @pytest.mark.parametrize("setup_env,why", [
+        ({"QUICK_STOP": "0"}, "spento da QUICK_STOP=0"),
+        ({}, "nessuna mappa"),
+    ])
+    def test_every_reason_for_not_testing_is_written_once(self, tmp_path, monkeypatch, caplog, setup_env, why):
+        for key, value in setup_env.items():
+            monkeypatch.setenv(key, value)
+        controller, _ = _controller(tmp_path, QuickState() if setup_env else None)
+
+        with caplog.at_level(logging.INFO):
+            _spin(controller, 1)
+            _spin(controller, 2)
+
+        assert caplog.text.count("NON TESTATO (") == 1 and why in caplog.text
+
+    def test_free_spins_and_anomalies_say_why(self, tmp_path, caplog):
+        controller, _ = _controller(tmp_path, QuickState())
+        controller.quick_stop_suspended = True
+        with caplog.at_level(logging.INFO):
+            _spin(controller)
+        assert "NON TESTATO (free spin in corso)" in caplog.text
+
+    def test_the_lines_are_on_the_console_logger(self):
+        from orchestrator.scripts import run_autopilot
+        from orchestrator.modules.slot_autopilot import spin_controller
+        assert spin_controller.quick_log.name in run_autopilot._CONSOLE_INFO_LOGGERS
+
+    def test_ctrl_c_still_writes_the_quick_stop_summary(self, caplog):
+        autopilot = MagicMock()
+        autopilot.prepare.side_effect = KeyboardInterrupt
+        autopilot.spin_controller.quick_stats = {"state": "untested", "reason": "", "spins": 0, "seconds": 0.0}
+
+        with caplog.at_level(logging.INFO), pytest.raises(KeyboardInterrupt):
+            session.play_session(autopilot, "d", "wrap", Decimal("1"), 5)
+
+        assert "Quick Stop: NON TESTATO." in caplog.text

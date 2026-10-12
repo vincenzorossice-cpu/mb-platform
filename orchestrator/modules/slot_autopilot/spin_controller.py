@@ -19,6 +19,7 @@ from orchestrator.modules.slot_autopilot.verifier import ActionVerifier, Expecta
 from orchestrator.modules.step_logger.interface import StepLoggerInterface, StepRecord
 
 logger = logging.getLogger(__name__)
+quick_log = logging.getLogger("orchestrator.quick_stop")     # sulla console (vedi _CONSOLE_INFO_LOGGERS in run_autopilot)
 
 _ELEMENT = "spin"
 _MAX_NORMAL_DURATION_SECONDS = 20.0   # oltre, e' un bonus/feature: non conta per la durata tipica
@@ -91,6 +92,7 @@ class SpinController:
         self.quick_stop_suspended = False           # la sessione lo sospende durante i free spin
         self._quick_seen_slots = set()              # il test si fa solo al primo spin della sessione
         self._quick_retry = set()                   # slot il cui test a QUICK_STOP_DELAY e' "ignorato": riprova a 0.3 s
+        self._quick_noted = set()                   # (slot, motivo) gia' scritti in console
         self._quick_retrying = set()                # slot con la riprova a 0.3 s in corso (una sola volta)
         self._quick_delay_used = {}                 # slot -> delay con cui il Quick Stop e' stato provato con successo
         self.quick_stats = {"state": "untested", "reason": "", "spins": 0, "seconds": 0.0}
@@ -551,27 +553,50 @@ class SpinController:
         ))
 
     # ---- Quick Stop ------------------------------------------------------------------------------------------
+    def _quick_note(self, slot_name: str, text: str) -> None:
+        """Una riga per slot e per motivo: il Quick Stop non resta mai muto."""
+        key = (slot_name, text)
+        if key not in self._quick_noted:
+            self._quick_noted.add(key)
+            quick_log.info("Quick Stop: %s", text)
+
     def _quick_mode(self, slot_name: str, force: bool, candidate) -> str:
         """'off' | 'test' (primo spin della sessione, mai provato) | 'use' (provato e funzionante)."""
         state = self.quick_stop_state
-        if (state is None or force or candidate.verified or self.quick_stop_suspended
-                or os.environ.get("QUICK_STOP", "1").strip().lower() in ("0", "false", "no")
-                or self._anomaly.get(slot_name)):
+        why = None
+        if os.environ.get("QUICK_STOP", "1").strip().lower() in ("0", "false", "no"):
+            why = "spento da QUICK_STOP=0"
+        elif state is None:
+            why = "nessuna mappa della slot (GPT spento o non collegata)"
+        elif force:
+            why = "spin forzato dal vigile"
+        elif candidate.verified:
+            why = "il punto dello spin arriva dall'operatore"
+        elif self.quick_stop_suspended:
+            why = "free spin in corso"
+        elif self._anomaly.get(slot_name):
+            why = "anomalia sullo spin precedente"
+        if why is not None:
+            self._quick_note(slot_name, f"NON TESTATO ({why}).")
             return "off"
         known = state.quick_stop(slot_name)
         first_spin = slot_name not in self._quick_seen_slots
         self._quick_seen_slots.add(slot_name)
         if known is True:
             self.quick_stats["state"] = "enabled"
+            self._quick_note(slot_name, "ABILITATO dalla mappa (provato in una sessione precedente).")
             return "use"
         if known is False:
             self.quick_stats.update(state="disabled", reason=self.quick_stats["reason"] or "gia' provato: non funziona")
+            self._quick_note(slot_name, "DISABILITATO dalla mappa (provato in una sessione precedente: non funziona).")
             return "off"
         if slot_name in self._quick_retry:
             self._quick_retry.discard(slot_name)
             self._quick_retrying.add(slot_name)
+            quick_log.info("Quick Stop test: AVVIO riprova (delay %.1f s).", QUICK_STOP_RETRY_DELAY)
             return "test"
         if first_spin:
+            quick_log.info("Quick Stop test: AVVIO (primo spin, delay %.1f s).", self._quick_delay_for(slot_name, "test"))
             return "test"
         return "off"
 
@@ -589,7 +614,7 @@ class SpinController:
         self.verifier.touch_injector.tap_coordinates(device_id, int(x), int(y))
         gap = time.monotonic() - tapped_at
         holder.update(second_tap=True, gap=gap, delay=delay)
-        logger.info("Quick Stop: intervallo tra i tocchi %.2f s (delay %.1f s).", gap, delay)
+        quick_log.info("Quick Stop: intervallo tra i tocchi %.2f s (delay %.1f s).", gap, delay)
         if mode == "use":
             time.sleep(_QUICK_USE_WAIT)
             return
@@ -610,7 +635,7 @@ class SpinController:
             self.quick_stats["spins"] += 1
             self.quick_stats["seconds"] += time.monotonic() - started
             if balance_after is not None and self._bet_understated(balance_before, balance_after, bet):
-                logger.warning("Quick Stop disabilitato: doppio addebito rilevato (saldo %s -> %s con puntata %s).",
+                quick_log.warning("Quick Stop disabilitato: doppio addebito rilevato (saldo %s -> %s con puntata %s).",
                                balance_before, balance_after, bet)
                 self._set_quick(slot_name, False, "doppio addebito rilevato")
                 return True
@@ -619,38 +644,38 @@ class SpinController:
         retrying = slot_name in self._quick_retrying
         self._quick_retrying.discard(slot_name)
         if not holder.get("second_tap") or not holder.get("s1"):
-            logger.info("Quick Stop test: NON CONCLUSIVO (secondo tocco o screenshot mancanti): riprovo alla prossima sessione.")
+            quick_log.info("Quick Stop test: NON CONCLUSIVO (secondo tocco o screenshot mancanti): riprovo alla prossima sessione.")
             return False
         gap = holder.get("gap")
         if gap is not None and gap > QUICK_STOP_MAX_GAP:
-            logger.warning("Quick Stop test: NON CONCLUSIVO (secondo tocco arrivato dopo %.1f s): riprovo.", gap)
+            quick_log.warning("Quick Stop test: NON CONCLUSIVO (secondo tocco arrivato dopo %.1f s): riprovo.", gap)
             return False
         mid = self._balance_from_image(holder["s1"])
         if mid is None:
-            logger.info("Quick Stop test: NON CONCLUSIVO (saldo illeggibile a t=3.5 s): riprovo alla prossima sessione.")
+            quick_log.info("Quick Stop test: NON CONCLUSIVO (saldo illeggibile a t=3.5 s): riprovo alla prossima sessione.")
             return False
         drop = balance_before - mid
         if drop >= bet * Decimal("1.75"):
-            logger.warning("Quick Stop test: DISABILITATO (doppio spin: saldo sceso %s con puntata %s).", drop, bet)
+            quick_log.warning("Quick Stop test: DISABILITATO (doppio spin: saldo sceso %s con puntata %s).", drop, bet)
             self._set_quick(slot_name, False, "doppio spin")
             return True
         if drop >= bet * Decimal("0.75"):
             still = holder.get("s2") is not None and self._reels_still(holder["s1"], holder["s2"])
             if still:
-                logger.info("Quick Stop test: ABILITATO (saldo sceso 1x, animazione saltata).")
+                quick_log.info("Quick Stop test: ABILITATO (saldo sceso 1x, animazione saltata).")
                 self._quick_delay_used[slot_name] = holder.get("delay", quick_stop_delay())
                 self._set_quick(slot_name, True, "animazione saltata dal secondo tocco")
             elif not retrying:
                 # Ignorato a QUICK_STOP_DELAY: nulla viene salvato, al prossimo spin si riprova una volta a 0.3 s.
                 self._quick_retry.add(slot_name)
-                logger.info("Quick Stop test: ignorato con delay %.1f s, riprovo al prossimo spin con %.1f s.",
+                quick_log.info("Quick Stop test: ignorato con delay %.1f s, riprovo al prossimo spin con %.1f s.",
                             holder.get("delay", 0.0), QUICK_STOP_RETRY_DELAY)
             else:
-                logger.info("Quick Stop test: DISABILITATO (ignorato: i rulli erano ancora in movimento, anche a %.1f s).",
+                quick_log.info("Quick Stop test: DISABILITATO (ignorato: i rulli erano ancora in movimento, anche a %.1f s).",
                             QUICK_STOP_RETRY_DELAY)
                 self._set_quick(slot_name, False, "tocco ignorato (0.5 s e 0.3 s)")
             return False
-        logger.info("Quick Stop test: NON CONCLUSIVO (nessun addebito visto a t=3.5 s): riprovo alla prossima sessione.")
+        quick_log.info("Quick Stop test: NON CONCLUSIVO (nessun addebito visto a t=3.5 s): riprovo alla prossima sessione.")
         return False
 
     def _set_quick(self, slot_name: str, enabled: bool, reason: str) -> None:
@@ -658,7 +683,7 @@ class SpinController:
         try:
             self.quick_stop_state.set_quick_stop(slot_name, enabled, reason)
         except Exception as exc:   # ricordare l'esito non deve mai rompere lo spin
-            logger.warning("Quick Stop: esito non salvato: %s", exc)
+            quick_log.warning("Quick Stop: esito non salvato: %s", exc)
 
     def _balance_from_image(self, path: str):
         try:

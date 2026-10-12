@@ -322,6 +322,20 @@ def play_session(
     autopilot, device_id: str, slot_name: str, target: Decimal, max_steps: int, log: logging.Logger = None,
     reenter=None,
 ) -> SlotSessionResult:
+    """Vedi _play_session. Con Ctrl+C il riepilogo di memoria e Quick Stop si scrive comunque."""
+    try:
+        return _play_session(autopilot, device_id, slot_name, target, max_steps, log, reenter)
+    except KeyboardInterrupt:
+        out = log or logger
+        _log_slot_memory(autopilot, out)
+        _log_quick_stats(autopilot, out)
+        raise
+
+
+def _play_session(
+    autopilot, device_id: str, slot_name: str, target: Decimal, max_steps: int, log: logging.Logger = None,
+    reenter=None,
+) -> SlotSessionResult:
     """Prepara la slot, porta la puntata al minimo VERIFICATO e gioca fino al target (o a un arresto di
     sicurezza). E' il ciclo usato sia da run_autopilot sia da CasinoFlow. `log` permette a chi chiama di
     tenere i propri messaggi (filtri della console compresi). `reenter(device) -> Result`, se dato, riporta
