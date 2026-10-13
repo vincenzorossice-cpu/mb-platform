@@ -791,3 +791,22 @@ class TestSessionHelpers:
         assert {15, 17, 18} <= set(indexes)                                  # login, campo e Button prima del resto
         assert all(e is filler[i] for i, e in shown)                         # indici originali
         assert [i for i, _ in ui_helpers.prioritized_elements(_screen(*filler), 50)] == list(range(20))
+
+
+class TestCurrentChromeUrl:
+    def _bar(self, text, rid="com.android.chrome:id/url_bar"):
+        return _screen(_el(text, "android.widget.EditText", [10, 10, 500, 60], rid))
+
+    def test_reads_the_address_bar(self):
+        assert ui_helpers.current_chrome_url(self._bar("www.sisal.it/bonus/promozioni")) == \
+            "https://www.sisal.it/bonus/promozioni"
+        assert ui_helpers.current_chrome_url(self._bar("https://m.sisal.it/x")) == "https://m.sisal.it/x"
+
+    def test_unreadable_or_truncated_is_none(self):
+        assert ui_helpers.current_chrome_url(self._bar("")) is None
+        assert ui_helpers.current_chrome_url(self._bar("Cerca o digita un URL")) is None
+        assert ui_helpers.current_chrome_url(self._bar("www.sisal.it/bonus/promo…")) is None
+        assert ui_helpers.current_chrome_url(self._bar("localhost")) is None
+        assert ui_helpers.current_chrome_url(self._bar("www.sisal.it", rid="altro:id/titolo")) is None
+        assert ui_helpers.current_chrome_url(_screen(_el("Promo"))) is None
+        assert ui_helpers.current_chrome_url(None) is None

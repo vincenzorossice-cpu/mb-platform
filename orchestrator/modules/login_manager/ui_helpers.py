@@ -269,3 +269,18 @@ def prioritized_elements(screen_content: ScreenContent, limit: int) -> list:
         return (1 if "Button" in cls else 2), item[0]
 
     return sorted(sorted(indexed, key=tier)[:limit], key=lambda item: item[0])
+
+
+def current_chrome_url(screen_content: Optional[ScreenContent]) -> Optional[str]:
+    """L'URL della pagina aperta, letto dalla barra degli indirizzi di Chrome (resource_id ...url_bar), se la barra e'
+    visibile e mostra un indirizzo intero. Schema https:// aggiunto se manca; None se non leggibile o troncato."""
+    if screen_content is None:
+        return None
+    for e in screen_content.elements:
+        text = e.text.strip()
+        if (e.resource_id or "").endswith("url_bar") and text:
+            if " " in text or "\u2026" in text or "..." in text or "." not in text:
+                continue
+            return text if "://" in text else "https://" + text
+    return None
+

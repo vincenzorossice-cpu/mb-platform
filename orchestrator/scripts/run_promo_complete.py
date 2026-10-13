@@ -127,6 +127,11 @@ def navigate_to_slot(args, navigation_client, screen_reader, touch_injector) -> 
         region_refiner=nav_refiner, max_steps=args.max_steps, step_observer=step_saver,
         app_guard=lambda device: book_navigator.is_app_in_front(device, nav_script.CHROME_PACKAGE),
         app_restore=lambda device: book_navigator.bring_to_front(device, nav_script.CHROME_PACKAGE),
+        # Pagina bloccata / sessione scaduta durante la navigazione: il navigatore non conosce URL ne' login.
+        start_url=args.url, url_opener=book_navigator.open_chrome,
+        relogin=None if getattr(args, "skip_login", False) else (
+            lambda device, book: LoginExecutor(screen_reader, touch_injector, book_navigator=book_navigator)
+            .ensure_logged_in(device, book)),
     )
     opened = book_navigator.open_chrome(args.device, args.url)
     if not opened.success:

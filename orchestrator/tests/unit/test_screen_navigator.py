@@ -894,3 +894,196 @@ class TestRejectionBrake:
 
         assert result.success
         touch.scroll.assert_not_called()                       # mai due rifiuti di fila
+
+
+# ======================== pagina bloccata ("wait" ripetuti) e sessione scaduta durante la navigazione ==================
+
+import logging  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+from orchestrator.modules.login_manager.interface import LoginResult, LoginStatus  # noqa: E402
+
+BOOK = "SISAL"
+START_URL = "https://www.sisal.it/bonus/promozioni"
+URL_BAR = "com.android.chrome:id/url_bar"
+
+
+def _view(text, resource_id=None, cls="android.view.View"):
+    return UIElement(text=text, bounds=[10, 10, 400, 60], resource_id=resource_id, class_name=cls, confidence=1.0)
+
+
+PROMO = _make_screen([_view("Promozioni attive")])
+CHANGED = _make_screen([_view("Altra schermata")])
+CHANGED_2 = _make_screen([_view("Ancora un'altra schermata")])
+LOGIN_PAGE = _make_screen([_view("Accedi", cls="android.widget.Button"), _view("Email / Username")])
+WAIT = ("wait", None)
+
+
+def _login(status):
+    return Result.ok(LoginResult(status, BOOK, DEVICE, "x"))
+
+
+@pytest.fixture
+def no_sleep(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr("orchestrator.modules.screen_navigator.navigator.time.sleep", lambda s: sleeps.append(s))
+    return sleeps
+
+
+def _rig(screens, actions, relogin="default", url_opener="default", start_url=START_URL, max_steps=30):
+    """Navigatore con reader che mostra le `screens` in sequenza (poi ripete l'ultima) e un client che risponde con
+    `actions` [(azione, target)]. relogin/url_opener: "default" = mock che riesce, None = assente."""
+    seq = list(screens)
+    reader = MagicMock()
+    reader.read_screen.side_effect = lambda device, **kw: Result.ok(seq.pop(0) if len(seq) > 1 else seq[0])
+    touch = MagicMock()
+    touch.scroll.return_value = Result.ok(True)
+    touch.tap_element.return_value = Result.ok(True)
+    client = MagicMock()
+    client.ask.side_effect = [Result.ok(_answers(a, t)) for a, t in actions]
+    opener = MagicMock(return_value=Result.ok(True)) if url_opener == "default" else url_opener
+    relogin_mock = MagicMock(return_value=_login(LoginStatus.LOGIN_SUCCESS)) if relogin == "default" else relogin
+    navigator = ScreenNavigator(
+        screen_reader=reader, touch_injector=touch, decision_engine_client=client, max_steps=max_steps,
+        start_url=start_url, url_opener=opener, relogin=relogin_mock,
+    )
+    return SimpleNamespace(nav=navigator, reader=reader, touch=touch, client=client, opener=opener,
+                           relogin=relogin_mock)
+
+
+def _ups(rig):
+    return [c for c in rig.touch.scroll.call_args_list if c.args[1] == "up"]
+
+
+def _downs(rig):
+    return [c for c in rig.touch.scroll.call_args_list if c.args[1] == "down"]
+
+
+class TestWaitRecoveryLadder:
+    def test_scroll_then_refresh_resolves(self, no_sleep, caplog):
+        # 3 wait -> scroll (la pagina cambia ma GPT aspetta ancora) -> altri 2 wait -> refresh -> GPT va avanti
+        rig = _rig([PROMO, PROMO, PROMO, CHANGED, CHANGED, CHANGED_2], [WAIT] * 5 + [("done", None)])
+        with caplog.at_level(logging.INFO):
+            result = rig.nav.navigate(DEVICE, goal="g", book=BOOK)
+        assert result.success
+        assert len(_downs(rig)) == 1                          # Recovery 1/3: scroll
+        assert len(_ups(rig)) == 3                            # Recovery 2/3: pull-to-refresh (barra di Chrome non letta)
+        rig.opener.assert_not_called()                        # nessuna ri-navigazione
+        assert "Recovery 1/3: scroll" in caplog.text and "Recovery 2/3: refresh pagina" in caplog.text
+        assert "Recovery 3/3" not in caplog.text
+
+    def test_refresh_reopens_the_current_url_read_from_the_chrome_bar(self, no_sleep):
+        bar = _view("www.sisal.it/bonus/promozioni/happy-monday", resource_id=URL_BAR)
+        shown = _make_screen([_view("Altra schermata"), bar])
+        rig = _rig([PROMO, PROMO, PROMO, shown, shown, CHANGED_2], [WAIT] * 5 + [("done", None)])
+        assert rig.nav.navigate(DEVICE, goal="g", book=BOOK).success
+        rig.opener.assert_called_once_with(DEVICE, "https://www.sisal.it/bonus/promozioni/happy-monday")
+        assert _ups(rig) == []                                # niente pull-to-refresh quando si legge l'URL
+
+    def test_scroll_refresh_then_renavigate_resolves(self, no_sleep, caplog):
+        rig = _rig([PROMO, PROMO, PROMO, CHANGED, CHANGED, CHANGED_2, CHANGED_2, PROMO],
+                   [WAIT] * 7 + [("done", None)])
+        with caplog.at_level(logging.INFO):
+            result = rig.nav.navigate(DEVICE, goal="g", book=BOOK)
+        assert result.success
+        rig.opener.assert_called_once_with(DEVICE, START_URL)    # Recovery 3/3: ri-naviga dall'inizio
+        assert "Recovery 3/3: ri-naviga" in caplog.text
+        actions = [h["action"] for h in rig.nav.last_history]
+        assert actions.count("scroll") >= 1 and "refresh" in actions and "ri-naviga" in actions
+
+    def test_still_stuck_after_renavigation_fails(self, no_sleep):
+        rig = _rig([PROMO, PROMO, PROMO, CHANGED, CHANGED, CHANGED_2, CHANGED_2, PROMO, PROMO, PROMO],
+                   [WAIT] * 12)
+        result = rig.nav.navigate(DEVICE, goal="g", book=BOOK)
+        assert not result.success and result.error_code == "NAVIGATION_FAILED"
+        rig.opener.assert_called_once_with(DEVICE, START_URL)    # una sola ri-navigazione
+
+    def test_an_unchanged_screen_skips_the_extra_wait(self, no_sleep):
+        # dopo lo scroll lo schermo e' identico: al primo wait successivo si passa subito al refresh
+        rig = _rig([PROMO], [WAIT] * 4 + [("done", None)])
+        assert rig.nav.navigate(DEVICE, goal="g", book=BOOK).success
+        assert len(_downs(rig)) == 1 and len(_ups(rig)) == 3
+        assert rig.client.ask.call_count == 5
+
+    def test_a_changed_screen_needs_two_more_waits_before_the_refresh(self, no_sleep):
+        rig = _rig([PROMO, PROMO, PROMO, CHANGED, CHANGED, CHANGED], [WAIT] * 4 + [("done", None)])
+        assert rig.nav.navigate(DEVICE, goal="g", book=BOOK).success
+        assert len(_downs(rig)) == 1 and _ups(rig) == []         # 4 wait: lo scroll basta, niente refresh
+
+    def test_without_a_start_url_the_third_level_is_not_available(self, no_sleep):
+        rig = _rig([PROMO, PROMO, PROMO, CHANGED, CHANGED, CHANGED_2, CHANGED_2], [WAIT] * 7,
+                   start_url=None, url_opener=None)
+        result = rig.nav.navigate(DEVICE, goal="g", book=BOOK)
+        assert not result.success and result.error_code == "NAVIGATION_FAILED"
+
+    def test_another_action_resets_the_ladder(self, no_sleep):
+        rig = _rig([PROMO, PROMO, PROMO, CHANGED, CHANGED, CHANGED, CHANGED_2, CHANGED_2],
+                   [WAIT, WAIT, WAIT, ("tap", "Promo"), WAIT, WAIT, WAIT, ("done", None)])
+        assert rig.nav.navigate(DEVICE, goal="g", book=BOOK).success
+        assert len(_downs(rig)) == 2 and _ups(rig) == []        # di nuovo il livello 1, non il refresh
+
+    def test_other_actions_keep_the_old_loop_handling(self, no_sleep):
+        rig = _rig([PROMO], [("tap", "Promo")] * 6)
+        result = rig.nav.navigate(DEVICE, goal="g", book=BOOK)
+        assert not result.success and result.error_code == "NAVIGATION_STUCK"     # invariato: solo i wait hanno la scala
+        rig.opener.assert_not_called()
+
+
+class TestSessionExpiredDuringNavigation:
+    def test_login_button_after_two_waits_relogs_in_and_renavigates(self, no_sleep, caplog):
+        rig = _rig([PROMO, PROMO, LOGIN_PAGE, PROMO], [WAIT, WAIT, ("done", None)])
+        with caplog.at_level(logging.INFO):
+            result = rig.nav.navigate(DEVICE, goal="g", book=BOOK)
+        assert result.success
+        rig.relogin.assert_called_once_with(DEVICE, BOOK)
+        rig.opener.assert_called_once_with(DEVICE, START_URL)           # ri-naviga dall'inizio
+        assert rig.client.ask.call_count == 3                           # il controllo precede la 3a chiamata a GPT
+        assert "Sessione scaduta durante la navigazione, rifaccio login" in caplog.text
+        assert any(h["action"] == "login" for h in rig.nav.last_history)
+
+    def test_a_failed_login_is_session_expired(self, no_sleep):
+        rig = _rig([PROMO, PROMO, LOGIN_PAGE], [WAIT, WAIT, ("done", None)],
+                   relogin=MagicMock(return_value=_login(LoginStatus.LOGIN_FAILED)))
+        result = rig.nav.navigate(DEVICE, goal="g", book=BOOK)
+        assert not result.success and result.error_code == "SESSION_EXPIRED"
+        rig.opener.assert_not_called()
+
+    def test_without_relogin_the_session_is_expired(self, no_sleep):
+        rig = _rig([PROMO, PROMO, LOGIN_PAGE], [WAIT, WAIT, ("done", None)], relogin=None)
+        result = rig.nav.navigate(DEVICE, goal="g", book=BOOK)
+        assert not result.success and result.error_code == "SESSION_EXPIRED"
+
+    def test_a_crashing_relogin_is_session_expired(self, no_sleep):
+        rig = _rig([PROMO, PROMO, LOGIN_PAGE], [WAIT, WAIT], relogin=MagicMock(side_effect=RuntimeError("boom")))
+        assert rig.nav.navigate(DEVICE, goal="g", book=BOOK).error_code == "SESSION_EXPIRED"
+
+    def test_only_one_new_login_per_navigation(self, no_sleep):
+        rig = _rig([PROMO, PROMO, LOGIN_PAGE, LOGIN_PAGE, LOGIN_PAGE, LOGIN_PAGE], [WAIT] * 6)
+        result = rig.nav.navigate(DEVICE, goal="g", book=BOOK)
+        assert not result.success and result.error_code == "SESSION_EXPIRED"
+        assert rig.relogin.call_count == 1
+
+    def test_the_session_is_checked_before_escalating_to_the_refresh(self, no_sleep):
+        # dopo lo scroll compare la pagina di login: al livello 2 si fa il login invece del refresh
+        rig = _rig([PROMO, PROMO, PROMO, LOGIN_PAGE, LOGIN_PAGE, PROMO], [WAIT] * 5 + [("done", None)])
+        result = rig.nav.navigate(DEVICE, goal="g", book=BOOK)
+        assert result.success
+        rig.relogin.assert_called_once_with(DEVICE, BOOK)
+        assert _ups(rig) == []                                          # nessun pull-to-refresh sulla pagina di login
+
+    def test_a_normal_navigation_never_checks_the_session(self, no_sleep, monkeypatch):
+        spy = MagicMock(return_value="unknown")
+        monkeypatch.setattr("orchestrator.modules.screen_navigator.navigator.ui_helpers.session_state", spy)
+        # anche con un pulsante di login a schermo: senza wait ripetuti non c'e' nessun controllo (veloce)
+        rig = _rig([LOGIN_PAGE], [("tap", "Promo"), ("tap", "Altro"), ("done", None)])
+        assert rig.nav.navigate(DEVICE, goal="g", book=BOOK).success
+        spy.assert_not_called()
+        rig.relogin.assert_not_called()
+        rig.opener.assert_not_called()
+
+    def test_a_single_wait_does_not_check_the_session(self, no_sleep, monkeypatch):
+        spy = MagicMock(return_value="unknown")
+        monkeypatch.setattr("orchestrator.modules.screen_navigator.navigator.ui_helpers.session_state", spy)
+        rig = _rig([LOGIN_PAGE], [WAIT, ("tap", "Promo"), ("done", None)])
+        assert rig.nav.navigate(DEVICE, goal="g", book=BOOK).success
+        spy.assert_not_called()

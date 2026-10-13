@@ -532,3 +532,64 @@ class TestLoginOnReentry:
         reenter = self._reenter(env, login_env, monkeypatch, tmp_path, "--skip-login")
         assert reenter("D1").success
         assert login_env.executors == [] and login_env.calls == ["navigate"]
+
+
+class TestNavigatorWiring:
+    """navigate_to_slot passa al ScreenNavigator cio' che gli serve per i recuperi (il flusso non cambia)."""
+
+    @pytest.fixture
+    def wired(self, monkeypatch):
+        captured = {}
+
+        class FakeNavigator:
+            last_history = []
+
+            def __init__(self, **kwargs):
+                captured["kwargs"] = kwargs
+
+            def navigate(self, *a, **k):
+                return Result.ok(True)
+
+        class FakeBookNavigator:
+            def __init__(self, screen_reader=None, touch_injector=None):
+                captured["book_navigator"] = self
+
+            def open_chrome(self, device, url):
+                captured.setdefault("opened", []).append((device, url))
+                return Result.ok(True)
+
+            def is_app_in_front(self, *a):
+                return True
+
+            def bring_to_front(self, *a):
+                return Result.ok(True)
+
+        class FakeExecutor:
+            def __init__(self, screen_reader, touch_injector, book_navigator=None, **kw):
+                captured["executor"] = (screen_reader, touch_injector, book_navigator)
+
+            def ensure_logged_in(self, device, book):
+                return _login(LoginStatus.LOGIN_SUCCESS)
+
+        monkeypatch.setattr("orchestrator.modules.screen_navigator.navigator.ScreenNavigator", FakeNavigator)
+        monkeypatch.setattr("orchestrator.modules.book_navigator.navigator.BookNavigator", FakeBookNavigator)
+        monkeypatch.setattr(script, "LoginExecutor", FakeExecutor)
+        monkeypatch.setattr("orchestrator.modules.slot_autopilot.strategies.gpt_locator_strategy.build_region_refiner",
+                            lambda client: None)
+        return captured
+
+    def test_start_url_opener_and_relogin_are_passed(self, wired, tmp_path):
+        args = _login_args(tmp_path, "--no-save-steps", "--url", "https://www.sisal.it/bonus/promozioni")
+        assert script.navigate_to_slot(args, object(), "SR", "TI").success
+        kwargs = wired["kwargs"]
+        assert kwargs["start_url"] == "https://www.sisal.it/bonus/promozioni"
+        assert kwargs["url_opener"] == wired["book_navigator"].open_chrome
+        result = kwargs["relogin"]("D1", "SISAL")
+        assert result.data.is_logged_in
+        assert wired["executor"] == ("SR", "TI", wired["book_navigator"])
+        assert wired["opened"] == [("D1", "https://www.sisal.it/bonus/promozioni")]     # l'apertura iniziale e' invariata
+
+    def test_no_relogin_with_skip_login(self, wired, tmp_path):
+        args = _args(tmp_path, "--no-save-steps")                    # _args passa --skip-login
+        assert script.navigate_to_slot(args, object(), "SR", "TI").success
+        assert wired["kwargs"]["relogin"] is None and wired["kwargs"]["start_url"] == args.url
