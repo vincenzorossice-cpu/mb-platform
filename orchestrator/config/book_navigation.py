@@ -9,6 +9,10 @@ Per ogni bookmaker sono mappati:
 - book_type: "bookmaker" | "exchange"
 - needs_login: True se richiede login per vedere il saldo (quasi tutti)
 - notes: note operative specifiche del book
+- needs_manual_login: True se il login va fatto a mano via scrcpy (LoginManager non tenta nulla)
+- login_url: URL della pagina di login (None = usa balance_url)
+- login_form_labels: etichette username/password/submit per riconoscere il form
+- logged_in_indicators: testi che indicano sessione attiva per quel book
 
 I percorsi di open_bets_path sono pre-popolati dalla guida
 P6-RICONCILIAZIONE-STORICO-SCOMMESSE-BOOK (MB BRAIN), normalizzando i nomi
@@ -462,6 +466,23 @@ BOOK_NAVIGATION = {
         "notes": "",
     },
 }
+
+# LOGIN-MANAGER: campi di login applicati a tutti i book senza ripeterli in
+# ogni entry. Nessun book e' marcato needs_manual_login=True per ora: va
+# attivato per-book (es. BET365) quando l'operatore decide quali sono sensibili.
+_DEFAULT_LOGIN_FORM_LABELS = {
+    "username_label": "Email",
+    "password_label": "Password",
+    "submit_label": "Accedi",
+}
+_DEFAULT_LOGGED_IN_INDICATORS = ["Il mio conto", "Profilo", "Logout", "Esci", "Saldo"]
+
+for _cfg in BOOK_NAVIGATION.values():
+    _cfg.setdefault("needs_manual_login", False)  # LOGIN-MANAGER
+    _cfg.setdefault("login_url", None)  # LOGIN-MANAGER: None = usa balance_url
+    _cfg.setdefault("login_form_labels", dict(_DEFAULT_LOGIN_FORM_LABELS))  # LOGIN-MANAGER
+    _cfg.setdefault("logged_in_indicators", list(_DEFAULT_LOGGED_IN_INDICATORS))  # LOGIN-MANAGER
+del _cfg
 
 # Book citati nella guida P6-RICONCILIAZIONE-STORICO-SCOMMESSE-BOOK che non
 # hanno un nome corrispondente nell'elenco bookmaker Netcap (probabilmente

@@ -30,6 +30,21 @@ class TestBookNavigation(unittest.TestCase):
     def test_book_names_match_netcap(self):
         self.assertEqual(set(BOOK_NAVIGATION.keys()), NETCAP_BOOKMAKERS)
 
+    # LOGIN-MANAGER
+    def test_manual_login_default_false(self):
+        for name, cfg in BOOK_NAVIGATION.items():
+            self.assertIn("needs_manual_login", cfg, name)
+            self.assertFalse(cfg["needs_manual_login"], name)
+
+    # LOGIN-MANAGER
+    def test_login_config_fields(self):
+        for name, cfg in BOOK_NAVIGATION.items():
+            self.assertIn("login_url", cfg, name)
+            labels = cfg["login_form_labels"]
+            for key in ("username_label", "password_label", "submit_label"):
+                self.assertTrue(labels.get(key), f"{name} manca {key}")
+            self.assertTrue(cfg["logged_in_indicators"], name)
+
 
 if __name__ == "__main__":
     unittest.main()
