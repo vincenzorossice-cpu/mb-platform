@@ -27,7 +27,7 @@ DEFAULT_CONFIG = PROJECT_ROOT / "orchestrator" / "config" / "config.json"
 DEFAULT_LOG_DIR = "logs/multi_phone"
 DEFAULT_MODEL = "gpt-6.1-sol"
 # Variabili che i figli leggono: se impostate nell'ambiente o in .env vengono passate (mai stampate, solo i nomi).
-PASSED_ENV = ("OPENAI_API_KEY", "GPT_MODEL", "OCR_URL", "SCREENSHOT_MODE", "NETCAP_SESSION_TOKEN")
+PASSED_ENV = ("OPENAI_API_KEY", "GPT_MODEL", "OCR_URL", "ADB_CAPTURE_MODE", "SCREENSHOT_MODE", "NETCAP_SESSION_TOKEN")
 TERMINATE_GRACE_SECONDS = 10.0
 
 _LEVEL = re.compile(r"\[(WARNING|ERROR|CRITICAL)\]")

@@ -12,3 +12,11 @@ def _no_remote_ocr_from_the_environment(monkeypatch):
     """Un OCR_URL impostato sul PC di chi lancia i test non deve cambiarne il comportamento."""
     monkeypatch.delenv("OCR_URL", raising=False)
     monkeypatch.delenv("OCR_TIMEOUT", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_capture_mode_from_the_environment(monkeypatch):
+    """SCREENSHOT_MODE / ADB_CAPTURE_MODE impostati sul PC di chi lancia i test non devono cambiare il comando di
+    cattura che i test si aspettano (png)."""
+    monkeypatch.delenv("ADB_CAPTURE_MODE", raising=False)
+    monkeypatch.delenv("SCREENSHOT_MODE", raising=False)

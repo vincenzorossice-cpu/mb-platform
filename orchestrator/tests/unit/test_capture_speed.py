@@ -215,3 +215,135 @@ class TestRawGzipCapture:
             result = reader._screenshot("dev1")
 
         assert result.success and reader.last_method == "png"
+
+
+# ---------------- SCREENSHOT_MODE / ADB_CAPTURE_MODE: da dove arriva il modo di cattura ----------------
+
+class TestCaptureModeSelection:
+    def _reader(self, tmp_path, **kwargs):
+        return ScreenReader(screenshot_dir=str(tmp_path), **kwargs)
+
+    def test_screenshot_mode_is_honoured(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("SCREENSHOT_MODE", "rawgz")
+        reader = self._reader(tmp_path)
+        assert reader.capture_mode == "rawgz" and reader.capture_mode_source == "SCREENSHOT_MODE"
+
+    def test_adb_capture_mode_still_works_and_wins_over_the_alias(self, monkeypatch, tmp_path, caplog):
+        monkeypatch.setenv("ADB_CAPTURE_MODE", "raw")
+        monkeypatch.setenv("SCREENSHOT_MODE", "rawgz")
+        with caplog.at_level("WARNING"):
+            reader = self._reader(tmp_path)
+        assert reader.capture_mode == "raw" and reader.capture_mode_source == "ADB_CAPTURE_MODE"
+        assert "ADB_CAPTURE_MODE='raw'" in caplog.text and "SCREENSHOT_MODE='rawgz'" in caplog.text
+
+    def test_the_same_value_in_both_variables_is_not_a_conflict(self, monkeypatch, tmp_path, caplog):
+        monkeypatch.setenv("ADB_CAPTURE_MODE", "rawgz")
+        monkeypatch.setenv("SCREENSHOT_MODE", " RawGz ")
+        with caplog.at_level("WARNING"):
+            assert self._reader(tmp_path).capture_mode == "rawgz"
+        assert caplog.text == ""
+
+    def test_the_constructor_argument_beats_both_variables(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("ADB_CAPTURE_MODE", "raw")
+        monkeypatch.setenv("SCREENSHOT_MODE", "rawgz")
+        reader = self._reader(tmp_path, capture_mode="png")
+        assert reader.capture_mode == "png" and reader.capture_mode_source == "argomento"
+
+    def test_case_and_spaces_are_ignored_and_empty_means_unset(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("SCREENSHOT_MODE", "  RAWGZ ")
+        assert self._reader(tmp_path).capture_mode == "rawgz"
+        monkeypatch.setenv("SCREENSHOT_MODE", "   ")
+        reader = self._reader(tmp_path)
+        assert reader.capture_mode == "png" and reader.capture_mode_source == "predefinito"
+
+    def test_an_invalid_value_falls_back_to_png_but_says_so(self, monkeypatch, tmp_path, caplog):
+        monkeypatch.setenv("SCREENSHOT_MODE", "raw-gz")
+        with caplog.at_level("WARNING"):
+            reader = self._reader(tmp_path)
+        assert reader.capture_mode == "png" and "SCREENSHOT_MODE non valido" in reader.capture_mode_source
+        assert "SCREENSHOT_MODE='raw-gz' non valido" in caplog.text and "rawgz" in caplog.text
+
+    def test_without_variables_the_mode_is_png(self, tmp_path):
+        reader = self._reader(tmp_path)
+        assert (reader.capture_mode, reader.capture_mode_source) == ("png", "predefinito")
+
+    def test_the_variable_really_changes_the_adb_command(self, monkeypatch, tmp_path):
+        import gzip
+        commands = []
+
+        def run(cmd, stdout=None, **kwargs):
+            commands.append(cmd[-1])
+            if cmd[-1] == "-p":
+                stdout.write(b"\x89PNG-bytes")
+                return MagicMock(returncode=0)
+            return SimpleNamespace(stdout=gzip.compress(_raw(width=6, height=5)), returncode=0)
+
+        with patch(RUN, side_effect=run):
+            png_reader = self._reader(tmp_path)
+            assert png_reader._screenshot("dev1").success
+            monkeypatch.setenv("SCREENSHOT_MODE", "rawgz")
+            rawgz_reader = self._reader(tmp_path)
+            assert rawgz_reader._screenshot("dev1").success
+
+        assert commands == ["-p", "screencap | gzip -1"]
+        assert png_reader.method_counts == {"png": 1, "raw": 0, "rawgz": 0}
+        assert rawgz_reader.method_counts == {"png": 0, "raw": 0, "rawgz": 1} and rawgz_reader.last_method == "rawgz"
+
+    def test_a_phone_that_cannot_do_rawgz_is_counted_as_png(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("SCREENSHOT_MODE", "rawgz")
+
+        def run(cmd, stdout=None, **kwargs):
+            if cmd[-1] == "-p":
+                stdout.write(b"\x89PNG-bytes")
+                return MagicMock(returncode=0)
+            return SimpleNamespace(stdout=b"nessun gzip su questo telefono", returncode=0)
+
+        reader = self._reader(tmp_path)
+        with patch(RUN, side_effect=run):
+            assert reader._screenshot("dev1").success
+        assert reader.capture_mode == "rawgz"                                   # il modo richiesto non cambia...
+        assert reader.method_counts == {"png": 1, "raw": 0, "rawgz": 0}          # ...ma i metodi usati lo dicono
+
+
+class TestSessionLogsTheCaptureMode:
+    def _autopilot(self, mode, counts, source="SCREENSHOT_MODE"):
+        return SimpleNamespace(screen_reader=SimpleNamespace(
+            capture_stats={"calls": 40, "seconds": 40.0}, capture_mode=mode, capture_mode_source=source,
+            method_counts=counts))
+
+    def test_the_start_of_the_session_names_the_mode_and_where_it_comes_from(self, caplog):
+        with caplog.at_level("INFO"):
+            session_module._log_capture_mode(self._autopilot("rawgz", {}), session_module.logger)
+        assert "Screenshot ADB: modo rawgz (da SCREENSHOT_MODE)" in caplog.text
+
+    def test_no_line_when_the_reader_does_not_say(self, caplog):
+        with caplog.at_level("INFO"):
+            session_module._log_capture_mode(SimpleNamespace(screen_reader=MagicMock()), session_module.logger)
+        assert caplog.text == ""
+
+    def test_the_summary_says_rawgz_and_stays_quiet_when_nothing_fell_back(self, caplog):
+        with caplog.at_level("INFO"):
+            session_module._log_capture_stats(
+                self._autopilot("rawgz", {"png": 0, "raw": 0, "rawgz": 40}), session_module.logger)
+        assert "Screenshot ADB (modo rawgz): 40 in 40 s, 1.00 s a scatto." in caplog.text
+        assert "metodi usati" not in caplog.text
+
+    def test_the_summary_reports_the_fallbacks(self, caplog):
+        with caplog.at_level("INFO"):
+            session_module._log_capture_stats(
+                self._autopilot("rawgz", {"png": 2, "raw": 0, "rawgz": 38}), session_module.logger)
+        assert "Screenshot ADB (modo rawgz): 40 in 40 s" in caplog.text
+        assert "metodi usati: png 2, rawgz 38 (ripiego su PNG)" in caplog.text
+
+    def test_png_mode_summary_is_unchanged(self, caplog):
+        with caplog.at_level("INFO"):
+            session_module._log_capture_stats(
+                self._autopilot("png", {"png": 40, "raw": 0, "rawgz": 0}, "predefinito"), session_module.logger)
+        assert "Screenshot ADB (modo png): 40 in 40 s, 1.00 s a scatto." in caplog.text
+        assert "metodi usati" not in caplog.text
+
+
+def test_multi_phone_lists_both_capture_variable_names():
+    from orchestrator.scripts import multi_phone
+    names = multi_phone.passed_env_names({"SCREENSHOT_MODE": "rawgz", "ADB_CAPTURE_MODE": "raw", "ALTRO": "x"})
+    assert "SCREENSHOT_MODE" in names and "ADB_CAPTURE_MODE" in names and "ALTRO" not in names

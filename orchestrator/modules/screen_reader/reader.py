@@ -21,6 +21,30 @@ from orchestrator.modules.screen_reader.interface import (
 logger = logging.getLogger(__name__)
 
 _CAPTURE_MODES = ("png", "raw", "rawgz", "auto")
+# Variabili d'ambiente che scelgono il modo di cattura, in ordine di priorita'. SCREENSHOT_MODE e' un alias: era il
+# nome che chi lancia gli script si aspettava, ma nessuno lo leggeva (si restava su png senza accorgersene).
+_CAPTURE_MODE_ENV_VARS = ("ADB_CAPTURE_MODE", "SCREENSHOT_MODE")
+
+
+def resolve_capture_mode(capture_mode: Optional[str] = None) -> tuple:
+    """(modo, fonte). Priorita': argomento > ADB_CAPTURE_MODE > SCREENSHOT_MODE > png. Un valore non valido ripiega su
+    png ma con un avviso che nomina variabile e valore; due variabili in disaccordo: vince la prima, con un avviso."""
+    if capture_mode is not None and str(capture_mode).strip():
+        name, raw = "argomento", str(capture_mode)
+    else:
+        values = {n: (os.environ.get(n) or "").strip() for n in _CAPTURE_MODE_ENV_VARS}
+        set_names = [n for n in _CAPTURE_MODE_ENV_VARS if values[n]]
+        if not set_names:
+            return "png", "predefinito"
+        name, raw = set_names[0], values[set_names[0]]
+        if len(set_names) > 1 and values[set_names[1]].lower() != raw.lower():
+            logger.warning("%s=%r e %s=%r sono diversi: vale %s.", set_names[0], raw, set_names[1],
+                           values[set_names[1]], set_names[0])
+    mode = raw.strip().lower()
+    if mode not in _CAPTURE_MODES:
+        logger.warning("%s=%r non valido (ammessi: %s): uso png.", name, raw, ", ".join(_CAPTURE_MODES))
+        return "png", f"predefinito, {name} non valido"
+    return mode, name
 _RAW_FORMATS = (1, 2)            # RGBA_8888, RGBX_8888
 _MAX_RAW_PIXELS = 25_000_000
 
@@ -97,9 +121,10 @@ class ScreenReader(ScreenReaderInterface):
         # compressione sul telefono, ~10 MB sulla USB: spesso piu' veloce, da misurare con benchmark_capture);
         # rawgz = grezzo compresso sul telefono con gzip (~10 MB -> pochi MB, se il telefono ha gzip); auto = prova
         # rawgz, poi raw, poi png, spegnendo i metodi che falliscono. Default png finche' non si decide con i numeri.
-        mode = (capture_mode or os.environ.get("ADB_CAPTURE_MODE") or "png").strip().lower()
-        self.capture_mode = mode if mode in _CAPTURE_MODES else "png"
+        self.capture_mode, self.capture_mode_source = resolve_capture_mode(capture_mode)
+        logger.info("Cattura screenshot ADB: modo %s (da %s)", self.capture_mode, self.capture_mode_source)
         self.capture_stats = {"calls": 0, "seconds": 0.0, "raw_failures": 0}
+        self.method_counts = {"png": 0, "raw": 0, "rawgz": 0}   # metodi realmente usati (il modo e' solo quello richiesto)
         self._disabled_methods = set()        # metodi di cattura spenti da un fallimento (solo modo auto)
         self.last_method = "png"
         self.ocr_confidence_threshold = ocr_confidence_threshold
@@ -312,8 +337,10 @@ class ScreenReader(ScreenReaderInterface):
             for method in self._methods():
                 if self._capture_raw(device_id, local_path, gz=(method == "rawgz")):
                     self.last_method = method
+                    self.method_counts[method] += 1
                     return Result.ok(local_path)
             self.last_method = "png"
+            self.method_counts["png"] += 1
             return self._capture_png(device_id, local_path)
         finally:
             self.capture_stats["calls"] += 1

@@ -127,14 +127,29 @@ def _log_phase(autopilot, label: str, seconds: float, log) -> None:
         log.info("%s", text)
 
 
+def _log_capture_mode(autopilot, log) -> None:
+    """Modo di cattura degli screenshot e da dove viene (una riga a inizio sessione)."""
+    reader = getattr(autopilot, "screen_reader", None)
+    mode, source = getattr(reader, "capture_mode", None), getattr(reader, "capture_mode_source", None)
+    if isinstance(mode, str) and isinstance(source, str):
+        log.info("Screenshot ADB: modo %s (da %s)", mode, source)
+
+
 def _log_capture_stats(autopilot, log) -> None:
     """Quanto sono costati gli screenshot ADB in tutta la sessione (il collo di bottiglia misurato il 7 ottobre)."""
     try:
         stats = autopilot.screen_reader.capture_stats
         calls, seconds = int(stats["calls"]), float(stats["seconds"])
         if calls > 0:
-            log.info("Screenshot ADB (modo %s): %d in %.0f s, %.2f s a scatto.",
-                     getattr(autopilot.screen_reader, "capture_mode", "?"), calls, seconds, seconds / calls)
+            mode = getattr(autopilot.screen_reader, "capture_mode", "?")
+            log.info("Screenshot ADB (modo %s): %d in %.0f s, %.2f s a scatto.", mode, calls, seconds, seconds / calls)
+            # Il modo e' quello richiesto: se il telefono non regge il grezzo si ripiega su altri metodi, e i tempi
+            # sono quelli di quelli. Lo si dice solo quando non coincide.
+            counts = getattr(autopilot.screen_reader, "method_counts", None)
+            used = {m: n for m, n in counts.items() if n} if isinstance(counts, dict) else {}
+            if used and set(used) != {mode}:
+                log.info("Screenshot ADB, metodi usati: %s%s.", ", ".join(f"{m} {n}" for m, n in used.items()),
+                         " (ripiego su PNG)" if mode != "png" and "png" in used else "")
     except Exception:
         pass
 
@@ -369,6 +384,7 @@ def _play_session(
     understated_rechecks = 0
     clean_spins_since_understated = 0
 
+    _log_capture_mode(autopilot, log)
     log.info("Verifica puntata minima in corso...")
     phase_started = time.monotonic()
     bet_result = autopilot.set_min_bet(device_id)
