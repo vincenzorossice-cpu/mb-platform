@@ -280,12 +280,67 @@ def test_balance_readable_immediately_skips_the_intro(tmp_path):
     supervisor.observe.assert_not_called()                           # niente chiamata a Sol
 
 
-def test_balance_alone_is_not_enough_to_be_ready(tmp_path):
+def test_balance_alone_is_enough_even_if_the_bet_is_unreadable(tmp_path):
     scenes = _scenes(tmp_path)
     phone = Phone([scenes["text"]], advance_on_tap=False)
-    ocr = FakeOCR(states={scenes["text"]: {"saldo": 50.0, "posta": None, "spin_button_coords": None}})
+    ocr = FakeOCR(states={scenes["text"]: {"saldo": 50.0, "posta": None, "spin_button_coords": (160, 520)}})
+    supervisor = MagicMock()
+
+    result = _ocr_intro(phone, tmp_path, ocr, supervisor=supervisor).run("d", "Slot")
+
+    assert result.success and phone.taps == [] and result.data.rounds == 1      # niente tocchi, SPIN compreso
+    supervisor.observe.assert_not_called()
+
+
+def test_bet_alone_is_enough_even_if_the_balance_is_unreadable(tmp_path):
+    scenes = _scenes(tmp_path)
+    phone = Phone([scenes["text"]], advance_on_tap=False)
+    ocr = FakeOCR(states={scenes["text"]: {"saldo": None, "posta": 0.2, "spin_button_coords": (160, 520)}})
 
     result = _ocr_intro(phone, tmp_path, ocr).run("d", "Slot")
+
+    assert result.success and phone.taps == []
+
+
+def test_spin_tap_waits_for_the_round_then_balance_ends_the_intro_and_the_spin_is_not_remembered(tmp_path):
+    scenes = _scenes(tmp_path)
+    phone = Phone([scenes["text"], scenes["game"]], advance_if=lambda x, y, i: (x, y) == (160, 520))
+    ocr = FakeOCR(states={scenes["text"]: {"saldo": None, "posta": None, "spin_button_coords": (160, 520)},
+                          scenes["game"]: {"saldo": 99.0, "posta": None, "spin_button_coords": None}})
+    pauses = []
+    intro = _ocr_intro(phone, tmp_path, ocr)
+    intro.sleep = pauses.append
+
+    result = intro.run("d", "Slot")
+
+    assert result.success and phone.taps == [(150, 300), (160, 520)]
+    assert slot_intro._SPIN_SETTLE_SECONDS in pauses                            # attesa della fine del giro
+    assert result.data.learned == 0 and not (tmp_path / "mem" / "slot.intro.json").exists()
+
+
+def _gray_scenes(tmp_path, n):
+    return [_img(tmp_path, f"s{i}.png", (v, v, v)) for i, v in enumerate(range(70, 70 + 55 * n, 55))]
+
+
+def test_three_remembered_steps_that_changed_the_screen_end_the_intro(tmp_path, caplog):
+    screens = _gray_scenes(tmp_path, 4)
+    mem = tmp_path / "mem"
+    mem.mkdir()
+    steps = [{"sig": signature(path), "x": 10 + i, "y": 20, "kind": "gpt"} for i, path in enumerate(screens[:3])]
+    (mem / "slot.intro.json").write_text(json.dumps({"screens": {"300x600": steps}}))
+    phone = Phone(screens)                                       # nessun OCR leggibile, Sol dice "ancora intro"
+
+    with caplog.at_level("INFO"):
+        result = _ocr_intro(phone, tmp_path, FakeOCR()).run("d", "Slot")
+
+    assert result.success and phone.taps == [(10, 20), (11, 20), (12, 20)]
+    assert "3 passi ricordati eseguiti, schermo cambiato 3 volte - intro superate" in caplog.text
+
+
+def test_three_changes_by_strategies_without_readable_amounts_stay_in_intro(tmp_path):
+    phone = Phone(_gray_scenes(tmp_path, 4))                     # ogni tocco cambia schermo, ma nulla e' leggibile
+
+    result = _ocr_intro(phone, tmp_path, FakeOCR()).run("d", "Slot")
 
     assert not result.success and result.error_code == "INTRO_STUCK"
 

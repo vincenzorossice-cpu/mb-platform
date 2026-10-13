@@ -28,6 +28,8 @@ _MAX_ROUNDS = 20
 _MAX_SECONDS = 120.0
 _IDLE_WAITS = 2                   # attese (forse sta caricando) prima di arrendersi con strategie esaurite
 _MAX_BUTTON_TRIES = 2             # candidati "pulsante" provati per schermata
+_SPIN_SETTLE_SECONDS = 4.0        # dopo un tocco su SPIN: il giro deve finire prima di rileggere saldo e puntata
+_REMEMBERED_STEPS_ENOUGH = 3      # passi ricordati che hanno cambiato lo schermo = intro superate
 _BOTTOM_FRACTION = 0.79           # ~1900 su 2400: dove stanno di solito "Continua"/"Tocca per continuare"
 _SETTLE_SECONDS = 1.5
 _CONTINUE_DESCRIPTION = (
@@ -161,7 +163,7 @@ class SlotIntro:
     # ---- ciclo ---------------------------------------------------------------------------------------------
     def run(self, device_id: str, slot_name: str) -> Result[IntroOutcome]:
         started = time.monotonic()
-        taps = learned = attempts = waits = 0
+        taps = learned = attempts = waits = memory_changes = 0
         pending = None                  # ultimo tocco, il cui esito si legge dallo schermo del giro dopo
         screen_sig = None               # schermata su cui si stanno provando le strategie
         tried: set = set()
@@ -181,7 +183,9 @@ class SlotIntro:
             sig = signature(path)
 
             if pending is not None:
-                learned += self._judge_tap(pending, sig, slot_name, size)
+                gained, changed = self._judge_tap(pending, sig, slot_name, size)
+                learned += gained
+                memory_changes += 1 if changed and pending["kind"] == "memory" else 0
                 pending = None
             if screen_sig is None or sig is None or not same_screen(sig, screen_sig):
                 screen_sig, tried, tried_texts, waits = sig, set(), set(), 0
@@ -191,6 +195,12 @@ class SlotIntro:
             if ready:
                 logger.info("intro: gioco pronto dopo %d giri, %d tocchi (%d schermate nuove ricordate).",
                             round_no, taps, learned)
+                return Result.ok(IntroOutcome(rounds=round_no, taps=taps, ready=True, learned=learned))
+
+            if (memory_changes >= _REMEMBERED_STEPS_ENOUGH and not dark and sig
+                    and not any(same_screen(step["sig"], sig) for step in self._load(slot_name, size))):
+                logger.info("intro: %d passi ricordati eseguiti, schermo cambiato %d volte - intro superate",
+                            memory_changes, memory_changes)
                 return Result.ok(IntroOutcome(rounds=round_no, taps=taps, ready=True, learned=learned))
 
             action = self._next_action(device_id, slot_name, path, size, sig, dark, ready, tried, tried_texts)
@@ -211,11 +221,11 @@ class SlotIntro:
             self.touch_injector.tap_coordinates(device_id, int(action["x"]), int(action["y"]))
             taps += 1
             pending = action
-            self.sleep(_SETTLE_SECONDS)
+            self.sleep(_SPIN_SETTLE_SECONDS if action["kind"] == "spin" else _SETTLE_SECONDS)
         return Result.fail("le schermate di ingresso non finiscono", "INTRO_NOT_FINISHED")
 
-    def _judge_tap(self, tap: dict, sig, slot_name: str, size: tuple) -> int:
-        """Logga l'esito del tocco e aggiorna la memoria. Ritorna 1 se una schermata nuova e' stata ricordata."""
+    def _judge_tap(self, tap: dict, sig, slot_name: str, size: tuple) -> tuple:
+        """Logga l'esito del tocco e aggiorna la memoria. Ritorna (schermate nuove ricordate, schermo cambiato)."""
         changed = bool(sig) and bool(tap["sig"]) and not same_screen(tap["sig"], sig)
         logger.info("intro: tentativo %d - %s - schermo %s", tap["number"], tap["label"],
                     "cambiato" if changed else "non cambiato")
@@ -225,16 +235,18 @@ class SlotIntro:
             if not changed:
                 logger.info("intro: il tocco ricordato non funziona piu', lo dimentico.")
                 self._save(slot_name, size, [step for step in steps if not same(step)])
-            return 0
+            return 0, changed
+        if tap["kind"] == "spin":
+            return 0, changed               # uno spin ricordato = uno spin a puntata di default a ogni esecuzione
         if not changed or not tap["sig"]:
-            return 0
+            return 0, changed
         step = {"sig": tap["sig"], "x": int(tap["x"]), "y": int(tap["y"]), "kind": tap["kind"]}
         if tap.get("text"):
             step["text"] = tap["text"]
         self._save(slot_name, size, [s for s in steps if not same(s)] + [step])
         logger.info("intro: schermata superata con '%s' (%d,%d): la ricordo per '%s'.",
                     tap["kind"], tap["x"], tap["y"], slot_name)
-        return 1
+        return 1, changed
 
     # ---- strategie -----------------------------------------------------------------------------------------
     def _next_action(self, device_id, slot_name, path, size, sig, dark, ready, tried: set, tried_texts: set):
@@ -340,10 +352,11 @@ class SlotIntro:
             return self.button.classify(slot_name, size, path, int(spin[0]), int(spin[1])) is True
         if not dark:
             state = self._ocr_state(path)
-            # Un header del sito mostra il saldo ma non la puntata: servono entrambi.
-            if state and state.get("saldo") is not None and state.get("posta") is not None:
-                logger.info("intro: saldo leggibile (%s) - slot attiva, esco dalle intro", state["saldo"])
-                return True
+            # Basta uno dei due: su alcune slot l'OCR non legge l'etichetta della puntata (o del saldo).
+            for field, name in (("saldo", "saldo"), ("posta", "puntata")):
+                if state and state.get(field) is not None:
+                    logger.info("intro: %s leggibile (%s) - slot attiva, esco dalle intro", name, state[field])
+                    return True
         if self.supervisor is None:
             return None
         if dark or not self._worth_asking(slot_name, size, sig):

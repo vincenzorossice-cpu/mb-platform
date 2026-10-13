@@ -162,3 +162,12 @@ def test_another_safety_block_ends_the_session_without_a_failure():
     result = _play(_autopilot([_spin("blocked", bet=None, invariant="INSUFFICIENT_BALANCE")]), target="30")
 
     assert not result.failed and result.stop_reason == "BLOCKED" and not result.target_reached
+
+
+def test_min_bet_is_always_set_before_the_first_spin():
+    autopilot = _autopilot([_spin(index=i) for i in range(1, 6)])
+
+    _play(autopilot)
+
+    names = [call[0] for call in autopilot.mock_calls if call[0] in ("prepare", "set_min_bet", "spin")]
+    assert names[:3] == ["prepare", "set_min_bet", "spin"]
