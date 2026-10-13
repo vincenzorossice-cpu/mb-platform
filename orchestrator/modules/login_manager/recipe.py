@@ -6,11 +6,12 @@ from typing import Optional
 
 from orchestrator.core.result import Result
 
-VALID_ACTIONS = ("tap_button", "tap_field", "tap_coordinates", "wait", "check_session")
+VALID_ACTIONS = ("tap_button", "tap_field", "tap_coordinates", "press_enter", "wait", "check_session")
 
 # Indicatori di default: usati dal Mapper per i nuovi recipe e uniti a quelli del
 # recipe dall'Executor. Solo testi affidabili (niente "Benvenuto", "Account", "Saldo").
 LOGIN_BUTTON_INDICATORS = ["Accedi", "Registrati", "Login", "Log in", "Sign in"]
+CAPTCHA_INDICATORS = ["Non sono un robot", "reCAPTCHA", "recaptcha", "captcha"]
 DEFAULT_LOGGED_IN_INDICATORS = [
     "Logout", "Esci", "Il mio conto", "Profilo", "Saldo disponibile", "Effettua logout",
 ]
@@ -26,7 +27,7 @@ DEFAULT_RECIPES_PATH = os.path.join(
 
 @dataclass
 class LoginStep:
-    action: str                          # uno di VALID_ACTIONS
+    action: str                          # uno di VALID_ACTIONS (press_enter = keyevent 66, senza parametri)
     target_text: Optional[str] = None    # tap_button: testo del pulsante
     target_label: Optional[str] = None   # tap_field: label del campo
     x: Optional[int] = None              # tap_coordinates

@@ -4,9 +4,10 @@ from typing import Optional
 from orchestrator.config.book_navigation import BOOK_NAVIGATION
 from orchestrator.core.result import Result
 from orchestrator.modules.book_navigator.navigator import BookNavigator
-from orchestrator.modules.login_manager import ui_helpers
+from orchestrator.modules.login_manager import adb_input, ui_helpers
 from orchestrator.modules.login_manager.interface import LoginResult, LoginStatus
 from orchestrator.modules.login_manager.recipe import (
+    CAPTCHA_INDICATORS,
     DEFAULT_LOGGED_IN_INDICATORS,
     DEFAULT_LOGIN_FAILED_INDICATORS,
     LOGIN_BUTTON_INDICATORS,
@@ -34,7 +35,7 @@ class LoginExecutor:
     # Solo indicatori affidabili: niente "Benvenuto", "Account", "Saldo" da soli.
     LOGGED_IN_INDICATORS = list(DEFAULT_LOGGED_IN_INDICATORS)
     LOGIN_FAILED_INDICATORS = list(DEFAULT_LOGIN_FAILED_INDICATORS)
-    CAPTCHA_INDICATORS = ["Non sono un robot", "reCAPTCHA", "recaptcha", "captcha"]
+    CAPTCHA_INDICATORS = list(CAPTCHA_INDICATORS)
     TWO_FA_INDICATORS = ["inserisci codice", "codice SMS", "codice di verifica", "2FA"]
 
     def __init__(
@@ -189,8 +190,10 @@ class LoginExecutor:
                        "target": step.target_text or step.target_label,
                        "description": step.description}
             if res.error_code == "ELEMENT_NOT_FOUND":
+                details["action_required"] = "remap_book"
                 return self._hitl(LoginStatus.RECIPE_STEP_FAILED, recipe.book, device_id,
-                                  f"Step {index} ({step.description or step.action}): {res.error}",
+                                  f"Step {index} ({step.description or step.action}): {res.error} "
+                                  f"- sito cambiato: ri-mappare il book con il LoginMapper",
                                   details)
             if res.error_code == "AUTOFILL_NOT_FILLED":
                 return self._hitl(LoginStatus.AUTOFILL_FAILED, recipe.book, device_id,
@@ -203,6 +206,13 @@ class LoginExecutor:
         """Un singolo step. Ok(True): prosegui. Ok(False): sessione gia' attiva, fermati.
         Fail ELEMENT_NOT_FOUND / AUTOFILL_NOT_FILLED / errori di lettura e tap."""
         if step.action == "wait":
+            time.sleep(step.wait_after_seconds)
+            return Result.ok(True)
+
+        if step.action == "press_enter":
+            pressed = adb_input.press_enter(device_id)
+            if not pressed.success:
+                return Result.fail(pressed.error, pressed.error_code)
             time.sleep(step.wait_after_seconds)
             return Result.ok(True)
 
@@ -258,8 +268,9 @@ class LoginExecutor:
     # --------------------------------------------------------
 
     def _find_element_by_text(self, screen_content: ScreenContent, text: str) -> Optional[UIElement]:
-        """Elemento con quel testo (parola intera, case-insensitive)."""
-        return ui_helpers.find_element_by_text(screen_content, text)
+        """Elemento da toccare per quel testo (parola intera, case-insensitive): l'ULTIMO Button,
+        altrimenti un elemento non-Button. Stessa regola del LoginMapper."""
+        return ui_helpers.resolve_tap_target(screen_content, text)
 
     def _find_field_by_label(self, screen_content: ScreenContent, label: str) -> Optional[UIElement]:
         """EditText associato a una label (separata dall'EditText o nel suo testo)."""

@@ -56,6 +56,45 @@ def find_element_by_text(screen_content: ScreenContent, text: str) -> Optional[U
     return best[1] if best else None
 
 
+def find_last_button_by_text(screen_content: ScreenContent, text: str) -> Optional[UIElement]:
+    """ULTIMO Button con quel testo (parola intera): il submit sta in fondo al form, non nell'header.
+
+    Con piu' Button preferisce quelli dal testo identico; a parita' vince l'ultimo nell'ordine
+    del documento (un popup di sistema, come Touch to Fill, viene dopo la pagina).
+    """
+    candidates = [e for e in screen_content.elements
+                  if e.class_name and "Button" in e.class_name and e.text.strip()
+                  and valid_bounds(e.bounds) and word_in_text(text, e.text)]
+    if not candidates:
+        return None
+    exact = [e for e in candidates if e.text.strip().lower() == text.strip().lower()]
+    return (exact or candidates)[-1]
+
+
+def resolve_tap_target(screen_content: ScreenContent, text: str) -> Optional[UIElement]:
+    """Elemento da toccare per un tap_button: l'ultimo Button, altrimenti un elemento non-Button
+    (es. il link "Accedi" della home, che e' una View). Stessa regola per Mapper ed Executor, cosi'
+    quello che funziona in mapping colpisce lo stesso elemento al replay."""
+    return find_last_button_by_text(screen_content, text) or find_element_by_text(screen_content, text)
+
+
+def element_at_point(screen_content: ScreenContent, x: int, y: int) -> Optional[UIElement]:
+    """L'elemento non-EditText con testo che contiene il punto (il piu' piccolo), se esiste."""
+    hits = [e for e in screen_content.elements
+            if e.class_name != EDIT_TEXT_CLASS and e.text.strip() and valid_bounds(e.bounds)
+            and e.bounds[0] <= x <= e.bounds[2] and e.bounds[1] <= y <= e.bounds[3]]
+    if not hits:
+        return None
+    return min(hits, key=lambda e: (e.bounds[2] - e.bounds[0]) * (e.bounds[3] - e.bounds[1]))
+
+
+def screen_signature(screen_content: Optional[ScreenContent]) -> tuple:
+    """Firma della schermata (testo, classe, bounds di ogni elemento): se cambia, il tap ha avuto effetto."""
+    if screen_content is None:
+        return ()
+    return tuple((e.text, e.class_name, tuple(e.bounds or [])) for e in screen_content.elements)
+
+
 def edittext_match(label_element: UIElement, elements: list[UIElement]):
     """(EditText, contenuta, distanza) o None se la label non ha bounds o non c'e' nessun EditText."""
     if not valid_bounds(label_element.bounds):
