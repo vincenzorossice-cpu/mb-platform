@@ -1,7 +1,8 @@
 """Schermate di ingresso di una slot (overlay nero "schermo intero", testo informativo, "Continua", benvenuto) superate
 con il minimo di GPT. Per ogni schermata si prova una scala di strategie generiche, una per giro, verificando dallo
 schermo successivo se il tocco ha funzionato: centro (per prima sull'overlay nero), pulsanti trovati per testo con
-l'OCR, tasto SPIN, basso al centro e, solo alla fine, GPT. Ogni tocco che cambia lo schermo viene ricordato per quella
+l'OCR, attesa passiva (un banner spesso sparisce da solo), swipe, basso al centro e, solo alla fine, GPT. Mai il tasto
+SPIN: lancerebbe uno spin a puntata di default. Ogni tocco che cambia lo schermo viene ricordato per quella
 slot (`<slot>.intro.json`, per risoluzione) e ripetuto alla volta dopo senza strategie; un passo che non funziona piu'
 viene dimenticato. Il gioco e' pronto quando la freccia dello spin appresa lo dice o l'OCR legge saldo e puntata."""
 import json
@@ -25,7 +26,7 @@ _SAME_SCREEN_DIFF = 14.0          # differenza media (0-255) sotto cui due scher
 _DARK_LUMA = 45
 _DARK_FRACTION = 0.80             # overlay nero: almeno l'80% dei pixel scuri
 _MAX_ROUNDS = 30
-_MAX_SECONDS = 150.0
+_MAX_SECONDS = 240.0
 _LOADING_MAX_TEXTS = 5            # schermata di caricamento: al massimo questi testi, nessun pulsante riconosciuto
 _LOADING_WAITS = 5                # attese di _LOADING_SECONDS prima di passare alle strategie normali (15 s)
 _LOADING_SECONDS = 3.0
@@ -41,7 +42,9 @@ _SWIPES = (
 _SWIPE_KINDS = tuple(name for name, _, _ in _SWIPES)
 _IDLE_WAITS = 2                   # attese (forse sta caricando) prima di arrendersi con strategie esaurite
 _MAX_BUTTON_TRIES = 2             # candidati "pulsante" provati per schermata
-_SPIN_SETTLE_SECONDS = 4.0        # dopo un tocco su SPIN: il giro deve finire prima di rileggere saldo e puntata
+_PASSIVE_SECONDS = 30.0           # attesa passiva: non si tocca nulla e si rilegge lo schermo ogni _PASSIVE_INTERVAL
+_PASSIVE_INTERVAL = 5.0
+_PASSIVE_TOTAL_SECONDS = 90.0     # tetto dell'attesa passiva in una esecuzione, poi tocca all'operatore
 _REMEMBERED_STEPS_ENOUGH = 3      # passi ricordati che hanno cambiato lo schermo = intro superate
 _BOTTOM_FRACTION = 0.79           # ~1900 su 2400: dove stanno di solito "Continua"/"Tocca per continuare"
 _SETTLE_SECONDS = 1.5
@@ -153,8 +156,9 @@ class SlotIntro:
                 screens = {key: steps for key, steps in data["screens"].items() if isinstance(steps, list)}
             elif data.get("screen"):
                 screens = {self._key(data["screen"]): data.get("steps", [])}
-            return {key: [s for s in steps if isinstance(s, dict) and {"sig", "x", "y"} <= set(s)]
-                    for key, steps in screens.items()}
+            # I passi nati da un tocco su SPIN (vecchie memorie) non si ripetono mai: lancerebbero uno spin.
+            return {key: [s for s in steps if isinstance(s, dict) and {"sig", "x", "y"} <= set(s)
+                          and s.get("kind") != "spin"] for key, steps in screens.items()}
         except (OSError, ValueError, AttributeError, TypeError, IndexError):
             return {}
 
@@ -178,6 +182,7 @@ class SlotIntro:
     def run(self, device_id: str, slot_name: str) -> Result[IntroOutcome]:
         started = time.monotonic()
         taps = learned = attempts = waits = memory_changes = loading_waits = 0
+        passive_left = _PASSIVE_TOTAL_SECONDS
         last_swipe = None               # swipe appena eseguito: l'esito si vede dalla prontezza del giro dopo
         pending = None                  # ultimo tocco, il cui esito si legge dallo schermo del giro dopo
         screen_sig = None               # schermata su cui si stanno provando le strategie
@@ -196,6 +201,7 @@ class SlotIntro:
             except OSError:
                 return Result.fail("screenshot illeggibile", "SCREENSHOT_UNREADABLE")
             sig = signature(path)
+            self._boxes_cache = None            # il file dello screenshot puo' essere lo stesso di prima
 
             if pending is not None:
                 gained, changed = self._judge_tap(pending, sig, slot_name, size)
@@ -234,7 +240,8 @@ class SlotIntro:
                 self.sleep(_LOADING_SECONDS)
                 continue
 
-            action = self._next_action(device_id, slot_name, path, size, sig, dark, ready, tried, tried_texts)
+            action = self._next_action(device_id, slot_name, path, size, sig, dark, ready, tried, tried_texts,
+                                       passive_left)
             if action is None:
                 if ready is None:
                     logger.info("intro: nessun pulsante da toccare e nessun modo di verificare: considero il gioco pronto.")
@@ -247,6 +254,23 @@ class SlotIntro:
                                attempts)
                 return Result.fail("la schermata non cambia dopo piu' tocchi", "INTRO_STUCK")
 
+            if action.get("passive"):
+                seconds = min(float(action["seconds"]), passive_left)
+                logger.info("intro: attesa passiva (%ds), il banner potrebbe sparire da solo", int(seconds))
+                appeared, waited = self._passive_wait(device_id, slot_name, sig, seconds)
+                passive_left -= waited
+                if appeared:
+                    logger.info("intro: banner sparito dopo %ds - saldo leggibile, esco dalle intro", int(waited))
+                    if action["kind"] != "memory":
+                        learned += self._remember_wait(sig, waited, slot_name, size)
+                    return Result.ok(IntroOutcome(rounds=round_no, taps=taps, ready=True, learned=learned))
+                logger.info("intro: attesa passiva finita, nulla e' cambiato")
+                if action["kind"] == "memory":
+                    logger.info("intro: l'attesa ricordata non basta piu', la dimentico.")
+                    self._save(slot_name, size, [st for st in self._load(slot_name, size)
+                                                 if not same_screen(st["sig"], sig)])
+                continue
+
             attempts += 1
             action.update(sig=sig, number=attempts)
             loading_waits = 0
@@ -256,7 +280,7 @@ class SlotIntro:
                 self.touch_injector.tap_coordinates(device_id, int(action["x"]), int(action["y"]))
             taps += 1
             pending = action
-            self.sleep(action.get("wait") or (_SPIN_SETTLE_SECONDS if action["kind"] == "spin" else _SETTLE_SECONDS))
+            self.sleep(action.get("wait") or _SETTLE_SECONDS)
         return Result.fail("le schermate di ingresso non finiscono", "INTRO_NOT_FINISHED")
 
     def _judge_tap(self, tap: dict, sig, slot_name: str, size: tuple) -> tuple:
@@ -271,8 +295,8 @@ class SlotIntro:
                 logger.info("intro: il tocco ricordato non funziona piu', lo dimentico.")
                 self._save(slot_name, size, [step for step in steps if not same(step)])
             return 0, changed
-        if tap["kind"] == "spin" or tap["kind"] in _SWIPE_KINDS:
-            return 0, changed               # SPIN: mai ricordato; swipe: ricordato solo se poi il gioco e' pronto               # uno spin ricordato = uno spin a puntata di default a ogni esecuzione
+        if tap["kind"] in _SWIPE_KINDS:
+            return 0, changed               # uno swipe si ricorda solo se poi il gioco e' pronto
         if not changed or not tap["sig"]:
             return 0, changed
         step = {"sig": tap["sig"], "x": int(tap["x"]), "y": int(tap["y"]), "kind": tap["kind"]}
@@ -284,7 +308,8 @@ class SlotIntro:
         return 1, changed
 
     # ---- strategie -----------------------------------------------------------------------------------------
-    def _next_action(self, device_id, slot_name, path, size, sig, dark, ready, tried: set, tried_texts: set):
+    def _next_action(self, device_id, slot_name, path, size, sig, dark, ready, tried: set, tried_texts: set,
+                     passive_left: float = _PASSIVE_TOTAL_SECONDS):
         """Prossimo tocco da provare su questa schermata, o None se le strategie sono finite."""
         steps = self._load(slot_name, size)
         known = next((step for step in steps if same_screen(step["sig"], sig)), None) if sig else None
@@ -292,6 +317,10 @@ class SlotIntro:
             tried.add("memory")
             logger.info("intro: schermata gia' vista per '%s', ripeto il tocco ricordato (%d,%d).",
                         slot_name, known["x"], known["y"])
+            if known.get("kind") == "passive_wait":
+                seconds = float(known.get("wait_seconds") or _PASSIVE_SECONDS) + _PASSIVE_INTERVAL
+                return {"kind": "memory", "passive": True, "seconds": seconds, "x": 0, "y": 0,
+                        "label": f"attesa ricordata ({int(seconds)}s)"}
             if known.get("kind") == "swipe" and known.get("coords"):
                 return {"kind": "memory", "x": known["x"], "y": known["y"], "coords": list(known["coords"]),
                         "wait": known.get("wait_after") or _SWIPE_SECONDS,
@@ -302,7 +331,8 @@ class SlotIntro:
             # Nessuno sa dire se il gioco e' pronto: niente tocchi alla cieca su una schermata che potrebbe essere gioco.
             order = ("center", "buttons", "gpt") if dark else ("buttons", "gpt")
         else:
-            order = (("center", "buttons") if dark else ("buttons", "center")) + _SWIPE_KINDS + ("spin", "bottom", "gpt")
+            order = ((("center", "buttons") if dark else ("buttons", "center")) + ("passive_wait",) + _SWIPE_KINDS
+                     + ("passive_wait_2", "bottom", "gpt"))
         width, height = size
         for kind in order:
             if kind in tried:
@@ -328,15 +358,17 @@ class SlotIntro:
                 if action is None:
                     tried.update(_SWIPE_KINDS)          # niente banner in basso (o niente swipe): salto tutte e tre
                     continue
+                tried.add("_swiped")
                 return action
-            if kind == "spin":
+            if kind in ("passive_wait", "passive_wait_2"):
                 tried.add(kind)
-                point = self._spin_point(slot_name, path)
-                if point is None:
-                    logger.info("intro: cercato SPIN: non trovato")
-                    continue
-                return {"kind": kind, "x": point[0], "y": point[1],
-                        "label": f"cercato SPIN: trovato a ({point[0]},{point[1]})"}
+                if kind == "passive_wait_2" and "_swiped" not in tried:
+                    continue                            # la seconda attesa ha senso solo dopo gli swipe
+                boxes = self._boxes(path)
+                if passive_left < _PASSIVE_INTERVAL or not boxes:
+                    continue                            # budget finito, nessun OCR o schermo vuoto: niente da aspettare
+                return {"kind": kind, "passive": True, "seconds": min(_PASSIVE_SECONDS, passive_left), "x": 0, "y": 0,
+                        "label": "attesa passiva"}
             if kind == "bottom":
                 tried.add(kind)
                 x, y = width // 2, int(_BOTTOM_FRACTION * height)
@@ -421,13 +453,34 @@ class SlotIntro:
         logger.info("intro: swipe riuscito, lo ricordo per '%s'.", slot_name)
         return 1
 
-    def _spin_point(self, slot_name: str, path: str):
-        point = self.spin_point(slot_name) if callable(self.spin_point) else None
-        if point is not None:
-            return int(point[0]), int(point[1])
-        state = self._ocr_state(path)
-        coords = state.get("spin_button_coords") if state else None
-        return (int(coords[0]), int(coords[1])) if coords else None
+    def _passive_wait(self, device_id: str, slot_name: str, sig, seconds: float) -> tuple:
+        """Aspetta senza toccare nulla, rileggendo lo schermo ogni _PASSIVE_INTERVAL: (saldo/puntata comparsi, secondi
+        attesi). Si ferma se la schermata cambia (il giro normale ricalcola la scala). Solo OCR: niente Sol a ogni lettura."""
+        waited = 0.0
+        while waited < seconds:
+            self.sleep(_PASSIVE_INTERVAL)
+            waited += _PASSIVE_INTERVAL
+            shot = self.screen_reader._screenshot(device_id)
+            if not shot.success:
+                break
+            self._boxes_cache = None
+            if self._amounts_readable(shot.data):         # un banner che sparisce cambia anche la schermata: prima questo
+                return True, waited
+            new_sig = signature(shot.data)
+            if sig and new_sig and not same_screen(sig, new_sig):
+                logger.info("intro: durante l'attesa la schermata e' cambiata")
+                break
+        return False, waited
+
+    def _remember_wait(self, sig, waited: float, slot_name: str, size: tuple) -> int:
+        if not sig:
+            return 0
+        step = {"sig": sig, "x": 0, "y": 0, "kind": "passive_wait", "action": "passive_wait",
+                "wait_seconds": int(waited)}
+        steps = [st for st in self._load(slot_name, size) if not same_screen(st["sig"], sig)]
+        self._save(slot_name, size, steps + [step])
+        logger.info("intro: attesa riuscita, la ricordo per '%s'.", slot_name)
+        return 1
 
     # ---- prontezza -----------------------------------------------------------------------------------------
     def _ocr_state(self, path: str) -> Optional[dict]:
@@ -440,18 +493,23 @@ class SlotIntro:
             return None
         return state if isinstance(state, dict) else None
 
+    def _amounts_readable(self, path: str) -> bool:
+        """Saldo OPPURE puntata leggibili dall'OCR: su alcune slot un'etichetta non si legge, ma basta una per sapere che
+        il gioco e' attivo."""
+        state = self._ocr_state(path)
+        for field, name in (("saldo", "saldo"), ("posta", "puntata")):
+            if state and state.get(field) is not None:
+                logger.info("intro: %s leggibile (%s) - slot attiva, esco dalle intro", name, state[field])
+                return True
+        return False
+
     def _game_ready(self, device_id: str, slot_name: str, path: str, size: tuple, sig, dark: bool) -> Optional[bool]:
         """True/False se si sa dire se il gioco e' pronto; None se non c'e' modo di giudicare."""
         spin = self.spin_point(slot_name) if callable(self.spin_point) else None
         if self.button is not None and spin is not None and self.button.reference(slot_name, size) is not None:
             return self.button.classify(slot_name, size, path, int(spin[0]), int(spin[1])) is True
-        if not dark:
-            state = self._ocr_state(path)
-            # Basta uno dei due: su alcune slot l'OCR non legge l'etichetta della puntata (o del saldo).
-            for field, name in (("saldo", "saldo"), ("posta", "puntata")):
-                if state and state.get(field) is not None:
-                    logger.info("intro: %s leggibile (%s) - slot attiva, esco dalle intro", name, state[field])
-                    return True
+        if not dark and self._amounts_readable(path):
+            return True
         if self.supervisor is None:
             return None
         if dark or not self._worth_asking(slot_name, size, sig):

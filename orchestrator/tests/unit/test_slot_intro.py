@@ -222,30 +222,6 @@ def test_black_overlay_center_first_then_buttons_with_attempt_logs(tmp_path, cap
     assert "tentativo 2 - cercato pulsanti: trovato 'Continua' a (150,540) - schermo cambiato" in caplog.text
 
 
-def test_no_buttons_then_spin_found_by_ocr(tmp_path, caplog):
-    scenes = _scenes(tmp_path)
-    phone = Phone([scenes["text"], scenes["game"]], advance_if=lambda x, y, i: (x, y) == (160, 520))
-    ocr = FakeOCR(states={scenes["text"]: {"saldo": None, "posta": None, "spin_button_coords": (160, 520)},
-                          scenes["game"]: READY})
-
-    with caplog.at_level("INFO"):
-        result = _ocr_intro(phone, tmp_path, ocr).run("d", "Slot")
-
-    assert result.success and phone.taps == [(150, 300), (160, 520)]
-    assert "cercato SPIN: trovato a (160,520) - schermo cambiato" in caplog.text
-
-
-def test_spin_point_from_memory_is_preferred_to_ocr(tmp_path):
-    scenes = _scenes(tmp_path)
-    phone = Phone([scenes["text"], scenes["game"]], advance_if=lambda x, y, i: (x, y) == (111, 222))
-    ocr = FakeOCR(states={scenes["text"]: {"saldo": None, "posta": None, "spin_button_coords": (160, 520)},
-                          scenes["game"]: READY})
-
-    result = _ocr_intro(phone, tmp_path, ocr, spin_point=lambda slot: (111, 222)).run("d", "Slot")
-
-    assert result.success and phone.taps == [(150, 300), (111, 222)]
-
-
 def test_gpt_is_the_last_resort_after_center_spin_and_bottom(tmp_path):
     scenes = _scenes(tmp_path)
     describe = MagicMock(return_value=(30, 40))
@@ -308,22 +284,6 @@ def test_bet_alone_is_enough_even_if_the_balance_is_unreadable(tmp_path):
     result = _ocr_intro(phone, tmp_path, ocr).run("d", "Slot")
 
     assert result.success and phone.taps == []
-
-
-def test_spin_tap_waits_for_the_round_then_balance_ends_the_intro_and_the_spin_is_not_remembered(tmp_path):
-    scenes = _scenes(tmp_path)
-    phone = Phone([scenes["text"], scenes["game"]], advance_if=lambda x, y, i: (x, y) == (160, 520))
-    ocr = FakeOCR(states={scenes["text"]: {"saldo": None, "posta": None, "spin_button_coords": (160, 520)},
-                          scenes["game"]: {"saldo": 99.0, "posta": None, "spin_button_coords": None}})
-    pauses = []
-    intro = _ocr_intro(phone, tmp_path, ocr)
-    intro.sleep = pauses.append
-
-    result = intro.run("d", "Slot")
-
-    assert result.success and phone.taps == [(150, 300), (160, 520)]
-    assert slot_intro._SPIN_SETTLE_SECONDS in pauses                            # attesa della fine del giro
-    assert result.data.learned == 0 and not (tmp_path / "mem" / "slot.intro.json").exists()
 
 
 def _gray_scenes(tmp_path, n):
@@ -561,20 +521,6 @@ def test_swipe_left_when_right_does_nothing(tmp_path, caplog):
     assert [s["action"] for s in saved if s["kind"] == "swipe"] == ["swipe_left_banner"]
 
 
-def test_no_swipe_works_then_spin_tap_ends_the_intro(tmp_path):
-    scenes = _scenes(tmp_path)
-    phone = Phone([scenes["text"], scenes["game"]], advance_if=lambda x, y, i: (x, y) == (160, 520))
-    phone.swipe_ok = lambda x1, x2, index: False
-    ocr = FakeOCR(states={scenes["text"]: {"saldo": None, "posta": None, "spin_button_coords": (160, 520)},
-                          scenes["game"]: READY},
-                  boxes={scenes["text"]: _banner_boxes() + _texts(3, 300)})
-
-    result = _ocr_intro(phone, tmp_path, ocr).run("d", "Slot")
-
-    assert result.success and len(phone.swipes) == 3 and phone.taps[-1] == (160, 520)
-    assert not (tmp_path / "mem" / "slot.intro.json").exists()       # niente e' stato ricordato (lo SPIN mai)
-
-
 def test_saved_swipe_is_replayed_first_without_other_directions(tmp_path):
     scenes = _scenes(tmp_path)
     mem = tmp_path / "mem"
@@ -619,31 +565,160 @@ def test_swipes_are_skipped_without_text_at_the_bottom(tmp_path):
     assert phone.swipes == []
 
 
-def test_loading_then_banner_then_spin_all_passed(tmp_path):
+# ---- attesa passiva, mai SPIN -----------------------------------------------------------------------------------------
+
+SPIN_XY = (160, 520)
+
+
+class TimedPhone(Phone):
+    """Dopo `switch_after` screenshot il banner sparisce da solo: la schermata successiva e' il gioco."""
+    def __init__(self, paths, switch_after, **kw):
+        super().__init__(paths, advance_on_tap=False, **kw)
+        self.shots = 0
+        self.switch_after = switch_after
+
+    def _screenshot(self, device):
+        self.shots += 1
+        if self.shots >= self.switch_after:
+            self.index = len(self.paths) - 1
+        return super()._screenshot(device)
+
+
+def _banner_ocr(scenes, extra_states=None):
+    states = {scenes["text"]: {"saldo": None, "posta": None, "spin_button_coords": SPIN_XY}, scenes["game"]: READY}
+    states.update(extra_states or {})
+    return FakeOCR(states=states, boxes={scenes["text"]: _banner_boxes() + _texts(3, 300)})
+
+
+def _counting(intro):
+    pauses = []
+    intro.sleep = pauses.append
+    return pauses
+
+
+def test_passive_wait_lets_a_banner_disappear_by_itself_without_swipes_or_spin(tmp_path, caplog):
     scenes = _scenes(tmp_path)
-    loading = _img(tmp_path, "l.png", (90, 90, 140), patch=((100, 100, 200, 140), (200, 200, 200)))
-    banner = _img(tmp_path, "bn.png", (60, 40, 100), patch=((20, 400, 280, 560), (220, 220, 220)))
+    phone = TimedPhone([scenes["text"], scenes["game"]], switch_after=4)
+    intro = _ocr_intro(phone, tmp_path, _banner_ocr(scenes), spin_point=lambda slot: (111, 222))
 
-    def advance(x, y, index):
-        return index == 0 or (index == 2 and (x, y) == (160, 520))
+    with caplog.at_level("INFO"):
+        result = intro.run("d", "Slot")
 
-    phone = Phone([scenes["black"], loading, banner, scenes["game"]], advance_if=advance)
+    assert result.success and phone.swipes == [] and phone.taps == [(150, 300)]       # solo il centro, mai lo SPIN
+    assert "attesa passiva (30s)" in caplog.text and "banner sparito dopo 10s" in caplog.text
+    saved = json.loads((tmp_path / "mem" / "slot.intro.json").read_text())["screens"]["300x600"]
+    step = [st for st in saved if st["kind"] == "passive_wait"][0]
+    assert step["action"] == "passive_wait" and step["wait_seconds"] == 10
+
+
+def test_a_failed_passive_wait_is_followed_by_the_swipes(tmp_path):
+    scenes = _scenes(tmp_path)
+    phone = _swipe_phone([scenes["text"], scenes["game"]], works=lambda x1, x2: x1 > x2)
+    intro = _ocr_intro(phone, tmp_path, _banner_ocr(scenes))
+    pauses = _counting(intro)
+
+    result = intro.run("d", "Slot")
+
+    assert result.success and len(phone.swipes) == 1
+    assert pauses.count(slot_intro._PASSIVE_INTERVAL) == 6                            # 30 s di attesa prima dello swipe
+
+
+def test_wait_swipes_wait_then_the_operator_is_needed_and_the_spin_is_never_touched(tmp_path):
+    scenes = _scenes(tmp_path)
+    phone = Phone([scenes["text"]], advance_on_tap=False)
     phone.swipe_ok = lambda x1, x2, index: False
-    state = {"saldo": None, "posta": None, "spin_button_coords": (160, 520)}
-    ocr = FakeOCR(states={banner: state, scenes["game"]: READY},
-                  boxes={loading: _texts(2), banner: _banner_boxes() + _texts(3, 300)})
-    original = phone._screenshot
-    calls = {"n": 0}
+    intro = _ocr_intro(phone, tmp_path, _banner_ocr(scenes), spin_point=lambda slot: (111, 222),
+                       describe=MagicMock(return_value=None))
+    pauses = _counting(intro)
 
-    def screenshot(device):
-        calls["n"] += 1
-        if phone.index == 1 and calls["n"] >= 4:                       # il caricamento finisce da solo
-            phone.index = 2
-        return original(device)
+    result = intro.run("d", "Slot")
 
-    phone._screenshot = screenshot
+    assert not result.success and result.error_code == "INTRO_STUCK"                  # tocca all'operatore (HITL)
+    assert len(phone.swipes) == 3
+    assert pauses.count(slot_intro._PASSIVE_INTERVAL) == 12                           # 30 s + 30 s, dentro i 90 s
+    assert phone.taps == [(150, 300), (150, 474)]                                     # centro e basso: nessuno SPIN
+    assert SPIN_XY not in phone.taps and (111, 222) not in phone.taps
+
+
+def test_total_passive_wait_never_exceeds_90_seconds(tmp_path):
+    scenes = _scenes(tmp_path)
+    phone = Phone([scenes["text"]], advance_on_tap=False)
+    intro = _ocr_intro(phone, tmp_path, _banner_ocr(scenes))
+    pauses = _counting(intro)
+
+    intro.run("d", "Slot")
+
+    assert pauses.count(slot_intro._PASSIVE_INTERVAL) * slot_intro._PASSIVE_INTERVAL <= slot_intro._PASSIVE_TOTAL_SECONDS
+
+
+def test_saved_passive_wait_is_used_alone_without_center_or_swipes(tmp_path):
+    scenes = _scenes(tmp_path)
+    mem = tmp_path / "mem"
+    mem.mkdir()
+    (mem / "slot.intro.json").write_text(json.dumps({"screens": {"300x600": [
+        {"sig": signature(scenes["text"]), "x": 0, "y": 0, "kind": "passive_wait", "action": "passive_wait",
+         "wait_seconds": 10}]}}))
+    phone = TimedPhone([scenes["text"], scenes["game"]], switch_after=3)
+
+    result = _ocr_intro(phone, tmp_path, _banner_ocr(scenes)).run("d", "Slot")
+
+    assert result.success and phone.taps == [] and phone.swipes == []
+
+
+def test_saved_passive_wait_that_is_not_enough_is_forgotten(tmp_path):
+    scenes = _scenes(tmp_path)
+    mem = tmp_path / "mem"
+    mem.mkdir()
+    (mem / "slot.intro.json").write_text(json.dumps({"screens": {"300x600": [
+        {"sig": signature(scenes["text"]), "x": 0, "y": 0, "kind": "passive_wait", "wait_seconds": 5}]}}))
+    phone = Phone([scenes["text"], scenes["game"]], advance_if=lambda x, y, i: (x, y) == (150, 540))
+    ocr = FakeOCR(states={scenes["game"]: READY},
+                  boxes={scenes["text"]: _banner_boxes() + [_box("Continua", 150, 540)]})
 
     result = _ocr_intro(phone, tmp_path, ocr).run("d", "Slot")
 
-    assert result.success and len(phone.swipes) == 3
-    assert phone.taps[0] == (150, 300) and phone.taps[-1] == (160, 520)
+    assert result.success and phone.taps == [(150, 540)]
+    saved = json.loads((mem / "slot.intro.json").read_text())["screens"]["300x600"]
+    assert all(st["kind"] != "passive_wait" for st in saved)
+
+
+def test_old_memory_steps_born_from_a_spin_tap_are_never_replayed(tmp_path):
+    scenes = _scenes(tmp_path)
+    mem = tmp_path / "mem"
+    mem.mkdir()
+    (mem / "slot.intro.json").write_text(json.dumps({"screens": {"300x600": [
+        {"sig": signature(scenes["text"]), "x": SPIN_XY[0], "y": SPIN_XY[1], "kind": "spin"}]}}))
+    phone = Phone([scenes["text"], scenes["game"]], advance_if=lambda x, y, i: (x, y) == (150, 540))
+    ocr = FakeOCR(states={scenes["game"]: READY}, boxes={scenes["text"]: [_box("Continua", 150, 540)]})
+
+    result = _ocr_intro(phone, tmp_path, ocr).run("d", "Slot")
+
+    assert result.success and phone.taps == [(150, 540)]
+
+
+def test_no_passive_wait_on_an_empty_screen_or_without_ocr(tmp_path):
+    scenes = _scenes(tmp_path)
+    phone = Phone([scenes["text"]], advance_on_tap=False)
+    intro = _ocr_intro(phone, tmp_path, FakeOCR())                                     # 0 testi: caricamento, non banner
+    pauses = _counting(intro)
+    intro.run("d", "Slot")
+    assert slot_intro._PASSIVE_INTERVAL not in pauses
+
+    plain = Phone([scenes["text"]], advance_on_tap=False)
+    bare = _intro(plain, tmp_path, supervisor=SUPERVISOR_NEVER_READY)                  # senza OCR
+    pauses = _counting(bare)
+    bare.run("d", "Slot")
+    assert slot_intro._PASSIVE_INTERVAL not in pauses
+
+
+def test_passive_wait_stops_if_the_screen_changes(tmp_path):
+    scenes = _scenes(tmp_path)
+    other = _img(tmp_path, "o.png", (200, 40, 40), patch=((10, 10, 100, 60), (255, 255, 255)))
+    phone = TimedPhone([scenes["text"], other], switch_after=4)
+    intro = _ocr_intro(phone, tmp_path, _banner_ocr(scenes))
+    pauses = _counting(intro)
+
+    intro.run("d", "Slot")
+
+    assert pauses.count(slot_intro._PASSIVE_INTERVAL) < 12                            # non ha aspettato fino in fondo
+
