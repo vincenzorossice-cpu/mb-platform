@@ -303,6 +303,101 @@ def test_find_login_form_elements_no_form(manager):
                     "submit_element": None}
 
 
+# Layout reale Sisal (debug): EditText vuoti con rid neutro + label View separate
+SISAL_EMAIL_BOUNDS = [100, 628, 980, 743]
+SISAL_PASSWORD_BOUNDS = [100, 798, 980, 913]
+SISAL_BUTTON_BOUNDS = [100, 1118, 980, 1213]
+
+
+def _sisal_screen(email_text="", password_text=""):
+    return _screen(
+        _el("Wrappin' More Gold", "android.view.View", [100, 100, 980, 200]),
+        _el(email_text, "android.widget.EditText", SISAL_EMAIL_BOUNDS, "_r_0_-form-item"),
+        _el("Email / Username", "android.view.View", [125, 658, 492, 713]),
+        _el(password_text, "android.widget.EditText", SISAL_PASSWORD_BOUNDS, "password"),
+        _el("Password", "android.view.View", [125, 828, 352, 883]),
+        _el("Accedi", "android.widget.Button", SISAL_BUTTON_BOUNDS))
+
+
+def test_find_username_via_label(manager):
+    screen = _screen(
+        _el("", "android.widget.EditText", SISAL_EMAIL_BOUNDS, "_r_0_-form-item"),
+        _el("Email / Username", "android.view.View", [125, 658, 492, 713]))
+    form = manager._find_login_form_elements(screen)
+    assert form["username_element"].bounds == SISAL_EMAIL_BOUNDS
+
+
+def test_find_password_via_label(manager):
+    screen = _screen(
+        _el("", "android.widget.EditText", SISAL_EMAIL_BOUNDS, "_r_0_-form-item"),
+        _el("Email / Username", "android.view.View", [125, 658, 492, 713]),
+        _el("", "android.widget.EditText", SISAL_PASSWORD_BOUNDS, "field_2"),
+        _el("Password", "android.view.View", [125, 828, 352, 883]))
+    form = manager._find_login_form_elements(screen)
+    assert form["password_element"].bounds == SISAL_PASSWORD_BOUNDS
+    assert form["username_element"].bounds == SISAL_EMAIL_BOUNDS
+
+
+def test_find_nearest_edittext_contained(manager):
+    big = _el("", "android.widget.EditText", SISAL_EMAIL_BOUNDS)
+    # piccolo EditText con il centro piu' vicino al centro della label, ma che non la contiene
+    small = _el("", "android.widget.EditText", [300, 690, 320, 700])
+    label = _el("Email / Username", "android.view.View", [125, 658, 492, 713])
+    assert manager._find_nearest_edittext(label, [small, big, label]) is big
+
+
+def test_find_nearest_edittext_closest(manager):
+    near = _el("", "android.widget.EditText", [200, 0, 400, 50])
+    far = _el("", "android.widget.EditText", [200, 300, 400, 350])
+    label = _el("Email", "android.view.View", [0, 0, 100, 50])
+    assert manager._find_nearest_edittext(label, [far, near, label]) is near
+
+
+def test_find_nearest_no_edittext(manager):
+    label = _el("Email", "android.view.View", [0, 0, 100, 50])
+    assert manager._find_nearest_edittext(label, [label, _el("Accedi", "android.widget.Button")]) is None
+
+
+def test_find_form_elements_sisal_real(manager):
+    form = manager._find_login_form_elements(_sisal_screen())
+    assert form["username_element"].bounds == SISAL_EMAIL_BOUNDS
+    assert form["password_element"].bounds == SISAL_PASSWORD_BOUNDS
+    assert form["submit_element"].bounds == SISAL_BUTTON_BOUNDS
+
+
+def test_find_form_label_forgot_password_does_not_win(manager):
+    screen = _screen(
+        # link "dimenticato" sopra il campo email: il suo EditText piu' vicino e' l'email
+        _el("Hai dimenticato la password?", "android.view.View", [100, 560, 600, 600]),
+        _el("", "android.widget.EditText", SISAL_EMAIL_BOUNDS, "field_1"),
+        _el("Email / Username", "android.view.View", [125, 658, 492, 713]),
+        _el("", "android.widget.EditText", SISAL_PASSWORD_BOUNDS, "field_2"),
+        _el("Password", "android.view.View", [125, 828, 352, 883]))
+    form = manager._find_login_form_elements(screen)
+    assert form["username_element"].bounds == SISAL_EMAIL_BOUNDS
+    assert form["password_element"].bounds == SISAL_PASSWORD_BOUNDS
+
+
+def test_find_form_same_edittext_conflict(manager):
+    # Step 2: un solo campo (password). Il testo con "email" non deve rubarlo.
+    screen = _screen(
+        _el("Accedi con la tua email", "android.view.View", [100, 500, 700, 560]),
+        _el("", "android.widget.EditText", SISAL_EMAIL_BOUNDS, "field"),
+        _el("Password", "android.view.View", [125, 658, 352, 713]))
+    form = manager._find_login_form_elements(screen)
+    assert form["password_element"].bounds == SISAL_EMAIL_BOUNDS
+    assert form["username_element"] is None
+
+
+def test_perform_login_sisal_real_layout(manager, parts):
+    _set_screens(parts, _sisal_screen(), _sisal_screen("mario@example.it"),
+                 _sisal_screen("mario@example.it", "••••••••"), MOCK_LOGGED_IN_SCREEN)
+    res = manager.perform_login(DEVICE, BOOK)
+    assert res.data.status == LoginStatus.LOGIN_SUCCESS
+    taps = [c.args[1:] for c in parts[1].tap_coordinates.call_args_list]
+    assert taps == [(540, 685), (540, 855), (540, 1165)]
+
+
 def test_verify_login_success(manager, parts):
     _set_screens(parts, _screen(_el("Saldo 10€"), _el("Profilo")))
     assert manager.verify_login(DEVICE, BOOK).data.status == LoginStatus.LOGIN_SUCCESS

@@ -290,8 +290,26 @@ class LoginManager(LoginManagerInterface):
             blob = f"{e.text} {e.resource_id or ''}".lower()
             return any(w in blob for w in words)
 
-        username = next((e for e in edits if match(e, user_words)), None)
-        password = next((e for e in edits if e is not username and match(e, pass_words)), None)
+        # 1) Label separata dall'EditText (es. Sisal: EditText vuoto + View "Email / Username")
+        user_hit = self._best_label_field(elements, user_words)
+        pass_hit = self._best_label_field(elements, pass_words)
+        username = user_hit[1] if user_hit else None
+        password = pass_hit[1] if pass_hit else None
+        if username is not None and username is password:
+            # Stesso campo reclamato da due label (es. testo marketing con "email"
+            # sopra un campo password): vince la label con ranking migliore.
+            if user_hit[0] <= pass_hit[0]:
+                password = None
+            else:
+                username = None
+
+        # 2) Fallback: text/resource_id dell'EditText, solo per gli slot ancora vuoti
+        if username is None:
+            username = next((e for e in edits if e is not password and match(e, user_words)), None)
+        if password is None:
+            password = next((e for e in edits if e is not username and match(e, pass_words)), None)
+
+        # 3) Fallback posizionale
         if username is None and password is None and edits:
             username = edits[0]
         if password is None and username is not None and len(edits) > 1:
@@ -305,6 +323,69 @@ class LoginManager(LoginManagerInterface):
 
         return {"username_element": username, "password_element": password,
                 "submit_element": submit}
+
+    def _best_label_field(self, elements: list[UIElement], words: list[str]):
+        """Label (elemento non EditText) che matcha `words` + EditText associato.
+
+        Ritorna (rank, edittext) con rank = (non contenuta, distanza, lunghezza
+        testo): meglio una label dentro il campo, poi la piu' vicina, poi la
+        piu' corta (una label e' breve, "Hai dimenticato la password?" no).
+        """
+        best = None
+        for label in elements:
+            if label.class_name == EDIT_TEXT_CLASS or not label.text.strip():
+                continue
+            if not any(self._word_in_text(w, label.text) for w in words):
+                continue
+            hit = self._edittext_match(label, elements)
+            if hit is None:
+                continue
+            edit, contained, distance = hit
+            rank = (not contained, distance, len(label.text))
+            if best is None or rank < best[0]:
+                best = (rank, edit)
+        return best
+
+    def _edittext_match(self, label_element: UIElement, elements: list[UIElement]):
+        """(EditText, contenuta, distanza) o None se label senza bounds o nessun EditText."""
+        if not label_element.bounds or len(label_element.bounds) != 4 or not any(label_element.bounds):
+            return None
+        edits = [e for e in elements
+                 if e.class_name == EDIT_TEXT_CLASS and e.bounds and len(e.bounds) == 4 and any(e.bounds)]
+        if not edits:
+            return None
+        lx1, ly1, lx2, ly2 = label_element.bounds
+        cx, cy = (lx1 + lx2) / 2, (ly1 + ly2) / 2
+
+        containing = [e for e in edits
+                      if e.bounds[0] <= cx <= e.bounds[2] and e.bounds[1] <= cy <= e.bounds[3]]
+        if containing:
+            smallest = min(containing, key=lambda e: (e.bounds[2] - e.bounds[0]) * (e.bounds[3] - e.bounds[1]))
+            return smallest, True, 0.0
+
+        def distance(e: UIElement) -> float:
+            ex, ey = (e.bounds[0] + e.bounds[2]) / 2, (e.bounds[1] + e.bounds[3]) / 2
+            return ((ex - cx) ** 2 + (ey - cy) ** 2) ** 0.5
+
+        nearest = min(edits, key=distance)
+        return nearest, False, distance(nearest)
+
+    def _find_nearest_edittext(self, label_element: UIElement,
+                               elements: list[UIElement]) -> Optional[UIElement]:
+        """EditText associato a una label per geometria.
+
+        1. Se un EditText contiene la label (centro nei suoi bounds) -> quello
+           (il piu' piccolo, se piu' di uno)
+        2. Altrimenti il piu' vicino per distanza euclidea tra i centri
+        3. Nessun EditText -> None
+        """
+        hit = self._edittext_match(label_element, elements)
+        return hit[0] if hit else None
+
+    @staticmethod
+    def _word_in_text(word: str, text: str) -> bool:
+        """Parola intera: "PIN" non matcha in "Wrappin'", "Esci" in "Uscire"."""
+        return re.search(r"(?<!\w)" + re.escape(word.lower()) + r"(?!\w)", text.lower()) is not None
 
     def _is_field_filled(self, screen_content: ScreenContent, element: UIElement) -> bool:
         """Il campo (stessi bounds o stesso resource_id) ora ha un testo diverso da quello di prima."""
@@ -322,10 +403,8 @@ class LoginManager(LoginManagerInterface):
     def _has_indicators(self, screen_content: ScreenContent, indicators: list[str]) -> bool:
         if screen_content is None:
             return False
-        # Parola intera: "PIN" non deve matchare in "Wrappin'", "Esci" in "Uscire".
         for ind in indicators:
-            pattern = re.compile(r"(?<!\w)" + re.escape(ind.lower()) + r"(?!\w)")
-            if any(pattern.search(e.text.lower()) for e in screen_content.elements):
+            if any(self._word_in_text(ind, e.text) for e in screen_content.elements):
                 return True
         return False
 
