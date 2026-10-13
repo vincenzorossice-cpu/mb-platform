@@ -1,5 +1,6 @@
+import logging
 from decimal import Decimal
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call, patch
 
 from orchestrator.core.result import Result
 from orchestrator.modules.slot_autopilot.config import AutoPilotConfig
@@ -13,6 +14,7 @@ def _config(**overrides) -> AutoPilotConfig:
         device_id="dev", slot_name="pirots5", target_played_amount=Decimal("30.00"),
         max_spin_attempts_per_step=3, accounting_tolerance=Decimal("0.01"),
         spin_calm_check=False,   # ogni test lo accende se serve (verifier finto: non c'e' uno schermo vero)
+        balance_recheck_delay_seconds=0.0,   # niente attesa reale tra le riletture di conferma del safety net
     )
     defaults.update(overrides)
     return AutoPilotConfig(**defaults)
@@ -542,6 +544,110 @@ class TestBetUnderstated:
                                  MagicMock(return_value=_context_result(Decimal("100.00"))), True, Decimal("0.10"))
 
         assert not result.data.bet_understated
+
+
+class TestBalanceDropConfirmation:
+    """Safety net: prima di dare l'allarme "puntata piu' alta" si rilegge il saldo (con attesa, fino a 2 volte)."""
+
+    def _run(self, tap_after, rereads, bet="0.10", before="100.00", delay=0.0, state_after=None):
+        locator = MagicMock()
+        locator.locate.return_value = _candidate()
+        verifier = MagicMock()
+        outcome = _tap_outcome(True, balance_after=Decimal(tap_after))
+        outcome.data.state_after = state_after
+        verifier.verified_tap.return_value = outcome
+        controller, _, _, _ = _controller(locator=locator, verifier=verifier,
+                                          config=_config(balance_recheck_delay_seconds=delay))
+        provider = MagicMock(side_effect=[_context_result(Decimal(before))] + [
+            _context_result(None if r is None else Decimal(r)) for r in rereads])
+        result = controller.spin("dev", "pirots5", "ep", 1, provider, True, Decimal(bet)).data
+        return controller, result, provider
+
+    def test_a_coherent_first_reread_is_a_false_positive(self, caplog):
+        caplog.set_level(logging.INFO)
+        controller, result, provider = self._run("99.45", ["99.90"])      # calo 0.55 con puntata 0.10, poi 0.10
+        assert not result.bet_understated and result.balance_after == Decimal("99.90")
+        assert provider.call_count == 2                                    # saldo prima + una rilettura
+        assert controller.recheck_stats == {"alarms": 1, "false_positives": 1, "confirmed": 0}
+        assert "doppia lettura" in caplog.text and "falso positivo" in caplog.text
+
+    def test_two_concordant_anomalous_reads_confirm_the_alarm(self, caplog):
+        caplog.set_level(logging.INFO)
+        controller, result, provider = self._run("99.45", ["99.45"])
+        assert result.bet_understated
+        assert provider.call_count == 2                                    # concordi: nessuna terza lettura
+        assert controller.recheck_stats == {"alarms": 1, "false_positives": 0, "confirmed": 1}
+        assert "CONFERMATO" in caplog.text
+
+    def test_concordance_allows_the_accounting_tolerance(self):
+        _, result, provider = self._run("99.45", ["99.46"])
+        assert result.bet_understated and provider.call_count == 2
+
+    def test_an_unstable_ocr_gets_a_second_reread(self):
+        controller, result, provider = self._run("99.45", ["99.20", "99.90"])
+        assert not result.bet_understated and result.balance_after == Decimal("99.90")
+        assert provider.call_count == 3
+        assert controller.recheck_stats["false_positives"] == 1
+
+    def test_three_different_anomalous_reads_stay_cautious(self):
+        controller, result, provider = self._run("99.45", ["99.20", "99.00"])
+        assert result.bet_understated and provider.call_count == 3         # al massimo 2 riletture
+        assert controller.recheck_stats["confirmed"] == 1
+
+    def test_unreadable_rereads_are_cautious_but_do_not_hide_a_good_one(self):
+        assert self._run("99.45", [None, None])[1].bet_understated
+        _, result, _ = self._run("99.45", [None, "99.90"])
+        assert not result.bet_understated
+
+    def test_the_reread_waits_before_reading(self):
+        with patch("orchestrator.modules.slot_autopilot.spin_controller.time.sleep") as sleep:
+            self._run("99.45", ["99.20", "99.00"], delay=2.0)
+        assert sleep.call_args_list.count(call(2.0)) == 2                  # una attesa per ogni rilettura
+        with patch("orchestrator.modules.slot_autopilot.spin_controller.time.sleep") as sleep:
+            self._run("99.45", ["99.90"], delay=2.0)
+        assert sleep.call_args_list.count(call(2.0)) == 1                  # falso positivo alla prima
+        with patch("orchestrator.modules.slot_autopilot.spin_controller.time.sleep") as sleep:
+            self._run("99.45", ["99.90"], delay=0.0)
+        assert call(0.0) not in sleep.call_args_list and call(2.0) not in sleep.call_args_list
+
+    def test_a_normal_spin_never_rereads(self):
+        controller, result, provider = self._run("99.90", [])
+        assert not result.bet_understated and provider.call_count == 1
+        assert controller.recheck_stats == {"alarms": 0, "false_positives": 0, "confirmed": 0}
+
+    def test_the_log_reports_all_readings_and_the_screenshots(self, caplog):
+        caplog.set_level(logging.INFO)
+        self._run("99.45", ["99.20", "99.90"])
+        assert "/tmp/x.png" in caplog.text and "/tmp/b.png" in caplog.text   # schermata prima e dopo
+        assert "99.45" in caplog.text and "99.20" in caplog.text and "99.90" in caplog.text
+
+    def test_the_corrected_balance_also_reaches_the_next_spin_context(self):
+        state = {"saldo": "99.45", "posta": "0.10"}
+        _, result, _ = self._run("99.45", ["99.90"], state_after=state)
+        assert result.state_after["saldo"] == "99.90" and result.state_after["posta"] == "0.10"
+        assert state["saldo"] == "99.45"                                    # l'originale non viene toccato
+
+    def test_the_previous_spin_is_reported_when_its_win_explains_the_drop(self, caplog):
+        caplog.set_level(logging.INFO)
+        locator = MagicMock()
+        locator.locate.return_value = _candidate()
+        verifier = MagicMock()
+        verifier.verified_tap.side_effect = [_tap_outcome(True, balance_after=Decimal("100.35")),
+                                             _tap_outcome(True, balance_after=Decimal("99.80"))]
+        controller, _, _, _ = _controller(locator=locator, verifier=verifier)
+        provider = MagicMock(side_effect=[_context_result(Decimal("100.00")), _context_result(Decimal("100.35")),
+                                          _context_result(Decimal("99.80"))])
+        controller.spin("dev", "pirots5", "ep", 1, provider, True, Decimal("0.10"))     # sembra una vincita da 0.45
+        result = controller.spin("dev", "pirots5", "ep", 2, provider, True, Decimal("0.10")).data   # calo 0.55
+        assert result.bet_understated                                       # il comportamento non cambia: solo diagnostica
+        assert "Spin precedente: saldo 100.00 -> 100.35 (vincita dedotta 0.45)" in caplog.text
+        assert "calo sui due spin 0.20" in caplog.text
+
+    def test_the_recheck_delay_cannot_be_negative(self):
+        assert AutoPilotConfig(device_id="d", slot_name="s", target_played_amount=Decimal("1"),
+                               balance_recheck_delay_seconds=-1).validate().error_code == "CONFIG_INVALID"
+        assert AutoPilotConfig(device_id="d", slot_name="s", target_played_amount=Decimal("1")
+                               ).balance_recheck_delay_seconds == 2.0
 
 
 from orchestrator.modules.slot_autopilot.verifier import CalmResult

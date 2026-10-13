@@ -111,6 +111,38 @@ def test_repeated_understated_bets_stop_after_two_rereads():
     assert result.failed and result.stop_reason == "BET_UNDERSTATED" and result.spins == 3
 
 
+def test_isolated_false_alarms_do_not_stop_a_long_session():
+    # un allarme ogni 30 spin puliti: il budget (2) si ricarica, senza ricarica il terzo fermerebbe la sessione
+    spins = ([_spin(understated=True)] + [_spin() for _ in range(30)]) * 3 + [_spin()]
+    autopilot = _autopilot(spins)
+
+    result = _play(autopilot, target="1000", max_steps=len(spins))
+
+    assert not result.failed and result.stop_reason is None
+    assert autopilot.set_min_bet.call_count == 4                              # iniziale + una riverifica per allarme
+
+
+def test_the_understated_budget_is_refilled_after_exactly_thirty_clean_spins(caplog):
+    spins = [_spin(understated=True)] + [_spin() for _ in range(30)] + [_spin(understated=True) for _ in range(2)] \
+        + [_spin()]
+    autopilot = _autopilot(spins)
+
+    with caplog.at_level("INFO"):
+        result = _play(autopilot, target="1000", max_steps=len(spins))
+
+    assert not result.failed                                                  # 3 allarmi in tutto, mai piu' di 2 per volta
+    assert "il budget di riletture si ricarica" in caplog.text
+
+
+def test_fewer_than_thirty_clean_spins_do_not_refill_the_understated_budget():
+    spins = [_spin(understated=True)] + [_spin() for _ in range(29)] + [_spin(understated=True) for _ in range(3)]
+    autopilot = _autopilot(spins)
+
+    result = _play(autopilot, target="1000", max_steps=len(spins))
+
+    assert result.failed and result.stop_reason == "BET_UNDERSTATED"
+
+
 def test_a_failing_spin_call_is_an_error():
     autopilot = _autopilot([Result.fail("boom", "ADB_ERROR")])
 

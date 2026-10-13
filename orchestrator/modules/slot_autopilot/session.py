@@ -17,6 +17,9 @@ BET_WINDOW_RATIO = Decimal("0.6")
 BONUS_SETTLE_SECONDS = 2.0      # dopo un evento bonus si aspetta che il saldo si stabilizzi
 MAX_BONUS_EVENTS = 5           # eventi bonus di fila prima di chiedere all'operatore
 MAX_UNDERSTATED_RECHECKS = 2    # riletture della puntata per sessione prima di fermarsi con BET_UNDERSTATED
+# Spin puliti di fila dopo i quali il budget di riletture si ricarica: i falsi allarmi (letture OCR sbagliate) sono
+# isolati, i problemi veri si ripetono ravvicinati; senza ricarica tre falsi allarmi sparsi fermerebbero una sessione lunga.
+UNDERSTATED_RECHECK_RESET_SPINS = 30
 WARDEN_BUSY_SECONDS = 20        # schermo occupato da cosi' tanto: lo guarda il vigile (Sol)
 MAX_FREE_RUN = 15               # free spin consecutivi prima di richiamare Sol (tetto di sicurezza)
 FREE_IDLE_SECONDS = 25.0        # secondi senza cambiamenti in free spin prima di richiamare Sol
@@ -56,7 +59,8 @@ class SlotSessionResult:
     target: Decimal = Decimal("0.00")
     # Media per fase (secondi) degli spin riusciti: calma, tocco, attesa, lettura, altro, totale (None se nessuno).
     avg_timings: Optional[dict] = None
-    free_spins: int = 0                  # free spin giocati (NON entrano nel giocato)
+    free_spins: int = 0                  # tocchi sullo spin durante i free spin (NON i giri effettivi; fuori dal giocato)
+    free_spin_sequences: int = 0         # sequenze di free spin incontrate nella sessione
     reentries: int = 0                   # quante volte si e' rientrati nella slot dopo che ci ha cacciato
     net: Optional[Decimal] = None        # netto vinto/perso sommato su tutti gli ingressi (il saldo demo si ripristina)
 
@@ -363,6 +367,7 @@ def _play_session(
     method_saved = False
     bonus_streak = 0
     understated_rechecks = 0
+    clean_spins_since_understated = 0
 
     log.info("Verifica puntata minima in corso...")
     phase_started = time.monotonic()
@@ -416,15 +421,18 @@ def _play_session(
     except Exception:
         first_initial = None
 
-    fs = {"on": False, "done": 0, "run": 0, "start": None, "last": 0.0, "total": 0}
+    # done = tocchi sullo spin durante la sequenza (NON i giri gratis effettivi: un tocco ne puo' far partire molti e
+    # nessun dato a schermo li conta); total = tocchi di tutte le sequenze; sequences = sequenze di free spin viste.
+    fs = {"on": False, "done": 0, "run": 0, "start": None, "last": 0.0, "total": 0, "sequences": 0}
 
     def fs_enter(balance, counted: bool) -> None:
         """Sol ha confermato i free spin (indizi visivi): da qui si prosegue con controlli locali, senza chiamarlo a
         ogni giro gratuito. I free spin NON entrano nel giocato: hanno un contatore a parte."""
         if not fs["on"]:
             fs.update(on=True, done=0, run=0, start=balance)
-            log.warning("Free spin confermati da Sol: non contano nel giocato; continuo con controlli locali senza "
-                        "richiamare Sol a ogni giro.")
+            fs["sequences"] += 1
+            log.warning("Free spin confermati da Sol (sequenza %d): non contano nel giocato; continuo con controlli "
+                        "locali senza richiamare Sol a ogni giro.", fs["sequences"])
             if slot_setup is not None:
                 slot_setup.mark_free_spins(slot_name)
         if counted:
@@ -435,8 +443,9 @@ def _play_session(
     def fs_exit(balance_now) -> None:
         if not fs["on"]:
             return
-        log.info("Free spin terminati: %d spin gratis giocati, saldo passato da %s a %s, riprendo gioco normale.",
-                 fs["done"], fs["start"], balance_now)
+        log.info("Free spin terminati: sequenza %d completata (%d tocchi sullo spin durante i giri gratis, i giri "
+                 "effettivi non sono contati), saldo passato da %s a %s, riprendo gioco normale.",
+                 fs["sequences"], fs["done"], fs["start"], balance_now)
         fs["total"] += fs["done"]
         fs.update(on=False, done=0, run=0, start=None)
 
@@ -589,6 +598,7 @@ def _play_session(
                 # Il saldo scende piu' della puntata creduta: la puntata a schermo e' cambiata (es. un tocco ha colpito
                 # una cella, o uno spin e' partito prima di abbassarla). Si rilegge e si riporta al minimo e si prosegue.
                 understated_rechecks += 1
+                clean_spins_since_understated = 0
                 log.warning(
                     "La puntata reale e' piu' alta di %s (calo di saldo %s): rileggo e riporto la puntata al minimo "
                     "(%d/%d).", believed, drop, understated_rechecks, MAX_UNDERSTATED_RECHECKS,
@@ -716,6 +726,12 @@ def _play_session(
             consecutive_no_effect = 0
         if spin_result.data.outcome == "success" and spin_result.data.bet_amount:
             total_played += spin_result.data.bet_amount
+            if understated_rechecks:
+                clean_spins_since_understated += 1
+                if clean_spins_since_understated >= UNDERSTATED_RECHECK_RESET_SPINS:
+                    log.info("%d spin senza allarmi sulla puntata: il budget di riletture si ricarica (era %d/%d).",
+                             clean_spins_since_understated, understated_rechecks, MAX_UNDERSTATED_RECHECKS)
+                    understated_rechecks = clean_spins_since_understated = 0
             if slot_setup is not None and not spin_confirmed:
                 spin_confirmed = True
                 slot_setup.confirm_spin(device_id, slot_name)      # il 1o spin vero conferma lo spin della mappa
@@ -859,5 +875,5 @@ def _play_session(
     return SlotSessionResult(
         total_played, spin_index, failed=failed, stop_reason=stop_reason,
         initial_balance=initial_balance, final_balance=final_balance, target=target, avg_timings=averages,
-        reentries=reentry["n"], net=net, free_spins=fs["total"],
+        reentries=reentry["n"], net=net, free_spins=fs["total"], free_spin_sequences=fs["sequences"],
     )

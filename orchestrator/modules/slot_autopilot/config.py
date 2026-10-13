@@ -90,6 +90,9 @@ class AutoPilotConfig:
     full_read_every_spins: int = 30
     balance_rise_abort_margin: Decimal = Decimal("0.00")
     accounting_tolerance: Decimal = Decimal("0.01")
+    # Safety net sulla puntata: quando il saldo scende piu' del previsto si aspetta questo tempo e si rilegge
+    # (fino a 2 volte) prima di dare l'allarme: una lettura OCR sbagliata o instabile non e' una puntata alta.
+    balance_recheck_delay_seconds: float = 2.0
     enable_gpt_fallback: bool = True
     enable_hitl_fallback: bool = True
     require_profile: bool = True
@@ -136,6 +139,8 @@ class AutoPilotConfig:
             return Result.fail("tap_delay_seconds must be (min, max) with 0 <= min <= max", "CONFIG_INVALID")
         if self.spin_calm_skip_max_age_seconds <= 0:
             return Result.fail("spin_calm_skip_max_age_seconds must be > 0", "CONFIG_INVALID")
+        if self.balance_recheck_delay_seconds < 0:
+            return Result.fail("balance_recheck_delay_seconds must be >= 0", "CONFIG_INVALID")
         if self.full_read_every_spins < 1:
             return Result.fail("full_read_every_spins must be >= 1", "CONFIG_INVALID")
         if self.bet_burst_check_every < 1:

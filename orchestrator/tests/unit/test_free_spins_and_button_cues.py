@@ -220,7 +220,10 @@ class TestFreeSpinModeInTheSession:
 
         assert result.total_played == Decimal("0.60") and result.free_spins == 4        # 3 spin pagati, 4 free
         assert len(warden.triggers) == 1                                                # una sola conferma
-        assert "Free spin terminati: 4 spin gratis" in caplog.text and "riprendo gioco normale" in caplog.text
+        assert "Free spin terminati: sequenza 1 completata (4 tocchi sullo spin" in caplog.text
+        assert "i giri effettivi non sono contati" in caplog.text and "riprendo gioco normale" in caplog.text
+        assert "spin gratis giocati" not in caplog.text                                  # la vecchia dicitura fuorviante
+        assert result.free_spin_sequences == 1
 
     def test_a_spin_with_a_win_equal_to_the_bet_and_no_free_spin_indicators_is_counted(self, caplog):
         warden = FakeWarden(["resume"])                       # Sol: gioco normale, nessun indizio di free spin
@@ -270,6 +273,25 @@ class TestFreeSpinModeInTheSession:
         result = session.play_session(autopilot, "d", "slot", Decimal("0.40"), 30)
 
         assert result.total_played == Decimal("0.40") and result.free_spins == 2
+
+    def test_each_free_spin_sequence_is_numbered_and_counted(self, caplog):
+        warden = FakeWarden(["free_spins", "free_spins"])
+        spins = [_free(1), _free(2), _spin(3), _free(4), _free(5), _spin(6), _spin(7)]
+        autopilot = _autopilot(spins, warden)
+
+        with caplog.at_level(logging.INFO):
+            result = session.play_session(autopilot, "d", "slot", Decimal("0.60"), 30)
+
+        assert result.total_played == Decimal("0.60")
+        assert result.free_spins == 4 and result.free_spin_sequences == 2               # tocchi totali e sequenze
+        assert "Free spin confermati da Sol (sequenza 1)" in caplog.text
+        assert "Free spin confermati da Sol (sequenza 2)" in caplog.text
+        assert "sequenza 1 completata (2 tocchi sullo spin" in caplog.text
+        assert "sequenza 2 completata (2 tocchi sullo spin" in caplog.text
+
+    def test_a_session_without_free_spins_reports_no_sequences(self):
+        result = session.play_session(_autopilot([_spin(1), _spin(2)], FakeWarden([])), "d", "slot", Decimal("0.40"), 30)
+        assert result.free_spins == 0 and result.free_spin_sequences == 0
 
 
 class TestMapRemembersFreeSpinsAndTheSpinMethod:

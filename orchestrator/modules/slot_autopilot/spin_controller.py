@@ -85,6 +85,10 @@ class SpinController:
         # Opzionale: lost_check(device) -> 'in_game' | 'lost' | 'unknown' (SlotSupervisor.check_in_game). Se il pulsante
         # spin non si trova, prima dell'operatore si controlla che la slot sia ancora sullo schermo.
         self.lost_check = None
+        # Safety net sulla puntata: allarmi (calo oltre il limite), falsi positivi (la rilettura era coerente),
+        # confermati. Servono a vedere se i falsi positivi calano.
+        self.recheck_stats = {"alarms": 0, "false_positives": 0, "confirmed": 0}
+        self._last_normal_spin = None   # (spin_index, saldo prima, saldo dopo, puntata) dell'ultimo spin riuscito
         self.arrow_stats = {"arrow": 0, "still": 0, "with_reference": False, "shots": 0, "spins": 0}
         # Quick Stop (secondo tocco sullo spin per fermare l'animazione). quick_stop_state: oggetto con
         # quick_stop(slot) -> True/False/None e set_quick_stop(slot, abilitato, motivo) (SlotSetup). Senza, e' spento.
@@ -489,14 +493,16 @@ class SpinController:
         bet_understated = (outcome == "success" and not quick_explained
                            and self._bet_understated(balance_before, balance_after, expected_bet))
         if bet_understated:
-            # Una sola lettura sbagliata (cifre perse) non deve fermare la sessione: si rilegge il saldo.
-            second = self._reread_balance(context_provider)
-            if second is not None and not self._bet_understated(balance_before, second, expected_bet):
-                logger.warning(
-                    "spin %d: la prima lettura del saldo (%s) era incoerente, la seconda (%s) e' coerente: uso la seconda.",
-                    spin_index, balance_after, second,
-                )
-                balance_after = second
+            # Una sola lettura sbagliata (cifre perse, saldo non ancora aggiornato) non deve fermare la sessione:
+            # doppia lettura di conferma con attesa; l'allarme scatta solo se le letture lo confermano.
+            corrected = self._confirm_balance_drop(
+                spin_index, balance_before, balance_after, expected_bet, context_provider,
+                context.screenshot_path, screenshot_after,
+            )
+            if corrected is not None:
+                balance_after = corrected
+                if state_after is not None:   # il contesto dello spin dopo parte da questa lettura: niente valore sbagliato
+                    state_after = {**state_after, "saldo": str(corrected)}
                 bet_understated = False
         if outcome == "success":
             # La vincita si ricava dal SALDO (dopo - prima + puntata): la scritta "ultima vincita" del gioco
@@ -519,6 +525,8 @@ class SpinController:
                 "spin %d: il saldo e' sceso di %s con una puntata creduta di %s: la puntata reale e' piu' alta.",
                 spin_index, balance_before - balance_after, expected_bet,
             )
+        if outcome == "success":
+            self._last_normal_spin = (spin_index, balance_before, balance_after, expected_bet)
         accounting_anomaly = None   # il controllo per spin sulla vincita letta e' stato tolto: vedi sopra
         if outcome == "success" and not force and last_wait_seconds is not None and quick_mode == "off":
             self._record_duration(
@@ -744,6 +752,61 @@ class SpinController:
         forget_autopilot_element(slot_name, _ELEMENT, self.config.slot_memory_dir)
         self.locator.reject_position(_ELEMENT, point[0], point[1])
         self._dead_spin_points.pop(slot_name, None)
+
+    def _confirm_balance_drop(self, spin_index, balance_before, balance_after, bet, context_provider,
+                              before_shot=None, after_shot=None) -> Optional[Decimal]:
+        """Doppia lettura di conferma quando il calo di saldo supera il limite.
+
+        Dopo balance_recheck_delay_seconds si rilegge il saldo (al massimo 2 volte):
+        - lettura coerente col calo normale -> falso positivo: ritorna quella lettura;
+        - lettura ancora anomala e concorde con una precedente (entro la tolleranza) -> confermato: None;
+        - anomala ma diversa (OCR instabile) -> un'altra rilettura; l'ultima anomala, o illeggibile -> confermato.
+        Nel dubbio si resta prudenti. Logga sempre, con le letture e gli screenshot prima/dopo.
+        """
+        delay = max(0.0, self.config.balance_recheck_delay_seconds)
+        tolerance = self.config.accounting_tolerance
+        self.recheck_stats["alarms"] += 1
+        drop = balance_before - balance_after
+        logger.warning(
+            "spin %d: calo di saldo anomalo %s con una puntata creduta di %s (saldo %s -> %s): doppia lettura di "
+            "conferma dopo %.1f s. Screenshot prima=%s dopo=%s.%s",
+            spin_index, drop, bet, balance_before, balance_after, delay, before_shot, after_shot,
+            self._previous_spin_note(spin_index, balance_after, bet),
+        )
+        readings = [balance_after]
+        for attempt in (1, 2):
+            if delay > 0:
+                time.sleep(delay)
+            reading = self._reread_balance(context_provider)
+            readings.append(reading)
+            if reading is not None and not self._bet_understated(balance_before, reading, bet):
+                self.recheck_stats["false_positives"] += 1
+                logger.warning(
+                    "spin %d: doppia lettura del saldo %s: la rilettura %d (%s) e' coerente, il calo reale e' %s: "
+                    "falso positivo, lo spin conta normalmente.",
+                    spin_index, [str(r) for r in readings], attempt, reading, balance_before - reading,
+                )
+                return reading
+            if reading is not None and any(r is not None and abs(r - reading) <= tolerance for r in readings[:-1]):
+                break   # due letture anomale concordi: il calo e' reale
+        self.recheck_stats["confirmed"] += 1
+        logger.warning(
+            "spin %d: doppia lettura del saldo %s: calo anomalo CONFERMATO (%s con puntata creduta %s).",
+            spin_index, [str(r) for r in readings], drop, bet,
+        )
+        return None
+
+    def _previous_spin_note(self, spin_index, balance_after, bet) -> str:
+        """Solo diagnostica: se lo spin precedente sembrava una vincita pari all'eccesso di calo, la lettura
+        a cavallo tra i due spin e' sospetta (un valore sbagliato sposta il calo da uno spin all'altro)."""
+        last = self._last_normal_spin
+        if last is None or last[0] != spin_index - 1 or None in last[1:3] or last[3] is None:
+            return ""
+        prev_before, prev_after, prev_bet = last[1], last[2], last[3]
+        prev_win = prev_after - prev_before + prev_bet
+        two_spin_drop = prev_before - balance_after
+        return (f" Spin precedente: saldo {prev_before} -> {prev_after} (vincita dedotta {prev_win}); "
+                f"calo sui due spin {two_spin_drop} contro puntate {prev_bet} + {bet}.")
 
     def _reread_balance(self, context_provider) -> Optional[Decimal]:
         result = context_provider()
