@@ -11,7 +11,6 @@ VALID_ACTIONS = ("tap_button", "tap_field", "tap_coordinates", "press_enter", "w
 # Indicatori di default: usati dal Mapper per i nuovi recipe e uniti a quelli del
 # recipe dall'Executor. Solo testi affidabili (niente "Benvenuto", "Account", "Saldo").
 LOGIN_BUTTON_INDICATORS = ["Accedi", "Registrati", "Login", "Log in", "Sign in"]
-CAPTCHA_INDICATORS = ["Non sono un robot", "reCAPTCHA", "recaptcha", "captcha"]
 DEFAULT_LOGGED_IN_INDICATORS = [
     "Logout", "Esci", "Il mio conto", "Profilo", "Saldo disponibile", "Effettua logout",
 ]

@@ -4,11 +4,27 @@ Condivise da LoginExecutor e LoginMapper. Limite noto di ScreenReader: scarta i 
 senza text e senza resource-id, quindi un EditText vuoto e anonimo non e' visibile.
 """
 import re
-from typing import Optional
+from typing import NamedTuple, Optional
 
 from orchestrator.modules.screen_reader.interface import ScreenContent, UIElement
 
 EDIT_TEXT_CLASS = "android.widget.EditText"
+
+# --- CAPTCHA ---------------------------------------------------------------------------------------------------
+# Il solo testo "reCAPTCHA"/"captcha" NON basta: compare nel badge informativo ("This site is protected by
+# reCAPTCHA"), nei link alla privacy policy e nei testi SEO. Un CAPTCHA e' attivo solo con un elemento strutturale.
+_CAPTCHA_CHECKBOX_TEXTS = ("Non sono un robot", "I'm not a robot", "I am not a robot")
+_CAPTCHA_CHALLENGE_TEXTS = ("Seleziona tutte le immagini", "Seleziona tutti i riquadri", "Seleziona tutti i quadrati",
+                            "Select all images", "Select all squares")
+_RECAPTCHA_URL_PARTS = ("google.com/recaptcha", "recaptcha/api2", "recaptcha/enterprise")
+_BADGE_PARTS = ("badge", "invisible")                        # frame/id del badge, non di una sfida
+_HIDDEN_FIELD_PARTS = ("badge", "invisible", "response", "token")   # g-recaptcha-response e simili
+MIN_CAPTCHA_IMAGE_SIDE = 150
+
+
+class CaptchaFinding(NamedTuple):
+    kind: str      # "reCAPTCHA" | "captcha"
+    reason: str    # perche' e' stato riconosciuto (per il log / il messaggio all'operatore)
 
 
 def word_in_text(word: str, text: str) -> bool:
@@ -159,4 +175,46 @@ def find_field_by_label(screen_content: ScreenContent, label: str) -> Optional[U
         if e.class_name == EDIT_TEXT_CLASS and valid_bounds(e.bounds) and (
                 word_in_text(label, e.text) or wanted in (e.resource_id or "").lower()):
             return e
+    return None
+
+
+def _is_visible(e: UIElement) -> bool:
+    return valid_bounds(e.bounds) and e.bounds[2] > e.bounds[0] and e.bounds[3] > e.bounds[1]
+
+
+def find_active_captcha(screen_content: Optional[ScreenContent]) -> Optional[CaptchaFinding]:
+    """Il CAPTCHA ATTIVO sulla schermata, o None. Cerca elementi strutturali, mai solo testo:
+
+    a. casella (CheckBox/Button/ImageButton) "Non sono un robot"
+    b. frame della sfida: URL reCAPTCHA in testo/resource_id, con bounds visibili, escluso il badge
+    c. resource_id con "recaptcha" (es. recaptcha-anchor), visibile, esclusi badge e campi nascosti
+    d. sfida a immagini: un prompt ("Seleziona tutte le immagini...") piu' un ImageView grande
+    Ignorati: badge "This site is protected by reCAPTCHA", View "reCAPTCHA" invisibile, link alla privacy policy.
+    """
+    if screen_content is None:
+        return None
+    elements = screen_content.elements
+    for e in elements:
+        cls = e.class_name or ""
+        if ("CheckBox" in cls or "Button" in cls) and any(word_in_text(t, e.text) for t in _CAPTCHA_CHECKBOX_TEXTS):
+            return CaptchaFinding("reCAPTCHA", f"casella '{e.text.strip()}' ({cls.rsplit('.', 1)[-1]})")
+        if not _is_visible(e):
+            continue
+        rid = (e.resource_id or "").lower()
+        haystack = f"{e.text} {rid}".lower()
+        if (any(part in haystack for part in _RECAPTCHA_URL_PARTS)
+                and not any(part in haystack for part in _BADGE_PARTS)):
+            return CaptchaFinding("reCAPTCHA", "frame reCAPTCHA della sfida")
+        if "recaptcha" in rid and not any(part in rid for part in _HIDDEN_FIELD_PARTS):
+            return CaptchaFinding("reCAPTCHA", f"elemento '{e.resource_id}'")
+
+    prompt = next((e for e in elements if any(word_in_text(t, e.text) for t in _CAPTCHA_CHALLENGE_TEXTS)), None)
+    if prompt is not None:
+        has_image = any(
+            "Image" in (e.class_name or "") and _is_visible(e)
+            and e.bounds[2] - e.bounds[0] >= MIN_CAPTCHA_IMAGE_SIDE
+            and e.bounds[3] - e.bounds[1] >= MIN_CAPTCHA_IMAGE_SIDE
+            for e in elements)
+        if has_image:
+            return CaptchaFinding("captcha", f"sfida a immagini ('{prompt.text.strip()[:40]}')")
     return None

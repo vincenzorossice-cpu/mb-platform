@@ -46,7 +46,11 @@ def _login_page(email="", password=""):
         _el("Email / Username", "android.view.View", [125, 658, 492, 713]),
         _el(password, "android.widget.EditText", PASSWORD_BOUNDS, "password"),
         _el("Password", "android.view.View", [125, 828, 352, 883]),
-        _el("Accedi", "android.widget.Button", BUTTON_BOUNDS))
+        _el("Accedi", "android.widget.Button", BUTTON_BOUNDS),
+        # badge informativo in fondo alla pagina (Sisal): NON e' un CAPTCHA attivo
+        _el("This site is protected by reCAPTCHA and the Google Privacy Policy and Terms of Service apply.",
+            "android.view.View", [100, 1300, 980, 1380]),
+        _el("Privacy Policy", "android.view.View", [100, 1390, 400, 1440]))
 
 
 LOGGED_IN_SCREEN = _screen(_el("Saldo disponibile: 125.50€"), _el("Il mio conto"),
@@ -649,3 +653,91 @@ def test_verify_login_form_visible_twice_is_an_autofill_failure(executor, parts)
     res = executor.verify_login(DEVICE, BOOK)
     assert res.data.status == LoginStatus.AUTOFILL_FAILED and res.data.details == {"form_still_visible": True}
     assert parts[0].read_screen.call_count == 2
+
+
+# ---------------- CAPTCHA: conta l'elemento attivo, non il testo del badge informativo ----------------
+
+def test_the_recaptcha_badge_is_not_a_captcha(executor, parts, store):
+    badge = _screen(_el("This site is protected by reCAPTCHA", "android.view.View", [100, 1300, 980, 1380]),
+                    _el("Accedi", "android.widget.Button", BUTTON_BOUNDS))
+    assert executor._detect_captcha(badge) is False
+    _set_screens(parts, badge)
+    assert executor.check_session(DEVICE, BOOK).data.status == LoginStatus.LOGIN_REQUIRED
+
+
+def test_a_checkbox_not_a_robot_is_a_captcha(executor, parts):
+    page = _screen(_el("Non sono un robot", "android.widget.CheckBox", [100, 1200, 400, 1280]),
+                   _el("Accedi", "android.widget.Button", BUTTON_BOUNDS))
+    assert executor._detect_captcha(page) is True
+    _set_screens(parts, page)
+    res = executor.check_session(DEVICE, BOOK)
+    assert res.data.status == LoginStatus.CAPTCHA_DETECTED and "casella 'Non sono un robot'" in res.data.message
+    _set_screens(parts, page)
+    assert executor.verify_login(DEVICE, BOOK).data.status == LoginStatus.CAPTCHA_DETECTED
+
+
+def test_an_element_with_a_recaptcha_resource_id_is_a_captcha(executor, parts):
+    page = _screen(_el("", "android.view.View", [100, 1200, 400, 1280], "recaptcha-anchor"),
+                   _el("Accedi", "android.widget.Button", BUTTON_BOUNDS))
+    _set_screens(parts, page)
+    res = executor.check_session(DEVICE, BOOK)
+    assert res.data.status == LoginStatus.CAPTCHA_DETECTED and "recaptcha-anchor" in res.data.message
+
+
+def test_an_invisible_recaptcha_view_is_ignored(executor, parts):
+    page = _screen(_el("reCAPTCHA", "android.view.View", [0, 0, 0, 0]),
+                   _el("Accedi", "android.widget.Button", BUTTON_BOUNDS))
+    assert executor._detect_captcha(page) is False
+    _set_screens(parts, page)
+    assert executor.check_session(DEVICE, BOOK).data.status == LoginStatus.LOGIN_REQUIRED
+
+
+def test_the_real_sisal_login_page_with_the_badge_is_not_a_captcha_and_the_login_completes(executor, parts, store):
+    assert executor._detect_captcha(_login_page()) is False       # _login_page() porta il badge informativo
+    store.save_recipe(_recipe())
+    _set_screens(parts, *_sisal_flow(LOGGED_IN_SCREEN))
+    assert executor.perform_login(DEVICE, BOOK).data.status == LoginStatus.LOGIN_SUCCESS
+
+
+class TestFindActiveCaptcha:
+    def test_text_alone_never_counts(self):
+        for cls in ("android.view.View", "android.widget.TextView"):
+            for text in ("Non sono un robot", "reCAPTCHA", "captcha", "Protetto da reCAPTCHA"):
+                page = _screen(_el(text, cls, [100, 100, 600, 160]))
+                assert ui_helpers.find_active_captcha(page) is None, (cls, text)
+
+    def test_a_button_or_checkbox_with_the_text_counts(self):
+        for cls in ("android.widget.CheckBox", "android.widget.Button", "android.widget.ImageButton"):
+            finding = ui_helpers.find_active_captcha(_screen(_el("Non sono un robot", cls)))
+            assert finding is not None and finding.kind == "reCAPTCHA"
+        assert ui_helpers.find_active_captcha(_screen(_el("I'm not a robot", "android.widget.CheckBox"))) is not None
+
+    def test_resource_id_rules(self):
+        box = [10, 10, 300, 90]
+        assert ui_helpers.find_active_captcha(_screen(_el("", "android.view.View", box, "recaptcha-anchor")))
+        # badge e campi nascosti non sono una sfida; un elemento invisibile non conta
+        for rid in ("grecaptcha-badge", "g-recaptcha-response", "recaptcha-token", "recaptcha-invisible"):
+            assert ui_helpers.find_active_captcha(_screen(_el("", "android.view.View", box, rid))) is None, rid
+        assert ui_helpers.find_active_captcha(_screen(_el("", "android.view.View", [0, 0, 0, 0], "recaptcha-anchor"))) is None
+
+    def test_challenge_frame_url_but_not_the_badge_frame(self):
+        box = [10, 10, 600, 700]
+        bframe = "https://www.google.com/recaptcha/api2/bframe?hl=it"
+        badge = "https://www.google.com/recaptcha/api2/anchor?size=invisible"
+        assert ui_helpers.find_active_captcha(_screen(_el(bframe, "android.view.View", box)))
+        assert ui_helpers.find_active_captcha(_screen(_el(badge, "android.view.View", box))) is None
+
+    def test_image_challenge_needs_both_the_prompt_and_a_big_image(self):
+        prompt = _el("Seleziona tutte le immagini con semafori", "android.view.View", [10, 10, 600, 80])
+        big = _el("", "android.widget.ImageView", [10, 100, 310, 400])
+        small = _el("", "android.widget.ImageView", [10, 100, 60, 150])
+        finding = ui_helpers.find_active_captcha(_screen(prompt, big))
+        assert finding is not None and finding.kind == "captcha"
+        assert ui_helpers.find_active_captcha(_screen(big)) is None                 # un banner non e' un CAPTCHA
+        assert ui_helpers.find_active_captcha(_screen(prompt)) is None
+        assert ui_helpers.find_active_captcha(_screen(prompt, small)) is None
+        badge = _el("This site is protected by reCAPTCHA", "android.view.View", [10, 500, 600, 560])
+        assert ui_helpers.find_active_captcha(_screen(badge, big)) is None          # il badge non e' contesto
+
+    def test_none_screen(self):
+        assert ui_helpers.find_active_captcha(None) is None

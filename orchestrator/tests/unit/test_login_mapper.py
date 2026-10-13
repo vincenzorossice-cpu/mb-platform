@@ -302,8 +302,21 @@ def test_map_book_login_failed_action_is_reported_to_gpt(mapper, parts):
     assert "Azioni già eseguite" not in first_prompt
 
 
+def test_map_book_login_ignores_the_informational_recaptcha_badge(mapper, parts, store):
+    # Sisal: in fondo alla pagina di login c'e' solo il badge informativo, non un CAPTCHA attivo
+    badge_page = _screen(*_LOGIN_FORM, _el("This site is protected by reCAPTCHA", "android.view.View",
+                                           [100, 1300, 980, 1360]))
+    _screens(parts, HOME, badge_page, LOGGED_IN)
+    client = _client(_act("tap_button", target_text="Accedi"),
+                     _act("tap_field", target_label="Email / Username"),
+                     _act("done"))
+    with patch(OPENAI_PATH, return_value=client):
+        res = mapper.map_book_login(DEVICE, BOOK)
+    assert res.success and res.data.has_captcha is False and res.data.captcha_type is None
+
+
 def test_map_book_login_detects_captcha(mapper, parts):
-    captcha_page = _screen(*_LOGIN_FORM, _el("Protetto da reCAPTCHA"))
+    captcha_page = _screen(*_LOGIN_FORM, _el("Non sono un robot", "android.widget.CheckBox", [100, 1250, 400, 1330]))
     _screens(parts, HOME, captcha_page, LOGGED_IN)
     client = _client(_act("tap_button", target_text="Accedi"),
                      _act("tap_field", target_label="Email / Username"),

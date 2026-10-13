@@ -15,7 +15,6 @@ from orchestrator.core.result import Result
 from orchestrator.modules.book_navigator.navigator import BookNavigator
 from orchestrator.modules.login_manager import adb_input, ui_helpers
 from orchestrator.modules.login_manager.recipe import (
-    CAPTCHA_INDICATORS,
     DEFAULT_LOGGED_IN_INDICATORS,
     DEFAULT_LOGIN_FAILED_INDICATORS,
     LOGIN_BUTTON_INDICATORS,
@@ -148,10 +147,10 @@ class LoginMapper:
             if pending is not None:
                 pending["changed"] = ui_helpers.screen_signature(screen) != pending.pop("_signature_before")
                 pending = None
-            if ui_helpers.has_indicators(screen, CAPTCHA_INDICATORS):
+            captcha = ui_helpers.find_active_captcha(screen)    # solo un CAPTCHA attivo, non il badge informativo
+            if captcha is not None:
                 has_captcha = True
-                captcha_type = captcha_type or (
-                    "reCAPTCHA" if ui_helpers.has_indicators(screen, ["reCAPTCHA"]) else "captcha")
+                captcha_type = captcha_type or captcha.kind
 
             if data["status"] == "done":
                 if not executed:

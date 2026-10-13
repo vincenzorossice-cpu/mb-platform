@@ -7,7 +7,6 @@ from orchestrator.modules.book_navigator.navigator import BookNavigator
 from orchestrator.modules.login_manager import adb_input, ui_helpers
 from orchestrator.modules.login_manager.interface import LoginResult, LoginStatus
 from orchestrator.modules.login_manager.recipe import (
-    CAPTCHA_INDICATORS,
     DEFAULT_LOGGED_IN_INDICATORS,
     DEFAULT_LOGIN_FAILED_INDICATORS,
     LOGIN_BUTTON_INDICATORS,
@@ -36,7 +35,6 @@ class LoginExecutor:
     # Solo indicatori affidabili: niente "Benvenuto", "Account", "Saldo" da soli.
     LOGGED_IN_INDICATORS = list(DEFAULT_LOGGED_IN_INDICATORS)
     LOGIN_FAILED_INDICATORS = list(DEFAULT_LOGIN_FAILED_INDICATORS)
-    CAPTCHA_INDICATORS = list(CAPTCHA_INDICATORS)
     TWO_FA_INDICATORS = ["inserisci codice", "codice SMS", "codice di verifica", "2FA"]
 
     def __init__(
@@ -148,8 +146,10 @@ class LoginExecutor:
     def _evaluate_login_screen(self, screen: ScreenContent, book_key: str, device_id: str,
                                recipe: Optional[LoginRecipe]) -> Optional[Result[LoginResult]]:
         """Esito del login dalla schermata, o None se ambigua."""
-        if self._detect_captcha(screen):
-            return self._hitl(LoginStatus.CAPTCHA_DETECTED, book_key, device_id, "CAPTCHA rilevato")
+        captcha = self._find_captcha(screen)
+        if captcha is not None:
+            return self._hitl(LoginStatus.CAPTCHA_DETECTED, book_key, device_id,
+                              f"CAPTCHA rilevato ({captcha.reason})")
         if self._detect_2fa(screen):
             return self._hitl(LoginStatus.TWO_FA_REQUIRED, book_key, device_id, "2FA richiesta")
         failed = self.LOGIN_FAILED_INDICATORS + (recipe.login_failed_indicators if recipe else [])
@@ -205,8 +205,10 @@ class LoginExecutor:
 
     def _classify(self, screen: ScreenContent, book_key: str, device_id: str,
                   recipe: Optional[LoginRecipe]) -> LoginResult:
-        if self._detect_captcha(screen):
-            return self._hitl(LoginStatus.CAPTCHA_DETECTED, book_key, device_id, "CAPTCHA rilevato").data
+        captcha = self._find_captcha(screen)
+        if captcha is not None:
+            return self._hitl(LoginStatus.CAPTCHA_DETECTED, book_key, device_id,
+                              f"CAPTCHA rilevato ({captcha.reason})").data
         if self._detect_2fa(screen):
             return self._hitl(LoginStatus.TWO_FA_REQUIRED, book_key, device_id, "2FA richiesta").data
         if self._has_indicators(screen, self.LOGIN_BUTTON_INDICATORS):
@@ -319,8 +321,12 @@ class LoginExecutor:
     def _has_indicators(self, screen_content: ScreenContent, indicators: list[str]) -> bool:
         return ui_helpers.has_indicators(screen_content, indicators)
 
+    def _find_captcha(self, screen_content: ScreenContent):
+        """CAPTCHA attivo (casella, frame, sfida a immagini), non il badge "protected by reCAPTCHA"."""
+        return ui_helpers.find_active_captcha(screen_content)
+
     def _detect_captcha(self, screen_content: ScreenContent) -> bool:
-        return self._has_indicators(screen_content, self.CAPTCHA_INDICATORS)
+        return self._find_captcha(screen_content) is not None
 
     def _detect_2fa(self, screen_content: ScreenContent) -> bool:
         return self._has_indicators(screen_content, self.TWO_FA_INDICATORS)
