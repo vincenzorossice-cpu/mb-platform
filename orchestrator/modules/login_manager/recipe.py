@@ -32,7 +32,9 @@ class LoginStep:
     target_label: Optional[str] = None   # tap_field: label del campo
     x: Optional[int] = None              # tap_coordinates
     y: Optional[int] = None
-    trigger_autofill: bool = False       # tap_field: dopo il tap verifica che Chrome abbia riempito
+    # Ignorato dall'Executor (resta per i recipe gia' salvati): col popup Touch to Fill il campo si riempie solo dopo
+    # il tap sul suggerimento, quindi il riempimento si verifica a fine recipe (verify_login), non dopo il tap.
+    trigger_autofill: bool = False
     wait_after_seconds: float = 3.0
     description: str = ""
 

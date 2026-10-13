@@ -160,19 +160,3 @@ def find_field_by_label(screen_content: ScreenContent, label: str) -> Optional[U
                 word_in_text(label, e.text) or wanted in (e.resource_id or "").lower()):
             return e
     return None
-
-
-def is_field_filled(screen_content: ScreenContent, field: UIElement, label: str) -> bool:
-    """Il campo (stessi bounds o stesso resource_id) ora ha un testo diverso dalla label.
-
-    Non confronta con il testo di prima: se l'autofill del campo precedente ha gia'
-    riempito anche questo, il testo non cambia ma il campo e' comunque riempito.
-    """
-    for e in screen_content.elements:
-        if e.class_name != EDIT_TEXT_CLASS:
-            continue
-        same = e.bounds == field.bounds or (field.resource_id and e.resource_id == field.resource_id)
-        if same:
-            now = e.text.strip().lower()
-            return bool(now) and now != label.strip().lower()
-    return False

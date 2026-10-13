@@ -120,22 +120,29 @@ class LoginExecutor:
 
         CAPTCHA/2FA -> LOGIN_FAILED_INDICATORS (LOGIN_FAILED) -> LOGGED_IN_INDICATORS (LOGIN_SUCCESS).
         Se la schermata e' ambigua (la pagina puo' non aver finito di caricare) attende
-        VERIFY_RETRY_WAIT secondi e rilegge UNA volta; ancora ambigua -> AMBIGUOUS.
-        Gli esiti definitivi non aspettano.
+        VERIFY_RETRY_WAIT secondi e rilegge UNA volta; se resta ambigua e il form di login e' ancora visibile
+        (senza messaggi di errore) l'autofill non ha riempito/inviato -> AUTOFILL_FAILED, altrimenti AMBIGUOUS.
+        "Credenziali errate" resta LOGIN_FAILED. Gli esiti definitivi non aspettano.
         """
         book_key = self._book_key(book)
         recipe_res = self.recipe_store.load_recipe(book_key)
         recipe = recipe_res.data if recipe_res.success else None
 
+        screen = None
         for attempt in range(2):
             screen_res = self._read(device_id)
             if not screen_res.success:
                 return Result.fail(screen_res.error, screen_res.error_code)
-            outcome = self._evaluate_login_screen(screen_res.data, book_key, device_id, recipe)
+            screen = screen_res.data
+            outcome = self._evaluate_login_screen(screen, book_key, device_id, recipe)
             if outcome is not None:
                 return outcome
             if attempt == 0:
                 time.sleep(self.VERIFY_RETRY_WAIT)
+        if self._has_indicators(screen, self.LOGIN_BUTTON_INDICATORS):
+            return self._hitl(LoginStatus.AUTOFILL_FAILED, book_key, device_id,
+                              "Form di login ancora visibile a fine recipe: l'autofill non ha riempito o inviato",
+                              {"form_still_visible": True})
         return self._hitl(LoginStatus.AMBIGUOUS, book_key, device_id, "Esito del login non determinabile")
 
     def _evaluate_login_screen(self, screen: ScreenContent, book_key: str, device_id: str,
@@ -213,9 +220,10 @@ class LoginExecutor:
     def _execute_recipe(self, device_id: str, recipe: LoginRecipe) -> Result[LoginResult]:
         """Esegue gli step in sequenza e poi verify_login.
 
-        Esiti terminali: step che non trova l'elemento (RECIPE_STEP_FAILED), campo non
-        riempito dall'autofill (AUTOFILL_FAILED), step check_session che trova la
-        sessione attiva (LOGGED_IN, il login si ferma).
+        Esiti terminali: step che non trova l'elemento (RECIPE_STEP_FAILED), step check_session
+        che trova la sessione attiva (LOGGED_IN, il login si ferma). Il riempimento dei campi non si
+        controlla step per step: lo dice verify_login alla fine (AUTOFILL_FAILED se il form e' ancora
+        visibile).
         """
         for index, step in enumerate(recipe.steps):
             res = self._execute_step(device_id, step, recipe)
@@ -234,16 +242,13 @@ class LoginExecutor:
                                   f"Step {index} ({step.description or step.action}): {res.error} "
                                   f"- sito cambiato: ri-mappare il book con il LoginMapper",
                                   details)
-            if res.error_code == "AUTOFILL_NOT_FILLED":
-                return self._hitl(LoginStatus.AUTOFILL_FAILED, recipe.book, device_id,
-                                  f"Chrome non ha riempito il campo '{step.target_label}'", details)
             return Result.fail(res.error, res.error_code)
 
         return self.verify_login(device_id, recipe.book)
 
     def _execute_step(self, device_id: str, step: LoginStep, recipe: Optional[LoginRecipe] = None) -> Result[bool]:
-        """Un singolo step. Ok(True): prosegui. Ok(False): sessione gia' attiva, fermati.
-        Fail ELEMENT_NOT_FOUND / AUTOFILL_NOT_FILLED / errori di lettura e tap."""
+        """Un singolo step: azione, attesa, avanti. Ok(True): prosegui. Ok(False): sessione gia' attiva, fermati.
+        Fail ELEMENT_NOT_FOUND / errori di lettura e tap. Nessuno step verifica il proprio effetto."""
         if step.action == "wait":
             time.sleep(step.wait_after_seconds)
             return Result.ok(True)
@@ -291,13 +296,9 @@ class LoginExecutor:
             if not tapped.success:
                 return Result.fail(tapped.error, tapped.error_code)
             time.sleep(step.wait_after_seconds)
-            if step.trigger_autofill:
-                after = self._read(device_id)
-                if not after.success:
-                    return Result.fail(after.error, after.error_code)
-                if not ui_helpers.is_field_filled(after.data, element, step.target_label):
-                    return Result.fail(f"Campo '{step.target_label}' non riempito",
-                                       "AUTOFILL_NOT_FILLED")
+            # Nessun controllo di riempimento (trigger_autofill e' ignorato): con il popup Touch to Fill o la
+            # barra sopra la tastiera il campo si riempie solo DOPO il tap sul suggerimento, che e' lo step
+            # successivo. Il riempimento si giudica a fine recipe, in verify_login.
             return Result.ok(True)
 
         return Result.fail(f"Azione sconosciuta '{step.action}'", "ELEMENT_NOT_FOUND")

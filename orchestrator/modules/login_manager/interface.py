@@ -8,7 +8,7 @@ class LoginStatus(Enum):
     LOGIN_REQUIRED = "login_required"          # sessione assente: serve eseguire il recipe
     LOGIN_SUCCESS = "login_success"            # login effettuato con successo
     LOGIN_FAILED = "login_failed"              # credenziali errate
-    AUTOFILL_FAILED = "autofill_failed"        # Chrome non ha riempito il campo
+    AUTOFILL_FAILED = "autofill_failed"        # a fine recipe il form di login e' ancora visibile (nessun errore)
     CAPTCHA_DETECTED = "captcha_detected"
     TWO_FA_REQUIRED = "two_fa_required"
     RECIPE_NOT_FOUND = "recipe_not_found"      # book non ancora mappato dal LoginMapper

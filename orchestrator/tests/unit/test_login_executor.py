@@ -123,6 +123,12 @@ def _taps(parts):
     return [c.args[1:] for c in parts[1].tap_coordinates.call_args_list]
 
 
+def _sisal_flow(*after):
+    """Letture di perform_login con _recipe(): apertura (HOME), step 1 (HOME), un'unica lettura per ciascuno dei due
+    tap_field e per il submit (nessuna rilettura di verifica dopo il tap), poi le schermate di verify_login."""
+    return (_home_screen(), _home_screen(), _login_page(), _login_page(), _login_page(), *after)
+
+
 # ---------------- perform_login ----------------
 
 def test_perform_login_already_logged_in(executor, parts, store):
@@ -141,10 +147,7 @@ def test_perform_login_recipe_not_found(executor, parts):
 
 def test_perform_login_success(executor, parts, store):
     store.save_recipe(_recipe())
-    _set_screens(parts, _home_screen(), _home_screen(),
-                 _login_page(), _login_page("mario@example.it"),
-                 _login_page("mario@example.it"), _login_page("mario@example.it", "••••••••"),
-                 _login_page("mario@example.it", "••••••••"), LOGGED_IN_SCREEN)
+    _set_screens(parts, *_sisal_flow(LOGGED_IN_SCREEN))
     res = executor.perform_login(DEVICE, BOOK)
     assert res.data.status == LoginStatus.LOGIN_SUCCESS
     # link Accedi della home, campo email, campo password, Button (non il titolo) di submit
@@ -152,31 +155,26 @@ def test_perform_login_success(executor, parts, store):
     parts[2].open_chrome.assert_called_once_with(DEVICE, "https://m.sisal.it")
 
 
-def test_perform_login_autofill_failed(executor, parts, store):
+def test_form_still_visible_at_the_end_is_an_autofill_failure_after_all_steps(executor, parts, store):
     store.save_recipe(_recipe())
-    _set_screens(parts, _home_screen(), _home_screen(), _login_page())  # il campo resta vuoto
+    _set_screens(parts, *_sisal_flow(_login_page()))     # a fine recipe il form di login e' ancora li', senza errori
     res = executor.perform_login(DEVICE, BOOK)
     assert res.data.status == LoginStatus.AUTOFILL_FAILED
-    assert res.data.details["step_index"] == 1
-    assert len(_taps(parts)) == 2  # niente submit
+    assert res.data.details == {"form_still_visible": True} and res.data.screenshot_path
+    # nessuno step si e' fermato: tutti i tap sono stati fatti, submit compreso
+    assert _taps(parts) == [(890, 85), (540, 685), (540, 855), (540, 1165)]
 
 
 def test_perform_login_failed_credentials(executor, parts, store):
     store.save_recipe(_recipe())
-    _set_screens(parts, _home_screen(), _home_screen(),
-                 _login_page(), _login_page("mario@example.it"),
-                 _login_page("mario@example.it"), _login_page("mario@example.it", "••••••••"),
-                 _login_page("mario@example.it", "••••••••"), LOGIN_FAILED_SCREEN)
+    _set_screens(parts, *_sisal_flow(LOGIN_FAILED_SCREEN))
     res = executor.perform_login(DEVICE, BOOK)
     assert res.data.status == LoginStatus.LOGIN_FAILED
 
 
 def test_perform_login_captcha_after_submit(executor, parts, store):
     store.save_recipe(_recipe())
-    _set_screens(parts, _home_screen(), _home_screen(),
-                 _login_page(), _login_page("mario@example.it"),
-                 _login_page("mario@example.it"), _login_page("mario@example.it", "••••••••"),
-                 _login_page("mario@example.it", "••••••••"), CAPTCHA_SCREEN)
+    _set_screens(parts, *_sisal_flow(CAPTCHA_SCREEN))
     res = executor.perform_login(DEVICE, BOOK)
     assert res.data.status == LoginStatus.CAPTCHA_DETECTED
     assert res.data.screenshot_path == "/tmp/shot.png"
@@ -192,10 +190,7 @@ def test_perform_login_captcha_on_open(executor, parts, store):
 
 def test_perform_login_2fa(executor, parts, store):
     store.save_recipe(_recipe())
-    _set_screens(parts, _home_screen(), _home_screen(),
-                 _login_page(), _login_page("mario@example.it"),
-                 _login_page("mario@example.it"), _login_page("mario@example.it", "••••••••"),
-                 _login_page("mario@example.it", "••••••••"), TWO_FA_SCREEN)
+    _set_screens(parts, *_sisal_flow(TWO_FA_SCREEN))
     res = executor.perform_login(DEVICE, BOOK)
     assert res.data.status == LoginStatus.TWO_FA_REQUIRED
 
@@ -210,10 +205,7 @@ def test_perform_login_navigation_failed(executor, parts, store):
 
 def test_perform_login_never_types_text(executor, parts, store):
     store.save_recipe(_recipe())
-    _set_screens(parts, _home_screen(), _home_screen(),
-                 _login_page(), _login_page("mario@example.it"),
-                 _login_page("mario@example.it"), _login_page("mario@example.it", "••••••••"),
-                 _login_page("mario@example.it", "••••••••"), LOGGED_IN_SCREEN)
+    _set_screens(parts, *_sisal_flow(LOGGED_IN_SCREEN))
     executor.perform_login(DEVICE, BOOK)
     parts[1].input_text.assert_not_called()
 
@@ -276,27 +268,22 @@ def test_execute_recipe_tap_button(executor, parts):
 
 
 def test_execute_recipe_tap_field(executor, parts):
-    _set_screens(parts, _login_page(), _login_page("mario@example.it"))
+    _set_screens(parts, _login_page())
     step = LoginStep("tap_field", target_label="Email / Username", trigger_autofill=True)
     res = executor._execute_step(DEVICE, step, _recipe())
     assert res.success and res.data is True
     assert _taps(parts) == [(540, 685)]
+    assert parts[0].read_screen.call_count == 1          # nessuna rilettura per verificare il riempimento
 
 
-def test_execute_recipe_tap_field_autofill_not_filled(executor, parts):
+def test_tap_field_never_checks_that_the_field_is_filled(executor, parts):
+    # il campo resta vuoto (col popup Touch to Fill si riempie solo dopo il tap sul suggerimento): lo step va avanti
     _set_screens(parts, _login_page())
     step = LoginStep("tap_field", target_label="Email / Username", trigger_autofill=True)
     res = executor._execute_step(DEVICE, step, _recipe())
-    assert not res.success and res.error_code == "AUTOFILL_NOT_FILLED"
-
-
-def test_execute_recipe_tap_field_already_filled_by_previous_autofill(executor, parts):
-    # Chrome ha riempito email e password con il primo tap: il testo del campo password non cambia
-    filled = _login_page("mario@example.it", "••••••••")
-    _set_screens(parts, filled)
-    step = LoginStep("tap_field", target_label="Password", trigger_autofill=True)
-    res = executor._execute_step(DEVICE, step, _recipe())
     assert res.success and res.data is True
+    assert parts[0].read_screen.call_count == 1
+    assert not hasattr(ui_helpers, "is_field_filled") and not hasattr(executor, "_is_field_filled")
 
 
 def test_execute_recipe_tap_coordinates_and_wait(executor, parts):
@@ -504,11 +491,7 @@ def test_verify_login_second_read_error_is_propagated(executor, parts):
 
 def test_perform_login_page_loads_late(executor, parts, store):
     store.save_recipe(_recipe())
-    _set_screens(parts, _home_screen(), _home_screen(),
-                 _login_page(), _login_page("mario@example.it"),
-                 _login_page("mario@example.it"), _login_page("mario@example.it", "••••••••"),
-                 _login_page("mario@example.it", "••••••••"),
-                 NEUTRAL_SCREEN, LOGGED_IN_SCREEN)  # prima lettura post-submit: pagina non ancora caricata
+    _set_screens(parts, *_sisal_flow(NEUTRAL_SCREEN, LOGGED_IN_SCREEN))  # prima lettura post-submit: pagina non ancora caricata
     res = executor.perform_login(DEVICE, BOOK)
     assert res.data.status == LoginStatus.LOGIN_SUCCESS
 
@@ -570,11 +553,7 @@ def test_ensure_logged_in_recipe_not_found(executor, parts):
 
 def test_ensure_logged_in_full_relogin(executor, parts, store):
     store.save_recipe(_recipe())
-    _set_screens(parts, _home_screen(),                                   # check_session
-                 _home_screen(), _home_screen(),                          # perform_login: apertura + step 1
-                 _login_page(), _login_page("mario@example.it"),
-                 _login_page("mario@example.it"), _login_page("mario@example.it", "••••••••"),
-                 _login_page("mario@example.it", "••••••••"), LOGGED_IN_SCREEN)
+    _set_screens(parts, _home_screen(), *_sisal_flow(LOGGED_IN_SCREEN))   # check_session + perform_login
     res = executor.ensure_logged_in(DEVICE, BOOK)
     assert res.data.status == LoginStatus.LOGIN_SUCCESS and res.data.is_logged_in
     assert _taps(parts) == [(890, 85), (540, 685), (540, 855), (540, 1165)]
@@ -586,10 +565,7 @@ def test_ensure_logged_in_does_not_retake_the_device_lock(parts, store):
     dm = MagicMock()
     dm.acquire_lock.return_value = False
     ex = LoginExecutor(parts[0], parts[1], book_navigator=parts[2], recipe_store=store, device_manager=dm)
-    _set_screens(parts, _home_screen(), _home_screen(), _home_screen(),
-                 _login_page(), _login_page("mario@example.it"),
-                 _login_page("mario@example.it"), _login_page("mario@example.it", "••••••••"),
-                 _login_page("mario@example.it", "••••••••"), LOGGED_IN_SCREEN)
+    _set_screens(parts, _home_screen(), *_sisal_flow(LOGGED_IN_SCREEN))
     res = ex.ensure_logged_in(DEVICE, BOOK)
     assert res.data.status == LoginStatus.LOGIN_SUCCESS
     dm.acquire_lock.assert_not_called()
@@ -603,3 +579,73 @@ def test_login_result_is_logged_in():
     for status in LoginStatus:
         result = LoginResult(status, BOOK, DEVICE, "x")
         assert result.is_logged_in == (status in LOGGED_IN_STATUSES)
+
+
+# ---------------- tap_field non verifica il riempimento: col popup Touch to Fill il campo e' vuoto fino al tap ----------
+
+POPUP_BOUNDS = [0, 1700, 1080, 1800]
+
+
+def _popup_page():
+    """Pagina di login con il popup Chrome Touch to Fill: il suo Button "Accedi" e' l'ULTIMO della schermata."""
+    return _screen(*_login_page().elements, _el("Accedi", "android.widget.Button", POPUP_BOUNDS))
+
+
+def _two_fields_and_submit():
+    return _recipe([
+        LoginStep("tap_field", target_label="Email / Username", trigger_autofill=True, wait_after_seconds=3),
+        LoginStep("tap_field", target_label="Password", trigger_autofill=True, wait_after_seconds=3),
+        LoginStep("tap_button", target_text="Accedi", wait_after_seconds=5),
+    ])
+
+
+def test_two_fields_and_submit_all_run_then_verify_login_decides(executor, parts, store):
+    store.save_recipe(_two_fields_and_submit())
+    assert store.load_recipe(BOOK).data.steps[0].trigger_autofill is True       # recipe vecchio: il flag e' ignorato
+    # campi sempre vuoti dopo i tap (i campi si riempiono col popup): nessuno step si ferma
+    _set_screens(parts, _home_screen(), _login_page(), _login_page(), _login_page(), LOGGED_IN_SCREEN)
+    res = executor.perform_login(DEVICE, BOOK)
+    assert res.data.status == LoginStatus.LOGIN_SUCCESS
+    assert _taps(parts) == [(540, 685), (540, 855), (540, 1165)]
+    assert parts[0].read_screen.call_count == 5      # apertura + 3 step + verify: nessuna rilettura di verifica
+
+
+def test_two_fields_and_submit_with_the_form_still_visible_is_an_autofill_failure(executor, parts, store):
+    store.save_recipe(_two_fields_and_submit())
+    _set_screens(parts, _home_screen(), _login_page(), _login_page(), _login_page(), _login_page())
+    res = executor.perform_login(DEVICE, BOOK)
+    assert res.data.status == LoginStatus.AUTOFILL_FAILED
+    assert len(_taps(parts)) == 3                    # eseguiti comunque tutti gli step
+    assert parts[0].read_screen.call_count == 6      # apertura + 3 step + verify con una rilettura
+
+
+def test_wrong_credentials_stay_a_login_failure_not_an_autofill_failure(executor, parts, store):
+    store.save_recipe(_two_fields_and_submit())
+    _set_screens(parts, _home_screen(), _login_page(), _login_page(), _login_page(), LOGIN_FAILED_SCREEN)
+    assert executor.perform_login(DEVICE, BOOK).data.status == LoginStatus.LOGIN_FAILED
+
+
+def test_field_then_touch_to_fill_popup_button(executor, parts, store):
+    store.save_recipe(_recipe([
+        LoginStep("tap_field", target_label="Email / Username", trigger_autofill=True, wait_after_seconds=3),
+        LoginStep("tap_button", target_text="Accedi", wait_after_seconds=5, description="Accedi del popup"),
+    ]))
+    _set_screens(parts, _home_screen(), _login_page(), _popup_page(), LOGGED_IN_SCREEN)
+    res = executor.perform_login(DEVICE, BOOK)
+    assert res.data.status == LoginStatus.LOGIN_SUCCESS
+    # campo email, poi il Button "Accedi" del popup (l'ultimo), non quello del form
+    assert _taps(parts) == [(540, 685), (540, 1750)]
+
+
+def test_verify_login_form_visible_then_logged_in_is_a_success(executor, parts):
+    _set_screens(parts, _login_page(), LOGGED_IN_SCREEN)      # la pagina post-login non aveva ancora finito di caricare
+    res = executor.verify_login(DEVICE, BOOK)
+    assert res.data.status == LoginStatus.LOGIN_SUCCESS and parts[0].read_screen.call_count == 2
+    parts[0]._screenshot.assert_not_called()
+
+
+def test_verify_login_form_visible_twice_is_an_autofill_failure(executor, parts):
+    _set_screens(parts, _login_page())
+    res = executor.verify_login(DEVICE, BOOK)
+    assert res.data.status == LoginStatus.AUTOFILL_FAILED and res.data.details == {"form_still_visible": True}
+    assert parts[0].read_screen.call_count == 2
