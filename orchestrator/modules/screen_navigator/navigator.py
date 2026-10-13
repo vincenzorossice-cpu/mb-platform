@@ -30,8 +30,13 @@ _SYSTEM_BAR_FRACTION = 0.95
 # Differenza sotto la quale due screenshot sono "lo stesso schermo" (la pagina non si e' mossa).
 _PAGE_UNCHANGED_THRESHOLD = 0.01
 _MAX_APP_RESTORES = 3
-# Pagina bloccata ("wait" ripetuti): scala di recupero scroll -> refresh -> ri-navigazione. Il 1o livello scatta al 3o
-# "wait" di fila, i successivi dopo altri _WAIT_RECOVERY_THRESHOLD "wait" (o subito se lo schermo non e' cambiato).
+# "wait" = la pagina sta caricando: NON e' un loop. Si aspetta _WAIT_SECONDS, si rilegge e si richiede a GPT. Solo se
+# l'attesa totale supera _WAIT_REFRESH_AFTER_SECONDS si prova UN refresh; se dopo il refresh GPT aspetta ancora per
+# _WAIT_FAIL_AFTER_REFRESH_SECONDS la navigazione fallisce. _WAIT_RECOVERY_THRESHOLD: "wait" di fila dopo i quali si
+# controlla se la sessione e' scaduta (pagina di login a schermo).
+_WAIT_SECONDS = 5
+_WAIT_REFRESH_AFTER_SECONDS = 90
+_WAIT_FAIL_AFTER_REFRESH_SECONDS = 60
 _WAIT_RECOVERY_THRESHOLD = 2
 _REFRESH_WAIT_SECONDS = 5
 # Tocchi scartati di fila (punto non precisabile): al 2o si cambia inquadratura con uno scroll, al 4o si ferma.
@@ -97,6 +102,7 @@ class ScreenNavigator(ScreenNavigatorInterface):
         start_url: Optional[str] = None,
         url_opener: Optional[Callable[[str, str], object]] = None,
         relogin: Optional[Callable[[str, str], object]] = None,
+        clock: Callable[[], float] = time.monotonic,
     ):
         # screen_reader e' tipizzato come la classe concreta ScreenReader (non
         # ScreenReaderInterface): read_screen(..., force_refresh=True) esiste solo
@@ -106,6 +112,7 @@ class ScreenNavigator(ScreenNavigatorInterface):
         self.touch_injector = touch_injector
         self.decision_engine_client = decision_engine_client or _create_default_decision_engine_client()
         self.max_steps = max_steps
+        self._clock = clock      # misura l'attesa totale dei "wait" (iniettabile nei test)
         # Con vision_fallback=True, quando il passo a solo testo non basta (confidenza bassa, schermo senza
         # testi leggibili, loop) lo stesso passo si ripete UNA volta con la visione, fino a max_vision_steps.
         self.vision_fallback = vision_fallback
@@ -164,7 +171,7 @@ class ScreenNavigator(ScreenNavigatorInterface):
         vision_stuck_tried = False
         app_restores = 0
         rejections = 0
-        recovery_signature = None   # schermo prima dell'ultimo recupero: se non cambia, il recupero non e' servito
+        wait_started = None         # inizio della serie di "wait" in corso (None = GPT non sta aspettando)
 
         for step in range(1, self.max_steps + 1):
             self._current_step = step
@@ -262,39 +269,23 @@ class ScreenNavigator(ScreenNavigatorInterface):
                 vision_stuck_tried = False
             last_action_signature = action_signature
 
-            wait_loop = False
             if action == "wait":
-                needed = _STUCK_LOOP_THRESHOLD if wait_level == 0 else _WAIT_RECOVERY_THRESHOLD
-                unchanged = (
-                    wait_level > 0 and recovery_signature is not None and screen_res.success
-                    and ui_helpers.screen_signature(screen_res.data) == recovery_signature
-                )
-                wait_loop = consecutive_same_action >= needed or unchanged
-            else:
-                wait_level, recovery_signature = 0, None   # GPT ha cambiato azione: il recupero ha funzionato
-
-            if wait_loop:
-                if (
-                    wait_level == 0 and not use_vision and not vision_stuck_tried
-                    and self._vision_allowed(vision_mode, vision_steps_used)
-                ):
-                    logger.warning(
-                        f"Loop rilevato: azione '{action}' su '{target}' ripetuta {consecutive_same_action} volte. "
-                        "Provo con la visione."
-                    )
-                    vision_stuck_tried = True
-                    force_vision_next_step = True
+                # Attesa di caricamento, non un loop: nessun contatore di azioni ripetute. Conta il tempo totale.
+                now = self._clock()
+                wait_started = now if wait_started is None else wait_started
+                limit = _WAIT_REFRESH_AFTER_SECONDS if wait_level == 0 else _WAIT_FAIL_AFTER_REFRESH_SECONDS
+                if now - wait_started > limit:
+                    finished, outcome = self._wait_recovery(
+                        device_id, goal, book, vision_mode, wait_level, recovery_restarts, relogin_used,
+                        screen_res, history, step)
+                    if finished:
+                        return outcome
+                    wait_level += 1
+                    wait_started = self._clock()
                     consecutive_same_action = 0
                     continue
-                finished, outcome = self._wait_recovery(
-                    device_id, goal, book, vision_mode, wait_level, recovery_restarts, relogin_used,
-                    screen_res, history, step, consecutive_same_action)
-                if finished:
-                    return outcome
-                wait_level += 1
-                recovery_signature = ui_helpers.screen_signature(screen_res.data) if screen_res.success else None
-                consecutive_same_action = 0
-                continue
+            else:
+                wait_level, wait_started = 0, None   # GPT ha cambiato azione: la pagina e' andata avanti
 
             if action != "wait" and consecutive_same_action >= _STUCK_LOOP_THRESHOLD:
                 if not use_vision and not vision_stuck_tried and self._vision_allowed(vision_mode, vision_steps_used):
@@ -337,44 +328,24 @@ class ScreenNavigator(ScreenNavigatorInterface):
 
     def _wait_recovery(
         self, device_id, goal, book, vision_mode, wait_level, recovery_restarts, relogin_used,
-        screen_res, history, step, consecutive,
+        screen_res, history, step,
     ) -> tuple:
-        """Il prossimo livello della scala di recupero su una pagina bloccata ("wait" ripetuti). Ritorna
-        (True, Result) se la navigazione finisce qui (ripartenza da capo o fallimento), (False, None) se il recupero
-        e' stato fatto sul posto e si prosegue."""
-        level = wait_level + 1
+        """Cosa fare quando GPT aspetta da troppo. Ritorna (True, Result) se la navigazione finisce qui (sessione scaduta
+        o fallimento), (False, None) se il refresh e' stato fatto e si prosegue."""
         screen = screen_res.data if screen_res.success else None
-        # Oltre lo scroll, prima di insistere (e prima di ri-navigare) si controlla che non sia la sessione scaduta.
-        if level >= 2 and screen is not None and ui_helpers.session_state(screen) == "login_required":
+        # Prima di insistere si controlla che non sia la sessione scaduta.
+        if screen is not None and ui_helpers.session_state(screen) == "login_required":
             return True, self._recover_expired_session(
                 device_id, goal, book, vision_mode, wait_level, recovery_restarts, relogin_used)
-
-        if level == 1:
-            logger.warning(f"Recovery 1/3: scroll (azione 'wait' ripetuta {consecutive} volte consecutive)")
-            self.touch_injector.scroll(device_id, "down")
-            self._invalidate_cache()
-            self._record(history, step, "scroll", "down (recovery 1/3)")
-            return False, None
-        if level == 2:
-            logger.warning("Recovery 2/3: refresh pagina")
+        if wait_level == 0:
+            logger.warning("Pagina in caricamento da oltre %ds, provo refresh", _WAIT_REFRESH_AFTER_SECONDS)
             self._refresh_page(device_id, screen)
             self._invalidate_cache()
-            self._record(history, step, "refresh", "pagina (recovery 2/3)")
+            self._record(history, step, "refresh", "pagina (in caricamento da oltre 90s)")
             return False, None
-        if level == 3:
-            if recovery_restarts >= 1 or not (self.start_url and self.url_opener):
-                logger.error("Recovery 3/3: ri-navigazione non disponibile (nessun URL di partenza o gia' fatta): "
-                             "navigazione fallita.")
-                return True, Result.fail("Page stuck and re-navigation is not available", "NAVIGATION_FAILED")
-            logger.warning("Recovery 3/3: ri-naviga dall'inizio")
-            self.last_history.append({"step": step, "action": "ri-naviga", "target": f"{self.start_url} (recovery 3/3)"})
-            reopened = self._reopen_start(device_id)
-            if not reopened.success:
-                return True, Result.fail(f"Re-navigation failed: {reopened.error}", "NAVIGATION_FAILED")
-            return True, self._run(device_id, goal, book, vision_mode, wait_level=3,
-                                   recovery_restarts=recovery_restarts + 1, relogin_used=relogin_used)
-        logger.error("Pagina ancora bloccata dopo scroll, refresh e ri-navigazione: navigazione fallita.")
-        return True, Result.fail("Page still stuck after scroll, refresh and re-navigation", "NAVIGATION_FAILED")
+        logger.error("Pagina ancora in caricamento %ds dopo il refresh: navigazione fallita.",
+                     _WAIT_FAIL_AFTER_REFRESH_SECONDS)
+        return True, Result.fail("Page still loading after refresh", "NAVIGATION_FAILED")
 
     def _refresh_page(self, device_id: str, screen) -> None:
         """Ricarica la pagina: riapre l'URL corrente (letto dalla barra di Chrome) o, se non si legge, pull-to-refresh."""
@@ -598,7 +569,7 @@ class ScreenNavigator(ScreenNavigatorInterface):
         elif action == "scroll":
             return self._scroll(device_id, target)
         elif action == "wait":
-            time.sleep(3)
+            time.sleep(_WAIT_SECONDS)
             return ""
         else:
             logger.warning(f"Azione non riconosciuta: {action}")
