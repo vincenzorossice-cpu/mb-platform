@@ -388,3 +388,240 @@ class TestReaderModel:
 
         client.record_usage.assert_called_once()
         assert client.record_usage.call_args.args[2] == "gpt-4o-mini"
+
+
+# ======================== importi: l'OCR prima, la visione (GPT) come ultima risorsa ===================================
+
+import logging  # noqa: E402
+
+from orchestrator.modules.slot_autopilot.value_parser import parse_amount  # noqa: E402
+from orchestrator.modules.slot_ocr.reader import SlotOCRReader  # noqa: E402
+
+AMOUNT_FORMATS = [
+    ("99999.8", 99999.8), ("99999,8", 99999.8), ("€ 99999.8", 99999.8), ("Saldo: 99999.8", 99999.8),
+    ("99999.8€", 99999.8), ("50.00", 50.0), ("50,00€", 50.0), ("50,00 €", 50.0), ("1.234,56", 1234.56),
+]
+
+
+class TestAmountFormats:
+    """Il parser non e' la causa delle chiamate GPT: questi formati si leggono gia'. I test lo fissano."""
+
+    @pytest.mark.parametrize("text, expected", AMOUNT_FORMATS)
+    def test_both_parsers_read_the_listed_formats(self, text, expected):
+        assert float(parse_amount(text).data) == pytest.approx(expected)        # parse_amount da' un Decimal
+        assert SlotOCRReader(ocr_url=None)._extract_amount(text) == pytest.approx(expected)
+
+    @pytest.mark.parametrize("balance_text, bet_text", [
+        ("99999.8", "0.10"), ("99999,8", "0,10"), ("€ 99999.8", "€ 0,10"), ("99999.8€", "0.10€"),
+    ])
+    def test_a_whole_screen_with_labels_gives_saldo_and_posta(self, shot, balance_text, bet_text):
+        box = lambda x, y: [[x, y], [x + 150, y], [x + 150, y + 30], [x, y + 30]]    # noqa: E731
+        detections = [(box(0, 10), "SALDO", 0.95), (box(200, 10), balance_text, 0.95),
+                      (box(0, 100), "PUNTATA", 0.95), (box(200, 100), bet_text, 0.95)]
+        reader = SlotOCRReader(ocr_url=None)
+        reader._get_raw_detections = lambda path: detections
+
+        state = reader.read_slot_state(shot)
+
+        assert state["saldo"] == pytest.approx(99999.8) and state["posta"] == pytest.approx(0.10)
+
+    @pytest.mark.parametrize("text", ["SALDO: 99999.8", "Saldo 99999,8", "CREDITO € 99999.8"])
+    def test_label_and_amount_in_the_same_text(self, shot, text):
+        box = [[0, 10], [300, 10], [300, 40], [0, 40]]
+        reader = SlotOCRReader(ocr_url=None)
+        reader._get_raw_detections = lambda path: [(box, text, 0.95)]
+        assert reader.read_slot_state(shot)["saldo"] == pytest.approx(99999.8)
+
+
+def _ready(ocr_states, vision_reads, capture=None, **kwargs):
+    """Lettore con la prima lettura (confronto OCR-visione) gia' fatta e concorde: da qui in poi la visione e' la rete
+    di sicurezza."""
+    first = {"saldo": 100.0, "posta": 1.0}
+    ocr = _ocr([first] + list(ocr_states))
+    vision = _vision(first, *vision_reads)
+    reader = ResilientOCRReader(ocr, vision, capture=capture, **kwargs)
+    reader.read_slot_state("/first.png")
+    return reader, ocr, vision
+
+
+class TestRawOcrIsLogged:
+    def test_unreadable_text_is_logged_raw_and_then_the_vision_answers(self, caplog):
+        garbled = {"saldo": None, "posta": None, "raw_texts": [("¿?", (10, 10), 0.9), ("###", (50, 10), 0.8)]}
+        reader, ocr, vision = _ready([garbled], [{"saldo": 99.0, "posta": 1.0}])
+
+        with caplog.at_level(logging.WARNING):
+            state = reader.read_slot_state("/b.png")
+
+        assert "OCR testo grezzo: ['¿?', '###']" in caplog.text
+        assert "saldo=None puntata=None: parsing saldo e puntata fallito" in caplog.text
+        assert state["saldo"] == 99.0 and vision.read.call_count == 2         # fallback GPT
+
+    def test_the_log_names_only_the_missing_field(self, caplog):
+        reader, _, _ = _ready([{"saldo": 99.0, "posta": None, "raw_texts": [("99.0", (1, 1), 0.9)]}],
+                              [{"saldo": 99.0, "posta": 1.0}])
+        with caplog.at_level(logging.WARNING):
+            reader.read_slot_state("/b.png")
+        assert "saldo=99.0 puntata=None: parsing puntata fallito" in caplog.text
+
+    def test_the_raw_text_is_logged_the_first_time_and_then_once_every_ten(self, caplog):
+        miss = {"saldo": None, "posta": None, "raw_texts": [("?", (1, 1), 0.9)]}
+        reader, _, _ = _ready([miss] * 11, [{"saldo": 99.0, "posta": 1.0}] * 11)
+        with caplog.at_level(logging.WARNING):
+            for i in range(11):
+                reader.read_slot_state(f"/{i}.png")
+        assert caplog.text.count("OCR testo grezzo") == 2                    # 1a lettura e 11a
+
+    def test_nothing_is_logged_when_the_ocr_reads_both(self, caplog):
+        reader, _, _ = _ready([{"saldo": 99.0, "posta": 1.0}], [])
+        with caplog.at_level(logging.WARNING):
+            reader.read_slot_state("/b.png")
+        assert "OCR testo grezzo" not in caplog.text
+
+
+class TestSecondOcrReadBeforeTheVision:
+    def test_a_field_lost_once_is_recovered_by_a_second_ocr_read_without_gpt(self):
+        capture = MagicMock(return_value="/new.png")
+        reader, ocr, vision = _ready(
+            [{"saldo": 99.0, "posta": None}, {"saldo": 98.0, "posta": 1.0}], [], capture=capture)
+
+        state = reader.read_slot_state("/b.png")
+
+        assert state["saldo"] == 98.0 and state["posta"] == 1.0              # la seconda lettura
+        assert vision.read.call_count == 1                                   # solo il controllo iniziale: niente GPT
+        capture.assert_called_once_with()
+        assert [c.args[0] for c in ocr.read_slot_state.call_args_list] == ["/first.png", "/b.png", "/new.png"]
+
+    def test_two_failures_in_a_row_call_the_vision(self):
+        capture = MagicMock(return_value="/new.png")
+        reader, ocr, vision = _ready(
+            [{"saldo": 99.0, "posta": None}, {"saldo": 98.0, "posta": None}], [{"saldo": 99.0, "posta": 1.0}],
+            capture=capture)
+
+        state = reader.read_slot_state("/b.png")
+
+        assert vision.read.call_count == 2 and state["posta"] == 1.0
+        assert reader.vision_reasons == {"prima_lettura": 1, "campo_mancante": 1}
+
+    def test_without_a_capture_function_the_vision_is_called_at_once(self):
+        reader, ocr, vision = _ready([{"saldo": 99.0, "posta": None}], [{"saldo": 99.0, "posta": 1.0}])
+        reader.read_slot_state("/b.png")
+        assert vision.read.call_count == 2 and ocr.read_slot_state.call_count == 2
+
+    def test_a_capture_that_fails_falls_back_to_the_vision(self):
+        capture = MagicMock(side_effect=RuntimeError("adb offline"))
+        reader, _, vision = _ready([{"saldo": 99.0, "posta": None}], [{"saldo": 99.0, "posta": 1.0}], capture=capture)
+        assert reader.read_slot_state("/b.png")["posta"] == 1.0 and vision.read.call_count == 2
+
+    def test_after_two_useless_retries_it_goes_straight_to_the_vision(self):
+        capture = MagicMock(return_value="/new.png")
+        miss = {"saldo": 99.0, "posta": None}
+        reader, _, vision = _ready([miss, miss] * 3, [{"saldo": 99.0, "posta": 1.0}] * 3, capture=capture)
+
+        for i in range(3):
+            reader.read_slot_state(f"/{i}.png")
+
+        assert capture.call_count == 2                                       # la terza lettura non riprova
+        assert vision.read.call_count == 1 + 3
+
+    def test_a_complete_read_resets_the_retry_counter(self):
+        capture = MagicMock(return_value="/new.png")
+        miss, ok = {"saldo": 99.0, "posta": None}, {"saldo": 99.0, "posta": 1.0}
+        reader, _, _ = _ready([miss, miss, ok, miss, ok], [{"saldo": 99.0, "posta": 1.0}] * 2, capture=capture)
+        for i in range(3):
+            reader.read_slot_state(f"/{i}.png")      # fallita+retry fallito, poi OK
+        assert reader._retry_failures == 0
+
+
+class TestVisionFieldsAreNotForever:
+    def _mismatched(self, ocr_after, vision_after):
+        first_ocr = {"saldo": 50.0, "posta": 1.0}                            # l'OCR legge male il saldo (50 contro 50000)
+        reader = ResilientOCRReader(_ocr([first_ocr] + ocr_after), _vision({"saldo": 50000.0, "posta": 1.0},
+                                                                          *vision_after))
+        reader.read_slot_state("/first.png")
+        assert reader.prefer_vision
+        return reader
+
+    def test_a_field_returns_to_the_ocr_after_five_agreeing_reads(self, caplog):
+        values = [49999.9, 49999.8, 49999.7, 49999.6, 49999.5]
+        ocr_after = [{"saldo": v, "posta": 1.0} for v in values]
+        vision_after = [{"saldo": v, "posta": 1.0} for v in values]
+        reader = self._mismatched(ocr_after + [{"saldo": 49999.4, "posta": 1.0}], vision_after)
+
+        with caplog.at_level(logging.INFO):
+            for i, _ in enumerate(values):
+                reader.read_slot_state(f"/{i}.png")
+        assert not reader.prefer_vision and "torno all'OCR per questo campo" in caplog.text
+
+        vision = reader.vision
+        calls = vision.read.call_count
+        assert reader.read_slot_state("/last.png")["saldo"] == 49999.4
+        assert vision.read.call_count == calls                               # niente piu' GPT per questo campo
+
+    def test_a_disagreement_resets_the_count(self):
+        agree = lambda v: ({"saldo": v, "posta": 1.0}, {"saldo": v, "posta": 1.0})    # noqa: E731
+        pairs = [agree(49999.9 - i * 0.1) for i in range(4)]
+        pairs.append(({"saldo": 12.0, "posta": 1.0}, {"saldo": 49999.4, "posta": 1.0}))   # l'OCR sbaglia ancora
+        pairs += [agree(49999.3 - i * 0.1) for i in range(4)]
+        reader = self._mismatched([o for o, _ in pairs], [v for _, v in pairs])
+        for i in range(len(pairs)):
+            reader.read_slot_state(f"/{i}.png")
+        assert reader.prefer_vision                                          # 4 + 4 concordanze, mai 5 di fila
+
+
+class TestUselessOcrIsRechecked:
+    GOOD = {"saldo": 100.0, "posta": 1.0}
+
+    def _useless(self, ocr_after):
+        ocr = _ocr([{"saldo": None, "posta": None, "raw_texts": []}] + ocr_after)
+        vision = MagicMock()
+        vision.read.return_value = dict(self.GOOD)
+        reader = ResilientOCRReader(ocr, vision)
+        reader.read_slot_state("/first.png")          # la prima lettura cade su una schermata senza importi
+        reader.set_spin_mode(True)
+        assert reader._ocr_useless_for_amounts
+        return reader, ocr, vision
+
+    def test_two_agreeing_checks_bring_the_ocr_back(self, caplog):
+        reader, ocr, vision = self._useless([dict(self.GOOD), dict(self.GOOD), dict(self.GOOD)])
+
+        with caplog.at_level(logging.INFO):
+            for i in range(20):
+                reader.read_slot_state(f"/{i}.png")
+        assert not reader._ocr_useless_for_amounts and not reader.prefer_vision
+        assert "OCR di nuovo affidabile" in caplog.text
+        assert ocr.read_slot_state.call_count == 1 + 2                      # il primo + i due controlli (10a e 20a)
+
+        calls = vision.read.call_count
+        assert reader.read_slot_state("/after.png")["saldo"] == 100.0
+        assert vision.read.call_count == calls and ocr.read_slot_state.call_count == 4
+
+    def test_an_ocr_that_still_cannot_read_stays_skipped(self):
+        blank = {"saldo": None, "posta": None, "raw_texts": []}
+        reader, ocr, _ = self._useless([blank, blank])
+        for i in range(25):
+            reader.read_slot_state(f"/{i}.png")
+        assert reader._ocr_useless_for_amounts and ocr.read_slot_state.call_count == 1 + 2   # solo i controlli
+
+    def test_one_failed_check_resets_the_streak(self):
+        blank = {"saldo": None, "posta": None, "raw_texts": []}
+        reader, _, _ = self._useless([dict(self.GOOD), blank, dict(self.GOOD)])
+        for i in range(30):
+            reader.read_slot_state(f"/{i}.png")
+        assert reader._ocr_useless_for_amounts                               # controlli: ok, no, ok: mai due di fila
+
+
+class TestWhyTheVisionWasCalled:
+    def test_reasons_are_counted_and_summarised_every_twenty_calls(self, caplog):
+        reader = ResilientOCRReader(_ocr([]), None)
+        with caplog.at_level(logging.WARNING):
+            for _ in range(15):
+                reader._count_vision("ocr_inutile")
+            for _ in range(5):
+                reader._count_vision("campo_mancante")
+        assert reader.vision_reasons == {"ocr_inutile": 15, "campo_mancante": 5}
+        assert "Importi per visione: 20 chiamate su 0 letture (motivi: ocr_inutile 15, campo_mancante 5)" in caplog.text
+
+    def test_reads_and_first_reason_are_tracked(self):
+        reader, _, _ = _ready([{"saldo": 99.0, "posta": 1.0}], [])
+        reader.read_slot_state("/b.png")
+        assert reader.reads == 2 and reader.vision_reads == 1 and reader.vision_reasons == {"prima_lettura": 1}

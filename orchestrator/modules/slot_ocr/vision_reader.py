@@ -130,6 +130,14 @@ _KEYS = ("saldo", "posta")
 # Un singolo spin non puo' cambiare il saldo di oltre la meta': una lettura piu' lontana e' un errore di lettura.
 _BALANCE_CONTINUITY = 0.5
 _BET_RECHECK_EVERY = 10   # letture in modo spin tra due riletture di controllo della puntata con la visione
+# La visione (GPT) e' l'ultima risorsa: costa ~1 s e un po' di denaro a lettura. Le decisioni prese alla prima lettura
+# (campo affidato alla visione, "OCR inutile") non valgono per sempre: si rivedono se l'OCR dimostra di leggere.
+_RELEASE_AFTER_AGREEMENTS = 5   # letture di fila in cui OCR e visione concordano su un campo: torna all'OCR
+_REPROBE_EVERY = 10             # in modo "OCR inutile": ogni quante letture si controlla se l'OCR ora legge
+_REPROBE_NEEDED = 2             # controlli concordi di fila per tornare all'OCR
+_RETRY_FAILURES_LIMIT = 2       # seconde letture OCR fallite di fila dopo le quali non si riprova (si va alla visione)
+_RAW_TEXT_LIMIT = 30            # testi OCR grezzi riportati nel log quando saldo o puntata non si leggono
+_SUMMARY_EVERY = 20             # ogni quante chiamate di visione si riassume il perche'
 
 
 def _within(value: float, reference: float, tolerance: float) -> bool:
@@ -171,6 +179,13 @@ class ResilientOCRReader:
         self._ocr_useless_for_amounts = False
         self._spin_mode = False
         self._bet_skips = 0       # letture consecutive in cui la puntata fidata ha sostituito la visione
+        self._agreements = {"saldo": 0, "posta": 0}   # letture di fila in cui OCR e visione concordano (campi a visione)
+        self._useless_reads = 0   # letture fatte in modo "OCR inutile" (per il controllo periodico dell'OCR)
+        self._probe_agreements = 0
+        self._retry_failures = 0  # seconde letture OCR fallite di fila
+        self.reads = 0            # letture di importi in totale
+        self.vision_reads = 0     # letture che hanno chiamato la visione (le chiamate GPT "importi")
+        self.vision_reasons = {}  # motivo -> chiamate di visione
         # Ultimo valore fidato per campo (concordato tra i due lettori o coerente con la storia).
         self._trusted = {"saldo": None, "posta": None}
 
@@ -201,10 +216,15 @@ class ResilientOCRReader:
         return getattr(self.__dict__["ocr"], name)
 
     def read_slot_state(self, screenshot_path: str) -> dict:
+        self.reads += 1
         if self.vision is not None and self._spin_mode and self._ocr_useless_for_amounts and self._self_checked:
+            self._useless_reads += 1
+            if self._useless_reads % _REPROBE_EVERY == 0:
+                return self._reprobe_ocr(screenshot_path)    # ogni tanto si controlla se l'OCR ora legge
             empty = {"saldo": None, "posta": None, "vincita": None, "spin_button_coords": None,
                      "is_active": False, "raw_texts": []}
             started = time.monotonic()
+            self._count_vision("ocr_inutile")
             merged = self._combine(empty, self.vision.read(screenshot_path))
             logger.info("lettura importi (solo visione, OCR saltato): %.1f s", time.monotonic() - started)
             return merged
@@ -216,7 +236,10 @@ class ResilientOCRReader:
         if not self._self_checked:
             self._self_checked = True
             self._ocr_useless_for_amounts = state.get("saldo") is None and state.get("posta") is None
+            self._log_raw_ocr(state)
+            self._count_vision("prima_lettura")
             return self._first_read(state, self.vision.read(screenshot_path))
+        self._log_raw_ocr(state)
         if self._can_reuse_trusted_bet(state):
             # La puntata non cambia durante gli spin e l'OCR non la legge: la lettura verificata vale, senza una
             # chiamata di visione a ogni spin (~1 s e un costo). Ogni _BET_RECHECK_EVERY letture si ricontrolla.
@@ -224,8 +247,21 @@ class ResilientOCRReader:
             merged = dict(state)
             merged["posta"] = self._trusted["posta"]
             return self._sane(merged)
-        if self._vision_fields or any(state.get(key) is None for key in _KEYS) or self._balance_is_suspicious(state):
+        if self._incomplete(state) and not self._vision_fields and self._retry_failures < _RETRY_FAILURES_LIMIT:
+            # L'OCR ha perso un campo UNA volta (animazione, overlay): prima di pagare la visione si rilegge con uno
+            # screenshot nuovo. La visione parte solo se anche la seconda lettura fallisce (due volte di fila).
+            retried = self._retry_ocr()
+            if retried is not None:
+                logger.info("OCR: campo mancante alla prima lettura, la seconda e' completa: niente visione.")
+                state, self._retry_failures = retried, 0
+            else:
+                self._retry_failures += 1
+        elif not self._incomplete(state):
+            self._retry_failures = 0
+        reason = self._vision_reason(state)
+        if reason is not None:
             self._bet_skips = 0
+            self._count_vision(reason)
             vision_started = time.monotonic()
             merged = self._combine(state, self.vision.read(screenshot_path))
             logger.info("lettura importi: OCR %.1f s, visione %.1f s", ocr_seconds, time.monotonic() - vision_started)
@@ -233,6 +269,88 @@ class ResilientOCRReader:
         for key in _KEYS:
             self._trusted[key] = state[key]
         return state
+
+    @staticmethod
+    def _incomplete(state: dict) -> bool:
+        return any(state.get(key) is None for key in _KEYS)
+
+    def _vision_reason(self, state: dict) -> Optional[str]:
+        """Perche' questa lettura chiede la visione (None se l'OCR basta)."""
+        if self._vision_fields:
+            return "campo_a_visione:" + "+".join(sorted(self._vision_fields))
+        if self._incomplete(state):
+            return "campo_mancante"
+        if self._balance_is_suspicious(state):
+            return "saldo_sospetto"
+        return None
+
+    def _count_vision(self, reason: str) -> None:
+        self.vision_reads += 1
+        self.vision_reasons[reason] = self.vision_reasons.get(reason, 0) + 1
+        if self.vision_reads % _SUMMARY_EVERY == 0:
+            reasons = ", ".join(f"{r} {n}" for r, n in sorted(self.vision_reasons.items(), key=lambda item: -item[1]))
+            logger.warning("Importi per visione: %d chiamate su %d letture (motivi: %s).",
+                           self.vision_reads, self.reads, reasons)
+
+    def _log_raw_ocr(self, state: dict) -> None:
+        """Saldo o puntata non letti dall'OCR: si riportano i testi grezzi, per capire se manca l'etichetta, se il
+        numero e' scritto in modo strano o se il testo non c'e' proprio. Il primo avviso e poi uno ogni 10."""
+        missing = [key for key in _KEYS if state.get(key) is None]
+        if not missing:
+            return
+        texts = [(item[0] if isinstance(item, (tuple, list)) and item else item)
+                 for item in (state.get("raw_texts") or [])][:_RAW_TEXT_LIMIT]
+        names = {"saldo": "saldo", "posta": "puntata"}
+        self._warn("ocr_raw", "OCR testo grezzo: %s -> saldo=%s puntata=%s: parsing %s fallito",
+                   texts, state.get("saldo"), state.get("posta"), " e ".join(names[key] for key in missing))
+
+    def _retry_ocr(self) -> Optional[dict]:
+        """Seconda lettura OCR su uno screenshot NUOVO; lo stato se e' completo, altrimenti None."""
+        if self._capture is None:
+            return None
+        try:
+            path = self._capture()
+        except Exception as exc:
+            logger.warning("seconda lettura OCR: cattura non riuscita (%s).", exc)
+            return None
+        if not path:
+            return None
+        second = self.ocr.read_slot_state(path)
+        return second if not self._incomplete(second) else None
+
+    def _reprobe_ocr(self, screenshot_path: str) -> dict:
+        """In modo 'OCR inutile': la prima lettura puo' essere caduta su una schermata senza importi (caricamento).
+        Ogni _REPROBE_EVERY letture si legge anche con l'OCR; dopo _REPROBE_NEEDED controlli in cui legge saldo e
+        puntata concordi con la visione, si torna all'OCR."""
+        state = self.ocr.read_slot_state(screenshot_path)
+        self._log_raw_ocr(state)
+        self._count_vision("ocr_inutile")
+        seen = self.vision.read(screenshot_path)
+        agrees = all(state.get(key) is not None and seen.get(key) is not None
+                     and _within(state[key], seen[key], self.tolerance) for key in _KEYS)
+        self._probe_agreements = self._probe_agreements + 1 if agrees else 0
+        if self._probe_agreements >= _REPROBE_NEEDED:
+            self._ocr_useless_for_amounts = False
+            self._vision_fields.clear()
+            self._probe_agreements = 0
+            logger.info("OCR di nuovo affidabile: legge saldo e puntata e concorda con la visione da %d controlli: "
+                        "torno all'OCR (niente piu' chiamate di visione).", _REPROBE_NEEDED)
+        return self._combine(state, seen)
+
+    def _track_agreement(self, key: str, ocr_value: Optional[float], vision_value: Optional[float]) -> None:
+        """Campo affidato alla visione: se l'OCR lo legge e concorda per _RELEASE_AFTER_AGREEMENTS letture di fila,
+        l'OCR basta (la decisione presa alla prima lettura non vale per sempre)."""
+        if key not in self._vision_fields:
+            return
+        if ocr_value is not None and vision_value is not None and _within(ocr_value, vision_value, self.tolerance):
+            self._agreements[key] += 1
+        else:
+            self._agreements[key] = 0
+        if self._agreements[key] >= _RELEASE_AFTER_AGREEMENTS:
+            self._vision_fields.discard(key)
+            self._agreements[key] = 0
+            logger.info("'%s': OCR e visione concordano da %d letture: torno all'OCR per questo campo "
+                        "(niente piu' chiamate di visione).", key, _RELEASE_AFTER_AGREEMENTS)
 
     def _can_reuse_trusted_bet(self, state: dict) -> bool:
         return (
@@ -322,6 +440,7 @@ class ResilientOCRReader:
                 key == "saldo" and ocr_value is not None and self._balance_is_suspicious(state)
             ):
                 merged[key] = self._arbitrate(key, ocr_value, vision_value)
+                self._track_agreement(key, ocr_value, vision_value)
             elif ocr_value is None and vision_value is not None:
                 merged[key] = self._trusted[key] = vision_value
             elif ocr_value is not None:

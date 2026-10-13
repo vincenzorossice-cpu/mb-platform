@@ -85,20 +85,23 @@ class SlotOCRReader:
             self._ocr_timeout = float(ocr_timeout or os.environ.get("OCR_TIMEOUT") or self._DEFAULT_REMOTE_TIMEOUT)
         except ValueError:
             self._ocr_timeout = self._DEFAULT_REMOTE_TIMEOUT
-        # Il server remoto (1,5-2 s) batte l'OCR locale solo sulle letture grandi (schermo intero ~9 s); sulla fascia
-        # di saldo/puntata (~0,6 s in locale) e' piu' lento: sotto questa frazione dello schermo si legge in locale.
+        # Sotto questa frazione dello schermo si legge in locale (EasyOCR CPU), sopra si usa il server. Con OCR_URL il
+        # default e' 0: tutte le letture vanno al server, anche in un singolo telefono (la fascia di saldo/puntata in
+        # locale costava 1-2 s e teneva la CPU occupata). Una soglia esplicita (argomento o OCR_REMOTE_MIN_AREA, es. 0.3
+        # per il vecchio comportamento) vale sempre. Senza OCR_URL e' tutto locale e la soglia non ha effetto.
+        default_area = 0.0 if self._ocr_url is not None else self._DEFAULT_REMOTE_MIN_AREA
         try:
             self._remote_min_area = float(
                 remote_min_area if remote_min_area is not None
-                else os.environ.get("OCR_REMOTE_MIN_AREA") or self._DEFAULT_REMOTE_MIN_AREA
+                else os.environ.get("OCR_REMOTE_MIN_AREA") or default_area
             )
         except ValueError:
-            self._remote_min_area = self._DEFAULT_REMOTE_MIN_AREA
+            self._remote_min_area = default_area
         self.stats = {"calls": 0, "seconds": 0.0, "remote_calls": 0}   # letture fatte e secondi spesi
         if self._ocr_url is None:
             logger.info("SlotOCRReader: OCR locale (EasyOCR CPU)")
         elif self._remote_min_area <= 0:
-            logger.info("SlotOCRReader: OCR remoto attivo (RunPod), nessun carico CPU locale")
+            logger.info("SlotOCRReader: OCR remoto attivo (RunPod), tutte le letture remote")
         else:
             logger.info("SlotOCRReader: OCR remoto attivo (RunPod); letture piccole (< %.0f%% dello schermo) in locale: "
                         "la CPU locale resta in uso", self._remote_min_area * 100)

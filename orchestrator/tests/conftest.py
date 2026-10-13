@@ -12,6 +12,7 @@ def _no_remote_ocr_from_the_environment(monkeypatch):
     """Un OCR_URL impostato sul PC di chi lancia i test non deve cambiarne il comportamento."""
     monkeypatch.delenv("OCR_URL", raising=False)
     monkeypatch.delenv("OCR_TIMEOUT", raising=False)
+    monkeypatch.delenv("OCR_REMOTE_MIN_AREA", raising=False)
 
 
 @pytest.fixture(autouse=True)

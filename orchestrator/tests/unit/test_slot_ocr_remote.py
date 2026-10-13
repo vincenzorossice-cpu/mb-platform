@@ -180,8 +180,8 @@ class TestRemote:
 
 
 class TestHybridReadings:
-    def test_a_small_band_is_read_locally_even_with_a_server(self, shot):
-        reader = SlotOCRReader(ocr_url="https://x")                 # soglia di default: 30% dello schermo
+    def test_a_small_band_is_read_locally_with_an_explicit_threshold(self, shot):
+        reader = SlotOCRReader(ocr_url="https://x", remote_min_area=0.3)   # soglia esplicita: 30% dello schermo
         reader.set_region((0, 2000, 1080, 2300))                    # ~12%: la fascia di saldo e puntata
         reader._ocr = MagicMock()
         reader._ocr.readtext.return_value = []
@@ -193,7 +193,7 @@ class TestHybridReadings:
         reader._ocr.readtext.assert_called_once()
 
     def test_a_big_region_or_the_full_screen_goes_to_the_server(self, shot):
-        reader = SlotOCRReader(ocr_url="https://x")
+        reader = SlotOCRReader(ocr_url="https://x", remote_min_area=0.3)
 
         with patch(POST, return_value=_response([_item("SALDO 5,00", 10, 10)])) as post:
             reader.read_slot_state(shot)
@@ -205,8 +205,11 @@ class TestHybridReadings:
     def test_the_threshold_comes_from_the_environment(self, monkeypatch):
         monkeypatch.setenv("OCR_REMOTE_MIN_AREA", "0.05")
         assert SlotOCRReader(ocr_url="https://x")._remote_min_area == 0.05
+        monkeypatch.setenv("OCR_REMOTE_MIN_AREA", "0.3")
+        assert SlotOCRReader(ocr_url="https://x")._remote_min_area == 0.3          # esplicita: vale
         monkeypatch.setenv("OCR_REMOTE_MIN_AREA", "boh")
-        assert SlotOCRReader(ocr_url="https://x")._remote_min_area == 0.3
+        assert SlotOCRReader(ocr_url="https://x")._remote_min_area == 0.0          # non valida con URL: tutto remoto
+        assert SlotOCRReader()._remote_min_area == 0.3                             # senza URL: il vecchio default
 
     def test_the_reader_counts_its_readings_and_seconds(self, shot):
         reader = SlotOCRReader(ocr_url="https://x")
@@ -218,6 +221,32 @@ class TestHybridReadings:
 
 
 class TestAllReadingsRemote:
+    def test_with_a_server_and_no_explicit_threshold_even_a_small_band_goes_remote(self, shot):
+        reader = SlotOCRReader(ocr_url="https://x")                 # nessuna soglia: con OCR_URL vale 0
+        assert reader._remote_min_area == 0.0
+        reader.set_region((0, 2000, 1080, 2300))                    # ~12%: la fascia di saldo e puntata
+        reader._ocr = MagicMock()
+
+        with patch(POST, return_value=_response([_item("SALDO 5,00", 10, 10)])) as post:
+            state = reader.read_slot_state(shot)
+
+        post.assert_called_once()
+        reader._ocr.readtext.assert_not_called()
+        assert state["saldo"] == 5.0 and reader.stats["remote_calls"] == 1
+
+    def test_without_a_server_everything_stays_local_whatever_the_threshold(self, shot, monkeypatch):
+        monkeypatch.delenv("OCR_URL", raising=False)
+        reader = SlotOCRReader()
+        reader.set_region((0, 2000, 1080, 2300))
+        reader._ocr = MagicMock()
+        reader._ocr.readtext.return_value = []
+
+        with patch(POST) as post:
+            reader.read_slot_state(shot)
+
+        post.assert_not_called()
+        reader._ocr.readtext.assert_called_once()
+
     def test_threshold_zero_sends_even_a_small_band_to_the_server(self, shot):
         reader = SlotOCRReader(ocr_url="https://x", remote_min_area=0)
         reader.set_region((0, 2000, 1080, 2300))
@@ -259,10 +288,11 @@ class TestStartupLog:
 
     def test_remote_everything(self, caplog):
         with caplog.at_level("INFO"):
-            SlotOCRReader(ocr_url="https://x", remote_min_area=0)
-        assert "SlotOCRReader: OCR remoto attivo (RunPod), nessun carico CPU locale" in caplog.text
+            SlotOCRReader(ocr_url="https://x")                       # default con OCR_URL
+        assert "SlotOCRReader: OCR remoto attivo (RunPod), tutte le letture remote" in caplog.text
 
     def test_remote_with_local_small_reads_says_so(self, caplog):
         with caplog.at_level("INFO"):
-            SlotOCRReader(ocr_url="https://x")
-        assert "letture piccole (< 30% dello schermo) in locale" in caplog.text and "nessun carico" not in caplog.text
+            SlotOCRReader(ocr_url="https://x", remote_min_area=0.3)  # soglia esplicita
+        assert "letture piccole (< 30% dello schermo) in locale" in caplog.text
+        assert "tutte le letture remote" not in caplog.text
