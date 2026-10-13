@@ -1,6 +1,7 @@
 import logging
 from decimal import Decimal
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -127,44 +128,69 @@ def test_total_cost_sums_and_flags_unknown_price():
     assert "parziale" in script.cost_line(a, b) and "COSTO AI TOTALE" in script.cost_line(a, b)
 
 
+def _btn(text, bounds, cls="android.widget.Button"):
+    from orchestrator.modules.screen_reader.interface import UIElement
+    return UIElement(text=text, bounds=bounds, resource_id=None, class_name=cls, confidence=1.0)
+
+
+def _screen_of(*elements):
+    from orchestrator.modules.screen_reader.interface import ScreenContent
+    return ScreenContent(elements=list(elements), screen_type="unknown", confidence=1.0, method="uiautomator")
+
+
+SLOT_TEXTS = [_btn(t, [0, 100 * i, 500, 100 * i + 80], "android.view.View") for i, t in
+              enumerate(["Gioca", "Puntata 0.10", "Saldo 99.80", "Vincita 0.00"], start=3)]
+
+
 class FakeReader:
-    def __init__(self, texts, ok=True):
-        self.texts, self.ok = texts, ok
+    """Mostra le schermate in sequenza (poi ripete l'ultima); ok=False: la lettura fallisce."""
+
+    def __init__(self, *screens, ok=True):
+        self.screens, self.ok = list(screens), ok
 
     def read_screen(self, device):
         if not self.ok:
             return Result.fail("x", "E")
-        return Result.ok(SimpleNamespace(elements=[SimpleNamespace(text=t) for t in self.texts]))
+        return Result.ok(self.screens.pop(0) if len(self.screens) > 1 else self.screens[0])
 
 
 class FakeInjector:
     def __init__(self, ok=True, raises=False):
         self.taps, self.ok, self.raises = [], ok, raises
 
-    def tap_element(self, device, hint):
+    def tap_coordinates(self, device, x, y):
         if self.raises:
             raise RuntimeError("adb")
-        self.taps.append(hint)
+        self.taps.append((x, y))
         return Result.ok(True) if self.ok else Result.fail("no", "TAP_MISSED")
+
+
+PROMO_PAGE = _screen_of(*[_btn(t, [0, 100 * i, 500, 100 * i + 80], "android.view.View") for i, t in
+                          enumerate(["Promozioni attive", "Happy Monday", "Prova", "Gioca ora"], start=3)])
 
 
 def test_exit_slot_found(caplog):
     sleeps, inj = [], FakeInjector()
+    slot = _screen_of(*SLOT_TEXTS, _btn("Esci", [900, 100, 1050, 180]))
+    back = MagicMock()
     with caplog.at_level(logging.INFO):
-        result = script.exit_slot(FakeReader(["Gioca", "Esci"]), inj, "D", sleep=sleeps.append)
-    assert result.success and inj.taps == ["Esci"] and sleeps == [3]
-    assert "Uscita dalla slot effettuata" in caplog.text
+        result = script.exit_slot(FakeReader(slot, PROMO_PAGE), inj, "D", sleep=sleeps.append, press_back=back)
+    assert result.success and inj.taps == [(975, 140)] and sleeps == [3]       # tocco al centro, attesa di 3 s
+    assert "Uscita dalla slot effettuata" in caplog.text and "trovato pulsante 'Esci' a (975,140)" in caplog.text
+    back.assert_not_called()
 
 
-@pytest.mark.parametrize("reader,inj", [
-    (FakeReader(["Gioca"]), FakeInjector()), (FakeReader([], ok=False), FakeInjector()),
-    (FakeReader(["Esci"]), FakeInjector(ok=False)), (FakeReader(["Esci"]), FakeInjector(raises=True)),
+@pytest.mark.parametrize("reader, inj", [
+    (FakeReader(_screen_of(*SLOT_TEXTS)), FakeInjector()),                       # niente da toccare, Back senza effetto
+    (FakeReader(_screen_of(), ok=False), FakeInjector()),                         # schermo illeggibile
+    (FakeReader(_screen_of(*SLOT_TEXTS, _btn("Esci", [900, 100, 1050, 180]))), FakeInjector(ok=False)),
+    (FakeReader(_screen_of(*SLOT_TEXTS, _btn("Esci", [900, 100, 1050, 180]))), FakeInjector(raises=True)),
 ])
 def test_exit_slot_never_fails_hard(reader, inj, caplog):
     sleeps = []
     with caplog.at_level(logging.WARNING):
-        result = script.exit_slot(reader, inj, "D", sleep=sleeps.append)
-    assert not result.success and sleeps == [] and caplog.records
+        result = script.exit_slot(reader, inj, "D", sleep=sleeps.append, press_back=lambda device: Result.ok(True))
+    assert not result.success and caplog.records
 
 
 # ======================== login automatico prima della navigazione ====================================================

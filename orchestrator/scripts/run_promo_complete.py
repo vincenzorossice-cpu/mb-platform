@@ -25,6 +25,7 @@ from orchestrator.modules.login_manager.executor import LoginExecutor
 from orchestrator.modules.login_manager.interface import LoginResult, LoginStatus
 from orchestrator.modules.login_manager.mapper import LoginMapper
 from orchestrator.modules.slot_autopilot.session import _setup_of
+from orchestrator.modules.slot_autopilot.slot_exit import leave_slot
 from orchestrator.modules.slot_autopilot.slot_intro import build_slot_intro
 from orchestrator.scripts import run_autopilot
 from orchestrator.tests.validation import test_casino_navigation as nav_script
@@ -151,26 +152,11 @@ def navigate_to_slot(args, navigation_client, screen_reader, touch_injector) -> 
     return Result.ok(len(navigator.last_history))
 
 
-def exit_slot(screen_reader, touch_injector, device_id: str, sleep=time.sleep) -> Result[bool]:
-    """Esce dalla slot toccando "Esci". Mai bloccante: se non c'e' si segnala e basta."""
-    try:
-        screen = screen_reader.read_screen(device_id)
-        found = screen.success and any(
-            EXIT_BUTTON_HINT.lower() in (element.text or "").lower() for element in screen.data.elements
-        )
-        if not found:
-            logger.warning("Pulsante '%s' non trovato: resto nella slot (il target e' gia' raggiunto).", EXIT_BUTTON_HINT)
-            return Result.fail("Esci non trovato", "EXIT_NOT_FOUND")
-        tap = touch_injector.tap_element(device_id, EXIT_BUTTON_HINT)
-        if not tap.success:
-            logger.warning("Tocco su '%s' fallito: %s", EXIT_BUTTON_HINT, tap.error)
-            return Result.fail(tap.error, tap.error_code)
-        sleep(EXIT_WAIT_SECONDS)
-        logger.info("Uscita dalla slot effettuata")
-        return Result.ok(True)
-    except Exception as exc:
-        logger.warning("Uscita dalla slot non riuscita: %s", exc)
-        return Result.fail(str(exc), "EXIT_ERROR")
+def exit_slot(screen_reader, touch_injector, device_id: str, sleep=time.sleep, press_back=None) -> Result[bool]:
+    """Esce dalla slot: pulsante con testo ("Esci", "Chiudi", "Home"...), poi icona di chiusura in alto a destra, poi tasto
+    Back di Android, verificando ogni volta di essere usciti. Mai bloccante: se non si riesce si segnala e basta."""
+    kwargs = {} if press_back is None else {"press_back": press_back}
+    return leave_slot(screen_reader, touch_injector, device_id, sleep=sleep, wait_seconds=EXIT_WAIT_SECONDS, **kwargs)
 
 
 def _prepare_slot_map(autopilot, args) -> None:
