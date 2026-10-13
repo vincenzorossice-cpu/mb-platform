@@ -24,8 +24,21 @@ _SIG_SIZE = 24
 _SAME_SCREEN_DIFF = 14.0          # differenza media (0-255) sotto cui due schermate sono "la stessa"
 _DARK_LUMA = 45
 _DARK_FRACTION = 0.80             # overlay nero: almeno l'80% dei pixel scuri
-_MAX_ROUNDS = 20
-_MAX_SECONDS = 120.0
+_MAX_ROUNDS = 30
+_MAX_SECONDS = 150.0
+_LOADING_MAX_TEXTS = 5            # schermata di caricamento: al massimo questi testi, nessun pulsante riconosciuto
+_LOADING_WAITS = 5                # attese di _LOADING_SECONDS prima di passare alle strategie normali (15 s)
+_LOADING_SECONDS = 3.0
+_BANNER_Y_FRACTION = 0.70         # un banner sta in basso: serve almeno un testo sotto il 70% dell'altezza
+_SWIPE_SECONDS = 2.0              # attesa dopo uno swipe (e `wait_after` dei passi salvati)
+_SWIPE_DURATION_MS = 300
+# Swipe per chiudere un banner, come % dello schermo: (nome, (x1, y1, x2, y2)). Le coordinate sono quelle richieste.
+_SWIPES = (
+    ("swipe_right", "destra", (0.8, 0.85, 0.2, 0.85)),
+    ("swipe_left", "sinistra", (0.2, 0.85, 0.8, 0.85)),
+    ("swipe_up", "su", (0.5, 0.9, 0.5, 0.5)),
+)
+_SWIPE_KINDS = tuple(name for name, _, _ in _SWIPES)
 _IDLE_WAITS = 2                   # attese (forse sta caricando) prima di arrendersi con strategie esaurite
 _MAX_BUTTON_TRIES = 2             # candidati "pulsante" provati per schermata
 _SPIN_SETTLE_SECONDS = 4.0        # dopo un tocco su SPIN: il giro deve finire prima di rileggere saldo e puntata
@@ -116,6 +129,7 @@ class SlotIntro:
         self.spin_point = spin_point
         self.supervisor = supervisor
         self.ocr = ocr
+        self._boxes_cache = None
         self.memory_dir = memory_dir
         self.sleep = sleep
         self.max_rounds = max_rounds
@@ -163,7 +177,8 @@ class SlotIntro:
     # ---- ciclo ---------------------------------------------------------------------------------------------
     def run(self, device_id: str, slot_name: str) -> Result[IntroOutcome]:
         started = time.monotonic()
-        taps = learned = attempts = waits = memory_changes = 0
+        taps = learned = attempts = waits = memory_changes = loading_waits = 0
+        last_swipe = None               # swipe appena eseguito: l'esito si vede dalla prontezza del giro dopo
         pending = None                  # ultimo tocco, il cui esito si legge dallo schermo del giro dopo
         screen_sig = None               # schermata su cui si stanno provando le strategie
         tried: set = set()
@@ -186,12 +201,21 @@ class SlotIntro:
                 gained, changed = self._judge_tap(pending, sig, slot_name, size)
                 learned += gained
                 memory_changes += 1 if changed and pending["kind"] == "memory" else 0
+                last_swipe = pending if pending["kind"] in _SWIPE_KINDS else None
                 pending = None
             if screen_sig is None or sig is None or not same_screen(sig, screen_sig):
                 screen_sig, tried, tried_texts, waits = sig, set(), set(), 0
 
             dark = is_dark_overlay(path)
             ready = self._game_ready(device_id, slot_name, path, size, sig, dark)
+            if last_swipe is not None:
+                name = last_swipe["label"]
+                if ready:
+                    logger.info("intro: %s per banner → saldo leggibile", name)
+                    learned += self._remember_swipe(last_swipe, slot_name, size)
+                else:
+                    logger.info("intro: %s per banner → nessun cambiamento", name)
+                last_swipe = None
             if ready:
                 logger.info("intro: gioco pronto dopo %d giri, %d tocchi (%d schermate nuove ricordate).",
                             round_no, taps, learned)
@@ -202,6 +226,13 @@ class SlotIntro:
                 logger.info("intro: %d passi ricordati eseguiti, schermo cambiato %d volte - intro superate",
                             memory_changes, memory_changes)
                 return Result.ok(IntroOutcome(rounds=round_no, taps=taps, ready=True, learned=learned))
+
+            if loading_waits < _LOADING_WAITS and self._is_loading(path, slot_name, size, sig, dark, tried):
+                loading_waits += 1
+                logger.info("intro: schermata di caricamento rilevata (%d elementi), attendo... (%d/%d)",
+                            len(self._boxes(path) or []), loading_waits, _LOADING_WAITS)
+                self.sleep(_LOADING_SECONDS)
+                continue
 
             action = self._next_action(device_id, slot_name, path, size, sig, dark, ready, tried, tried_texts)
             if action is None:
@@ -218,10 +249,14 @@ class SlotIntro:
 
             attempts += 1
             action.update(sig=sig, number=attempts)
-            self.touch_injector.tap_coordinates(device_id, int(action["x"]), int(action["y"]))
+            loading_waits = 0
+            if action.get("coords"):
+                self._swipe(device_id, action["coords"])
+            else:
+                self.touch_injector.tap_coordinates(device_id, int(action["x"]), int(action["y"]))
             taps += 1
             pending = action
-            self.sleep(_SPIN_SETTLE_SECONDS if action["kind"] == "spin" else _SETTLE_SECONDS)
+            self.sleep(action.get("wait") or (_SPIN_SETTLE_SECONDS if action["kind"] == "spin" else _SETTLE_SECONDS))
         return Result.fail("le schermate di ingresso non finiscono", "INTRO_NOT_FINISHED")
 
     def _judge_tap(self, tap: dict, sig, slot_name: str, size: tuple) -> tuple:
@@ -236,8 +271,8 @@ class SlotIntro:
                 logger.info("intro: il tocco ricordato non funziona piu', lo dimentico.")
                 self._save(slot_name, size, [step for step in steps if not same(step)])
             return 0, changed
-        if tap["kind"] == "spin":
-            return 0, changed               # uno spin ricordato = uno spin a puntata di default a ogni esecuzione
+        if tap["kind"] == "spin" or tap["kind"] in _SWIPE_KINDS:
+            return 0, changed               # SPIN: mai ricordato; swipe: ricordato solo se poi il gioco e' pronto               # uno spin ricordato = uno spin a puntata di default a ogni esecuzione
         if not changed or not tap["sig"]:
             return 0, changed
         step = {"sig": tap["sig"], "x": int(tap["x"]), "y": int(tap["y"]), "kind": tap["kind"]}
@@ -257,13 +292,17 @@ class SlotIntro:
             tried.add("memory")
             logger.info("intro: schermata gia' vista per '%s', ripeto il tocco ricordato (%d,%d).",
                         slot_name, known["x"], known["y"])
+            if known.get("kind") == "swipe" and known.get("coords"):
+                return {"kind": "memory", "x": known["x"], "y": known["y"], "coords": list(known["coords"]),
+                        "wait": known.get("wait_after") or _SWIPE_SECONDS,
+                        "label": f"swipe ricordato {list(known['coords'])}"}
             return {"kind": "memory", "x": known["x"], "y": known["y"],
                     "label": f"tocco ricordato ({int(known['x'])},{int(known['y'])})"}
         if ready is None:
             # Nessuno sa dire se il gioco e' pronto: niente tocchi alla cieca su una schermata che potrebbe essere gioco.
             order = ("center", "buttons", "gpt") if dark else ("buttons", "gpt")
         else:
-            order = ("center", "buttons", "spin", "bottom", "gpt") if dark else ("buttons", "center", "spin", "bottom", "gpt")
+            order = (("center", "buttons") if dark else ("buttons", "center")) + _SWIPE_KINDS + ("spin", "bottom", "gpt")
         width, height = size
         for kind in order:
             if kind in tried:
@@ -283,6 +322,13 @@ class SlotIntro:
                 tried_texts.add((text, x, y))
                 return {"kind": kind, "x": x, "y": y, "text": text,
                         "label": f"cercato pulsanti: trovato '{text}' a ({x},{y})"}
+            if kind in _SWIPE_KINDS:
+                tried.add(kind)
+                action = self._swipe_action(kind, path, size)
+                if action is None:
+                    tried.update(_SWIPE_KINDS)          # niente banner in basso (o niente swipe): salto tutte e tre
+                    continue
+                return action
             if kind == "spin":
                 tried.add(kind)
                 point = self._spin_point(slot_name, path)
@@ -305,19 +351,25 @@ class SlotIntro:
                         "label": f"GPT: pulsante a ({int(point[0])},{int(point[1])})"}
         return None
 
+    def _boxes(self, path: str) -> Optional[list]:
+        """Box OCR dello screenshot (una sola lettura per giro, condivisa da caricamento, pulsanti e banner)."""
+        if self._boxes_cache is not None and self._boxes_cache[0] == path:
+            return self._boxes_cache[1]
+        boxes = None
+        if self.ocr is not None and callable(getattr(self.ocr, "read_text_boxes", None)):
+            try:
+                result = self.ocr.read_text_boxes(path)
+                if getattr(result, "success", False):
+                    boxes = list(result.data or [])
+            except Exception as exc:
+                logger.warning("intro: OCR dei pulsanti fallito: %s", exc)
+        self._boxes_cache = (path, boxes)
+        return boxes
+
     def _button_candidates(self, path: str) -> list:
         """[(testo, x, y)] dei pulsanti generici letti dall'OCR, per priorita'. Niente testi di acquisto/uscita/menu."""
-        if self.ocr is None or not callable(getattr(self.ocr, "read_text_boxes", None)):
-            return []
-        try:
-            boxes = self.ocr.read_text_boxes(path)
-        except Exception as exc:
-            logger.warning("intro: OCR dei pulsanti fallito: %s", exc)
-            return []
-        if not getattr(boxes, "success", False):
-            return []
         found = []
-        for box in boxes.data or []:
+        for box in self._boxes(path) or []:
             rank = _button_rank(box.text)
             if rank is None:
                 continue
@@ -325,6 +377,49 @@ class SlotIntro:
             found.append((rank, -(y1 + y2) // 2, box.text.strip(), (x1 + x2) // 2, (y1 + y2) // 2))
         found.sort()
         return [(text, x, y) for _, _, text, x, y in found]
+
+    def _is_loading(self, path, slot_name, size, sig, dark, tried: set) -> bool:
+        """Schermata di caricamento: pochissimi testi e nessun pulsante riconosciuto (saldo/puntata sono gia' esclusi
+        da _game_ready). Si aspetta invece di toccare a vuoto. L'overlay nero si chiude prima col centro."""
+        if dark and "center" not in tried:
+            return False
+        if "memory" not in tried and sig and any(same_screen(step["sig"], sig) for step in self._load(slot_name, size)):
+            return False
+        boxes = self._boxes(path)
+        if boxes is None:
+            return False
+        return len(boxes) <= _LOADING_MAX_TEXTS and not self._button_candidates(path)
+
+    def _swipe_action(self, kind: str, path: str, size: tuple) -> Optional[dict]:
+        if not callable(getattr(self.touch_injector, "swipe", None)):
+            return None
+        boxes = self._boxes(path)
+        if not boxes:
+            return None
+        width, height = size
+        if not any((box.bbox[1] + box.bbox[3]) / 2 > _BANNER_Y_FRACTION * height for box in boxes):
+            logger.info("intro: nessun testo in basso, salto gli swipe per il banner")
+            return None
+        name, label, fractions = next(item for item in _SWIPES if item[0] == kind)
+        x1, y1, x2, y2 = (int(fractions[0] * width), int(fractions[1] * height),
+                          int(fractions[2] * width), int(fractions[3] * height))
+        return {"kind": kind, "x": x1, "y": y1, "coords": [x1, y1, x2, y2], "wait": _SWIPE_SECONDS,
+                "label": f"swipe {label}"}
+
+    def _swipe(self, device_id: str, coords) -> None:
+        swipe = getattr(self.touch_injector, "swipe", None)
+        if callable(swipe):
+            swipe(device_id, *[int(c) for c in coords], _SWIPE_DURATION_MS)
+
+    def _remember_swipe(self, tap: dict, slot_name: str, size: tuple) -> int:
+        if not tap.get("sig"):
+            return 0
+        step = {"sig": tap["sig"], "x": tap["x"], "y": tap["y"], "kind": "swipe",
+                "action": f"{tap['kind']}_banner", "coords": tap["coords"], "wait_after": int(_SWIPE_SECONDS)}
+        steps = [s for s in self._load(slot_name, size) if not same_screen(s["sig"], tap["sig"])]
+        self._save(slot_name, size, steps + [step])
+        logger.info("intro: swipe riuscito, lo ricordo per '%s'.", slot_name)
+        return 1
 
     def _spin_point(self, slot_name: str, path: str):
         point = self.spin_point(slot_name) if callable(self.spin_point) else None
