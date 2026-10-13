@@ -1,0 +1,454 @@
+import json
+import os
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from orchestrator.core.result import Result
+from orchestrator.modules.login_manager import ui_helpers
+from orchestrator.modules.login_manager.executor import LoginExecutor
+from orchestrator.modules.login_manager.interface import LoginStatus
+from orchestrator.modules.login_manager.recipe import LoginRecipe, LoginStep, RecipeStore
+from orchestrator.modules.screen_reader.interface import ScreenContent, UIElement
+
+DEVICE = "emulator-5554"
+BOOK = "SISAL"
+
+EMAIL_BOUNDS = [100, 628, 980, 743]
+PASSWORD_BOUNDS = [100, 798, 980, 913]
+BUTTON_BOUNDS = [100, 1118, 980, 1213]
+HOME_LINK_BOUNDS = [800, 50, 980, 120]
+
+
+def _screen(*elements, screen_type="login_page"):
+    return ScreenContent(elements=list(elements), screen_type=screen_type,
+                         confidence=1.0, method="uiautomator")
+
+
+def _el(text, cls="android.widget.TextView", bounds=None, resource_id=None):
+    return UIElement(text=text, bounds=bounds or [0, 0, 0, 0],
+                     resource_id=resource_id, class_name=cls)
+
+
+def _home_screen():
+    """Home Sisal: "Accedi" e' un link (View) verso la pagina di login."""
+    return _screen(_el("Bonus di benvenuto"),
+                   _el("Accedi", "android.view.View", HOME_LINK_BOUNDS),
+                   screen_type="home_page")
+
+
+def _login_page(email="", password=""):
+    """Pagina di login Sisal (debug reale): EditText con rid neutro + label View separate."""
+    return _screen(
+        _el("Wrappin' More Gold", "android.view.View", [100, 100, 980, 200]),
+        _el("Accedi", "android.view.View", [100, 300, 400, 360]),  # titolo della pagina
+        _el(email, "android.widget.EditText", EMAIL_BOUNDS, "_r_0_-form-item"),
+        _el("Email / Username", "android.view.View", [125, 658, 492, 713]),
+        _el(password, "android.widget.EditText", PASSWORD_BOUNDS, "password"),
+        _el("Password", "android.view.View", [125, 828, 352, 883]),
+        _el("Accedi", "android.widget.Button", BUTTON_BOUNDS))
+
+
+LOGGED_IN_SCREEN = _screen(_el("Saldo disponibile: 125.50€"), _el("Il mio conto"),
+                           _el("Logout", "android.widget.Button"), screen_type="home_page")
+CAPTCHA_SCREEN = _screen(_el("Non sono un robot", "android.widget.CheckBox"),
+                         _el("Accedi", "android.widget.Button"))
+TWO_FA_SCREEN = _screen(_el("Inserisci il codice di verifica"), _el("Codice", "android.widget.EditText"))
+LOGIN_FAILED_SCREEN = _screen(_el("Credenziali errate. Riprova."), _el("Accedi", "android.widget.Button"))
+NEUTRAL_SCREEN = _screen(_el("Promozioni"), _el("Calcio"), screen_type="unknown")
+
+
+def _recipe(steps=None):
+    return LoginRecipe(
+        book=BOOK, login_url="https://m.sisal.it",
+        steps=steps if steps is not None else [
+            LoginStep("tap_button", target_text="Accedi", wait_after_seconds=5,
+                      description="Naviga alla pagina di login"),
+            LoginStep("tap_field", target_label="Email / Username", trigger_autofill=True,
+                      wait_after_seconds=3, description="Tap sul campo email"),
+            LoginStep("tap_field", target_label="Password", trigger_autofill=True,
+                      wait_after_seconds=3, description="Tap sul campo password"),
+            LoginStep("tap_button", target_text="Accedi", wait_after_seconds=5,
+                      description="Submit form di login"),
+        ],
+        has_captcha=True, captcha_type="reCAPTCHA",
+        logged_in_indicators=["Logout", "Il mio conto", "Saldo disponibile"],
+        login_failed_indicators=["credenziali errate", "riprova"],
+        mapped_at="2026-09-20T14:00:00", mapped_by="gpt_vision")
+
+
+def _reader(*screens):
+    """read_screen che restituisce le schermate in sequenza, poi ripete l'ultima."""
+    seq = list(screens)
+
+    def _read(device_id, *args, **kwargs):
+        screen = seq.pop(0) if len(seq) > 1 else seq[0]
+        return Result.ok(screen)
+
+    return _read
+
+
+@pytest.fixture(autouse=True)
+def no_sleep():
+    with patch("orchestrator.modules.login_manager.executor.time.sleep"):
+        yield
+
+
+@pytest.fixture
+def parts():
+    screen_reader = MagicMock()
+    screen_reader._screenshot.return_value = Result.ok("/tmp/shot.png")
+    touch_injector = MagicMock()
+    touch_injector.tap_coordinates.return_value = Result.ok(True)
+    book_navigator = MagicMock()
+    book_navigator.open_chrome.return_value = Result.ok(True)
+    return screen_reader, touch_injector, book_navigator
+
+
+@pytest.fixture
+def store(tmp_path):
+    return RecipeStore(str(tmp_path / "recipes.json"))
+
+
+@pytest.fixture
+def executor(parts, store):
+    return LoginExecutor(parts[0], parts[1], book_navigator=parts[2], recipe_store=store)
+
+
+def _set_screens(parts, *screens):
+    parts[0].read_screen.side_effect = _reader(*screens)
+
+
+def _taps(parts):
+    return [c.args[1:] for c in parts[1].tap_coordinates.call_args_list]
+
+
+# ---------------- perform_login ----------------
+
+def test_perform_login_already_logged_in(executor, parts, store):
+    store.save_recipe(_recipe())
+    _set_screens(parts, LOGGED_IN_SCREEN)
+    res = executor.perform_login(DEVICE, BOOK)
+    assert res.data.status == LoginStatus.LOGGED_IN
+    parts[1].tap_coordinates.assert_not_called()  # recipe non eseguito
+
+
+def test_perform_login_recipe_not_found(executor, parts):
+    res = executor.perform_login(DEVICE, BOOK)
+    assert res.success and res.data.status == LoginStatus.RECIPE_NOT_FOUND
+    parts[2].open_chrome.assert_not_called()
+
+
+def test_perform_login_success(executor, parts, store):
+    store.save_recipe(_recipe())
+    _set_screens(parts, _home_screen(), _home_screen(),
+                 _login_page(), _login_page("mario@example.it"),
+                 _login_page("mario@example.it"), _login_page("mario@example.it", "••••••••"),
+                 _login_page("mario@example.it", "••••••••"), LOGGED_IN_SCREEN)
+    res = executor.perform_login(DEVICE, BOOK)
+    assert res.data.status == LoginStatus.LOGIN_SUCCESS
+    # link Accedi della home, campo email, campo password, Button (non il titolo) di submit
+    assert _taps(parts) == [(890, 85), (540, 685), (540, 855), (540, 1165)]
+    parts[2].open_chrome.assert_called_once_with(DEVICE, "https://m.sisal.it")
+
+
+def test_perform_login_autofill_failed(executor, parts, store):
+    store.save_recipe(_recipe())
+    _set_screens(parts, _home_screen(), _home_screen(), _login_page())  # il campo resta vuoto
+    res = executor.perform_login(DEVICE, BOOK)
+    assert res.data.status == LoginStatus.AUTOFILL_FAILED
+    assert res.data.details["step_index"] == 1
+    assert len(_taps(parts)) == 2  # niente submit
+
+
+def test_perform_login_failed_credentials(executor, parts, store):
+    store.save_recipe(_recipe())
+    _set_screens(parts, _home_screen(), _home_screen(),
+                 _login_page(), _login_page("mario@example.it"),
+                 _login_page("mario@example.it"), _login_page("mario@example.it", "••••••••"),
+                 _login_page("mario@example.it", "••••••••"), LOGIN_FAILED_SCREEN)
+    res = executor.perform_login(DEVICE, BOOK)
+    assert res.data.status == LoginStatus.LOGIN_FAILED
+
+
+def test_perform_login_captcha_after_submit(executor, parts, store):
+    store.save_recipe(_recipe())
+    _set_screens(parts, _home_screen(), _home_screen(),
+                 _login_page(), _login_page("mario@example.it"),
+                 _login_page("mario@example.it"), _login_page("mario@example.it", "••••••••"),
+                 _login_page("mario@example.it", "••••••••"), CAPTCHA_SCREEN)
+    res = executor.perform_login(DEVICE, BOOK)
+    assert res.data.status == LoginStatus.CAPTCHA_DETECTED
+    assert res.data.screenshot_path == "/tmp/shot.png"
+
+
+def test_perform_login_captcha_on_open(executor, parts, store):
+    store.save_recipe(_recipe())
+    _set_screens(parts, CAPTCHA_SCREEN)
+    res = executor.perform_login(DEVICE, BOOK)
+    assert res.data.status == LoginStatus.CAPTCHA_DETECTED
+    parts[1].tap_coordinates.assert_not_called()
+
+
+def test_perform_login_2fa(executor, parts, store):
+    store.save_recipe(_recipe())
+    _set_screens(parts, _home_screen(), _home_screen(),
+                 _login_page(), _login_page("mario@example.it"),
+                 _login_page("mario@example.it"), _login_page("mario@example.it", "••••••••"),
+                 _login_page("mario@example.it", "••••••••"), TWO_FA_SCREEN)
+    res = executor.perform_login(DEVICE, BOOK)
+    assert res.data.status == LoginStatus.TWO_FA_REQUIRED
+
+
+def test_perform_login_navigation_failed(executor, parts, store):
+    store.save_recipe(_recipe())
+    parts[2].open_chrome.return_value = Result.fail("adb down", "CHROME_OPEN_FAILED")
+    res = executor.perform_login(DEVICE, BOOK)
+    assert res.data.status == LoginStatus.NAVIGATION_FAILED
+    parts[0].read_screen.assert_not_called()
+
+
+def test_perform_login_never_types_text(executor, parts, store):
+    store.save_recipe(_recipe())
+    _set_screens(parts, _home_screen(), _home_screen(),
+                 _login_page(), _login_page("mario@example.it"),
+                 _login_page("mario@example.it"), _login_page("mario@example.it", "••••••••"),
+                 _login_page("mario@example.it", "••••••••"), LOGGED_IN_SCREEN)
+    executor.perform_login(DEVICE, BOOK)
+    parts[1].input_text.assert_not_called()
+
+
+def test_perform_login_device_lock(parts, store):
+    store.save_recipe(_recipe())
+    dm = MagicMock()
+    dm.acquire_lock.return_value = False
+    ex = LoginExecutor(parts[0], parts[1], book_navigator=parts[2], recipe_store=store, device_manager=dm)
+    res = ex.perform_login(DEVICE, BOOK)
+    assert not res.success and res.error_code == "DEVICE_BUSY"
+    dm.release_lock.assert_not_called()
+
+    dm.acquire_lock.return_value = True
+    _set_screens(parts, LOGGED_IN_SCREEN)
+    ex.perform_login(DEVICE, BOOK)
+    dm.release_lock.assert_called_once_with(DEVICE)
+
+
+# ---------------- check_session ----------------
+
+def test_check_session_logged_in(executor, parts):
+    _set_screens(parts, _screen(_el("Logout"), _el("Saldo disponibile")))
+    assert executor.check_session(DEVICE, BOOK).data.status == LoginStatus.LOGGED_IN
+
+
+def test_check_session_needs_login(executor, parts):
+    _set_screens(parts, _home_screen())
+    assert executor.check_session(DEVICE, BOOK).data.status == LoginStatus.LOGIN_REQUIRED
+
+
+def test_check_session_ambiguous(executor, parts):
+    _set_screens(parts, NEUTRAL_SCREEN)
+    assert executor.check_session(DEVICE, BOOK).data.status == LoginStatus.AMBIGUOUS
+
+
+def test_check_session_benvenuto_not_logged_in(executor, parts):
+    _set_screens(parts, _screen(_el("Bonus di benvenuto"), _el("Accedi", "android.view.View", HOME_LINK_BOUNDS)))
+    assert executor.check_session(DEVICE, BOOK).data.status == LoginStatus.LOGIN_REQUIRED
+
+
+def test_check_session_login_button_beats_logged_in(executor, parts):
+    _set_screens(parts, _screen(_el("Saldo disponibile"), _el("Accedi", "android.view.View", HOME_LINK_BOUNDS)))
+    assert executor.check_session(DEVICE, BOOK).data.status == LoginStatus.LOGIN_REQUIRED
+
+
+def test_check_session_benvenuto_alone_ambiguous(executor, parts):
+    _set_screens(parts, _screen(_el("Benvenuto"), _el("collega il tuo account Fantacalcio")))
+    assert executor.check_session(DEVICE, BOOK).data.status == LoginStatus.AMBIGUOUS
+
+
+# ---------------- _execute_recipe / _execute_step ----------------
+
+def test_execute_recipe_tap_button(executor, parts):
+    _set_screens(parts, _home_screen())
+    step = LoginStep("tap_button", target_text="Accedi")
+    res = executor._execute_step(DEVICE, step, _recipe())
+    assert res.success and res.data is True
+    assert _taps(parts) == [(890, 85)]
+
+
+def test_execute_recipe_tap_field(executor, parts):
+    _set_screens(parts, _login_page(), _login_page("mario@example.it"))
+    step = LoginStep("tap_field", target_label="Email / Username", trigger_autofill=True)
+    res = executor._execute_step(DEVICE, step, _recipe())
+    assert res.success and res.data is True
+    assert _taps(parts) == [(540, 685)]
+
+
+def test_execute_recipe_tap_field_autofill_not_filled(executor, parts):
+    _set_screens(parts, _login_page())
+    step = LoginStep("tap_field", target_label="Email / Username", trigger_autofill=True)
+    res = executor._execute_step(DEVICE, step, _recipe())
+    assert not res.success and res.error_code == "AUTOFILL_NOT_FILLED"
+
+
+def test_execute_recipe_tap_field_already_filled_by_previous_autofill(executor, parts):
+    # Chrome ha riempito email e password con il primo tap: il testo del campo password non cambia
+    filled = _login_page("mario@example.it", "••••••••")
+    _set_screens(parts, filled)
+    step = LoginStep("tap_field", target_label="Password", trigger_autofill=True)
+    res = executor._execute_step(DEVICE, step, _recipe())
+    assert res.success and res.data is True
+
+
+def test_execute_recipe_tap_coordinates_and_wait(executor, parts):
+    assert executor._execute_step(DEVICE, LoginStep("tap_coordinates", x=10, y=20)).success
+    assert _taps(parts) == [(10, 20)]
+    assert executor._execute_step(DEVICE, LoginStep("wait", wait_after_seconds=2)).data is True
+
+
+def test_execute_recipe_check_session_stops(executor, parts):
+    recipe = _recipe([LoginStep("check_session"),
+                      LoginStep("tap_button", target_text="Accedi")])
+    _set_screens(parts, LOGGED_IN_SCREEN)
+    res = executor._execute_recipe(DEVICE, recipe)
+    assert res.data.status == LoginStatus.LOGGED_IN
+    parts[1].tap_coordinates.assert_not_called()
+
+
+def test_execute_recipe_check_session_continues_when_not_logged(executor, parts):
+    recipe = _recipe([LoginStep("check_session"), LoginStep("tap_button", target_text="Accedi")])
+    _set_screens(parts, _home_screen(), _home_screen(), LOGGED_IN_SCREEN)
+    res = executor._execute_recipe(DEVICE, recipe)
+    assert res.data.status == LoginStatus.LOGIN_SUCCESS
+    assert _taps(parts) == [(890, 85)]
+
+
+def test_execute_recipe_step_failed(executor, parts):
+    recipe = _recipe([LoginStep("tap_button", target_text="Entra", description="Pulsante cambiato")])
+    _set_screens(parts, _home_screen())
+    res = executor._execute_recipe(DEVICE, recipe)
+    assert res.data.status == LoginStatus.RECIPE_STEP_FAILED
+    assert res.data.details["step_index"] == 0 and res.data.details["target"] == "Entra"
+    parts[1].tap_coordinates.assert_not_called()
+
+
+# ---------------- verify_login ----------------
+
+def test_verify_login_success(executor, parts):
+    _set_screens(parts, _screen(_el("Saldo disponibile"), _el("Profilo")))
+    assert executor.verify_login(DEVICE, BOOK).data.status == LoginStatus.LOGIN_SUCCESS
+
+
+def test_verify_login_failed(executor, parts):
+    _set_screens(parts, LOGIN_FAILED_SCREEN)
+    assert executor.verify_login(DEVICE, BOOK).data.status == LoginStatus.LOGIN_FAILED
+
+
+def test_verify_login_ambiguous(executor, parts):
+    _set_screens(parts, NEUTRAL_SCREEN)
+    assert executor.verify_login(DEVICE, BOOK).data.status == LoginStatus.AMBIGUOUS
+
+
+# ---------------- ui_helpers / wrapper ----------------
+
+def test_find_field_by_label(executor):
+    screen = _login_page()
+    assert executor._find_field_by_label(screen, "Email / Username").bounds == EMAIL_BOUNDS
+    assert executor._find_field_by_label(screen, "Password").bounds == PASSWORD_BOUNDS
+    assert executor._find_field_by_label(screen, "Codice fiscale") is None
+
+
+def test_find_field_by_label_forgot_password_link_does_not_win(executor):
+    screen = _screen(
+        _el("Hai dimenticato la password?", "android.view.View", [100, 560, 600, 600]),
+        _el("", "android.widget.EditText", EMAIL_BOUNDS, "field_1"),
+        _el("Email / Username", "android.view.View", [125, 658, 492, 713]),
+        _el("", "android.widget.EditText", PASSWORD_BOUNDS, "field_2"),
+        _el("Password", "android.view.View", [125, 828, 352, 883]))
+    assert executor._find_field_by_label(screen, "Password").bounds == PASSWORD_BOUNDS
+
+
+def test_find_field_by_label_inside_edittext_text(executor):
+    screen = _screen(_el("Email", "android.widget.EditText", EMAIL_BOUNDS))
+    assert executor._find_field_by_label(screen, "Email").bounds == EMAIL_BOUNDS
+
+
+def test_find_element_by_text_prefers_exact_then_button(executor):
+    screen = _screen(
+        _el("Accedi per vedere il saldo", "android.view.View", [0, 300, 500, 360]),
+        _el("Accedi", "android.view.View", [100, 300, 400, 360]),
+        _el("Accedi", "android.widget.Button", BUTTON_BOUNDS))
+    assert executor._find_element_by_text(screen, "accedi").bounds == BUTTON_BOUNDS
+    assert executor._find_element_by_text(screen, "Registrati") is None
+
+
+def test_find_nearest_edittext_contained():
+    big = _el("", "android.widget.EditText", EMAIL_BOUNDS)
+    small = _el("", "android.widget.EditText", [300, 690, 320, 700])  # centro piu' vicino, ma non contiene
+    label = _el("Email / Username", "android.view.View", [125, 658, 492, 713])
+    assert ui_helpers.find_nearest_edittext(label, [small, big, label]) is big
+
+
+def test_find_nearest_edittext_closest():
+    near = _el("", "android.widget.EditText", [200, 0, 400, 50])
+    far = _el("", "android.widget.EditText", [200, 300, 400, 350])
+    label = _el("Email", "android.view.View", [0, 0, 100, 50])
+    assert ui_helpers.find_nearest_edittext(label, [far, near, label]) is near
+
+
+def test_find_nearest_no_edittext():
+    label = _el("Email", "android.view.View", [0, 0, 100, 50])
+    assert ui_helpers.find_nearest_edittext(label, [label]) is None
+
+
+def test_has_indicators_whole_word(executor):
+    assert not executor._has_indicators(_screen(_el("Wrappin' More Gold")), ["PIN"])
+    assert not executor._has_indicators(_screen(_el("Uscire")), ["Esci"])
+    assert executor._has_indicators(_screen(_el("Inserisci il PIN")), ["PIN"])
+
+
+# ---------------- RecipeStore ----------------
+
+def test_recipe_store_save_load(store):
+    assert store.save_recipe(_recipe()).success
+    res = store.load_recipe("sisal")  # chiave case-insensitive
+    assert res.success and res.data == _recipe()
+    assert store.has_recipe("SISAL")
+    assert not [f for f in os.listdir(os.path.dirname(store.path)) if f.endswith(".tmp")]
+
+
+def test_recipe_store_not_found(store):
+    res = store.load_recipe("NON-ESISTE")
+    assert res.success and res.data is None
+    assert not store.has_recipe("NON-ESISTE")
+
+
+def test_recipe_store_list_books(store):
+    store.save_recipe(_recipe())
+    other = _recipe()
+    other.book = "SNAI"
+    store.save_recipe(other)
+    assert store.list_books() == ["SISAL", "SNAI"]
+
+
+def test_recipe_store_ignores_unknown_step_keys(store):
+    with open(store.path, "w", encoding="utf-8") as f:
+        json.dump({"SISAL": {"login_url": "https://m.sisal.it", "steps": [
+            {"action": "tap_button", "target_text": "Accedi", "campo_nuovo": 1}]}}, f)
+    res = store.load_recipe("SISAL")
+    assert res.success and res.data.steps[0].target_text == "Accedi"
+
+
+def test_recipe_store_rejects_invalid_step(store):
+    with open(store.path, "w", encoding="utf-8") as f:
+        json.dump({"SISAL": {"login_url": "https://m.sisal.it", "steps": [{"action": "tap_button"}]}}, f)
+    res = store.load_recipe("SISAL")
+    assert not res.success and res.error_code == "RECIPE_INVALID"
+
+
+def test_recipe_store_corrupt_file_is_not_overwritten(store):
+    with open(store.path, "w", encoding="utf-8") as f:
+        f.write("{ non json")
+    assert store.load_recipe("SISAL").error_code == "RECIPE_FILE_CORRUPT"
+    assert store.save_recipe(_recipe()).error_code == "RECIPE_FILE_CORRUPT"
+    with open(store.path, encoding="utf-8") as f:
+        assert f.read() == "{ non json"

@@ -1,0 +1,139 @@
+"""Funzioni pure per leggere una ScreenContent: matching a parola intera e geometria label -> EditText.
+
+Condivise da LoginExecutor e LoginMapper. Limite noto di ScreenReader: scarta i nodi
+senza text e senza resource-id, quindi un EditText vuoto e anonimo non e' visibile.
+"""
+import re
+from typing import Optional
+
+from orchestrator.modules.screen_reader.interface import ScreenContent, UIElement
+
+EDIT_TEXT_CLASS = "android.widget.EditText"
+
+
+def word_in_text(word: str, text: str) -> bool:
+    """Parola intera: "PIN" non matcha in "Wrappin'", "Esci" non matcha in "Uscire"."""
+    return re.search(r"(?<!\w)" + re.escape(word.lower()) + r"(?!\w)", text.lower()) is not None
+
+
+def has_indicators(screen_content: Optional[ScreenContent], indicators: list[str]) -> bool:
+    """Almeno uno degli indicatori e' presente (parola intera) in un elemento della schermata."""
+    if screen_content is None:
+        return False
+    return any(word_in_text(ind, e.text) for ind in indicators for e in screen_content.elements)
+
+
+def valid_bounds(bounds) -> bool:
+    return bool(bounds) and len(bounds) == 4 and any(bounds)
+
+
+def element_center(bounds) -> Optional[tuple[int, int]]:
+    """Centro [x1,y1,x2,y2] come coordinate intere di tap, None se i bounds non sono validi."""
+    if not valid_bounds(bounds):
+        return None
+    x1, y1, x2, y2 = bounds
+    return (x1 + x2) // 2, (y1 + y2) // 2
+
+
+def find_element_by_text(screen_content: ScreenContent, text: str) -> Optional[UIElement]:
+    """Elemento non-EditText il cui testo contiene `text` (parola intera, case-insensitive).
+
+    Preferenza: testo identico, poi classe Button, poi il testo piu' corto, poi il primo
+    nell'ordine del documento. Cosi' "Accedi" esatto batte "Accedi per vedere il saldo" e,
+    a parita', il Button di submit batte il titolo "Accedi" della pagina.
+    """
+    best = None
+    for e in screen_content.elements:
+        if e.class_name == EDIT_TEXT_CLASS or not e.text.strip() or not valid_bounds(e.bounds):
+            continue
+        if not word_in_text(text, e.text):
+            continue
+        exact = e.text.strip().lower() == text.strip().lower()
+        is_button = bool(e.class_name) and "Button" in e.class_name
+        rank = (not exact, not is_button, len(e.text))
+        if best is None or rank < best[0]:
+            best = (rank, e)
+    return best[1] if best else None
+
+
+def edittext_match(label_element: UIElement, elements: list[UIElement]):
+    """(EditText, contenuta, distanza) o None se la label non ha bounds o non c'e' nessun EditText."""
+    if not valid_bounds(label_element.bounds):
+        return None
+    edits = [e for e in elements if e.class_name == EDIT_TEXT_CLASS and valid_bounds(e.bounds)]
+    if not edits:
+        return None
+    lx1, ly1, lx2, ly2 = label_element.bounds
+    cx, cy = (lx1 + lx2) / 2, (ly1 + ly2) / 2
+
+    containing = [e for e in edits
+                  if e.bounds[0] <= cx <= e.bounds[2] and e.bounds[1] <= cy <= e.bounds[3]]
+    if containing:
+        smallest = min(containing, key=lambda e: (e.bounds[2] - e.bounds[0]) * (e.bounds[3] - e.bounds[1]))
+        return smallest, True, 0.0
+
+    def distance(e: UIElement) -> float:
+        ex, ey = (e.bounds[0] + e.bounds[2]) / 2, (e.bounds[1] + e.bounds[3]) / 2
+        return ((ex - cx) ** 2 + (ey - cy) ** 2) ** 0.5
+
+    nearest = min(edits, key=distance)
+    return nearest, False, distance(nearest)
+
+
+def find_nearest_edittext(label_element: UIElement, elements: list[UIElement]) -> Optional[UIElement]:
+    """EditText associato a una label per geometria.
+
+    1. Se un EditText contiene la label (centro nei suoi bounds) -> quello (il piu' piccolo)
+    2. Altrimenti il piu' vicino per distanza euclidea tra i centri
+    3. Nessun EditText -> None
+    """
+    hit = edittext_match(label_element, elements)
+    return hit[0] if hit else None
+
+
+def find_field_by_label(screen_content: ScreenContent, label: str) -> Optional[UIElement]:
+    """EditText del campo con quella label.
+
+    Prima la label come elemento separato (es. Sisal: EditText vuoto + View "Email / Username"),
+    associata all'EditText per geometria; con piu' label candidate vince quella identica,
+    poi quella dentro il campo, poi la piu' vicina, poi la piu' corta ("Hai dimenticato la
+    password?" non batte "Password"). Fallback: EditText con la label nel proprio text/resource_id.
+    """
+    elements = screen_content.elements
+    best = None
+    for e in elements:
+        if e.class_name == EDIT_TEXT_CLASS or not e.text.strip() or not word_in_text(label, e.text):
+            continue
+        hit = edittext_match(e, elements)
+        if hit is None:
+            continue
+        edit, contained, distance = hit
+        exact = e.text.strip().lower() == label.strip().lower()
+        rank = (not exact, not contained, distance, len(e.text))
+        if best is None or rank < best[0]:
+            best = (rank, edit)
+    if best:
+        return best[1]
+
+    wanted = label.strip().lower()
+    for e in elements:
+        if e.class_name == EDIT_TEXT_CLASS and valid_bounds(e.bounds) and (
+                word_in_text(label, e.text) or wanted in (e.resource_id or "").lower()):
+            return e
+    return None
+
+
+def is_field_filled(screen_content: ScreenContent, field: UIElement, label: str) -> bool:
+    """Il campo (stessi bounds o stesso resource_id) ora ha un testo diverso dalla label.
+
+    Non confronta con il testo di prima: se l'autofill del campo precedente ha gia'
+    riempito anche questo, il testo non cambia ma il campo e' comunque riempito.
+    """
+    for e in screen_content.elements:
+        if e.class_name != EDIT_TEXT_CLASS:
+            continue
+        same = e.bounds == field.bounds or (field.resource_id and e.resource_id == field.resource_id)
+        if same:
+            now = e.text.strip().lower()
+            return bool(now) and now != label.strip().lower()
+    return False

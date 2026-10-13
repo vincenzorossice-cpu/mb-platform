@@ -31,19 +31,15 @@ class TestBookNavigation(unittest.TestCase):
         self.assertEqual(set(BOOK_NAVIGATION.keys()), NETCAP_BOOKMAKERS)
 
     # LOGIN-MANAGER
-    def test_manual_login_default_false(self):
-        for name, cfg in BOOK_NAVIGATION.items():
-            self.assertIn("needs_manual_login", cfg, name)
-            self.assertFalse(cfg["needs_manual_login"], name)
-
-    # LOGIN-MANAGER
-    def test_login_config_fields(self):
+    def test_login_url_field_present(self):
         for name, cfg in BOOK_NAVIGATION.items():
             self.assertIn("login_url", cfg, name)
-            labels = cfg["login_form_labels"]
-            for key in ("username_label", "password_label", "submit_label"):
-                self.assertTrue(labels.get(key), f"{name} manca {key}")
-            self.assertTrue(cfg["logged_in_indicators"], name)
+
+    # LOGIN-MANAGER: i passaggi del login stanno nei recipe, non in BOOK_NAVIGATION
+    def test_obsolete_login_fields_removed(self):
+        for name, cfg in BOOK_NAVIGATION.items():
+            for field in ("needs_manual_login", "login_form_labels", "logged_in_indicators"):
+                self.assertNotIn(field, cfg, f"{name} ha ancora '{field}'")
 
 
 if __name__ == "__main__":
