@@ -70,6 +70,7 @@ class LoginMapper:
     MAX_STEPS = 10
     STEP_WAIT = 3         # attesa dopo ogni azione
     PAGE_LOAD_WAIT = 3    # dopo l'apertura del book
+    LOGIN_FAILED_RETRY_WAIT = 5  # prima di richiedere a GPT dopo un login_failed
     MAX_REPEATS = 3       # azioni identiche consecutive: oltre, MAP_STUCK (non martellare il submit)
     MAX_UI_ELEMENTS = 80
     MAX_UI_TEXT = 60
@@ -90,7 +91,9 @@ class LoginMapper:
         model: str = "gpt-4o",
         book_navigator: Optional[BookNavigator] = None,
         recipe_store: Optional[RecipeStore] = None,
+        max_login_failed_retries: int = 2,
     ):
+        self.max_login_failed_retries = max(1, int(max_login_failed_retries))
         self.screen_reader = screen_reader
         self.touch_injector = touch_injector
         self.openai_api_key = openai_api_key or os.environ.get("OPENAI_API_KEY")
@@ -107,7 +110,10 @@ class LoginMapper:
 
         1. Apre il book (BookNavigator.open_chrome)
         2. Loop GPT-guided (max MAX_STEPS): screenshot + elementi UI -> azione -> esecuzione -> attesa
-           - "done" -> login completato; "login_failed" -> fail
+           - "done" -> login completato
+           - "login_failed" -> NON si ferma subito: attende 5s, nuovo screenshot, nuovo step GPT.
+             Fail solo con max_login_failed_retries (default 2) risposte login_failed consecutive;
+             se GPT cambia risposta il mapping continua. Il retry conta nei MAX_STEPS.
         3. Genera il recipe dagli step eseguiti e lo salva nel RecipeStore
         """
         if not self.openai_api_key:
@@ -128,6 +134,7 @@ class LoginMapper:
         seen_texts: set[str] = set()  # testi delle schermate precedenti (per gli indicatori finali)
         pending: Optional[dict] = None
         last_key, repeats = None, 0
+        failed_streak = 0  # risposte login_failed consecutive
         has_captcha, captcha_type = False, None
 
         for step_num in range(1, self.MAX_STEPS + 1):
@@ -160,8 +167,19 @@ class LoginMapper:
                 return Result.ok(recipe)
 
             if data["status"] == "failed":
-                reason = _EMAIL.sub("<email>", data.get("description") or "")
-                return Result.fail(f"GPT ha rilevato un login fallito: {reason}".strip(), "MAP_LOGIN_FAILED")
+                # GPT puo' sbagliare (testo marketing, schermata ambigua): si conferma solo dopo
+                # max_login_failed_retries risposte consecutive. Nessuna azione su questo giro, e la
+                # schermata non entra in seen_texts (se la pagina era gia' loggata, gli indicatori
+                # finali verrebbero esclusi).
+                failed_streak += 1
+                if failed_streak >= self.max_login_failed_retries:
+                    reason = _EMAIL.sub("<email>", data.get("description") or "")
+                    return Result.fail(
+                        f"GPT ha confermato il login fallito ({failed_streak} risposte consecutive): "
+                        f"{reason}".strip(), "MAP_LOGIN_FAILED")
+                time.sleep(self.LOGIN_FAILED_RETRY_WAIT)
+                continue
+            failed_streak = 0
 
             key = (data["action"], data["target_text"], data["target_label"], data["x"], data["y"])
             repeats = repeats + 1 if key == last_key else 1

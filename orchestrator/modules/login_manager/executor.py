@@ -28,6 +28,7 @@ class LoginExecutor:
     """
 
     PAGE_LOAD_WAIT = 3
+    VERIFY_RETRY_WAIT = 3  # verify_login: attesa prima della rilettura se la schermata e' ambigua
 
     # Pulsanti presenti solo da sloggati: se ce n'e' uno la sessione NON e' attiva,
     # anche se un testo marketing contiene un indicatore di sessione.
@@ -56,17 +57,44 @@ class LoginExecutor:
     # PUBLIC
     # --------------------------------------------------------
 
-    def perform_login(self, device_id: str, book: str) -> Result[LoginResult]:
-        """Flusso completo: recipe -> apri il book -> check sessione -> esegui recipe -> verifica."""
+    def perform_login(self, device_id: str, book: str, lock_device: bool = True) -> Result[LoginResult]:
+        """Flusso completo: recipe -> apri il book -> check sessione -> esegui recipe -> verifica.
+
+        lock_device=False: non prende il lock del DeviceManager (il device e' gia' del chiamante,
+        il lock non e' rientrante). Un solo tentativo di submit, nessun retry.
+        """
         book_key = self._book_key(book)
-        if self.device_manager is not None:
+        use_lock = lock_device and self.device_manager is not None
+        if use_lock:
             if not self.device_manager.acquire_lock(device_id, f"login:{book_key}"):
                 return Result.fail(f"Device {device_id} occupato", "DEVICE_BUSY")
         try:
             return self._perform_login_locked(device_id, book_key)
         finally:
-            if self.device_manager is not None:
+            if use_lock:
                 self.device_manager.release_lock(device_id)
+
+    def ensure_logged_in(self, device_id: str, book: str) -> Result[LoginResult]:
+        """Verifica che la sessione sia attiva e, se scaduta, rifa il login.
+
+        1. check_session
+        2. LOGGED_IN -> ritorna LOGGED_IN
+        3. LOGIN_REQUIRED -> perform_login (un solo tentativo) e ritorna il suo esito
+           (LOGIN_SUCCESS, LOGIN_FAILED, CAPTCHA_DETECTED, ...)
+        4. Qualunque altro stato (CAPTCHA, 2FA, AMBIGUOUS, NAVIGATION_FAILED, ...): ritornato cosi' com'e'
+        Per sapere se si e' dentro: LoginResult.is_logged_in (LOGGED_IN o LOGIN_SUCCESS).
+
+        Da chiamare prima di ogni operazione sul book e quando la sessione puo' essere scaduta a meta'
+        operazione. Attenzione:
+        - check_session NAVIGA a login_url: il telefono esce dalla pagina corrente (es. un gioco);
+          dopo la chiamata il chiamante deve riportarlo dove serviva.
+        - il device e' del chiamante, che di solito tiene gia' il lock: qui il login non lo riprende
+          (il lock del DeviceManager non e' rientrante e darebbe sempre DEVICE_BUSY).
+        """
+        checked = self.check_session(device_id, book)
+        if not checked.success or checked.data.status != LoginStatus.LOGIN_REQUIRED:
+            return checked  # LOGGED_IN, oppure uno stato che il login non risolve, oppure un errore
+        return self.perform_login(device_id, book, lock_device=False)
 
     def check_session(self, device_id: str, book: str) -> Result[LoginResult]:
         """Apre il book e legge la schermata per capire se la sessione e' attiva.
@@ -90,18 +118,29 @@ class LoginExecutor:
     def verify_login(self, device_id: str, book: str) -> Result[LoginResult]:
         """Verifica il login leggendo la schermata post-login.
 
-        CAPTCHA/2FA -> LOGIN_FAILED_INDICATORS (LOGIN_FAILED) -> LOGGED_IN_INDICATORS
-        (LOGIN_SUCCESS) -> AMBIGUOUS.
+        CAPTCHA/2FA -> LOGIN_FAILED_INDICATORS (LOGIN_FAILED) -> LOGGED_IN_INDICATORS (LOGIN_SUCCESS).
+        Se la schermata e' ambigua (la pagina puo' non aver finito di caricare) attende
+        VERIFY_RETRY_WAIT secondi e rilegge UNA volta; ancora ambigua -> AMBIGUOUS.
+        Gli esiti definitivi non aspettano.
         """
         book_key = self._book_key(book)
         recipe_res = self.recipe_store.load_recipe(book_key)
         recipe = recipe_res.data if recipe_res.success else None
 
-        screen_res = self._read(device_id)
-        if not screen_res.success:
-            return Result.fail(screen_res.error, screen_res.error_code)
-        screen = screen_res.data
+        for attempt in range(2):
+            screen_res = self._read(device_id)
+            if not screen_res.success:
+                return Result.fail(screen_res.error, screen_res.error_code)
+            outcome = self._evaluate_login_screen(screen_res.data, book_key, device_id, recipe)
+            if outcome is not None:
+                return outcome
+            if attempt == 0:
+                time.sleep(self.VERIFY_RETRY_WAIT)
+        return self._hitl(LoginStatus.AMBIGUOUS, book_key, device_id, "Esito del login non determinabile")
 
+    def _evaluate_login_screen(self, screen: ScreenContent, book_key: str, device_id: str,
+                               recipe: Optional[LoginRecipe]) -> Optional[Result[LoginResult]]:
+        """Esito del login dalla schermata, o None se ambigua."""
         if self._detect_captcha(screen):
             return self._hitl(LoginStatus.CAPTCHA_DETECTED, book_key, device_id, "CAPTCHA rilevato")
         if self._detect_2fa(screen):
@@ -112,7 +151,7 @@ class LoginExecutor:
                               "Credenziali errate o login rifiutato")
         if self._has_indicators(screen, self._logged_in_indicators(recipe)):
             return Result.ok(LoginResult(LoginStatus.LOGIN_SUCCESS, book_key, device_id, "Login riuscito"))
-        return self._hitl(LoginStatus.AMBIGUOUS, book_key, device_id, "Esito del login non determinabile")
+        return None
 
     # --------------------------------------------------------
     # INTERNAL: flow

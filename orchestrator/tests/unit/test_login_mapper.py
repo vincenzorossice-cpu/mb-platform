@@ -199,14 +199,85 @@ def test_map_book_login_max_steps(mapper, parts, store):
 
 
 def test_map_book_login_login_failed(mapper, parts, store):
+    # login_failed va confermato: serve una seconda risposta login_failed consecutiva
     _screens(parts, HOME, LOGIN_PAGE)
     client = _client(_act("tap_button", target_text="Accedi"),
+                     _act("login_failed", description="Credenziali errate per mario@example.it"),
                      _act("login_failed", description="Credenziali errate per mario@example.it"))
     with patch(OPENAI_PATH, return_value=client):
         res = mapper.map_book_login(DEVICE, BOOK)
     assert res.error_code == "MAP_LOGIN_FAILED"
+    assert "2 risposte consecutive" in res.error
     assert "mario@example.it" not in res.error
+    assert client.chat.completions.create.call_count == 3
     assert not store.has_recipe(BOOK)
+
+
+def test_map_book_login_login_failed_then_done_continues(mapper, parts, store):
+    # falso positivo di GPT: la pagina e' gia' loggata ma al primo giro dice login_failed
+    _screens(parts, HOME, LOGGED_IN, LOGGED_IN)
+    client = _client(_act("tap_button", target_text="Accedi"), _act("login_failed"), _act("done"))
+    with patch("orchestrator.modules.login_manager.mapper.time.sleep") as sleep, \
+         patch(OPENAI_PATH, return_value=client):
+        res = mapper.map_book_login(DEVICE, BOOK)
+    assert res.success
+    assert [s.action for s in res.data.steps] == ["tap_button"]
+    assert store.has_recipe(BOOK)
+    sleep.assert_any_call(5)  # attesa prima della nuova richiesta a GPT
+    assert client.chat.completions.create.call_count == 3
+    # la schermata del giro login_failed non entra in seen_texts: gli indicatori finali restano
+    assert "Deposita" in res.data.logged_in_indicators
+
+
+def test_map_book_login_login_failed_executes_nothing(mapper, parts):
+    _screens(parts, HOME)
+    client = _client(_act("login_failed"), _act("login_failed"))
+    with patch(OPENAI_PATH, return_value=client):
+        res = mapper.map_book_login(DEVICE, BOOK)
+    assert res.error_code == "MAP_LOGIN_FAILED"
+    parts[1].tap_coordinates.assert_not_called()  # nessun nuovo submit sui giri login_failed
+    parts[0]._screenshot.assert_called()
+    assert parts[0]._screenshot.call_count == 2  # nuovo screenshot a ogni giro
+
+
+def test_map_book_login_login_failed_not_consecutive(mapper, parts, store):
+    _screens(parts, HOME, HOME, LOGIN_PAGE, LOGGED_IN)
+    client = _client(_act("login_failed"),                      # 1a (streak 1)
+                     _act("tap_button", target_text="Accedi"),  # azione: azzera il contatore
+                     _act("login_failed"),                      # di nuovo la 1a, non si conferma
+                     _act("done"))
+    with patch(OPENAI_PATH, return_value=client):
+        res = mapper.map_book_login(DEVICE, BOOK)
+    assert res.success and store.has_recipe(BOOK)
+
+
+def test_map_book_login_max_login_failed_retries_configurable(parts, store):
+    _screens(parts, HOME)
+    immediate = LoginMapper(parts[0], parts[1], openai_api_key="sk-test", book_navigator=parts[2],
+                            recipe_store=store, max_login_failed_retries=1)
+    client = _client(_act("login_failed"))
+    with patch(OPENAI_PATH, return_value=client):
+        res = immediate.map_book_login(DEVICE, BOOK)
+    assert res.error_code == "MAP_LOGIN_FAILED" and client.chat.completions.create.call_count == 1
+
+    patient = LoginMapper(parts[0], parts[1], openai_api_key="sk-test", book_navigator=parts[2],
+                          recipe_store=store, max_login_failed_retries=3)
+    client = _client(*[_act("login_failed")] * 3)
+    with patch(OPENAI_PATH, return_value=client):
+        res = patient.map_book_login(DEVICE, BOOK)
+    assert res.error_code == "MAP_LOGIN_FAILED" and client.chat.completions.create.call_count == 3
+    assert "3 risposte consecutive" in res.error
+
+
+def test_map_book_login_login_failed_retries_count_in_max_steps(parts, store):
+    _screens(parts, HOME)
+    mapper = LoginMapper(parts[0], parts[1], openai_api_key="sk-test", book_navigator=parts[2],
+                         recipe_store=store, max_login_failed_retries=50)
+    client = _client(*[_act("login_failed")] * 10)
+    with patch(OPENAI_PATH, return_value=client):
+        res = mapper.map_book_login(DEVICE, BOOK)
+    assert res.error_code == "MAP_MAX_STEPS"
+    assert client.chat.completions.create.call_count == 10
 
 
 def test_map_book_login_stuck_stops_hammering_submit(mapper, parts):

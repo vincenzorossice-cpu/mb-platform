@@ -17,6 +17,10 @@ class LoginStatus(Enum):
     NAVIGATION_FAILED = "navigation_failed"
 
 
+# "Sono dentro": sessione gia' attiva oppure login appena riuscito.
+LOGGED_IN_STATUSES = (LoginStatus.LOGGED_IN, LoginStatus.LOGIN_SUCCESS)
+
+
 @dataclass
 class LoginResult:
     status: LoginStatus
@@ -25,3 +29,7 @@ class LoginResult:
     message: str
     screenshot_path: Optional[str] = None  # screenshot per HITL
     details: Optional[dict] = None
+
+    @property
+    def is_logged_in(self) -> bool:
+        return self.status in LOGGED_IN_STATUSES

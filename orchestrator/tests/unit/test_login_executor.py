@@ -7,7 +7,7 @@ import pytest
 from orchestrator.core.result import Result
 from orchestrator.modules.login_manager import ui_helpers
 from orchestrator.modules.login_manager.executor import LoginExecutor
-from orchestrator.modules.login_manager.interface import LoginStatus
+from orchestrator.modules.login_manager.interface import LOGGED_IN_STATUSES, LoginResult, LoginStatus
 from orchestrator.modules.login_manager.recipe import LoginRecipe, LoginStep, RecipeStore
 from orchestrator.modules.screen_reader.interface import ScreenContent, UIElement
 
@@ -452,3 +452,154 @@ def test_recipe_store_corrupt_file_is_not_overwritten(store):
     assert store.save_recipe(_recipe()).error_code == "RECIPE_FILE_CORRUPT"
     with open(store.path, encoding="utf-8") as f:
         assert f.read() == "{ non json"
+
+
+# ---------------- verify_login: una rilettura se la pagina non ha finito di caricare ----------------
+
+def test_verify_login_ambiguous_then_success(executor, parts):
+    _set_screens(parts, NEUTRAL_SCREEN, LOGGED_IN_SCREEN)
+    with patch("orchestrator.modules.login_manager.executor.time.sleep") as sleep:
+        res = executor.verify_login(DEVICE, BOOK)
+    assert res.data.status == LoginStatus.LOGIN_SUCCESS
+    assert parts[0].read_screen.call_count == 2
+    sleep.assert_called_once_with(3)
+    parts[0]._screenshot.assert_not_called()  # lo screenshot HITL scatta solo per l'esito finale ambiguo
+
+
+def test_verify_login_ambiguous_then_failed(executor, parts):
+    _set_screens(parts, NEUTRAL_SCREEN, LOGIN_FAILED_SCREEN)
+    res = executor.verify_login(DEVICE, BOOK)
+    assert res.data.status == LoginStatus.LOGIN_FAILED
+    assert parts[0].read_screen.call_count == 2
+
+
+def test_verify_login_still_ambiguous(executor, parts):
+    _set_screens(parts, NEUTRAL_SCREEN, NEUTRAL_SCREEN)
+    res = executor.verify_login(DEVICE, BOOK)
+    assert res.data.status == LoginStatus.AMBIGUOUS
+    assert parts[0].read_screen.call_count == 2  # una sola rilettura, non di piu'
+    assert parts[0]._screenshot.call_count == 1
+
+
+@pytest.mark.parametrize("screen, status", [
+    (LOGGED_IN_SCREEN, LoginStatus.LOGIN_SUCCESS),
+    (LOGIN_FAILED_SCREEN, LoginStatus.LOGIN_FAILED),
+    (CAPTCHA_SCREEN, LoginStatus.CAPTCHA_DETECTED),
+    (TWO_FA_SCREEN, LoginStatus.TWO_FA_REQUIRED),
+])
+def test_verify_login_definitive_outcome_does_not_wait(executor, parts, screen, status):
+    _set_screens(parts, screen)
+    with patch("orchestrator.modules.login_manager.executor.time.sleep") as sleep:
+        res = executor.verify_login(DEVICE, BOOK)
+    assert res.data.status == status
+    assert parts[0].read_screen.call_count == 1
+    sleep.assert_not_called()
+
+
+def test_verify_login_second_read_error_is_propagated(executor, parts):
+    parts[0].read_screen.side_effect = [Result.ok(NEUTRAL_SCREEN), Result.fail("boom", "ADB_TIMEOUT")]
+    res = executor.verify_login(DEVICE, BOOK)
+    assert not res.success and res.error_code == "ADB_TIMEOUT"
+
+
+def test_perform_login_page_loads_late(executor, parts, store):
+    store.save_recipe(_recipe())
+    _set_screens(parts, _home_screen(), _home_screen(),
+                 _login_page(), _login_page("mario@example.it"),
+                 _login_page("mario@example.it"), _login_page("mario@example.it", "••••••••"),
+                 _login_page("mario@example.it", "••••••••"),
+                 NEUTRAL_SCREEN, LOGGED_IN_SCREEN)  # prima lettura post-submit: pagina non ancora caricata
+    res = executor.perform_login(DEVICE, BOOK)
+    assert res.data.status == LoginStatus.LOGIN_SUCCESS
+
+
+# ---------------- ensure_logged_in: sessioni che scadono a meta' operazione ----------------
+
+def _status_result(status):
+    return Result.ok(LoginResult(status, BOOK, DEVICE, "x"))
+
+
+def test_ensure_logged_in_already_active(executor, parts):
+    _set_screens(parts, LOGGED_IN_SCREEN)  # senza recipe: check_session usa BOOK_NAVIGATION
+    res = executor.ensure_logged_in(DEVICE, BOOK)
+    assert res.data.status == LoginStatus.LOGGED_IN and res.data.is_logged_in
+    parts[1].tap_coordinates.assert_not_called()
+
+
+def test_ensure_logged_in_needs_login(executor):
+    with patch.object(executor, "check_session", return_value=_status_result(LoginStatus.LOGIN_REQUIRED)), \
+         patch.object(executor, "perform_login", return_value=_status_result(LoginStatus.LOGIN_SUCCESS)) as perform:
+        res = executor.ensure_logged_in(DEVICE, BOOK)
+    assert res.data.status == LoginStatus.LOGIN_SUCCESS and res.data.is_logged_in
+    perform.assert_called_once_with(DEVICE, BOOK, lock_device=False)
+
+
+def test_ensure_logged_in_login_fails(executor):
+    with patch.object(executor, "check_session", return_value=_status_result(LoginStatus.LOGIN_REQUIRED)), \
+         patch.object(executor, "perform_login", return_value=_status_result(LoginStatus.LOGIN_FAILED)):
+        res = executor.ensure_logged_in(DEVICE, BOOK)
+    assert res.data.status == LoginStatus.LOGIN_FAILED and not res.data.is_logged_in
+
+
+@pytest.mark.parametrize("status", [
+    LoginStatus.CAPTCHA_DETECTED, LoginStatus.TWO_FA_REQUIRED, LoginStatus.AMBIGUOUS,
+    LoginStatus.NAVIGATION_FAILED,
+])
+def test_ensure_logged_in_other_states_are_returned_without_login(executor, status):
+    with patch.object(executor, "check_session", return_value=_status_result(status)), \
+         patch.object(executor, "perform_login") as perform:
+        res = executor.ensure_logged_in(DEVICE, BOOK)
+    assert res.data.status == status
+    perform.assert_not_called()
+
+
+def test_ensure_logged_in_check_session_error_is_propagated(executor):
+    failure = Result.fail("lettura fallita", "ADB_TIMEOUT")
+    with patch.object(executor, "check_session", return_value=failure), \
+         patch.object(executor, "perform_login") as perform:
+        res = executor.ensure_logged_in(DEVICE, BOOK)
+    assert not res.success and res.error_code == "ADB_TIMEOUT"
+    perform.assert_not_called()
+
+
+def test_ensure_logged_in_recipe_not_found(executor, parts):
+    _set_screens(parts, _home_screen())  # sloggato, ma il book non e' mai stato mappato
+    res = executor.ensure_logged_in(DEVICE, BOOK)
+    assert res.data.status == LoginStatus.RECIPE_NOT_FOUND
+
+
+def test_ensure_logged_in_full_relogin(executor, parts, store):
+    store.save_recipe(_recipe())
+    _set_screens(parts, _home_screen(),                                   # check_session
+                 _home_screen(), _home_screen(),                          # perform_login: apertura + step 1
+                 _login_page(), _login_page("mario@example.it"),
+                 _login_page("mario@example.it"), _login_page("mario@example.it", "••••••••"),
+                 _login_page("mario@example.it", "••••••••"), LOGGED_IN_SCREEN)
+    res = executor.ensure_logged_in(DEVICE, BOOK)
+    assert res.data.status == LoginStatus.LOGIN_SUCCESS and res.data.is_logged_in
+    assert _taps(parts) == [(890, 85), (540, 685), (540, 855), (540, 1165)]
+
+
+def test_ensure_logged_in_does_not_retake_the_device_lock(parts, store):
+    # chi chiama ensure_logged_in sta gia' facendo l'operazione e tiene il lock (non rientrante)
+    store.save_recipe(_recipe())
+    dm = MagicMock()
+    dm.acquire_lock.return_value = False
+    ex = LoginExecutor(parts[0], parts[1], book_navigator=parts[2], recipe_store=store, device_manager=dm)
+    _set_screens(parts, _home_screen(), _home_screen(), _home_screen(),
+                 _login_page(), _login_page("mario@example.it"),
+                 _login_page("mario@example.it"), _login_page("mario@example.it", "••••••••"),
+                 _login_page("mario@example.it", "••••••••"), LOGGED_IN_SCREEN)
+    res = ex.ensure_logged_in(DEVICE, BOOK)
+    assert res.data.status == LoginStatus.LOGIN_SUCCESS
+    dm.acquire_lock.assert_not_called()
+    dm.release_lock.assert_not_called()
+    # perform_login chiamato direttamente continua a prendere il lock
+    assert ex.perform_login(DEVICE, BOOK).error_code == "DEVICE_BUSY"
+
+
+def test_login_result_is_logged_in():
+    assert set(LOGGED_IN_STATUSES) == {LoginStatus.LOGGED_IN, LoginStatus.LOGIN_SUCCESS}
+    for status in LoginStatus:
+        result = LoginResult(status, BOOK, DEVICE, "x")
+        assert result.is_logged_in == (status in LOGGED_IN_STATUSES)
