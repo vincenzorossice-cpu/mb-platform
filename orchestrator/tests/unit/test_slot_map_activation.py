@@ -60,7 +60,8 @@ def _setup(tmp_path, explorer, **kw):
 def _args(**kw):
     base = dict(device="D1", book="SISAL", promo_name="P", slot_name="Wrap", target=1.0, max_steps=20, url="u",
                 demo=True, already_active=True, not_active=False, live=False, no_gpt=False, no_hitl=False,
-                no_save_steps=True, log_dir="logs", min_bet=0.2, nav_direct=False, reset_slot_memory=False)
+                no_save_steps=True, log_dir="logs", min_bet=0.2, nav_direct=False, reset_slot_memory=False,
+                skip_login=True)
     base.update(kw)
     return argparse.Namespace(**base)
 

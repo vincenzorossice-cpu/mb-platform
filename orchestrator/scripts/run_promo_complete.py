@@ -3,9 +3,14 @@
 
 Riusa ScreenNavigator (fasi 1-4) e SlotAutoPilot/play_session (fasi 5-7) senza modificarli.
 
+PRIMA della navigazione si controlla la sessione del book e, se e' scaduta, si rifa il login (LoginExecutor con il
+recipe del book; se il book non ha ancora un recipe lo mappa il LoginMapper con GPT). --skip-login salta tutto
+(comportamento di prima); --login-only fa solo il login e si ferma (serve per mappare un book nuovo senza giocare).
+
 Uso:
     python -m orchestrator.scripts.run_promo_complete --device ZE223HNBKJ --book SISAL \
         --promo-name "Happy Monday" --slot-name "Break The Diamond Piggy" --target 30 --max-steps 200 --demo
+    python -m orchestrator.scripts.run_promo_complete --device ZE223HNBKJ --book SISAL --login-only
 """
 import argparse
 import logging
@@ -16,6 +21,9 @@ from decimal import Decimal
 
 from orchestrator.core import model_metrics
 from orchestrator.core.result import Result
+from orchestrator.modules.login_manager.executor import LoginExecutor
+from orchestrator.modules.login_manager.interface import LoginResult, LoginStatus
+from orchestrator.modules.login_manager.mapper import LoginMapper
 from orchestrator.modules.slot_autopilot.session import _setup_of
 from orchestrator.modules.slot_autopilot.slot_intro import build_slot_intro
 from orchestrator.scripts import run_autopilot
@@ -33,9 +41,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Navigazione + gioco di una promo casino in un solo comando.")
     parser.add_argument("--device", required=True, help="ID del dispositivo ADB.")
     parser.add_argument("--book", default="SISAL")
-    parser.add_argument("--promo-name", required=True)
-    parser.add_argument("--slot-name", required=True)
-    parser.add_argument("--target", type=float, required=True, help="Importo target da giocare (EUR).")
+    # Obbligatori tranne con --login-only (si controlla dopo il parsing, con lo stesso messaggio di argparse).
+    parser.add_argument("--promo-name")
+    parser.add_argument("--slot-name")
+    parser.add_argument("--target", type=float, help="Importo target da giocare (EUR).")
     parser.add_argument("--max-steps", type=int, default=200, help="Massimo passi di navigazione e di spin.")
     parser.add_argument("--url", default=nav_script.SISAL_PROMOTIONS_URL)
     parser.add_argument("--demo", action="store_true", help="Obbligatorio: la slot si apre in demo (Prova), mai soldi veri.")
@@ -53,7 +62,19 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--no-hitl", action="store_true", help="Niente operatore da terminale: se serve aiuto ci si ferma.")
     parser.add_argument("--no-save-steps", action="store_true")
     parser.add_argument("--log-dir", default="logs")
-    return parser.parse_args(argv)
+    login = parser.add_mutually_exclusive_group()
+    login.add_argument("--skip-login", action="store_true",
+                       help="Non controlla ne' rifa il login prima della navigazione (si assume il telefono gia' loggato).")
+    login.add_argument("--login-only", action="store_true",
+                       help="Fa solo il login (mappandolo con GPT se il book non ha un recipe) e si ferma: niente "
+                            "navigazione, niente gioco, niente --demo. Utile la prima volta su un book nuovo.")
+    args = parser.parse_args(argv)
+    if not args.login_only:
+        missing = [flag for flag, value in (("--promo-name", args.promo_name), ("--slot-name", args.slot_name),
+                                            ("--target", args.target)) if value is None]
+        if missing:
+            parser.error("the following arguments are required: " + ", ".join(missing))
+    return args
 
 
 def _client_cost(client) -> tuple:
@@ -167,6 +188,12 @@ def make_reenter(args, navigation_client, autopilot):
     import copy
 
     def reenter(device_id: str) -> Result[bool]:
+        if not getattr(args, "skip_login", False):
+            # Il sito ci ha cacciati (sessione scaduta?): senza login il rientro fallirebbe. Qui non si mappa.
+            login = login_before_navigation(args, autopilot.screen_reader, autopilot.touch_injector, autopilot,
+                                            allow_mapping=False)
+            if not login.success:
+                return Result.fail(f"login di rientro fallito: {login.error}", login.error_code)
         rejoin_args = copy.copy(args)
         rejoin_args.already_active, rejoin_args.not_active = True, False
         nav = navigate_to_slot(rejoin_args, navigation_client, autopilot.screen_reader, autopilot.touch_injector)
@@ -193,7 +220,139 @@ def _ask_intro_help(autopilot, args) -> str:
         return "stop"
 
 
+# Stati del login che richiedono una persona (CAPTCHA, credenziali, autofill, recipe rotto, schermata ambigua).
+_LOGIN_OPERATOR_STATUSES = (
+    LoginStatus.LOGIN_FAILED, LoginStatus.CAPTCHA_DETECTED, LoginStatus.TWO_FA_REQUIRED,
+    LoginStatus.AUTOFILL_FAILED, LoginStatus.RECIPE_STEP_FAILED, LoginStatus.AMBIGUOUS,
+)
+
+
+def _login_problem_text(status, book) -> str:
+    return {
+        LoginStatus.LOGIN_FAILED: "Login: fallito (credenziali errate o login rifiutato)",
+        LoginStatus.CAPTCHA_DETECTED: "Login: CAPTCHA rilevato, richiesto intervento operatore",
+        LoginStatus.TWO_FA_REQUIRED: "Login: 2FA richiesta, richiesto intervento operatore",
+        LoginStatus.AUTOFILL_FAILED: "Login: Autofill Chrome non funzionante",
+        LoginStatus.RECIPE_STEP_FAILED: (
+            f"Login: il recipe di {book} non funziona piu' (sito cambiato): elimina la voce {book.upper()} da "
+            f"orchestrator/config/login_recipes.json e rilancia con --login-only per rimapparlo"),
+        LoginStatus.AMBIGUOUS: "Login: fallito (stato della sessione non determinabile)",
+        LoginStatus.NAVIGATION_FAILED: "Login: fallito (apertura del book non riuscita)",
+        LoginStatus.RECIPE_NOT_FOUND: "Login: fallito (nessun recipe per il book)",
+    }.get(status, f"Login: fallito ({status.value})")
+
+
+def _ask_login_help(autopilot, args, reason) -> str:
+    """Login che non si risolve da solo: si chiede all'operatore (se c'e'). "none" = nessun operatore; "stop" =
+    vuole fermarsi; "recheck" = e' intervenuto sul telefono, si ricontrolla la sessione (una volta, in sola lettura)."""
+    hitl = getattr(autopilot, "hitl_strategy", None)
+    ask = getattr(hitl, "ask_for_help", None)
+    if not callable(ask) or not isinstance(getattr(hitl, "interventions", None), int):
+        return "none"
+    try:
+        return "stop" if ask(args.device, reason) == "stop" else "recheck"
+    except (EOFError, KeyboardInterrupt):
+        return "stop"
+
+
+def _login_stop(args, executor, result, autopilot) -> Result[LoginResult]:
+    """Il login non e' riuscito: log chiaro, eventuale aiuto dell'operatore, altrimenti Result.fail."""
+    if not result.success:
+        logger.error("Login: fallito (%s): %s", result.error_code, result.error)
+        return Result.fail(f"login fallito: {result.error}", result.error_code)
+    login = result.data
+    problem = _login_problem_text(login.status, args.book)
+    logger.error("%s%s%s", problem, f" [{login.message}]" if login.message else "",
+                 f" Screenshot: {login.screenshot_path}" if login.screenshot_path else "")
+    if login.status in _LOGIN_OPERATOR_STATUSES:
+        asked = _ask_login_help(autopilot, args, problem.removeprefix("Login: "))
+        if asked == "recheck":
+            # Un secondo login automatico con credenziali sbagliate rischia il blocco dell'account: solo lettura.
+            checked = executor.check_session(args.device, args.book)
+            if checked.success and checked.data.is_logged_in:
+                logger.info("Login: sessione attiva dopo l'intervento dell'operatore.")
+                return checked
+            logger.error("Login: la sessione non risulta attiva dopo l'intervento dell'operatore.")
+    return Result.fail(problem, login.status.name)
+
+
+def login_before_navigation(args, screen_reader, touch_injector, autopilot=None,
+                            allow_mapping: bool = True) -> Result[LoginResult]:
+    """Sessione attiva sul book prima di navigare alla promo. Result.ok(LoginResult loggato) oppure Result.fail.
+
+    ensure_logged_in controlla la sessione e, se e' scaduta, esegue il recipe del book. Se il book non ha un recipe
+    (RECIPE_NOT_FOUND) lo mappa LoginMapper con GPT (un login reale con le credenziali salvate in Chrome) e poi si
+    ricontrolla la sessione. Un solo tentativo di login: niente retry, per non rischiare il blocco dell'account.
+    allow_mapping=False (rientro a meta' sessione) e --no-gpt vietano il mapping.
+    """
+    book, device = args.book, args.device
+    executor = LoginExecutor(screen_reader, touch_injector)
+    logger.info("Login: controllo sessione per %s su %s", book, device)
+    try:
+        recipe_known = bool(executor.recipe_store.has_recipe(book))
+    except Exception:
+        recipe_known = False
+
+    result = executor.ensure_logged_in(device, book)
+    status = result.data.status if result.success else None
+
+    if status == LoginStatus.LOGIN_REQUIRED:      # non previsto da ensure_logged_in, che lo gestisce da solo
+        if recipe_known:
+            logger.info("Login: serve login, recipe trovato, eseguo")
+            result = executor.perform_login(device, book)
+            status = result.data.status if result.success else None
+        else:
+            status = LoginStatus.RECIPE_NOT_FOUND
+
+    if status == LoginStatus.RECIPE_NOT_FOUND:
+        if not allow_mapping or getattr(args, "no_gpt", False):
+            why = "con --no-gpt" if getattr(args, "no_gpt", False) else "durante un rientro a meta' sessione"
+            logger.error("Login: nessun recipe per %s e il mapping non e' consentito %s: mappalo prima con "
+                         "--login-only (senza --no-gpt).", book, why)
+            return Result.fail(f"nessun recipe per {book}", LoginStatus.RECIPE_NOT_FOUND.name)
+        logger.info("Login: nessun recipe, mappo con GPT")
+        mapped = LoginMapper(screen_reader, touch_injector).map_book_login(device, book)
+        if not mapped.success:
+            logger.error("Login: mappatura fallita (%s): %s", mapped.error_code, mapped.error)
+            return Result.fail(f"mappatura del login fallita: {mapped.error}", mapped.error_code)
+        logger.info("Login: recipe creato (%d passi): verifico la sessione", len(mapped.data.steps))
+        result = executor.ensure_logged_in(device, book)
+
+    if result.success and result.data.is_logged_in:
+        if result.data.status == LoginStatus.LOGGED_IN:
+            logger.info("Login: sessione attiva, skip login")
+        else:
+            logger.info("Login: serve login%s", ", recipe trovato, eseguito" if recipe_known else "")
+            logger.info("Login: riuscito")
+        return result
+    return _login_stop(args, executor, result, autopilot)
+
+
+def run_login_only(args) -> int:
+    """--login-only: solo il login. Niente autopilot, navigazione, gioco ne' metriche di run: bastano ScreenReader
+    e TouchInjector (costruiti come in build_autopilot_for)."""
+    log_path = run_autopilot._configure_logging(args.log_dir, f"login_{args.book}")
+    logger.info("Log del login: %s", log_path)
+    config = run_autopilot.AutoPilotConfig(device_id=args.device, slot_name="login", target_played_amount=Decimal("1"))
+    screen_reader = run_autopilot.ScreenReader(adb_timeout=config.adb_timeout)
+    touch_injector = run_autopilot.TouchInjector(
+        screen_reader=screen_reader, adb_timeout=config.adb_timeout, tap_delay_seconds=config.tap_delay_seconds,
+    )
+    try:
+        login = login_before_navigation(args, screen_reader, touch_injector)
+    except KeyboardInterrupt:
+        logger.warning("Interrotto dall'operatore (KeyboardInterrupt).")
+        return 1
+    if not login.success:
+        logger.error("Login non riuscito (%s): mi fermo.", login.error_code)
+        return 1
+    logger.info("Login completato (--login-only): mi fermo qui.")
+    return 0
+
+
 def run(args) -> int:
+    if getattr(args, "login_only", False):
+        return run_login_only(args)
     from orchestrator.modules.decision_engine.gpt_client import GPTDecisionClient
     from orchestrator.modules.slot_autopilot.session import play_session
 
@@ -221,6 +380,11 @@ def run(args) -> int:
 
     exit_code, nav_ok, session, nav_seconds, play_seconds, stop = 1, False, None, 0.0, 0.0, None
     try:
+        if not getattr(args, "skip_login", False):
+            login = login_before_navigation(args, autopilot.screen_reader, autopilot.touch_injector, autopilot)
+            if not login.success:
+                logger.error("Login non riuscito (%s): non navigo e non gioco.", login.error_code)
+                return exit_code            # 1: il finally chiude l'autopilot come per una navigazione fallita
         logger.info("=== FASE NAVIGAZIONE: %s -> %s -> %s ===", args.book, args.promo_name, args.slot_name)
         started = time.monotonic()
         nav = navigate_to_slot(args, navigation_client, autopilot.screen_reader, autopilot.touch_injector)
@@ -290,7 +454,7 @@ def run(args) -> int:
 
 def main(argv=None) -> None:
     args = parse_args(argv)
-    if not args.demo:
+    if not args.demo and not getattr(args, "login_only", False):
         print("Rifiuto di partire senza --demo: la slot si apre in modalita' demo (Prova), mai soldi veri.")
         sys.exit(2)
     sys.exit(run(args))
