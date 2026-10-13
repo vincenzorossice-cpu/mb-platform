@@ -211,10 +211,11 @@ class LoginExecutor:
                               f"CAPTCHA rilevato ({captcha.reason})").data
         if self._detect_2fa(screen):
             return self._hitl(LoginStatus.TWO_FA_REQUIRED, book_key, device_id, "2FA richiesta").data
-        if self._has_indicators(screen, self.LOGIN_BUTTON_INDICATORS):
+        state = ui_helpers.session_state(screen, recipe.logged_in_indicators if recipe else None)
+        if state == "login_required":
             return LoginResult(LoginStatus.LOGIN_REQUIRED, book_key, device_id,
                                "Sessione assente: serve login")
-        if self._has_indicators(screen, self._logged_in_indicators(recipe)):
+        if state == "logged_in":
             return LoginResult(LoginStatus.LOGGED_IN, book_key, device_id, "Sessione gia' attiva")
         return self._hitl(LoginStatus.AMBIGUOUS, book_key, device_id,
                           "Stato sessione non determinabile").data
@@ -276,9 +277,8 @@ class LoginExecutor:
 
         if step.action == "check_session":
             # Come _classify ma senza screenshot HITL: a meta' recipe basta sapere se si e' gia' loggati.
-            active = (not self._has_indicators(screen, self.LOGIN_BUTTON_INDICATORS)
-                      and self._has_indicators(screen, self._logged_in_indicators(recipe)))
-            return Result.ok(not active)
+            state = ui_helpers.session_state(screen, recipe.logged_in_indicators if recipe else None)
+            return Result.ok(state != "logged_in")
 
         if step.action == "tap_button":
             element = self._find_element_by_text(screen, step.target_text)

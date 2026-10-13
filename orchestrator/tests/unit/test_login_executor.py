@@ -741,3 +741,53 @@ class TestFindActiveCaptcha:
 
     def test_none_screen(self):
         assert ui_helpers.find_active_captcha(None) is None
+
+
+class TestSessionHelpers:
+    def test_session_state(self):
+        assert ui_helpers.session_state(_screen(_el("Accedi", "android.widget.Button"))) == "login_required"
+        assert ui_helpers.session_state(_screen(_el("Logout", "android.widget.Button"))) == "logged_in"
+        assert ui_helpers.session_state(_screen(_el("Promozioni"))) == "unknown"
+        assert ui_helpers.session_state(None) == "unknown"
+
+    def test_a_login_button_beats_a_session_indicator_and_marketing_is_ignored(self):
+        both = _screen(_el("Saldo disponibile"), _el("Accedi", "android.widget.Button"))
+        assert ui_helpers.session_state(both) == "login_required"
+        marketing = _screen(_el("Ti diamo il benvenuto"), _el("Bonus di benvenuto", "android.widget.Button"),
+                            _el("collega il tuo account Fantacalcio"))
+        assert ui_helpers.session_state(marketing) == "unknown"
+
+    def test_extra_indicators_of_the_recipe_count(self):
+        page = _screen(_el("Deposita"))
+        assert ui_helpers.session_state(page) == "unknown"
+        assert ui_helpers.session_state(page, ["Deposita"]) == "logged_in"
+
+    def test_the_executor_classification_uses_the_same_logic(self, executor, parts):
+        _set_screens(parts, _screen(_el("Saldo disponibile"), _el("Accedi", "android.widget.Button")))
+        assert executor.check_session(DEVICE, BOOK).data.status == LoginStatus.LOGIN_REQUIRED
+        _set_screens(parts, _screen(_el("Logout", "android.widget.Button")))
+        assert executor.check_session(DEVICE, BOOK).data.status == LoginStatus.LOGGED_IN
+
+    def test_login_button_label(self):
+        assert ui_helpers.login_button_label(_screen(_el("Registrati"), _el("Accedi"))) == "Accedi"
+        assert ui_helpers.login_button_label(_screen(_el("Sign in"))) == "Sign in"
+        assert ui_helpers.login_button_label(_screen(_el("Registrati"))) is None     # non e' per entrare
+
+    def test_login_form_visible_needs_the_password_field(self):
+        assert ui_helpers.login_form_visible(_login_page()) is True
+        newsletter = _screen(_el("", "android.widget.EditText", [10, 10, 500, 60]), _el("Email", "android.view.View",
+                                                                                          [20, 20, 100, 50]))
+        assert ui_helpers.login_form_visible(newsletter) is False
+        assert ui_helpers.login_form_visible(None) is False
+
+    def test_prioritized_elements_keeps_what_matters_in_document_order(self):
+        filler = [_el(f"Contenuto {i}", "android.view.View", [0, i, 10, i + 1]) for i in range(20)]
+        filler[15] = _el("Accedi", "android.widget.Button", [0, 15, 10, 16])
+        filler[17] = _el("", "android.widget.EditText", [0, 17, 10, 18], "campo")
+        filler[18] = _el("Altro", "android.widget.Button", [0, 18, 10, 19])
+        shown = ui_helpers.prioritized_elements(_screen(*filler), 5)
+        indexes = [i for i, _ in shown]
+        assert len(shown) == 5 and indexes == sorted(indexes)               # ordine di documento
+        assert {15, 17, 18} <= set(indexes)                                  # login, campo e Button prima del resto
+        assert all(e is filler[i] for i, e in shown)                         # indici originali
+        assert [i for i, _ in ui_helpers.prioritized_elements(_screen(*filler), 50)] == list(range(20))

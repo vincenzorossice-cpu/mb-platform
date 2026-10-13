@@ -17,7 +17,6 @@ from orchestrator.modules.login_manager import adb_input, ui_helpers
 from orchestrator.modules.login_manager.recipe import (
     DEFAULT_LOGGED_IN_INDICATORS,
     DEFAULT_LOGIN_FAILED_INDICATORS,
-    LOGIN_BUTTON_INDICATORS,
     LoginRecipe,
     LoginStep,
     RecipeStore,
@@ -73,6 +72,7 @@ class LoginMapper:
     MAX_REPEATS = 3       # azioni identiche consecutive: oltre, MAP_STUCK (non martellare il submit)
     MAX_UI_ELEMENTS = 80
     MAX_UI_TEXT = 60
+    MAX_REJECTED_DONE = 2    # "done" di GPT con il pulsante di login ancora visibile: dopo tanti rifiuti di fila si ferma
     MAX_HISTORY = 5
     MAX_EXTRA_INDICATORS = 5
     # attese scritte nel recipe (>= a quelle del mapping, mai sotto)
@@ -134,6 +134,7 @@ class LoginMapper:
         pending: Optional[dict] = None
         last_key, repeats = None, 0
         failed_streak = 0  # risposte login_failed consecutive
+        rejected_done = 0  # "done" respinti perche' gli elementi UI mostrano ancora il pulsante di login
         has_captcha, captcha_type = False, None
 
         for step_num in range(1, self.MAX_STEPS + 1):
@@ -151,6 +152,19 @@ class LoginMapper:
             if captcha is not None:
                 has_captcha = True
                 captcha_type = captcha_type or captcha.kind
+
+            if data["status"] == "done" and data["session_state"] == "login_required":
+                # GPT puo' sbagliarsi (pagina ricca di contenuti che sembra "loggata"): gli elementi UI dicono che il
+                # pulsante di login e' ancora li', quindi NON si esce. Come per login_failed, la schermata non entra
+                # in seen_texts.
+                rejected_done += 1
+                button = ui_helpers.login_button_label(screen) or "Accedi"
+                if rejected_done >= self.MAX_REJECTED_DONE:
+                    return Result.fail(
+                        f"GPT dichiara il login completato ma gli elementi UI mostrano ancora il pulsante '{button}': "
+                        f"l'utente non risulta loggato ({rejected_done} risposte done respinte)", "MAP_NOT_LOGGED_IN")
+                history.append(f"done rifiutato: l'utente NON risulta loggato (c'e' ancora il pulsante '{button}')")
+                continue
 
             if data["status"] == "done":
                 if not executed:
@@ -178,7 +192,7 @@ class LoginMapper:
                         f"{reason}".strip(), "MAP_LOGIN_FAILED")
                 time.sleep(self.LOGIN_FAILED_RETRY_WAIT)
                 continue
-            failed_streak = 0
+            failed_streak = rejected_done = 0
 
             key = (data["action"], data["target_text"], data["target_label"], data["x"], data["y"])
             repeats = repeats + 1 if key == last_key else 1
@@ -218,16 +232,18 @@ class LoginMapper:
         """Uno step: legge lo schermo, screenshot -> GPT -> azione.
 
         Ritorna dict con action, target_text, target_label, x, y, description, status
-        (done | failed | continue) e screen_content (la schermata letta in questo step).
-        Allo step 1, se il telefono e' gia' loggato, non invia nulla a OpenAI.
+        (done | failed | continue), screen_content (la schermata letta in questo step) e session_state
+        ("login_required" | "logged_in" | "unknown", letto dagli elementi UI).
+        Allo step 1, se gli elementi UI mostrano una sessione gia' attiva, non invia nulla a OpenAI.
         """
         screen_res = self.screen_reader.read_screen(device_id)
         if not screen_res.success:
             return Result.fail(screen_res.error, screen_res.error_code or "SCREEN_READ_FAILED")
         screen = screen_res.data
 
-        if step_num == 1 and ui_helpers.has_indicators(screen, DEFAULT_LOGGED_IN_INDICATORS) \
-                and not ui_helpers.has_indicators(screen, LOGIN_BUTTON_INDICATORS):
+        # Stato della sessione dagli ELEMENTI UI, la stessa logica di LoginExecutor.check_session: GPT non decide da solo.
+        state = ui_helpers.session_state(screen)
+        if step_num == 1 and state == "logged_in":
             return Result.fail(
                 "Sessione gia' attiva, niente da mappare (nessuno screenshot inviato). "
                 "Fai logout o usa un profilo Chrome pulito", "ALREADY_LOGGED_IN")
@@ -236,13 +252,13 @@ class LoginMapper:
         if not image.success:
             return Result.fail(image.error, image.error_code)
 
-        reply = self._call_gpt_vision(image.data, self._build_prompt(screen, history))
+        reply = self._call_gpt_vision(image.data, self._build_prompt(screen, history, state))
         if not reply.success:
             return Result.fail(reply.error, reply.error_code)
         action = self._parse_action(reply.data)
         if not action.success:
             return Result.fail(action.error, action.error_code)
-        return Result.ok({**action.data, "screen_content": screen})
+        return Result.ok({**action.data, "screen_content": screen, "session_state": state})
 
     def _execute_gpt_action(self, device_id: str, action_data: dict,
                             screen_content: ScreenContent) -> Result[bool]:
@@ -406,19 +422,46 @@ class LoginMapper:
     # INTERNAL: GPT
     # --------------------------------------------------------
 
-    def _build_prompt(self, screen: ScreenContent, history: Optional[list[str]]) -> str:
+    def _session_hint(self, screen: ScreenContent, state: str) -> str:
+        """Cosa dicono gli elementi UI sulla sessione, da dare a GPT insieme allo screenshot."""
+        head = "STATO SESSIONE (letto dagli elementi UI, piu' affidabile dello screenshot): "
+        if state == "login_required":
+            tail = " Non rispondere done finche' il pulsante di login e' visibile."
+            if ui_helpers.login_form_visible(screen):
+                # Qui "Accedi" e' l'invio del form, non la navigazione: dire di tapparlo per andare al form
+                # farebbe inviare i campi vuoti.
+                return (head + "l'utente NON e' loggato. Il form di login e' visibile: completalo (campi / "
+                        "suggerimento di Chrome) e invia con il pulsante del FORM." + tail)
+            label = ui_helpers.login_button_label(screen)
+            if label:
+                return (head + f"l'utente NON e' loggato. C'e' un pulsante '{label}' visibile: tappalo per andare "
+                        "al form di login." + tail)
+            return (head + "l'utente NON e' loggato (c'e' 'Registrati', ma non e' il pulsante per entrare): cerca "
+                    "il pulsante o il link per accedere." + tail)
+        if state == "logged_in":
+            return head + "gli elementi UI mostrano una sessione attiva."
+        return head + "Stato sessione non determinato dagli elementi UI. Guarda lo screenshot e decidi."
+
+    def _build_prompt(self, screen: ScreenContent, history: Optional[list[str]],
+                      session_state: Optional[str] = None) -> str:
         prompt = GUIDED_PROMPT.replace("{elementi_ui}", self._format_ui_elements(screen))
+        if session_state is not None:
+            prompt += "\n\n" + self._session_hint(screen, session_state)
         if history:
             recent = "\n".join(f"- {h}" for h in history[-self.MAX_HISTORY:])
             prompt += f"\n\nAzioni già eseguite (le più recenti):\n{recent}"
         return prompt
 
     def _format_ui_elements(self, screen: ScreenContent) -> str:
+        shown = ui_helpers.prioritized_elements(screen, self.MAX_UI_ELEMENTS)
         lines = []
-        for i, e in enumerate(screen.elements[:self.MAX_UI_ELEMENTS]):
+        for i, e in shown:
             cls = (e.class_name or "?").rsplit(".", 1)[-1]
             text = e.text.replace("\n", " ")[:self.MAX_UI_TEXT]
             lines.append(f"[{i}] {cls}, text='{text}', bounds={e.bounds}, resource_id='{e.resource_id or ''}'")
+        if len(shown) < len(screen.elements):
+            lines.append(f"(mostrati {len(shown)} di {len(screen.elements)} elementi: prima i testi di login/sessione, "
+                         "i campi e i pulsanti)")
         return "\n".join(lines) or "(nessun elemento letto)"
 
     @staticmethod

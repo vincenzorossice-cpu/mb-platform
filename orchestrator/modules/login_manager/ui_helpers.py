@@ -6,6 +6,7 @@ senza text e senza resource-id, quindi un EditText vuoto e anonimo non e' visibi
 import re
 from typing import NamedTuple, Optional
 
+from orchestrator.modules.login_manager.recipe import DEFAULT_LOGGED_IN_INDICATORS, LOGIN_BUTTON_INDICATORS
 from orchestrator.modules.screen_reader.interface import ScreenContent, UIElement
 
 EDIT_TEXT_CLASS = "android.widget.EditText"
@@ -218,3 +219,53 @@ def find_active_captcha(screen_content: Optional[ScreenContent]) -> Optional[Cap
         if has_image:
             return CaptchaFinding("captcha", f"sfida a immagini ('{prompt.text.strip()[:40]}')")
     return None
+
+
+# --- Stato della sessione (unica logica per LoginExecutor.check_session e LoginMapper) ---------------------------
+
+LOGIN_ENTRY_LABELS = ("Accedi", "Login", "Log in", "Sign in")     # i pulsanti per entrare ("Registrati" no)
+
+
+def session_state(screen_content: Optional[ScreenContent], logged_in_indicators: Optional[list] = None) -> str:
+    """Stato della sessione dagli ELEMENTI UI (mai dallo screenshot): "login_required" | "logged_in" | "unknown".
+
+    Un pulsante di login visibile ("Accedi", "Registrati", ...) vuol dire NON loggato, sempre (priorita'); solo
+    senza pulsanti di login contano gli indicatori di sessione attiva ("Logout", "Il mio conto", ...). I testi di
+    marketing ("Ti diamo il benvenuto") non sono indicatori.
+    """
+    if has_indicators(screen_content, LOGIN_BUTTON_INDICATORS):
+        return "login_required"
+    if has_indicators(screen_content, list(logged_in_indicators or []) + list(DEFAULT_LOGGED_IN_INDICATORS)):
+        return "logged_in"
+    return "unknown"
+
+
+def login_button_label(screen_content: Optional[ScreenContent]) -> Optional[str]:
+    """Il pulsante per entrare presente sulla schermata ("Accedi", "Login", ...), None se non c'e'."""
+    return next((label for label in LOGIN_ENTRY_LABELS if has_indicators(screen_content, [label])), None)
+
+
+def login_form_visible(screen_content: Optional[ScreenContent]) -> bool:
+    """Il form di login e' sulla schermata: c'e' il campo password (o PIN). Un campo "Email" da solo (newsletter,
+    ricerca) non basta."""
+    return screen_content is not None and any(
+        find_field_by_label(screen_content, label) is not None for label in ("Password", "PIN"))
+
+
+def prioritized_elements(screen_content: ScreenContent, limit: int) -> list:
+    """[(indice originale, elemento)] al massimo `limit`, in ordine di documento. Se ce ne sono di piu' si tengono
+    prima i testi di login/sessione, i campi di testo e le caselle, poi gli altri Button, poi il resto: su una
+    pagina da centinaia di elementi il pulsante "Accedi" non resta tagliato fuori."""
+    indexed = list(enumerate(screen_content.elements))
+    if len(indexed) <= limit:
+        return indexed
+    keywords = list(LOGIN_BUTTON_INDICATORS) + list(DEFAULT_LOGGED_IN_INDICATORS)
+
+    def tier(item) -> tuple:
+        e = item[1]
+        cls = e.class_name or ""
+        if cls == EDIT_TEXT_CLASS or "CheckBox" in cls or any(word_in_text(k, e.text) for k in keywords):
+            return 0, item[0]
+        return (1 if "Button" in cls else 2), item[0]
+
+    return sorted(sorted(indexed, key=tier)[:limit], key=lambda item: item[0])

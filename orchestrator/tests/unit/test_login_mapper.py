@@ -10,6 +10,7 @@ import pytest
 from orchestrator.core.result import Result
 from orchestrator.modules.login_manager.executor import LoginExecutor
 from orchestrator.modules.login_manager.interface import LoginStatus
+from orchestrator.modules.login_manager import ui_helpers
 from orchestrator.modules.login_manager.mapper import LoginMapper
 from orchestrator.modules.login_manager.recipe import LoginRecipe, LoginStep, RecipeStore
 from orchestrator.modules.screen_reader.interface import ScreenContent, UIElement
@@ -290,7 +291,7 @@ def test_map_book_login_stuck_stops_hammering_submit(mapper, parts):
 
 
 def test_map_book_login_failed_action_is_reported_to_gpt(mapper, parts):
-    _screens(parts, HOME, HOME, LOGIN_PAGE)
+    _screens(parts, HOME, HOME, LOGGED_IN)
     client = _client(_act("tap_button", target_text="Entra"),
                      _act("tap_button", target_text="Accedi"),
                      _act("done"))
@@ -300,6 +301,146 @@ def test_map_book_login_failed_action_is_reported_to_gpt(mapper, parts):
     assert "Azioni già eseguite" in second_prompt and "fallita" in second_prompt
     first_prompt = client.chat.completions.create.call_args_list[0].kwargs["messages"][0]["content"][0]["text"]
     assert "Azioni già eseguite" not in first_prompt
+
+
+def _sisal_home(total=493, accedi_at=300):
+    """Home di Sisal da sloggati: 493 elementi, "Accedi" e "Registrati" (Button) molto oltre i primi 80, e testi
+    di marketing che contengono "benvenuto"."""
+    elements = [_el(f"Contenuto {i}", "android.view.View", [0, i * 5, 1000, i * 5 + 4]) for i in range(total)]
+    elements[10] = _el("Ti diamo il benvenuto", "android.widget.TextView", [0, 50, 1000, 90])
+    elements[11] = _el("Bonus di benvenuto", "android.widget.Button", [0, 100, 500, 160])
+    elements[accedi_at] = _el("Accedi", "android.widget.Button", HOME_LINK_BOUNDS)
+    elements[accedi_at + 1] = _el("Registrati", "android.widget.Button", [600, 50, 780, 120])
+    return _screen(*elements)
+
+
+def _prompt(client, call=0):
+    return client.chat.completions.create.call_args_list[call].kwargs["messages"][0]["content"][0]["text"]
+
+
+class TestSessionStateFromUiElements:
+    """Lo stato della sessione si legge dagli elementi UI (come LoginExecutor.check_session), non lo decide GPT."""
+
+    def test_a_login_button_tells_gpt_the_user_is_not_logged_in(self, mapper, parts):
+        _screens(parts, _sisal_home())
+        client = _client(_act("tap_button", target_text="Accedi"))
+        with patch(OPENAI_PATH, return_value=client):
+            res = mapper._gpt_guided_step(DEVICE, 1)
+        assert res.success and res.data["session_state"] == "login_required"
+        prompt = _prompt(client)
+        assert "l'utente NON e' loggato" in prompt and "pulsante 'Accedi' visibile" in prompt
+        assert "tappalo per andare al form di login" in prompt
+        assert "text='Accedi'" in prompt and "bounds=" in prompt          # insieme agli elementi UI
+
+    def test_a_logged_in_page_returns_already_logged_in_without_calling_gpt(self, mapper, parts):
+        page = _sisal_home()
+        elements = [e for e in page.elements if e.text not in ("Accedi", "Registrati")]
+        elements.append(_el("Logout", "android.widget.Button", [600, 50, 780, 120]))
+        _screens(parts, _screen(*elements))
+        with patch(OPENAI_PATH) as openai_cls:
+            res = mapper.map_book_login(DEVICE, BOOK)
+        assert res.error_code == "ALREADY_LOGGED_IN"
+        openai_cls.assert_not_called()
+        parts[0]._screenshot.assert_not_called()
+
+    def test_an_unclear_state_is_sent_to_gpt_as_such(self, mapper, parts):
+        _screens(parts, NEUTRAL)
+        client = _client(_act("tap_button", target_text="Accedi"))
+        with patch(OPENAI_PATH, return_value=client):
+            res = mapper._gpt_guided_step(DEVICE, 1)
+        assert res.data["session_state"] == "unknown"
+        assert "Stato sessione non determinato dagli elementi UI. Guarda lo screenshot e decidi." in _prompt(client)
+
+    def test_the_real_sisal_home_is_not_logged_in_and_gpt_still_sees_accedi(self, mapper, parts):
+        home = _sisal_home()
+        assert len(home.elements) == 493
+        assert ui_helpers.session_state(home) == "login_required"           # "benvenuto" non e' un indicatore
+        listing = mapper._format_ui_elements(home)
+        assert "[300] Button, text='Accedi'" in listing and "[301] Button, text='Registrati'" in listing
+        assert f"(mostrati {mapper.MAX_UI_ELEMENTS} di 493 elementi" in listing
+        assert listing.count("\n[") + 1 == mapper.MAX_UI_ELEMENTS           # il tetto resta quello
+
+    def test_on_the_login_form_accedi_is_the_submit_not_the_navigation(self, mapper, parts):
+        _screens(parts, LOGIN_PAGE)       # campo password visibile + Button "Accedi"
+        client = _client(_act("tap_field", target_label="Email / Username"))
+        with patch(OPENAI_PATH, return_value=client):
+            res = mapper._gpt_guided_step(DEVICE, 2)
+        prompt = _prompt(client)
+        assert res.data["session_state"] == "login_required"
+        assert "Il form di login e' visibile" in prompt and "pulsante del FORM" in prompt
+        assert "tappalo per andare al form di login" not in prompt
+
+    def test_a_lone_email_field_does_not_make_the_home_a_login_form(self, mapper, parts):
+        home = _screen(_el("", "android.widget.EditText", [10, 10, 500, 60], "newsletter-email"),
+                       _el("Email", "android.view.View", [20, 20, 100, 50]),
+                       _el("Accedi", "android.widget.Button", HOME_LINK_BOUNDS))
+        _screens(parts, home)
+        client = _client(_act("tap_button", target_text="Accedi"))
+        with patch(OPENAI_PATH, return_value=client):
+            mapper._gpt_guided_step(DEVICE, 1)
+        assert "tappalo per andare al form di login" in _prompt(client)
+
+    def test_only_registrati_is_not_the_button_to_enter(self, mapper, parts):
+        _screens(parts, _screen(_el("Registrati", "android.widget.Button", HOME_LINK_BOUNDS)))
+        client = _client(_act("tap_button", target_text="Accedi"))
+        with patch(OPENAI_PATH, return_value=client):
+            mapper._gpt_guided_step(DEVICE, 1)
+        assert "non e' il pulsante per entrare" in _prompt(client)
+
+    def test_a_logged_in_step_after_the_first_tells_gpt_so(self, mapper, parts):
+        _screens(parts, LOGGED_IN)
+        client = _client(_act("done"))
+        with patch(OPENAI_PATH, return_value=client):
+            res = mapper._gpt_guided_step(DEVICE, 3)
+        assert res.data["session_state"] == "logged_in" and "sessione attiva" in _prompt(client)
+
+
+class TestFalseDoneFromGpt:
+    def test_done_on_the_not_logged_in_home_is_rejected_and_the_mapping_goes_on(self, mapper, parts, store):
+        _screens(parts, _sisal_home(), _sisal_home(), LOGIN_PAGE, LOGGED_IN)
+        client = _client(_act("done", description="Sembra una pagina loggata"),
+                         _act("tap_button", target_text="Accedi"),
+                         _act("tap_field", target_label="Email / Username"),
+                         _act("done"))
+        with patch(OPENAI_PATH, return_value=client):
+            res = mapper.map_book_login(DEVICE, BOOK)
+        assert res.success, res.error                                    # niente ALREADY_LOGGED_IN falso
+        assert [s.action for s in res.data.steps] == ["tap_button", "tap_field"]
+        assert "done rifiutato" in _prompt(client, 1) and "Accedi" in _prompt(client, 1)
+        assert store.has_recipe(BOOK)
+
+    def test_two_false_dones_in_a_row_fail_with_a_clear_code(self, mapper, parts, store):
+        _screens(parts, _sisal_home())
+        client = _client(_act("done"), _act("done"))
+        with patch(OPENAI_PATH, return_value=client):
+            res = mapper.map_book_login(DEVICE, BOOK)
+        assert res.error_code == "MAP_NOT_LOGGED_IN" and "'Accedi'" in res.error
+        assert client.chat.completions.create.call_count == 2 and not store.has_recipe(BOOK)
+        parts[1].tap_coordinates.assert_not_called()
+
+    def test_rejections_that_are_not_consecutive_do_not_fail(self, mapper, parts, store):
+        _screens(parts, _sisal_home(), _sisal_home(), _sisal_home(), LOGIN_PAGE, LOGGED_IN)
+        client = _client(_act("done"),                                       # rifiutato (1)
+                         _act("tap_button", target_text="Accedi"),            # azione: azzera il contatore
+                         _act("done"),                                        # rifiutato di nuovo (1), non 2
+                         _act("tap_field", target_label="Email / Username"),
+                         _act("done"))
+        with patch(OPENAI_PATH, return_value=client):
+            assert mapper.map_book_login(DEVICE, BOOK).success
+
+    def test_done_is_accepted_when_the_state_is_unclear(self, mapper, parts):
+        _screens(parts, HOME, NEUTRAL)
+        client = _client(_act("tap_button", target_text="Accedi"), _act("done"))
+        with patch(OPENAI_PATH, return_value=client):
+            res = mapper.map_book_login(DEVICE, BOOK)
+        assert res.success                                                   # nessun pulsante di login: GPT decide
+
+    def test_a_false_done_does_not_hide_the_logged_in_indicators_of_the_final_page(self, mapper, parts):
+        _screens(parts, _sisal_home(), _sisal_home(), LOGGED_IN)
+        client = _client(_act("done"), _act("tap_button", target_text="Accedi"), _act("done"))
+        with patch(OPENAI_PATH, return_value=client):
+            res = mapper.map_book_login(DEVICE, BOOK)
+        assert res.success and "Logout" in res.data.logged_in_indicators and "Deposita" in res.data.logged_in_indicators
 
 
 def test_map_book_login_ignores_the_informational_recaptcha_badge(mapper, parts, store):
