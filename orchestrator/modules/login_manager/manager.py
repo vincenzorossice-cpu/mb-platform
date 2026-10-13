@@ -26,7 +26,8 @@ DEFAULT_BOOK_CONFIG = {
     "logged_in_indicators": [],
 }
 
-USERNAME_WORDS = ["email", "e-mail", "username", "nome utente", "utente"]
+# Sinonimi extra rispetto a LoginManager.LOGIN_FORM_INDICATORS
+USERNAME_WORDS = ["e-mail", "utente"]
 PASSWORD_WORDS = ["password", "pin"]
 SUBMIT_WORDS = ["accedi", "login", "log in", "entra", "continua"]
 
@@ -45,15 +46,25 @@ class LoginManager(LoginManagerInterface):
     AUTOFILL_WAIT = 2
     POST_LOGIN_WAIT = 5
 
-    # Etichette comuni per riconoscere form di login
-    LOGIN_INDICATORS = [
+    # Indicatori forti: pulsanti presenti solo da sloggati. Se ce n'e' almeno
+    # uno, check_session restituisce LOGIN_REQUIRED.
+    LOGIN_BUTTON_INDICATORS = [
         "Accedi", "Registrati", "Login", "Log in", "Sign in",
-        "Username", "Email", "Password", "Nome utente", "PIN",
     ]
 
+    # Indicatori deboli: etichette di campo. Usati SOLO da
+    # _find_login_form_elements per trovare i campi; non decidono lo stato
+    # della sessione perche' compaiono anche in pagine loggate (es. profilo).
+    LOGIN_FORM_INDICATORS = [
+        "Email", "Username", "Password", "PIN", "Nome utente",
+    ]
+
+    # Solo indicatori affidabili (presenti solo da loggati). Niente termini
+    # generici come "Benvenuto", "Account", "Saldo" da soli: compaiono nel
+    # testo marketing delle home page anche da sloggati.
     LOGGED_IN_INDICATORS = [
-        "Il mio conto", "Profilo", "Logout", "Esci", "Saldo",
-        "Disponibile", "Benvenuto", "Account", "Dashboard",
+        "Logout", "Esci", "Il mio conto", "Profilo",
+        "Saldo disponibile", "Effettua logout",
     ]
 
     CAPTCHA_INDICATORS = [
@@ -179,12 +190,16 @@ class LoginManager(LoginManagerInterface):
             status, msg = LoginStatus.CAPTCHA_DETECTED, "CAPTCHA rilevato"
         elif self._detect_2fa(screen):
             status, msg = LoginStatus.TWO_FA_REQUIRED, "2FA richiesta"
+        # Priorita' al login: se "Accedi" & co. sono visibili l'utente NON e'
+        # loggato, anche se un testo marketing contiene un indicatore di sessione.
+        # Solo i pulsanti contano: le etichette di campo (Email, Password...)
+        # da sole non bastano, possono stare in pagine loggate.
+        elif self._has_indicators(screen, self.LOGIN_BUTTON_INDICATORS):
+            return Result.ok((LoginResult(LoginStatus.LOGIN_REQUIRED, book_key, device_id,
+                                          "Sessione assente: serve login"), screen))
         elif self._has_indicators(screen, self._logged_in_indicators(cfg)):
             return Result.ok((LoginResult(LoginStatus.LOGGED_IN, book_key, device_id,
                                           "Sessione gia' attiva"), screen))
-        elif self._has_indicators(screen, self.LOGIN_INDICATORS):
-            return Result.ok((LoginResult(LoginStatus.LOGIN_REQUIRED, book_key, device_id,
-                                          "Sessione assente: serve login"), screen))
         else:
             status, msg = LoginStatus.AMBIGUOUS, "Stato sessione non determinabile"
 
@@ -262,8 +277,10 @@ class LoginManager(LoginManagerInterface):
 
     def _find_login_form_elements(self, screen_content: ScreenContent, cfg: Optional[dict] = None) -> dict:
         labels = (cfg or DEFAULT_BOOK_CONFIG)["login_form_labels"]
-        user_words = USERNAME_WORDS + [labels["username_label"].lower()]
         pass_words = PASSWORD_WORDS + [labels["password_label"].lower()]
+        form_words = [w.lower() for w in self.LOGIN_FORM_INDICATORS]
+        user_words = ([w for w in form_words if w not in pass_words]
+                      + USERNAME_WORDS + [labels["username_label"].lower()])
         submit_words = SUBMIT_WORDS + [labels["submit_label"].lower()]
 
         elements = screen_content.elements
@@ -305,6 +322,7 @@ class LoginManager(LoginManagerInterface):
     def _has_indicators(self, screen_content: ScreenContent, indicators: list[str]) -> bool:
         if screen_content is None:
             return False
+        # Parola intera: "PIN" non deve matchare in "Wrappin'", "Esci" in "Uscire".
         for ind in indicators:
             pattern = re.compile(r"(?<!\w)" + re.escape(ind.lower()) + r"(?!\w)")
             if any(pattern.search(e.text.lower()) for e in screen_content.elements):

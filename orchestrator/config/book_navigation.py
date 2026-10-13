@@ -475,7 +475,7 @@ _DEFAULT_LOGIN_FORM_LABELS = {
     "password_label": "Password",
     "submit_label": "Accedi",
 }
-_DEFAULT_LOGGED_IN_INDICATORS = ["Il mio conto", "Profilo", "Logout", "Esci", "Saldo"]
+_DEFAULT_LOGGED_IN_INDICATORS = ["Il mio conto", "Profilo", "Logout", "Esci", "Saldo disponibile"]
 
 for _cfg in BOOK_NAVIGATION.values():
     _cfg.setdefault("needs_manual_login", False)  # LOGIN-MANAGER

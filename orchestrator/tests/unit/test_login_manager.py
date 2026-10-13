@@ -137,6 +137,74 @@ def test_check_session_ambiguous(manager, parts):
     assert res.data.status == LoginStatus.AMBIGUOUS
 
 
+def test_check_session_benvenuto_and_accedi_is_login_required(manager, parts):
+    _set_screens(parts, _screen(_el("Bonus di benvenuto"),
+                                _el("Accedi", "android.widget.Button")))
+    assert manager.check_session(DEVICE, BOOK).data.status == LoginStatus.LOGIN_REQUIRED
+
+
+def test_check_session_login_beats_logged_in(manager, parts):
+    _set_screens(parts, _screen(_el("Saldo disponibile"),
+                                _el("Accedi", "android.widget.Button")))
+    assert manager.check_session(DEVICE, BOOK).data.status == LoginStatus.LOGIN_REQUIRED
+
+
+def test_check_session_saldo_disponibile_logged_in(manager, parts):
+    _set_screens(parts, _screen(_el("Saldo disponibile: 10€"), _el("Calcio")))
+    assert manager.check_session(DEVICE, BOOK).data.status == LoginStatus.LOGGED_IN
+
+
+def test_check_session_benvenuto_alone_not_logged_in(manager, parts):
+    _set_screens(parts, _screen(_el("Benvenuto"), _el("Bonus di benvenuto"),
+                                _el("Ti diamo il benvenuto")))
+    assert manager.check_session(DEVICE, BOOK).data.status == LoginStatus.AMBIGUOUS
+
+
+def test_check_session_account_marketing_not_logged_in(manager, parts):
+    _set_screens(parts, _screen(_el("Collega il tuo account Fantacalcio"), _el("Saldo")))
+    assert manager.check_session(DEVICE, BOOK).data.status != LoginStatus.LOGGED_IN
+
+
+def test_check_session_form_labels_alone_not_login_required(manager, parts):
+    # Pagina loggata (profilo): "Email"/"Password" da soli non devono dare LOGIN_REQUIRED
+    _set_screens(parts, _screen(_el("Email"), _el("Password"), _el("Il mio conto")))
+    assert manager.check_session(DEVICE, BOOK).data.status == LoginStatus.LOGGED_IN
+
+
+def test_check_session_form_labels_alone_ambiguous(manager, parts):
+    _set_screens(parts, _screen(_el("Email"), _el("Password"), _el("Promozioni")))
+    assert manager.check_session(DEVICE, BOOK).data.status == LoginStatus.AMBIGUOUS
+
+
+def test_login_indicator_lists_are_split(manager):
+    assert "Accedi" in manager.LOGIN_BUTTON_INDICATORS
+    assert not set(manager.LOGIN_BUTTON_INDICATORS) & set(manager.LOGIN_FORM_INDICATORS)
+    assert {"Email", "Username", "Password", "PIN", "Nome utente"} == set(manager.LOGIN_FORM_INDICATORS)
+
+
+def test_find_login_form_elements_uses_form_indicators(manager):
+    screen = _screen(
+        _el("Nome utente", "android.widget.EditText", EMAIL_BOUNDS),
+        _el("PIN", "android.widget.EditText", PASSWORD_BOUNDS),
+        _el("Entra", "android.widget.Button", BUTTON_BOUNDS))
+    form = manager._find_login_form_elements(screen)
+    assert form["username_element"].bounds == EMAIL_BOUNDS
+    assert form["password_element"].bounds == PASSWORD_BOUNDS
+    assert form["submit_element"].bounds == BUTTON_BOUNDS
+
+
+def test_has_indicators_pin_not_in_wrappin(manager):
+    assert not manager._has_indicators(_screen(_el("Wrappin' More Gold")), ["PIN"])
+    assert not manager._has_indicators(_screen(_el("Accedire")), ["Accedi"])
+    assert not manager._has_indicators(_screen(_el("Uscire")), ["Esci"])
+    assert manager._has_indicators(_screen(_el("Inserisci il PIN")), ["PIN"])
+
+
+def test_default_config_has_no_bare_saldo():
+    for name, cfg in BOOK_NAVIGATION.items():
+        assert "Saldo" not in cfg["logged_in_indicators"], name
+
+
 # ---------------- perform_login ----------------
 
 def test_perform_login_already_logged(manager, parts):
