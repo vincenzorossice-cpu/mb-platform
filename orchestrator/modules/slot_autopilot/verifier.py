@@ -213,6 +213,30 @@ class ActionVerifier:
                 ))
             previous = shot.data
 
+    def wait_until_reels_still(
+        self, device_id: str, region: tuple, max_wait_seconds: float = 6.0, streak_needed: int = 3,
+    ) -> Result[CalmResult]:
+        """Ultimo ripiego con animazioni ambientali (banner, jackpot, luci) che non si fermano mai: confronta
+        screenshot consecutivi SOLO nella zona dei rulli. Fermi per `streak_needed` confronti di fila = calma."""
+        started = time.monotonic()
+        threshold = self.config.frame_diff_stable_threshold
+        previous = None
+        streak = 0
+        while True:
+            shot = self.screen_reader._screenshot(device_id)
+            if not shot.success:
+                return Result.fail(shot.error, shot.error_code)
+            if previous is not None:
+                part = diff_score(previous, shot.data, region)
+                streak = streak + 1 if part.success and part.data < threshold else 0
+                if streak >= streak_needed:
+                    return Result.ok(CalmResult(shot.data, calm=True, waited=True,
+                                                seconds=time.monotonic() - started, partial=True))
+            if time.monotonic() - started >= max_wait_seconds:
+                return Result.ok(CalmResult(shot.data, calm=False, waited=True, seconds=time.monotonic() - started))
+            previous = shot.data
+            time.sleep(self.config.frame_diff_poll_interval)
+
     def _read_state_after(self, screenshot_path: str, region_hint: Optional[tuple]) -> dict:
         if region_hint is None or not hasattr(self.ocr_reader, "set_region"):
             return self.ocr_reader.read_slot_state(screenshot_path)

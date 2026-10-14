@@ -667,16 +667,19 @@ def _unexpected(balance_before="4999.80", balance_after="4999.80"):
 
 
 class TestCalmBeforeTapping:
-    def _spin(self, calm_results, tap_results, contexts, strategy="profile", expected_bet="0.20"):
+    def _spin(self, calm_results, tap_results, contexts, strategy="profile", expected_bet="0.20", spins_done=1,
+              reels=None):
         locator = MagicMock()
         locator.locate.return_value = _candidate(strategy)
         locator.is_trusted_strategy.return_value = strategy in ("profile", "memory")
         verifier = MagicMock()
         verifier.wait_until_calm.side_effect = list(calm_results)
         verifier.verified_tap.side_effect = list(tap_results)
+        verifier.wait_until_reels_still.return_value = reels if reels is not None else _calm(calm=False)
         controller, _, _, _ = _controller(
             locator=locator, verifier=verifier, config=_config(spin_calm_check=True, max_spin_attempts_per_step=3),
         )
+        controller._spins_done["pirots5"] = spins_done        # gli spin gia' fatti: di default il primo e' passato
         provider = MagicMock(side_effect=list(contexts))
         result = controller.spin("dev", "pirots5", "ep", 1, provider, True, Decimal(expected_bet))
         return result, verifier, provider
@@ -708,6 +711,76 @@ class TestCalmBeforeTapping:
 
         assert result.data.outcome == "blocked" and result.data.violated_invariant == "UNSAFE_SCREEN_STATE"
         verifier.verified_tap.assert_not_called()
+
+    def test_before_the_first_spin_ambient_animations_never_block(self, caplog):
+        """Banner, jackpot e luci non si fermano mai: senza spin non c'e' vincita ne' bonus da aspettare."""
+        with caplog.at_level("INFO"):
+            result, verifier, _ = self._spin(
+                [_calm(calm=False, waited=True)], [_tap_outcome(True, balance_after=Decimal("99.80"))],
+                [_context_result(Decimal("100")), _context_result(Decimal("100"))], spins_done=0,
+            )
+
+        assert result.data.outcome == "success" and result.data.attempts == 1
+        verifier.verified_tap.assert_called_once()
+        assert "animazioni ambientali, procedo con il primo spin" in caplog.text
+        assert verifier.wait_until_calm.call_args.args[2] <= 5            # e senza aspettare 30 s
+        verifier.wait_until_reels_still.assert_not_called()
+
+    def test_after_a_spin_the_same_screen_still_blocks(self):
+        result, verifier, _ = self._spin([_calm(calm=False, waited=True)], [], [_context_result(Decimal("100"))],
+                                         spins_done=1)
+
+        assert result.data.outcome == "blocked" and result.data.blocked_detail == "schermo non fermo"
+        verifier.verified_tap.assert_not_called()
+
+    def test_ambient_animations_with_still_reels_do_not_block_a_later_spin(self, caplog):
+        with caplog.at_level("INFO"):
+            result, verifier, _ = self._spin(
+                [_calm(calm=False, waited=True)], [_tap_outcome(True, balance_after=Decimal("99.80"))],
+                [_context_result(Decimal("100")), _context_result(Decimal("100"))], reels=_calm(waited=True),
+            )
+
+        assert result.data.outcome == "success"
+        region = verifier.wait_until_reels_still.call_args.args[1]
+        assert region == (54, 528, 1026, 1632)                            # spin_wait_region 5-95% x 22-68% su 1080x2400
+        assert "animazioni ambientali continue rilevate, uso frame parziale per spin" in caplog.text
+
+    def test_moving_reels_still_block_a_later_spin(self):
+        result, verifier, _ = self._spin([_calm(calm=False, waited=True)], [], [_context_result(Decimal("100"))],
+                                         reels=_calm(calm=False, waited=True))
+
+        assert result.data.outcome == "blocked" and result.data.violated_invariant == "UNSAFE_SCREEN_STATE"
+        verifier.verified_tap.assert_not_called()
+
+    def test_the_spin_arrow_decides_when_it_is_usable_even_with_still_reels(self):
+        locator = MagicMock()
+        locator.locate.return_value = _candidate("profile")
+        locator.is_trusted_strategy.return_value = True
+        verifier = MagicMock()
+        verifier.wait_until_button_ready.return_value = _calm(calm=False, waited=True)
+        verifier.wait_until_reels_still.return_value = _calm(waited=True)
+        button = MagicMock()
+        button.reference.return_value = object()
+        controller, _, _, _ = _controller(locator=locator, verifier=verifier,
+                                          config=_config(spin_calm_check=True, max_spin_attempts_per_step=3))
+        controller.button = button
+        controller._spins_done["pirots5"] = 1
+
+        result = controller.spin("dev", "pirots5", "ep", 2, MagicMock(return_value=_context_result(Decimal("100"))),
+                                 True, Decimal("0.20"))
+
+        assert result.data.outcome == "blocked"                           # la freccia dice "occupato": i rulli non scavalcano
+        verifier.wait_until_reels_still.assert_not_called()
+
+    def test_only_a_real_tap_counts_as_a_spin_done(self):
+        controller, _, locator, verifier = _controller(config=_config(spin_calm_check=True))
+        locator.locate.return_value = _candidate("profile")
+        verifier.wait_until_calm.return_value = _calm(calm=False, waited=True)
+        verifier.wait_until_reels_still.return_value = _calm(calm=False)
+        controller._spins_done["pirots5"] = 1
+        controller.spin("dev", "pirots5", "ep", 2, MagicMock(return_value=_context_result(Decimal("100"))), True,
+                        Decimal("0.20"))
+        assert controller._spins_done["pirots5"] == 1                     # bloccato: non e' uno spin fatto
 
     def test_the_invariants_are_checked_again_on_the_fresh_reading(self):
         result, verifier, _ = self._spin(

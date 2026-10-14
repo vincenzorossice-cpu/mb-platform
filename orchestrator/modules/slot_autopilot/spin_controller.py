@@ -15,7 +15,7 @@ from orchestrator.modules.slot_autopilot.config import (
 from orchestrator.modules.slot_autopilot.frame_diff import diff_score
 from orchestrator.modules.slot_autopilot.locator import ElementLocator
 from orchestrator.modules.slot_autopilot.value_parser import parse_amount
-from orchestrator.modules.slot_autopilot.verifier import ActionVerifier, Expectation, classify_screen_state
+from orchestrator.modules.slot_autopilot.verifier import ActionVerifier, CalmResult, Expectation, classify_screen_state
 from orchestrator.modules.step_logger.interface import StepLoggerInterface, StepRecord
 
 logger = logging.getLogger(__name__)
@@ -30,6 +30,8 @@ _QUICK_TEST_WAIT = 1.5        # nel test: attesa dopo il secondo tocco prima di 
 _BUSY_SAMPLE_DELAY_SECONDS = 1.0  # quanto dopo il tocco si campiona il pulsante "occupato"
 _SPIN_ZONE_HALF_PX = 160          # quadrato di ~320 px attorno al pulsante spin
 _BOTTOM_STRIP_FRACTION = 0.12     # ultimo 12% dell'altezza: saldo, puntata, vincita
+_FIRST_SPIN_CALM_SECONDS = 5.0    # prima del primo spin non c'e' vincita ne' bonus: la calma non si aspetta a lungo
+_REELS_STILL_SECONDS = 6.0        # ultimo ripiego (senza freccia): i soli rulli, fermi, bastano a toccare
 
 
 @dataclass
@@ -105,8 +107,21 @@ class SpinController:
         self.verified_spin_point = None
         self._anomaly = {}                 # slot -> True dopo "schermo cambiato senza addebito" (animazione/bonus in corso?)
         self._dead_spin_points = {}        # slot -> ((x, y), volte di fila) tocchi che non hanno mai addebitato
+        self._spins_done = {}              # slot -> spin con un tocco vero (senza non c'e' vincita ne' bonus da aspettare)
 
     def spin(
+        self, device_id: str, slot_name: str, episode_id: str, spin_index: int,
+        context_provider: Callable[[], Result], min_bet_verified: bool,
+        expected_bet: Optional[Decimal], force: bool = False,
+    ) -> Result[SpinResult]:
+        result = self._spin_once(device_id, slot_name, episode_id, spin_index, context_provider, min_bet_verified,
+                                 expected_bet, force)
+        data = result.data if result.success else None
+        if data is not None and isinstance(data.attempts, int) and data.attempts > 0 and data.outcome != "blocked":
+            self._spins_done[slot_name] = self._spins_done.get(slot_name, 0) + 1
+        return result
+
+    def _spin_once(
         self, device_id: str, slot_name: str, episode_id: str, spin_index: int,
         context_provider: Callable[[], Result], min_bet_verified: bool,
         expected_bet: Optional[Decimal], force: bool = False,
@@ -220,15 +235,35 @@ class SpinController:
             # andrebbe perso e ritoccare alla cieca rischia due spin.
             calm_started = time.monotonic()
             calm = None
+            first_spin = not self._spins_done.get(slot_name)
+            calm_limit = self.config.spin_calm_max_wait_seconds
+            if first_spin:
+                calm_limit = min(calm_limit, _FIRST_SPIN_CALM_SECONDS)
             if ready_check is not None:
                 # La freccia dello spin e' la misura giusta (un overlay di vincita muove lo schermo anche a gioco pronto)
-                calm = self.verifier.wait_until_button_ready(device_id, ready_check, self.config.spin_calm_max_wait_seconds)
+                calm = self.verifier.wait_until_button_ready(device_id, ready_check, calm_limit)
             if calm is None:
                 calm = self.verifier.wait_until_calm(
-                    device_id, context.screenshot_path, self.config.spin_calm_max_wait_seconds,
+                    device_id, context.screenshot_path, calm_limit,
                     regions=self._calm_regions(context, candidate) if self.config.spin_partial_calm else None,
                 )
+            if calm.success and not calm.data.calm and not first_spin and ready_check is None:
+                # Animazioni ambientali (banner, jackpot, luci) che non si fermano mai e nessuna freccia da guardare:
+                # contano solo i rulli, il resto dello schermo si ignora.
+                region = self._wait_region(context)
+                if region is not None:
+                    logger.warning("spin %d: animazioni ambientali continue rilevate, uso frame parziale per spin.",
+                                   spin_index)
+                    reels = self.verifier.wait_until_reels_still(device_id, region, _REELS_STILL_SECONDS)
+                    if reels.success and reels.data.calm:
+                        logger.info("spin %d: i rulli sono fermi (il resto dello schermo si muove): tocco.", spin_index)
+                        calm = reels
             calm_seconds = time.monotonic() - calm_started
+            if calm.success and not calm.data.calm and first_spin:
+                logger.info("spin %d: schermo non fermo a causa di animazioni ambientali, procedo con il primo spin.",
+                            spin_index)
+                calm = Result.ok(CalmResult(calm.data.screenshot_path, calm=True, waited=calm.data.waited,
+                                            seconds=calm.data.seconds))
             if calm.success and calm.data.partial:
                 logger.info("spin %d: i rulli sono in animazione ma barra degli importi e pulsante sono fermi: "
                             "tocco (calma parziale).", spin_index)

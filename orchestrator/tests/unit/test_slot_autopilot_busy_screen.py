@@ -327,3 +327,68 @@ class TestControllerUsesTheZones:
             self._run(calm=CalmResult("p.png", calm=True, waited=True, seconds=1.0, partial=True))
 
         assert "calma parziale" in caplog.text
+
+
+# ---- animazioni ambientali: i soli rulli contano, e prima del primo spin nessun Vigile --------------------------------
+
+class TestReelsOnlyWait:
+    REGION = (int(W * 0.05), int(H * 0.22), int(W * 0.95), int(H * 0.68))
+
+    def test_ambient_animations_outside_the_reels_do_not_matter(self, tmp_path):
+        frames = [_image(None, bottom=color) for color in ("red", "blue", "green", "black", "white", "red")]
+        verifier, _ = _verifier(_reader(tmp_path, frames))
+
+        result = verifier.wait_until_reels_still("d", self.REGION, 2.0)
+
+        assert result.success and result.data.calm and result.data.partial
+
+    def test_moving_reels_are_not_still(self, tmp_path):
+        frames = [_image(None, top=color) for color in ("red", "blue", "green", "black") * 300]       # sempre in movimento
+        verifier, _ = _verifier(_reader(tmp_path, frames))
+
+        result = verifier.wait_until_reels_still("d", self.REGION, 0.3)
+
+        assert result.success and not result.data.calm
+
+
+class TestNoWardenBeforeTheFirstSpin:
+    @staticmethod
+    def _run(monkeypatch, spins):
+        from orchestrator.tests.unit.test_slot_autopilot_session import _autopilot
+        clock = {"now": 0.0}
+        fake_time = SimpleNamespace(
+            monotonic=lambda: clock["now"], sleep=lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
+        )
+        monkeypatch.setattr(session_module, "time", fake_time)
+        autopilot = _autopilot(spins)
+        autopilot.warden = SimpleNamespace(handle=MagicMock(return_value="resume"), calls=0)
+        result = play_session(autopilot, "dev", "slot", Decimal("0.20"), 80)
+        return autopilot, result
+
+    @staticmethod
+    def _blocked(count):
+        return [Result.ok(SpinResult(
+            slot_name="s", spin_index=1, bet_amount=Decimal("0.10"), balance_before=Decimal("100"),
+            balance_after=Decimal("100"), win_amount=None, verified=False, attempts=0, outcome="blocked",
+            violated_invariant="UNSAFE_SCREEN_STATE", blocked_detail="schermo non fermo")) for _ in range(count)]
+
+    @staticmethod
+    def _spin(index):
+        return Result.ok(SpinResult(
+            slot_name="s", spin_index=index, bet_amount=Decimal("0.10"), balance_before=Decimal("100"),
+            balance_after=Decimal("99.9"), win_amount=None, verified=True, attempts=1, outcome="success"))
+
+    def test_busy_screen_with_no_spin_done_never_calls_the_warden(self, monkeypatch):
+        spins = self._blocked(12) + [self._spin(1), self._spin(2)]
+        autopilot, result = self._run(monkeypatch, spins)
+
+        autopilot.warden.handle.assert_not_called()
+        assert not result.failed and result.target_reached
+
+    def test_busy_screen_after_a_spin_calls_the_warden(self, monkeypatch):
+        spins = [self._spin(1)] + self._blocked(12) + [self._spin(2)]
+        autopilot, result = self._run(monkeypatch, spins)
+
+        autopilot.warden.handle.assert_called()
+        assert not result.failed and result.target_reached
+

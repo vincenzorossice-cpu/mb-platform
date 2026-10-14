@@ -378,6 +378,7 @@ def _play_session(
     warden = _warden_of(autopilot)
     events = []                # ultimi eventi di spin (per il vigile)
     warden_asked_busy = False
+    spins_done = 0             # tocchi veri sullo spin: prima non c'e' ne' vincita ne' bonus, quindi niente Vigile
     spin_confirmed = False
     method_saved = False
     bonus_streak = 0
@@ -551,6 +552,8 @@ def _play_session(
                       f"{spin_result.data.balance_after}")
         del events[:-20]
         data = spin_result.data
+        if isinstance(getattr(data, "attempts", None), int) and data.attempts > 0 and data.outcome != "blocked":
+            spins_done += 1
         bal_before, bal_after = data.balance_before, data.balance_after
         debited = (data.outcome == "success" and bal_before is not None and bal_after is not None
                    and bal_after < bal_before)
@@ -790,7 +793,7 @@ def _play_session(
                         recent_spins.clear()
                         spin_index -= 1
                         continue
-                if warden is not None and waited >= WARDEN_BUSY_SECONDS and not warden_asked_busy:
+                if warden is not None and spins_done > 0 and waited >= WARDEN_BUSY_SECONDS and not warden_asked_busy:
                     warden_asked_busy = True
                     verdict = incident(f"schermo occupato da {waited:.0f} s")
                     if verdict == "free_spins":
