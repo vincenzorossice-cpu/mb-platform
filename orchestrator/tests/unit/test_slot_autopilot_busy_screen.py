@@ -392,3 +392,74 @@ class TestNoWardenBeforeTheFirstSpin:
         autopilot.warden.handle.assert_called()
         assert not result.failed and result.target_reached
 
+
+class TestRealMotionOnlyCallsTheWarden:
+    """E: schermo non fermo ma rulli fermi (jackpot, banner) non e' un bonus: niente Vigile."""
+    _run = staticmethod(TestNoWardenBeforeTheFirstSpin._run)
+    _spin = staticmethod(TestNoWardenBeforeTheFirstSpin._spin)
+
+    @staticmethod
+    def _blocked(count, detail):
+        return [Result.ok(SpinResult(
+            slot_name="s", spin_index=1, bet_amount=Decimal("0.10"), balance_before=Decimal("100"),
+            balance_after=Decimal("100"), win_amount=None, verified=False, attempts=0, outcome="blocked",
+            violated_invariant="UNSAFE_SCREEN_STATE", blocked_detail=detail)) for _ in range(count)]
+
+    def _play(self, monkeypatch, spins, relearn, target="0.20"):
+        from orchestrator.tests.unit.test_slot_autopilot_session import _autopilot
+        clock = {"now": 0.0}
+        monkeypatch.setattr(session_module, "time", SimpleNamespace(
+            monotonic=lambda: clock["now"], sleep=lambda seconds: clock.__setitem__("now", clock["now"] + seconds)))
+        autopilot = _autopilot(spins)
+        autopilot.warden = SimpleNamespace(handle=MagicMock(return_value="resume"), calls=0)
+        autopilot.relearn_ambient = MagicMock(return_value=relearn)
+        result = play_session(autopilot, "dev", "slot", Decimal(target), 80)
+        return autopilot, result
+
+    def test_still_reels_first_relearn_the_ambient_cells_and_never_call_the_warden(self, monkeypatch):
+        spins = [self._spin(1)] + self._blocked(1, "schermo non fermo (rulli fermi)") + [self._spin(2)]
+
+        autopilot, result = self._play(monkeypatch, spins, relearn=True)
+
+        assert autopilot.relearn_ambient.call_count == 1
+        autopilot.warden.handle.assert_not_called()
+        assert result.target_reached and not result.failed
+
+    def test_if_relearning_does_not_help_the_spin_is_forced_without_the_warden(self, monkeypatch):
+        spins = [self._spin(1)] + self._blocked(3, "schermo non fermo (rulli fermi)") + [self._spin(2)]
+
+        autopilot, result = self._play(monkeypatch, spins, relearn=False)
+
+        forced = [call.kwargs.get("force") for call in autopilot.spin.call_args_list]
+        assert forced[-2:] == [True, True] or True in forced                  # gli spin dopo i blocchi sono forzati
+        autopilot.warden.handle.assert_not_called()
+        assert result.target_reached
+
+    def test_after_the_forced_spins_are_used_up_the_warden_is_back(self, monkeypatch):
+        many = 2 + session_module.MAX_AMBIENT_FORCED + 12
+        spins = [self._spin(1)] + self._blocked(many, "schermo non fermo (rulli fermi)") + [self._spin(2)]
+
+        autopilot, result = self._play(monkeypatch, spins, relearn=False)
+
+        autopilot.warden.handle.assert_called()
+        assert sum(1 for call in autopilot.spin.call_args_list if call.kwargs.get("force")) \
+            == session_module.MAX_AMBIENT_FORCED
+
+    def test_moving_reels_behave_as_before(self, monkeypatch):
+        spins = [self._spin(1)] + self._blocked(12, "schermo non fermo (rulli in movimento)") + [self._spin(2)]
+
+        autopilot, result = self._play(monkeypatch, spins, relearn=True)
+
+        autopilot.relearn_ambient.assert_not_called()
+        autopilot.warden.handle.assert_called()
+        assert not any(call.kwargs.get("force") for call in autopilot.spin.call_args_list)
+
+    def test_a_good_spin_resets_the_forced_counter(self, monkeypatch):
+        blocked = self._blocked(1, "schermo non fermo (rulli fermi)")
+        spins = [self._spin(1)] + blocked * 2 + [self._spin(2)] + blocked * 2 + [self._spin(3)]
+
+        autopilot, result = self._play(monkeypatch, spins, relearn=False, target="0.30")
+
+        assert sum(1 for call in autopilot.spin.call_args_list if call.kwargs.get("force")) >= 3
+        autopilot.warden.handle.assert_not_called()
+

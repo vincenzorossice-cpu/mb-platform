@@ -116,6 +116,8 @@ class ActionVerifier:
         self.screen_reader = screen_reader
         self.ocr_reader = ocr_reader
         self.config = config
+        # Celle dello schermo che cambiano da sole (contatori jackpot, banner): ignorate dal confronto di calma.
+        self.ambient_mask = None
         # Contatori per capire dove va il tempo (secondi e numero di eventi): vedi snapshot().
         self.stats = {"tap_s": 0.0, "taps": 0, "wait_s": 0.0, "captures": 0, "read_s": 0.0, "reads": 0}
 
@@ -149,6 +151,12 @@ class ActionVerifier:
         except Exception as exc:
             return Result.fail(f"Unexpected error during verified_tap: {exc}", "VERIFICATION_ERROR")
 
+    def _calm_diff(self, path_a: str, path_b: str) -> Result[float]:
+        """Differenza tra due schermi per decidere la calma: ignora le celle che cambiano da sole, se la maschera c'e'."""
+        if self.ambient_mask is not None:
+            return self.ambient_mask.masked_diff(path_a, path_b)
+        return diff_score(path_a, path_b)
+
     def wait_until_calm(
         self, device_id: str, reference_screenshot: str, max_wait_seconds: Optional[float] = None,
         regions: Optional[list] = None,
@@ -160,7 +168,7 @@ class ActionVerifier:
         shot = self.screen_reader._screenshot(device_id)
         if not shot.success:
             return Result.fail(shot.error, shot.error_code)
-        diff = diff_score(reference_screenshot, shot.data)
+        diff = self._calm_diff(reference_screenshot, shot.data)
         if diff.success and diff.data < self.config.frame_diff_stable_threshold:
             return Result.ok(CalmResult(shot.data, calm=True, waited=False, seconds=time.monotonic() - started))
         if regions:
@@ -170,6 +178,7 @@ class ActionVerifier:
             max_wait_seconds=max_wait_seconds or self.config.frame_diff_max_wait_seconds,
             poll_interval=self.config.frame_diff_poll_interval,
             stable_threshold=self.config.frame_diff_stable_threshold,
+            diff_fn=self._calm_diff if self.ambient_mask is not None else None,
         )
         if not wait.success:
             return Result.fail(wait.error, wait.error_code)
@@ -195,7 +204,7 @@ class ActionVerifier:
             shot = self.screen_reader._screenshot(device_id)
             if not shot.success:
                 return Result.fail(shot.error, shot.error_code)
-            whole = diff_score(previous, shot.data)
+            whole = self._calm_diff(previous, shot.data)
             if not whole.success:
                 return Result.fail(whole.error, whole.error_code)
             if whole.data < threshold:

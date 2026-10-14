@@ -170,6 +170,21 @@ class TestUsingQuickStop:
         controller_after = _spin(controller, index=6)                              # poi si torna al metodo normale
         assert controller_after.verified
 
+    def test_a_drop_beyond_two_spins_is_a_changed_bet_not_a_double_tap(self, tmp_path, caplog):
+        """Shining Crown: puntata passata a 0.30 con 0.10 creduta. Due tocchi costano al massimo 0.20."""
+        state = QuickState(True)
+        controller, _ = _controller(tmp_path, state, balance_after="9.70")           # calo 0.30 con puntata 0.10
+
+        provider = MagicMock(side_effect=lambda: _context_result(Decimal("10.00") if provider.call_count == 1
+                                                                 else Decimal("9.70")))   # le riletture confermano il calo
+        with caplog.at_level(logging.WARNING):
+            result = controller.spin("dev", "wrap", "ep", 5, provider, True, BET).data
+
+        assert state.calls == []                                                   # Quick Stop NON spento
+        assert "oltre il doppio della puntata" in caplog.text
+        assert result.bet_understated                                              # si rilegge la puntata
+        assert controller.quick_stats["state"] != "disabled"
+
     def test_the_env_variable_switches_it_off_completely(self, tmp_path, monkeypatch):
         monkeypatch.setenv("QUICK_STOP", "0")
         controller, verifier = _controller(tmp_path, QuickState(True))

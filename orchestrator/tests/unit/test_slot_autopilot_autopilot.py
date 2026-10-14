@@ -33,7 +33,7 @@ def _isolated_slot_memory(tmp_path, monkeypatch):
 def _config(**overrides) -> AutoPilotConfig:
     defaults = dict(
         device_id="dev", slot_name="pirots5", target_played_amount=Decimal("1.00"),
-        require_profile=True,
+        require_profile=True, bet_watch_enabled=False, ambient_learning=False,     # letture extra: test a parte
     )
     defaults.update(overrides)
     return AutoPilotConfig(**defaults)

@@ -730,7 +730,7 @@ class TestCalmBeforeTapping:
         result, verifier, _ = self._spin([_calm(calm=False, waited=True)], [], [_context_result(Decimal("100"))],
                                          spins_done=1)
 
-        assert result.data.outcome == "blocked" and result.data.blocked_detail == "schermo non fermo"
+        assert result.data.outcome == "blocked" and result.data.blocked_detail == "schermo non fermo (rulli in movimento)"
         verifier.verified_tap.assert_not_called()
 
     def test_ambient_animations_with_still_reels_do_not_block_a_later_spin(self, caplog):
@@ -770,7 +770,7 @@ class TestCalmBeforeTapping:
                                  True, Decimal("0.20"))
 
         assert result.data.outcome == "blocked"                           # la freccia dice "occupato": i rulli non scavalcano
-        verifier.wait_until_reels_still.assert_not_called()
+        assert result.data.blocked_detail == "schermo non fermo (rulli fermi)"      # ma si sa che i rulli erano fermi
 
     def test_only_a_real_tap_counts_as_a_spin_done(self):
         controller, _, locator, verifier = _controller(config=_config(spin_calm_check=True))

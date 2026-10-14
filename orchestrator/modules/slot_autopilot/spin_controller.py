@@ -32,6 +32,7 @@ _SPIN_ZONE_HALF_PX = 160          # quadrato di ~320 px attorno al pulsante spin
 _BOTTOM_STRIP_FRACTION = 0.12     # ultimo 12% dell'altezza: saldo, puntata, vincita
 _FIRST_SPIN_CALM_SECONDS = 5.0    # prima del primo spin non c'e' vincita ne' bonus: la calma non si aspetta a lungo
 _REELS_STILL_SECONDS = 6.0        # ultimo ripiego (senza freccia): i soli rulli, fermi, bastano a toccare
+_REELS_ANNOTATE_SECONDS = 3.0     # a schermo bloccato: i rulli sono fermi o si muovono? (decide se serve il Vigile)
 
 
 @dataclass
@@ -63,6 +64,8 @@ class SpinResult:
     # Il tocco ha cambiato lo schermo ma non c'e' stato addebito (bonus intro, free spin, animazione): chi chiama non
     # deve toccare di nuovo lo spin finche' non ha capito cosa succede.
     anomaly: bool = False
+    # La cella di puntata selezionata (letta a set_min_bet) non ha piu' lo stesso aspetto: la puntata e' stata cambiata.
+    bet_cell_changed: bool = False
 
 
 class SpinController:
@@ -236,6 +239,7 @@ class SpinController:
             calm_started = time.monotonic()
             calm = None
             first_spin = not self._spins_done.get(slot_name)
+            reels_state = None            # "fermi" | "in movimento" | None (non misurato)
             calm_limit = self.config.spin_calm_max_wait_seconds
             if first_spin:
                 calm_limit = min(calm_limit, _FIRST_SPIN_CALM_SECONDS)
@@ -255,6 +259,8 @@ class SpinController:
                     logger.warning("spin %d: animazioni ambientali continue rilevate, uso frame parziale per spin.",
                                    spin_index)
                     reels = self.verifier.wait_until_reels_still(device_id, region, _REELS_STILL_SECONDS)
+                    if reels.success:
+                        reels_state = "fermi" if reels.data.calm else "in movimento"
                     if reels.success and reels.data.calm:
                         logger.info("spin %d: i rulli sono fermi (il resto dello schermo si muove): tocco.", spin_index)
                         calm = reels
@@ -270,6 +276,13 @@ class SpinController:
             if calm.success and not calm.data.calm:
                 violated = "UNSAFE_SCREEN_STATE"
                 logger.info("spin %d: lo schermo non si ferma (animazione in corso?): non tocco.", spin_index)
+                if reels_state is None and not first_spin:
+                    region = self._wait_region(context)
+                    if region is not None:
+                        reels = self.verifier.wait_until_reels_still(device_id, region, _REELS_ANNOTATE_SECONDS)
+                        if reels.success:
+                            reels_state = "fermi" if reels.data.calm else "in movimento"
+                detail = "schermo non fermo" + (f" (rulli {reels_state})" if reels_state else "")
                 self._log_step(
                     episode_id, spin_index, slot_name, device_id, None, None,
                     balance_before, balance_before, outcome="blocked", notes=violated,
@@ -278,7 +291,7 @@ class SpinController:
                     slot_name=slot_name, spin_index=spin_index, bet_amount=expected_bet,
                     balance_before=balance_before, balance_after=balance_before, win_amount=None,
                     verified=False, attempts=0, outcome="blocked", violated_invariant=violated,
-                    blocked_detail="schermo non fermo",
+                    blocked_detail=detail,
                 ))
             if calm.success and calm.data.waited:
                 # Si e' aspettato: il saldo letto prima e' vecchio (una vincita puo' essere stata accreditata
@@ -678,6 +691,13 @@ class SpinController:
             self.quick_stats["spins"] += 1
             self.quick_stats["seconds"] += time.monotonic() - started
             if balance_after is not None and self._bet_understated(balance_before, balance_after, bet):
+                if self._beyond_double_spin(balance_before, balance_after, bet):
+                    # Due tocchi a questa puntata costano al massimo il doppio: oltre, la puntata a schermo e' cambiata.
+                    quick_log.warning(
+                        "Calo di saldo %s oltre il doppio della puntata %s: non e' un doppio tocco, la puntata e' "
+                        "cambiata (Quick Stop resta attivo, rileggo la puntata).",
+                        balance_before - balance_after, bet)
+                    return False
                 quick_log.warning("Quick Stop disabilitato: doppio addebito rilevato (saldo %s -> %s con puntata %s).",
                                balance_before, balance_after, bet)
                 self._set_quick(slot_name, False, "doppio addebito rilevato")
@@ -848,6 +868,11 @@ class SpinController:
         if not result.success:
             return None
         return self._read_amount(result.data, "saldo")
+
+    def _beyond_double_spin(self, balance_before, balance_after, bet) -> bool:
+        """Il calo supera due spin alla puntata creduta (piu' tolleranza e margine): non puo' essere il Quick Stop."""
+        margin = max(bet * Decimal("0.25"), Decimal("0.02"))
+        return (balance_before - balance_after) > 2 * bet + self.config.accounting_tolerance + margin
 
     def _bet_understated(self, balance_before, balance_after, bet) -> bool:
         """Una vincita puo' solo RIDURRE il calo di saldo: se il saldo scende di piu' della puntata creduta

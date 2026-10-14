@@ -9,7 +9,9 @@ from orchestrator.core.result import Result
 from orchestrator.modules.provider_profile.loader import ProviderProfileLoader
 from orchestrator.modules.provider_profile.profile_builder import ProfileBuilder, SessionEvidence
 from orchestrator.modules.screen_reader.interface import ScreenReaderInterface
+from orchestrator.modules.slot_autopilot import ambient_mask
 from orchestrator.modules.slot_autopilot.bet_controller import BetController, BetResult
+from orchestrator.modules.slot_autopilot.bet_watch import BetWatch
 from orchestrator.modules.slot_autopilot.config import AutoPilotConfig
 from orchestrator.modules.slot_autopilot.locator import ElementLocator
 from orchestrator.modules.slot_autopilot.spin_controller import SpinController, SpinResult
@@ -93,6 +95,8 @@ class SlotAutoPilot:
         self.spin_controller = spin_controller
         self.step_logger = step_logger
         self.profile_builder = profile_builder
+        self.bet_watch = BetWatch()
+        self._ambient_checked = False       # la maschera delle animazioni ambientali e' gia' stata caricata/appresa
 
         self._profile = None
         self._screen_size: Optional[tuple] = None
@@ -165,9 +169,79 @@ class SlotAutoPilot:
                 self._current_bet = result.data.final_bet
                 if any(name not in _UNASSISTED_STRATEGIES for name in result.data.strategy_sequence):
                     self._assisted = True
+                if result.data.min_bet_verified:
+                    self._learn_bet_watch(device_id, result.data.final_bet)
+                    self._learn_ambient(device_id)
             return result
         except Exception as exc:
             return Result.fail(f"Unexpected error in set_min_bet: {exc}", "UNEXPECTED_ERROR")
+
+    # ---- sorveglianza della puntata e animazioni ambientali ----------------------------------------------------------
+    def _learn_bet_watch(self, device_id: str, final_bet) -> None:
+        """Dopo una puntata verificata: l'aspetto della cella selezionata (una lettura fresca, una volta)."""
+        if not self.config.bet_watch_enabled or final_bet is None:
+            return
+        try:
+            context = self._build_context(device_id)
+            if context.success:
+                self.bet_watch.learn(context.data.screenshot_path, list(context.data.text_boxes), final_bet)
+        except Exception as exc:
+            logger.warning("bet_watch: apprendimento saltato (%s).", exc)
+
+    def _learn_ambient(self, device_id: str) -> None:
+        """Slot ferma, prima di ogni spin: carica la maschera delle animazioni ambientali o la apprende (una volta)."""
+        if self._ambient_checked or not self.config.ambient_learning:
+            return
+        self._ambient_checked = True
+        try:
+            shot = self.screen_reader._screenshot(device_id)
+            if not shot.success:
+                return
+            from PIL import Image
+            with Image.open(shot.data) as image:
+                size = image.size
+            mask = ambient_mask.load_mask(self.config.slot_memory_dir, self.config.slot_name, size)
+            if mask is None:
+                mask = self._capture_mask(device_id, [shot.data])
+            self._set_mask(mask, "caricata o appresa")
+        except Exception as exc:
+            logger.warning("ambiente: apprendimento saltato (%s).", exc)
+
+    def _capture_mask(self, device_id: str, paths: list):
+        for _ in range(max(1, self.config.ambient_learn_frames - len(paths))):
+            time.sleep(self.config.ambient_learn_interval_seconds)
+            shot = self.screen_reader._screenshot(device_id)
+            if shot.success:
+                paths.append(shot.data)
+        learned = ambient_mask.learn_mask(paths)
+        if learned is not None:
+            ambient_mask.save_mask(self.config.slot_memory_dir, self.config.slot_name, learned)
+        return learned
+
+    def _set_mask(self, mask, how: str) -> None:
+        verifier = getattr(self.spin_controller, "verifier", None)
+        if verifier is not None:
+            verifier.ambient_mask = mask
+        if mask is not None:
+            logger.info("Animazioni ambientali: %d celle ignorate nel confronto di calma (%s).", len(mask.cells), how)
+        else:
+            logger.info("Animazioni ambientali: nessuna cella da ignorare.")
+
+    def relearn_ambient(self, device_id: str) -> bool:
+        """Lo schermo non e' fermo ma i rulli si': si riapprendono le celle che cambiano da sole (un banner nuovo)."""
+        try:
+            mask = self._capture_mask(device_id, [])
+            if mask is None:
+                return False
+            old = getattr(getattr(self.spin_controller, "verifier", None), "ambient_mask", None)
+            if old is not None and old.covers(mask.size):
+                mask = ambient_mask.AmbientMask(mask.size, old.cells | mask.cells)
+                ambient_mask.save_mask(self.config.slot_memory_dir, self.config.slot_name, mask)
+            self._set_mask(mask, "riappresa")
+            return True
+        except Exception as exc:
+            logger.warning("ambiente: riapprendimento fallito (%s).", exc)
+            return False
 
     def phase_report(self, label: str, seconds: float) -> str:
         """Dove e' andato il tempo di una fase (preparazione, puntata minima): letture OCR (locali/remote), attese
@@ -246,6 +320,9 @@ class SlotAutoPilot:
                     self._assisted = True
                 if result.data.outcome in ("no_effect", "error"):
                     self._no_effect_spins += 1
+                if result.data.outcome == "success" and self.bet_watch.check(result.data.screenshot_after) is True:
+                    logger.warning("La cella di puntata selezionata non e' piu' quella di prima: la puntata e' cambiata.")
+                    result.data.bet_cell_changed = True
                 if result.data.outcome == "success":
                     self._total_spins += 1
                     if result.data.bet_amount is not None:

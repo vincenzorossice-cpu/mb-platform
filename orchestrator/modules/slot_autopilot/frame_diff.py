@@ -57,12 +57,13 @@ class StabilityResult:
 
 def wait_until_stable(
     capture_fn: Callable[[], Result], max_wait_seconds: float, poll_interval: float,
-    stable_threshold: float, region: Optional[tuple] = None,
+    stable_threshold: float, region: Optional[tuple] = None, diff_fn: Optional[Callable] = None,
 ) -> Result[StabilityResult]:
     """Chiama ripetutamente capture_fn (iniettato: non tocca mai ScreenReader
     direttamente) finche' due frame consecutivi non differiscono meno di
     stable_threshold, o scade max_wait_seconds. Il timeout senza convergenza
-    e' un dato per il chiamante (stable=False), non un errore."""
+    e' un dato per il chiamante (stable=False), non un errore. `diff_fn(path_a, path_b) -> Result[float]`, se dato,
+    sostituisce il confronto (es. con le celle ambientali mascherate)."""
     start = time.monotonic()
     first = capture_fn()
     if not first.success:
@@ -88,7 +89,7 @@ def wait_until_stable(
         next_gray = _load_gray(next_path)        # ogni frame si decodifica una volta sola (poi diventa il "precedente")
         if isinstance(next_gray, Exception):
             return Result.fail(f"Cannot read image: {next_gray}", "IMAGE_READ_ERROR")
-        score_result = _gray_diff(previous_gray, next_gray, region)
+        score_result = diff_fn(previous_path, next_path) if diff_fn is not None else _gray_diff(previous_gray, next_gray, region)
         if not score_result.success:
             return Result.fail(score_result.error, score_result.error_code)
 

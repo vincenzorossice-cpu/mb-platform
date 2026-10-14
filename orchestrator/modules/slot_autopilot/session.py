@@ -20,6 +20,9 @@ MAX_UNDERSTATED_RECHECKS = 2    # riletture della puntata per sessione prima di 
 # Spin puliti di fila dopo i quali il budget di riletture si ricarica: i falsi allarmi (letture OCR sbagliate) sono
 # isolati, i problemi veri si ripetono ravvicinati; senza ricarica tre falsi allarmi sparsi fermerebbero una sessione lunga.
 UNDERSTATED_RECHECK_RESET_SPINS = 30
+MAX_VISUAL_RECHECKS = 5         # allarmi della cella di puntata per sessione: oltre, la sorveglianza visiva si spegne
+MAX_AMBIENT_RELEARNS = 2        # riapprendimenti delle animazioni ambientali per sessione (rulli fermi, schermo no)
+MAX_AMBIENT_FORCED = 3          # spin forzati di fila con i rulli fermi prima di richiamare il Vigile
 WARDEN_BUSY_SECONDS = 20        # schermo occupato da cosi' tanto: lo guarda il vigile (Sol)
 MAX_FREE_RUN = 15               # free spin consecutivi prima di richiamare Sol (tetto di sicurezza)
 FREE_IDLE_SECONDS = 25.0        # secondi senza cambiamenti in free spin prima di richiamare Sol
@@ -384,6 +387,8 @@ def _play_session(
     bonus_streak = 0
     understated_rechecks = 0
     clean_spins_since_understated = 0
+    visual_rechecks = 0
+    ambient_relearns = ambient_forced = 0
 
     _log_capture_mode(autopilot, log)
     log.info("Verifica puntata minima in corso...")
@@ -608,6 +613,28 @@ def _play_session(
             if verdict == "stop":
                 failed, stop_reason = True, "OPERATOR_STOP"
                 break
+        if getattr(spin_result.data, "bet_cell_changed", False) is True:
+            if visual_rechecks < MAX_VISUAL_RECHECKS:
+                visual_rechecks += 1
+                log.warning(
+                    "La cella di puntata selezionata e' cambiata (puntata creduta %s): rileggo e riporto la puntata al "
+                    "minimo (%d/%d). Questo spin non entra nel giocato.", spin_result.data.bet_amount, visual_rechecks,
+                    MAX_VISUAL_RECHECKS,
+                )
+                recheck = autopilot.set_min_bet(device_id)
+                recent_spins.clear()
+                if recheck.success and recheck.data.min_bet_verified:
+                    log.info("Puntata riportata a %s EUR: riprendo.", recheck.data.final_bet)
+                    continue
+                reason = recheck.data.aborted_reason if recheck.success else recheck.error_code
+                log.error("Impossibile riverificare la puntata (%s): mi fermo senza spinnare.", reason)
+                failed, stop_reason = True, "BET_NOT_VERIFIED"
+                break
+            log.warning("La cella di puntata cambia troppo spesso (%d allarmi): spengo la sorveglianza visiva; restano "
+                        "gli altri controlli sul saldo.", MAX_VISUAL_RECHECKS)
+            watch = getattr(autopilot, "bet_watch", None)
+            if watch is not None:
+                watch.enabled = False
         if spin_result.data.bet_understated:
             believed = spin_result.data.bet_amount
             drop = None
@@ -693,6 +720,7 @@ def _play_session(
             busy_asked = False
             lost_checked = False
             warden_asked_busy = False
+            ambient_forced = 0
         if spin_result.data.outcome == "no_effect":
             consecutive_no_effect += 1
             if consecutive_no_effect >= MAX_CONSECUTIVE_NO_EFFECT_SPINS:
@@ -791,6 +819,24 @@ def _play_session(
                     ):
                         consecutive_no_effect, busy_since, busy_asked, lost_checked = 0, None, False, False
                         recent_spins.clear()
+                        spin_index -= 1
+                        continue
+                if spins_done > 0 and "rulli fermi" in str(getattr(spin_result.data, "blocked_detail", None) or ""):
+                    # I rulli sono fermi, e' il resto dello schermo (jackpot, banner) che non sta mai fermo: non e' un
+                    # bonus. Prima si riapprendono le celle che si muovono da sole; poi si prova uno spin forzato.
+                    if ambient_relearns < MAX_AMBIENT_RELEARNS:
+                        ambient_relearns += 1
+                        log.info("Rulli fermi ma schermo non fermo (animazioni ambientali?): riapprendo le celle che "
+                                 "si muovono da sole (%d/%d).", ambient_relearns, MAX_AMBIENT_RELEARNS)
+                        relearn = getattr(autopilot, "relearn_ambient", None)
+                        if callable(relearn) and relearn(device_id) is True:
+                            spin_index -= 1
+                            continue
+                    if ambient_forced < MAX_AMBIENT_FORCED:
+                        ambient_forced += 1
+                        log.warning("Rulli fermi e schermo non fermo: provo uno spin forzato (%d/%d), senza il Vigile.",
+                                    ambient_forced, MAX_AMBIENT_FORCED)
+                        force_next = True
                         spin_index -= 1
                         continue
                 if warden is not None and spins_done > 0 and waited >= WARDEN_BUSY_SECONDS and not warden_asked_busy:

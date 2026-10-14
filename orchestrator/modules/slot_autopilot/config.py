@@ -99,6 +99,13 @@ class AutoPilotConfig:
     dataset_dir: str = "dataset"
     profiles_dir: str = "provider_profiles"
     slot_memory_dir: str = "slot_memory"
+    # Sorveglianza visiva della cella di puntata selezionata (un tocco accidentale non cambia il saldo subito).
+    bet_watch_enabled: bool = True
+    # Animazioni ambientali (jackpot, banner): a slot ferma si apprendono le celle che cambiano da sole e il confronto
+    # di calma le ignora. Frame e intervallo (s) dell'apprendimento.
+    ambient_learning: bool = True
+    ambient_learn_frames: int = 5
+    ambient_learn_interval_seconds: float = 0.6
     # Puntata minima della slot dichiarata dall'operatore (--min-bet): vale come minimo dimostrato.
     known_min_bet: Optional[Decimal] = None
     dry_run: bool = False
