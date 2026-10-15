@@ -67,6 +67,10 @@ class SlotExplorer:
         self.describe = describe
         self.sleep = sleep
         self.last_notes = []
+        # Autospin e turbo (opzionali, iniettati dalla radice di composizione). L'esploratore NON li usa in `explore()`:
+        # attivarli fa partire giri, quindi si esplorano dopo la puntata minima (vedi SlotSetup.explore_autospin).
+        self.autospin_manager = None
+        self.turbo_manager = None
 
     # ---- API ---------------------------------------------------------------------------------------------------
     def explore(self, device_id: str, slot_name: str, demo: bool = True, known_min_bet: Optional[Decimal] = None,
@@ -96,6 +100,18 @@ class SlotExplorer:
             return Result.fail("mappa incompleta: " + "; ".join(self.last_notes or ["spin non verificato"]),
                                "EXPLORE_INCOMPLETE")
         return Result.ok(smap)
+
+    def explore_autospin(self, device_id: str, slot_name: str, spin_point=None, bet_panel_point=None, previous=None):
+        """Cerca l'autospin (principale -> menu -> pannello puntata). Solo con la puntata gia' al minimo e in demo."""
+        if self.autospin_manager is None:
+            return Result.fail("nessun gestore dell'autospin collegato", "AUTOSPIN_NO_MANAGER")
+        return self.autospin_manager.explore_autospin(device_id, slot_name, spin_point, bet_panel_point, previous)
+
+    def explore_turbo(self, device_id: str, spin_point=None, previous=None):
+        """Cerca il turbo e lo attiva (la conferma e' dal tempo degli spin: TurboManager.conclude)."""
+        if self.turbo_manager is None:
+            return Result.fail("nessun gestore del turbo collegato", "TURBO_NO_MANAGER")
+        return self.turbo_manager.explore_turbo(device_id, spin_point, previous)
 
     # ---- bet menu ----------------------------------------------------------------------------------------------
     def _map_bet_menu(self, device_id: str, smap: SlotMap, closed_path: str, overview: dict,

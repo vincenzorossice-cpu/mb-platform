@@ -96,6 +96,7 @@ class SlotAutoPilot:
         self.step_logger = step_logger
         self.profile_builder = profile_builder
         self.bet_watch = BetWatch()
+        self.autospin_manager = None       # AutoSpinManager (radice di composizione); None = niente autospin
         self._ambient_checked = False       # la maschera delle animazioni ambientali e' gia' stata caricata/appresa
 
         self._profile = None
@@ -226,6 +227,18 @@ class SlotAutoPilot:
             logger.info("Animazioni ambientali: %d celle ignorate nel confronto di calma (%s).", len(mask.cells), how)
         else:
             logger.info("Animazioni ambientali: nessuna cella da ignorare.")
+
+    def autospin_cycle(self, device_id: str, info, bet, played_budget, spins_budget: int, period: float):
+        """Un ciclo di autospin con monitoraggio a campione (vedi AutoSpinManager.run_cycle)."""
+        manager = self.autospin_manager
+        if manager is None:
+            return None
+        spin_point = None
+        setup = getattr(self, "slot_setup", None)
+        if setup is not None:
+            spin_point = setup.spin_point(self.config.slot_name)
+        return manager.run_cycle(device_id, self.config.slot_name, info, spin_point, bet, played_budget,
+                                 spins_budget, period)
 
     def relearn_ambient(self, device_id: str) -> bool:
         """Lo schermo non e' fermo ma i rulli si': si riapprendono le celle che cambiano da sole (un banner nuovo)."""

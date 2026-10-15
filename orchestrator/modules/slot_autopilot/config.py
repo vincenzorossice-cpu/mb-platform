@@ -106,6 +106,16 @@ class AutoPilotConfig:
     ambient_learning: bool = True
     ambient_learn_frames: int = 5
     ambient_learn_interval_seconds: float = 0.6
+    # Autospin: la slot gira da sola e si controlla a campione (saldo, puntata, autospin ancora attivo) ogni N spin
+    # invece di toccare lo spin a ogni giro. Si ferma al `stop_threshold` del target e gli ultimi spin sono manuali.
+    autospin_enabled: bool = True
+    autospin_sample_interval: int = 15
+    autospin_stop_threshold: float = 0.9
+    autospin_period_safety: float = 1.2        # il periodo del giro si moltiplica: meglio sottostimare i giri fatti
+    # Turbo: 5 spin senza e 5 con, il turbo vale se il tempo scende almeno del 20%.
+    turbo_enabled: bool = True
+    speedup_measure_spins: int = 5
+    turbo_min_gain: float = 0.2
     # Puntata minima della slot dichiarata dall'operatore (--min-bet): vale come minimo dimostrato.
     known_min_bet: Optional[Decimal] = None
     dry_run: bool = False
@@ -123,6 +133,10 @@ class AutoPilotConfig:
             return Result.fail("tap_settle_seconds must be > 0", "CONFIG_INVALID")
         if self.spin_settle_seconds <= 0:
             return Result.fail("spin_settle_seconds must be > 0", "CONFIG_INVALID")
+        if self.autospin_sample_interval <= 0:
+            return Result.fail("autospin_sample_interval must be > 0", "CONFIG_INVALID")
+        if not 0 < self.autospin_stop_threshold <= 1:
+            return Result.fail("autospin_stop_threshold must be in (0, 1]", "CONFIG_INVALID")
         if self.spin_calm_max_wait_seconds <= 0:
             return Result.fail("spin_calm_max_wait_seconds must be > 0", "CONFIG_INVALID")
         if self.stable_reads_for_min < 1:

@@ -25,7 +25,9 @@ from orchestrator.modules.decision_engine.gpt_client import GPTDecisionClient, r
 from orchestrator.modules.provider_profile.loader import ProviderProfileLoader
 from orchestrator.modules.provider_profile.profile_builder import ProfileBuilder
 from orchestrator.modules.screen_reader.reader import ScreenReader
+from orchestrator.modules.login_manager import adb_input
 from orchestrator.modules.slot_autopilot.autopilot import SlotAutoPilot
+from orchestrator.modules.slot_autopilot.autospin_manager import AutoSpinManager
 from orchestrator.modules.slot_autopilot.bet_controller import BetController
 from orchestrator.modules.slot_autopilot.bet_menu import BetMenuSelector
 from orchestrator.modules.slot_autopilot.config import AutoPilotConfig
@@ -33,6 +35,7 @@ from orchestrator.modules.slot_autopilot.locator import ElementLocator
 from orchestrator.modules.slot_autopilot.spin_button import SpinButtonState
 from orchestrator.modules.slot_autopilot.spin_controller import SpinController
 from orchestrator.modules.slot_autopilot.supervisor import SlotSupervisor
+from orchestrator.modules.slot_autopilot.turbo_manager import TurboManager
 from orchestrator.modules.slot_autopilot.strategies.gpt_locator_strategy import GPTLocatorStrategy
 from orchestrator.modules.slot_autopilot.strategies.hitl_strategy import HITLStrategy
 from orchestrator.modules.slot_autopilot.strategies.memory_strategy import MemoryStrategy
@@ -65,6 +68,8 @@ _CONSOLE_INFO_LOGGERS = (
     # "Learn once, remember forever": mappa trovata/esplorata, intro superate, verifiche (prima erano solo nel file)
     "orchestrator.modules.slot_autopilot.slot_setup", "orchestrator.modules.slot_autopilot.slot_explorer",
     "orchestrator.modules.slot_autopilot.slot_intro", "orchestrator.quick_stop",
+    "orchestrator.modules.slot_autopilot.autospin_manager", "orchestrator.modules.slot_autopilot.turbo_manager",
+    "orchestrator.modules.slot_autopilot.speedup_controller",
     "orchestrator.modules.slot_ocr.reader",
 )
 _HARMLESS_WARNING_PATTERNS = (".*pin_memory.*", ".*quantize_per_tensor.*")
@@ -241,6 +246,18 @@ def build_autopilot_for(
             known_min_bet=config.known_min_bet, demo=explore_demo, gpt_client=gpt_client,
         )
         autopilot.slot_setup.button = spin_controller.button       # per ricordare/azzerare il metodo dello spin
+        # Autospin e turbo: si esplorano (solo in demo) dopo la puntata minima; senza mappa non c'e' dove ricordarli.
+        press_back = (lambda: adb_input.press_back(device_id))
+        autopilot.autospin_manager = autopilot_explorer.autospin_manager = AutoSpinManager(
+            screen_reader, touch_injector, ocr_reader=getattr(ocr_reader, "ocr", ocr_reader),
+            ask=autopilot_explorer._ask, button=spin_controller.button, bet_watch=autopilot.bet_watch,
+            ask_operator=input if enable_hitl else None, press_back=press_back,
+            sample_interval=config.autospin_sample_interval, period_safety=config.autospin_period_safety,
+        )
+        autopilot_explorer.turbo_manager = TurboManager(
+            screen_reader, touch_injector, ocr_reader=getattr(ocr_reader, "ocr", ocr_reader),
+            ask=autopilot_explorer._ask, press_back=press_back, min_gain=config.turbo_min_gain,
+        )
     if gpt_client is not None and "gpt" in strategies:
         slot_setup_obj = getattr(autopilot, "slot_setup", None)
 

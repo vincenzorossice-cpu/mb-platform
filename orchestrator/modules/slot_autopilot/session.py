@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Optional
 
+from orchestrator.modules.slot_autopilot.speedup_controller import SpeedupController
+
 logger = logging.getLogger(__name__)
 
 # Spin senza effetto di fila dopo i quali ci si ferma (invece di consumare max_steps).
@@ -423,6 +425,10 @@ def _play_session(
     )
     if slot_setup is not None:
         slot_setup.learn_bet_menu(device_id, slot_name, bet_result.data.final_bet)
+    speed = SpeedupController(autopilot, slot_setup, device_id, slot_name, target, log)
+    speed_stop = speed.prepare()           # autospin e turbo: esplorazione in demo; mai a puntata non verificata
+    if speed_stop is not None:
+        return SlotSessionResult(Decimal("0.00"), 0, failed=True, stop_reason=speed_stop, target=target)
 
     total_played = Decimal("0.00")
     spin_index = 0
@@ -534,6 +540,23 @@ def _play_session(
         return False
 
     while total_played < target and spin_index < max_steps:
+        current_bet = getattr(autopilot, "_current_bet", None)
+        cycle = speed.maybe_cycle(total_played, spin_index, max_steps, fs["on"], spins_done,
+                                  current_bet if isinstance(current_bet, Decimal) else bet_result.data.final_bet)
+        if cycle is not None:
+            total_played += cycle.played
+            spin_index += cycle.spins
+            if cycle.stop_reason:
+                failed, stop_reason = True, cycle.stop_reason
+                break
+            if cycle.recheck_bet:
+                recheck = autopilot.set_min_bet(device_id)
+                recent_spins.clear()
+                if not (recheck.success and recheck.data.min_bet_verified):
+                    log.error("Impossibile riverificare la puntata dopo l'autospin: mi fermo senza spinnare.")
+                    failed, stop_reason = True, "BET_NOT_VERIFIED"
+                    break
+            continue
         spin_index += 1
         started = time.monotonic()
         controller = getattr(autopilot, "spin_controller", None)
@@ -798,6 +821,7 @@ def _play_session(
                 button_status_shown = True
                 log.info("Pulsante spin: %s", status)
             log.info("%s", progress_line(spin_index, spin_result.data, total_played, target, seconds))
+            speed.note_spin(seconds)
         elif spin_result.data.outcome == "blocked":
             if spin_result.data.violated_invariant == "UNSAFE_SCREEN_STATE":
                 if busy_since is None:

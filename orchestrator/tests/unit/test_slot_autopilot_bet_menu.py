@@ -34,7 +34,7 @@ MAIN_BOXES = [_box("CREDITO", 150, 2200), _box("€99.998,00", 350, 2200),
 def _context(boxes, posta=None):
     state = {"posta": posta} if posta is not None else {}
     return LocateContext(
-        device_id="dev", slot_name="bigbass", screenshot_path="/tmp/x.png", screen_width=1080,
+        device_id="dev", slot_name="bigbass", screenshot_path="/nonexistent/x.png", screen_width=1080,
         screen_height=2400, text_boxes=boxes, slot_ocr_state=state,
     )
 

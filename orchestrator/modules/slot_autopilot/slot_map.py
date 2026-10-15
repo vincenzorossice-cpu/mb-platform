@@ -41,6 +41,117 @@ class Point:
             return None
 
 
+AUTOSPIN_STATUSES = ("present", "absent", "unknown")
+AUTOSPIN_LOCATIONS = ("main", "menu", "bet_panel", "unknown")
+AUTOSPIN_TYPES = ("infinite", "fixed", "unknown")
+STOP_METHODS = ("tap_spin", "tap_stop", "tap_button")
+COUNTER_LOCATIONS = ("button", "panel", "screen")
+TURBO_TYPES = ("toggle", "multi_level")
+
+
+def _enum(raw, allowed: tuple, default):
+    return raw if raw in allowed else default
+
+
+def _xy(raw) -> Optional[list]:
+    try:
+        return [int(raw[0]), int(raw[1])]
+    except (TypeError, ValueError, IndexError, KeyError):
+        return None
+
+
+def _steps(raw) -> list:
+    steps = []
+    for step in raw if isinstance(raw, list) else []:
+        try:
+            steps.append({"x": int(step["x"]), "y": int(step["y"]), "wait": float(step.get("wait", 1.0)),
+                          "note": str(step.get("note", ""))})
+        except (KeyError, TypeError, ValueError):
+            continue
+    return steps
+
+
+@dataclass
+class AutospinInfo:
+    """Autospin della slot: "present" solo se verificato dall'effetto; "absent" e' un esito normale."""
+    status: str = "unknown"                    # present | absent | unknown
+    location: str = "unknown"                  # main | menu | bet_panel | unknown
+    button_coords: Optional[list] = None
+    type: str = "unknown"                      # infinite | fixed | unknown
+    max_spins: Optional[int] = None            # None = infinito
+    spin_options: Optional[list] = None
+    requires_fixed_bet: bool = False
+    requires_loss_limit: bool = False
+    stop_method: Optional[str] = None          # tap_spin | tap_stop | tap_button
+    stop_coords: Optional[list] = None
+    counter_location: Optional[str] = None     # button | panel | screen
+    touch_sequence: Optional[list] = None      # [{x, y, wait, note}] dalla schermata principale
+    verified: bool = False                     # avvio E fermata verificati dall'effetto
+    period_seconds: Optional[float] = None     # secondi per giro misurati (None = non misurato)
+    attempts: int = 0                          # esplorazioni fallite (unknown): oltre 2 non si insiste
+    explored_at: str = ""
+
+    @staticmethod
+    def parse(raw) -> Optional["AutospinInfo"]:
+        if not isinstance(raw, dict):
+            return None
+        try:
+            max_spins = raw.get("max_spins")
+            period = raw.get("period_seconds")
+            return AutospinInfo(
+                status=_enum(raw.get("status"), AUTOSPIN_STATUSES, "unknown"),
+                location=_enum(raw.get("location"), AUTOSPIN_LOCATIONS, "unknown"),
+                button_coords=_xy(raw.get("button_coords")), type=_enum(raw.get("type"), AUTOSPIN_TYPES, "unknown"),
+                max_spins=int(max_spins) if max_spins is not None else None,
+                spin_options=[int(v) for v in raw["spin_options"]] if isinstance(raw.get("spin_options"), list) else None,
+                requires_fixed_bet=bool(raw.get("requires_fixed_bet", False)),
+                requires_loss_limit=bool(raw.get("requires_loss_limit", False)),
+                stop_method=_enum(raw.get("stop_method"), STOP_METHODS, None), stop_coords=_xy(raw.get("stop_coords")),
+                counter_location=_enum(raw.get("counter_location"), COUNTER_LOCATIONS, None),
+                touch_sequence=_steps(raw.get("touch_sequence")) or None,
+                verified=bool(raw.get("verified", False)),
+                period_seconds=float(period) if period is not None else None,
+                attempts=int(raw.get("attempts", 0)), explored_at=str(raw.get("explored_at", "")),
+            )
+        except (TypeError, ValueError):
+            return None
+
+    def usable(self) -> bool:
+        """Si puo' usare in gioco solo se presente, verificato, con la sequenza di avvio e un modo di fermarlo."""
+        return (self.status == "present" and self.verified and bool(self.touch_sequence)
+                and self.stop_method is not None)
+
+
+@dataclass
+class TurboInfo:
+    status: str = "unknown"                    # present | absent | unknown
+    location: Optional[str] = None             # main | menu | bet_panel
+    button_coords: Optional[list] = None
+    type: Optional[str] = None                 # toggle | multi_level
+    verified: bool = False                     # il tempo del ciclo e' sceso in modo evidente
+    touch_sequence: Optional[list] = None
+    seconds_without: Optional[float] = None    # secondi medi per spin senza turbo
+    seconds_with: Optional[float] = None       # ... con il turbo
+    attempts: int = 0
+
+    @staticmethod
+    def parse(raw) -> Optional["TurboInfo"]:
+        if not isinstance(raw, dict):
+            return None
+        try:
+            without, with_ = raw.get("seconds_without"), raw.get("seconds_with")
+            return TurboInfo(
+                status=_enum(raw.get("status"), AUTOSPIN_STATUSES, "unknown"),
+                location=_enum(raw.get("location"), AUTOSPIN_LOCATIONS, None), button_coords=_xy(raw.get("button_coords")),
+                type=_enum(raw.get("type"), TURBO_TYPES, None), verified=bool(raw.get("verified", False)),
+                touch_sequence=_steps(raw.get("touch_sequence")) or None,
+                seconds_without=float(without) if without is not None else None,
+                seconds_with=float(with_) if with_ is not None else None, attempts=int(raw.get("attempts", 0)),
+            )
+        except (TypeError, ValueError):
+            return None
+
+
 @dataclass
 class SlotMap:
     slot_name: str
@@ -66,6 +177,8 @@ class SlotMap:
     spin_ready_method: Optional[str] = None         # arrow | color | luminance | patch | frame_zone
     notes: Optional[list] = None                    # regole apprese per la slot (es. come gestire un bonus), max 10
     spin_pending: bool = False                      # soldi veri: punto di Sol non ancora provato, lo conferma il 1o spin
+    autospin: Optional[AutospinInfo] = None         # None = mai esplorato (unknown)
+    turbo: Optional[TurboInfo] = None
 
     def key(self) -> str:
         return f"{self.screen[0]}x{self.screen[1]}"
@@ -88,7 +201,9 @@ class SlotMap:
         close = "?" if self.close_point is None and self.close_method == "other" else (
             self.close_method + ("" if self.close_point is None else f" ({self.close_point.x},{self.close_point.y})"))
         minimum = "?" if self.min_bet is None else f"{self.min_bet}{' dimostrato' if self.min_bet_proven else ''}"
-        return f"spin {spin}; menu puntata {menu}; chiusura {close}; minimo {minimum}"
+        autospin = "?" if self.autospin is None else self.autospin.status + (" verificato" if self.autospin.verified else "")
+        turbo = "?" if self.turbo is None else self.turbo.status + (" verificato" if self.turbo.verified else "")
+        return f"spin {spin}; menu puntata {menu}; chiusura {close}; minimo {minimum}; autospin {autospin}; turbo {turbo}"
 
     def to_dict(self) -> dict:
         data = asdict(self)
@@ -126,6 +241,7 @@ class SlotMap:
                 spin_ready_method=data.get("spin_ready_method") if data.get("spin_ready_method") in (
                     "arrow", "color", "luminance", "patch", "frame_zone") else None,
                 bet_scroll_direction=data.get("bet_scroll_direction") if data.get("bet_scroll_direction") in ("left", "right") else None,
+                autospin=AutospinInfo.parse(data.get("autospin")), turbo=TurboInfo.parse(data.get("turbo")),
             )
         except (KeyError, TypeError, ValueError):
             return None

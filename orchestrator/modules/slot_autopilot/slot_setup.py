@@ -141,6 +141,74 @@ class SlotSetup:
         saved = self.memory.save(slot_map)
         return Result.ok(True) if saved.success else Result.fail(saved.error, saved.error_code)
 
+    # ---- autospin e turbo ---------------------------------------------------------------------------------------
+    def autospin_info(self, slot_name: str):
+        slot_map = self._maps.get(slot_name)
+        return slot_map.autospin if slot_map is not None else None
+
+    def turbo_info(self, slot_name: str):
+        slot_map = self._maps.get(slot_name)
+        return slot_map.turbo if slot_map is not None else None
+
+    def save_autospin(self, slot_name: str, info) -> Result[bool]:
+        slot_map = self._maps.get(slot_name)
+        if slot_map is None:
+            return Result.ok(False)
+        slot_map.autospin = info
+        saved = self.memory.save(slot_map)
+        return Result.ok(True) if saved.success else Result.fail(saved.error, saved.error_code)
+
+    def save_turbo(self, slot_name: str, info) -> Result[bool]:
+        slot_map = self._maps.get(slot_name)
+        if slot_map is None:
+            return Result.ok(False)
+        slot_map.turbo = info
+        saved = self.memory.save(slot_map)
+        return Result.ok(True) if saved.success else Result.fail(saved.error, saved.error_code)
+
+    def explore_autospin(self, device_id: str, slot_name: str) -> Result:
+        """Esplora l'autospin una volta per slot (e per schermo), SOLO in demo e dopo la puntata minima. Una mappa gia'
+        con esito (present/absent) o con troppi tentativi a vuoto non si riesplora. Salva l'esito nella mappa."""
+        from orchestrator.modules.slot_autopilot.autospin_manager import MAX_UNKNOWN_ATTEMPTS
+        current = self.autospin_info(slot_name)
+        if current is not None and (current.status != "unknown" or current.attempts >= MAX_UNKNOWN_ATTEMPTS):
+            return Result.ok(current)
+        if not self.demo:
+            return Result.fail("l'autospin si esplora solo in demo", "AUTOSPIN_NOT_DEMO")
+        if self.explorer is None or self._maps.get(slot_name) is None:
+            return Result.fail("nessuna mappa o esploratore", "AUTOSPIN_NO_MAP")
+        slot_map = self._maps[slot_name]
+        panel = slot_map.bet_menu_open
+        found = self.explorer.explore_autospin(
+            device_id, slot_name, self.spin_point(slot_name), (panel.x, panel.y) if panel is not None else None, current)
+        if not found.success:
+            return found
+        saved = self.save_autospin(slot_name, found.data)
+        if not saved.success:
+            logger.warning("Autospin: esito non salvato: %s", saved.error)
+        return found
+
+    def explore_turbo(self, device_id: str, slot_name: str) -> Result:
+        """Cerca e ATTIVA il turbo (solo demo). La conferma viene da `conclude_turbo` con i tempi misurati."""
+        from orchestrator.modules.slot_autopilot.turbo_manager import MAX_ATTEMPTS
+        current = self.turbo_info(slot_name)
+        if current is not None and (current.status != "unknown" or current.attempts >= MAX_ATTEMPTS):
+            return Result.ok(current)
+        if not self.demo:
+            return Result.fail("il turbo si esplora solo in demo", "TURBO_NOT_DEMO")
+        if self.explorer is None or self._maps.get(slot_name) is None:
+            return Result.fail("nessuna mappa o esploratore", "TURBO_NO_MAP")
+        return self.explorer.explore_turbo(device_id, self.spin_point(slot_name), current)
+
+    def conclude_turbo(self, device_id: str, slot_name: str, info, without, with_turbo):
+        """Conferma o scarta il turbo dai tempi misurati e salva l'esito."""
+        manager = getattr(self.explorer, "turbo_manager", None)
+        if manager is None:
+            return info
+        final = manager.conclude(device_id, info, without, with_turbo)
+        self.save_turbo(slot_name, final)
+        return final
+
     def reseed(self, slot_name: str) -> bool:
         """Dopo un rientro: rimette in memoria le coordinate della mappa (alcune possono essere state dimenticate o
         sovrascritte durante la sessione)."""
