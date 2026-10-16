@@ -87,6 +87,7 @@ class BetController:
         # dell'operatore) non deve riaprire il menu se la puntata e' gia' a quel valore o sotto.
         self._session_min = {}
         self._declared_applied = set()
+        self._invalid_trusted = set()      # slot il cui minimo "fidato" e' stato smentito da una puntata piu' bassa
 
     def forget_session_min(self, slot_name: str) -> None:
         """Dopo un rientro nella slot la puntata torna quella di partenza: il minimo verificato non vale piu'."""
@@ -141,13 +142,18 @@ class BetController:
             trusted_min_bet = proven_min if trusted_min_bet is None else min(trusted_min_bet, proven_min)
 
         starting_bet = self._read_bet(context)
+        if proven_min is not None and starting_bet is not None and starting_bet < proven_min:
+            self._distrust_min(slot_name, proven_min, starting_bet)
+            trusted_min_bet = (Decimal(str(context.profile.known_min_bet))
+                               if context.profile is not None and context.profile.verified
+                               and context.profile.known_min_bet is not None else None)
         # Minimo verificato in una sessione precedente (auto-appreso): un indizio che,
         # insieme a un tocco sul "-" che non scende, verifica il minimo. NON e' il
         # riscontro fidato di un profilo curato e non salta mai i tocchi da solo.
         remembered_min = self._remembered_min(slot_name)
         logger.info(
-            "set_min_bet: puntata iniziale=%s, riscontro fidato=%s, minimo ricordato=%s",
-            starting_bet, trusted_min_bet, remembered_min,
+            "set_min_bet: puntata iniziale=%s, riscontro fidato=%s%s, minimo ricordato=%s",
+            starting_bet, trusted_min_bet, self._trusted_source(slot_name, trusted_min_bet), remembered_min,
         )
 
         session_min = self._session_min.get(slot_name)
@@ -958,9 +964,33 @@ class BetController:
     def _trusted_min(self, slot_name: str) -> Optional[Decimal]:
         """Minimo DIMOSTRATO (dichiarato con --min-bet, confermato dall'operatore, provato con "+ poi -" o con la
         ricerca per scorrimento completa). Solo questo puo' far dire "sono gia' al minimo" senza verificare."""
+        if slot_name in self._invalid_trusted:
+            return None
         values = [v for v in (self.config.known_min_bet, self._memory_decimal(slot_name, _MIN_BET_TRUSTED_VALUE))
                   if v is not None]
         return min(values) if values else None
+
+    def _trusted_source(self, slot_name: str, value: Optional[Decimal]) -> str:
+        """Da dove viene il minimo fidato, per il log: --min-bet o memoria della slot."""
+        if value is None:
+            return ""
+        if self.config.known_min_bet is not None and Decimal(str(self.config.known_min_bet)) == value:
+            return " (da --min-bet)"
+        return " (dalla memoria della slot)"
+
+    def _distrust_min(self, slot_name: str, believed: Decimal, observed: Decimal) -> None:
+        """Si vede una puntata PIU' BASSA del minimo creduto: il minimo creduto e' sbagliato (--min-bet passato per
+        errore, memoria sporca). Si ignora per la sessione e si ripara la memoria; senza fiducia non si salta nessuna
+        verifica, quindi e' sempre la direzione prudente."""
+        source = self._trusted_source(slot_name, believed).strip(" ()")
+        logger.warning(
+            "set_min_bet: il minimo creduto %s (%s) e' maggiore della puntata letta %s: non puo' essere il minimo, "
+            "lo ignoro%s.", believed, source or "memoria", observed,
+            " (hai passato --min-bet col valore sbagliato?)" if "--min-bet" in source else "",
+        )
+        self._invalid_trusted.add(slot_name)
+        save_autopilot_value(slot_name, _MIN_BET_TRUSTED_VALUE, "", self.config.slot_memory_dir)
+        save_autopilot_value(slot_name, _MIN_BET_VALUE, str(observed), self.config.slot_memory_dir)
 
     def _memory_decimal(self, slot_name: str, key: str) -> Optional[Decimal]:
         raw = load_autopilot_value(slot_name, key, self.config.slot_memory_dir)
@@ -1045,6 +1075,8 @@ class BetController:
     def _menu_result(self, device_id, slot_name, episode_id, starting_bet, selection, strategy_sequence, attempts):
         """Esito finale di una puntata scelta dal menu: minimo = il piu' basso elencato, letto dallo schermo."""
         save_autopilot_flag(slot_name, _BET_VIA_MENU_FLAG, True, self.config.slot_memory_dir)
+        if selection.contradicted_min is not None:
+            self._distrust_min(slot_name, selection.contradicted_min, selection.final_bet)
         self._remember_min(slot_name, selection.final_bet, trusted=selection.proven)
         logger.info("set_min_bet: puntata minima dal menu: %s EUR (verificata sulla lettura dello schermo)",
                     selection.final_bet)

@@ -93,18 +93,71 @@ def _autopilot_with_watch(tmp_path, screenshot_after):
     return autopilot
 
 
-def test_spin_flags_a_changed_bet_cell_from_the_screenshot_already_taken(tmp_path):
-    autopilot = _autopilot_with_watch(tmp_path, _screen(tmp_path, "after.png", selected=2))
+def _with_second_shot(autopilot, path, monkeypatch):
+    monkeypatch.setattr("orchestrator.modules.slot_autopilot.autopilot.time.sleep", lambda s: None)
+    autopilot.screen_reader._screenshot.return_value = Result.ok(path)
+    return autopilot
 
-    result = autopilot.spin("dev", 1)
+
+def test_spin_flags_a_changed_bet_cell_when_two_screenshots_agree(tmp_path, monkeypatch, caplog):
+    moved = _screen(tmp_path, "after.png", selected=2)
+    autopilot = _with_second_shot(_autopilot_with_watch(tmp_path, moved), _screen(tmp_path, "again.png", 2), monkeypatch)
+
+    with caplog.at_level("INFO"):
+        result = autopilot.spin("dev", 1)
 
     assert result.success and result.data.bet_cell_changed is True
+    assert "Bet Watch: delta visivo" in caplog.text and "soglia 25" in caplog.text           # il delta e' nel log
 
 
-def test_spin_leaves_the_flag_off_when_the_cell_is_the_same(tmp_path):
-    autopilot = _autopilot_with_watch(tmp_path, _screen(tmp_path, "after.png", selected=0))
+def test_an_animation_seen_only_in_the_first_screenshot_is_not_an_alarm(tmp_path, monkeypatch, caplog):
+    flicker = _screen(tmp_path, "after.png", selected=2)                                       # solo nel primo
+    autopilot = _with_second_shot(_autopilot_with_watch(tmp_path, flicker), _screen(tmp_path, "again.png", 0), monkeypatch)
+
+    with caplog.at_level("INFO"):
+        result = autopilot.spin("dev", 1)
+
+    assert result.data.bet_cell_changed is False
+    assert "era un'animazione, nessun allarme" in caplog.text
+
+
+def test_spin_leaves_the_flag_off_when_the_cell_is_the_same(tmp_path, monkeypatch):
+    autopilot = _with_second_shot(_autopilot_with_watch(tmp_path, _screen(tmp_path, "after.png", selected=0)),
+                                  _screen(tmp_path, "again.png", 0), monkeypatch)
 
     assert autopilot.spin("dev", 1).data.bet_cell_changed is False
+
+
+def test_bet_watch_never_looks_at_the_quick_stop_test_spin(tmp_path, monkeypatch):
+    from orchestrator.tests.unit.test_slot_autopilot_autopilot import _collaborators, _config
+    from orchestrator.modules.slot_autopilot.autopilot import SlotAutoPilot
+    moved = _screen(tmp_path, "after.png", selected=2)
+    deps = _collaborators(config=_config())
+    result = SpinResult(slot_name="pirots5", spin_index=1, bet_amount=Decimal("0.10"), balance_before=Decimal("100"),
+                        balance_after=Decimal("99.9"), win_amount=None, verified=True, attempts=1, outcome="success",
+                        screenshot_after=moved, quick_mode="test")
+    deps["spin_controller"].spin.return_value = Result.ok(result)
+    deps["ocr_reader"].region = None
+    autopilot = SlotAutoPilot(**deps)
+    autopilot.bet_watch.learn(_screen(tmp_path, "ref.png", 0), _boxes(), Decimal("0.10"))
+    monkeypatch.setattr("orchestrator.modules.slot_autopilot.autopilot.time.sleep", lambda s: None)
+    deps["screen_reader"]._screenshot.return_value = Result.ok(moved)
+
+    out = autopilot.spin("dev", 1)
+
+    assert out.data.bet_cell_changed is False                         # la cella e' diversa, ma e' lo spin di prova
+    deps["screen_reader"]._screenshot.assert_not_called()
+
+
+def test_the_last_delta_is_recorded_for_the_logs(tmp_path):
+    watch = BetWatch()
+    watch.learn(_screen(tmp_path, "a.png", 0), _boxes(), Decimal("0.10"))
+
+    watch.check(_screen(tmp_path, "same.png", 0))
+    same = watch.last_delta
+    watch.check(_screen(tmp_path, "moved.png", 3))
+
+    assert same == 0.0 and watch.last_delta > 25
 
 
 def test_set_min_bet_relearns_the_cell_with_one_fresh_reading(tmp_path, monkeypatch):

@@ -229,6 +229,27 @@ class SlotAutoPilot:
         else:
             logger.info("Animazioni ambientali: nessuna cella da ignorare.")
 
+    def _bet_cell_changed(self, device_id: str, screenshot_after) -> bool:
+        """Bet Watch con conferma: una cella diversa nello screenshot dello spin puo' essere un'animazione. Prima di
+        dare l'allarme si guarda un secondo screenshot ~1 s dopo: deve essere diversa anche li'. Si logga il delta."""
+        watch = self.bet_watch
+        if watch.check(screenshot_after) is not True:
+            return False
+        first = watch.last_delta
+        time.sleep(1.0)
+        shot = self.screen_reader._screenshot(device_id)
+        if not shot.success:
+            logger.warning("Bet Watch: delta visivo %.1f (soglia %.0f), conferma non possibile: do l'allarme.",
+                           first or 0.0, watch.CHANGED_DIFF)
+            return True
+        if watch.check(shot.data) is True:
+            logger.warning("Bet Watch: delta visivo %.1f e %.1f (soglia %.0f) in due screenshot: cella cambiata.",
+                           first or 0.0, watch.last_delta or 0.0, watch.CHANGED_DIFF)
+            return True
+        logger.info("Bet Watch: delta visivo %.1f (soglia %.0f) solo nel primo screenshot, poi %.1f: era "
+                    "un'animazione, nessun allarme.", first or 0.0, watch.CHANGED_DIFF, watch.last_delta or 0.0)
+        return False
+
     def _autospin_preflight(self, device_id: str) -> Optional[str]:
         """L'autospin parte SOLO con la puntata verificata al minimo, nessun popup e la cella di puntata confermata.
         Ritorna None (via libera) o il motivo per cui non si parte."""
@@ -354,7 +375,8 @@ class SlotAutoPilot:
                     self._assisted = True
                 if result.data.outcome in ("no_effect", "error"):
                     self._no_effect_spins += 1
-                if result.data.outcome == "success" and self.bet_watch.check(result.data.screenshot_after) is True:
+                if (result.data.outcome == "success" and getattr(result.data, "quick_mode", "off") != "test"
+                        and self._bet_cell_changed(device_id, result.data.screenshot_after)):
                     logger.warning("La cella di puntata selezionata non e' piu' quella di prima: la puntata e' cambiata.")
                     result.data.bet_cell_changed = True
                 if result.data.outcome == "success":

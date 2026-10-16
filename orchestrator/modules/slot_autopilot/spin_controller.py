@@ -66,6 +66,9 @@ class SpinResult:
     anomaly: bool = False
     # La cella di puntata selezionata (letta a set_min_bet) non ha piu' lo stesso aspetto: la puntata e' stata cambiata.
     bet_cell_changed: bool = False
+    # Come e' andato il Quick Stop in questo spin: "test" (due tocchi di prova, lo schermo dopo e' in animazione),
+    # "use" o "off". Bet Watch non guarda mai uno spin di test.
+    quick_mode: str = "off"
 
 
 class SpinController:
@@ -605,6 +608,7 @@ class SpinController:
             verified=verified, attempts=attempts, outcome=outcome,
             accounting_anomaly=accounting_anomaly, strategy_name=candidate.strategy_name,
             screenshot_after=screenshot_after, state_after=state_after, bet_understated=bet_understated,
+            quick_mode=quick_mode,
             timings=timings, button_status=button_status, anomaly=anomaly,
         ))
 

@@ -17,14 +17,18 @@ _MIN_CELLS = 3                    # una riga di scelte di puntata ha almeno tre 
 _MARGIN_FRACTION = 0.25           # margine attorno al testo: dentro ci sta lo sfondo evidenziato
 _THUMB = 12                       # impronta 12x12 RGB
 _CHANGED_DIFF = 25.0              # differenza media (0-255) oltre la quale la cella non e' piu' quella
+CHANGED_DIFF = _CHANGED_DIFF
 _ROW_TOLERANCE = 0.6              # due celle sono sulla stessa riga se i centri distano meno del 60% dell'altezza
 
 
 class BetWatch:
+    CHANGED_DIFF = _CHANGED_DIFF
+
     def __init__(self):
         self._region: Optional[tuple] = None
         self._reference: Optional[np.ndarray] = None
         self.enabled = True
+        self.last_delta: Optional[float] = None       # ultima differenza misurata (0-255), per capire i falsi allarmi
 
     @property
     def active(self) -> bool:
@@ -75,7 +79,8 @@ class BetWatch:
                 current = _thumb(image, self._region)
         except (OSError, ValueError):
             return None
-        return float(np.mean(np.abs(current - self._reference))) > _CHANGED_DIFF
+        self.last_delta = float(np.mean(np.abs(current - self._reference)))
+        return self.last_delta > _CHANGED_DIFF
 
 
 def _cy(box) -> float:

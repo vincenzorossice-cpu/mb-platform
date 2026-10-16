@@ -56,6 +56,7 @@ _MAX_CLOSE_RETRIES = 3
 _ROW_DIRECTION_VALUE = "bet_row_direction"   # verso dello scorrimento che ha abbassato la minima (appreso)
 _MAX_PICK_ATTEMPTS = 3   # tocco -> verifica -> correzione: in un carosello la fila si ricentra dopo il tocco
 _SETTLE_SECONDS = 1.5   # pausa prima di rileggere una puntata non leggibile (animazione di chiusura)
+_MAX_ACCEPTED_LOWER_BET = Decimal("1")   # una puntata letta PIU' BASSA dell'attesa si accetta solo se e' un importo piccolo
 
 
 @dataclass
@@ -64,6 +65,9 @@ class MenuSelection:
     lowest_listed: Decimal
     toggle_strategy: str
     proven: bool = False   # nessuna puntata piu' bassa su nessun lato: e' davvero il minimo, non solo il piu' basso visibile
+    # Il minimo noto (dichiarato o ricordato) era PIU' ALTO della puntata letta: non poteva essere il minimo. Chi chiama
+    # ripara la memoria.
+    contradicted_min: Optional[Decimal] = None
 
 
 def menu_amounts(text_boxes: list) -> list:
@@ -294,10 +298,25 @@ class BetMenuSelector:
             return Result.fail(
                 f"Bet after menu selection cannot be read (expected {lowest})", "MENU_SELECTION_UNREADABLE",
             )
-        if Decimal(str(bet)) != lowest:
+        source = "minimo noto (dichiarato o ricordato)" if wanted_cells else "la piu' bassa del menu"
+        read_bet = Decimal(str(bet))
+        if read_bet != lowest:
+            if read_bet < lowest and read_bet <= _MAX_ACCEPTED_LOWER_BET:
+                # Nessuna puntata sta sotto il minimo: se se ne legge una piu' bassa, e' il minimo atteso a essere
+                # sbagliato (non la selezione). Si accetta, ma il minimo NON si da' per dimostrato.
+                logger.warning(
+                    "bet menu: il minimo atteso %s (%s) e' maggiore della puntata letta %s: il minimo creduto era "
+                    "sbagliato (--min-bet o memoria?), lo ignoro e tengo %s.", lowest, source, read_bet, read_bet,
+                )
+                return Result.ok(MenuSelection(
+                    final_bet=read_bet, lowest_listed=lowest, proven=False,
+                    toggle_strategy=toggle.strategy_name if toggle is not None else "hitl",
+                    contradicted_min=lowest if wanted_cells else None,
+                ))
             return Result.fail(
-                f"Bet after menu selection is {bet}, expected {lowest}", "MENU_SELECTION_NOT_CONFIRMED",
+                f"Bet after menu selection is {bet}, expected {lowest} ({source})", "MENU_SELECTION_NOT_CONFIRMED",
             )
+        logger.info("Puntata letta: %.2f, attesa: %.2f (%s), OK", read_bet, lowest, source)
         return Result.ok(MenuSelection(
             final_bet=Decimal(str(bet)), lowest_listed=lowest,
             toggle_strategy=toggle.strategy_name if toggle is not None else "hitl", proven=proven,
