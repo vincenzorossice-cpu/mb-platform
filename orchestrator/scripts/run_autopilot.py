@@ -262,9 +262,20 @@ def build_autopilot_for(
             sample_interval=config.autospin_sample_interval, period_safety=config.autospin_period_safety,
             popup_guard=autopilot.gamble_guard,
         )
+        def spin_ready(path: str):
+            """Il pulsante SPIN e' visibile e pronto? (freccia appresa); None se non si sa dire."""
+            point = autopilot.slot_setup.spin_point(slot_name)
+            if point is None:
+                return None
+            from PIL import Image
+            with Image.open(path) as image:
+                size = image.size
+            return spin_controller.button.classify(slot_name, size, path, int(point[0]), int(point[1]))
+
         autopilot_explorer.turbo_manager = TurboManager(
             screen_reader, touch_injector, ocr_reader=getattr(ocr_reader, "ocr", ocr_reader),
             ask=autopilot_explorer._ask, press_back=press_back, min_gain=config.turbo_min_gain,
+            ready_probe=spin_ready,
         )
     if gpt_client is not None and "gpt" in strategies:
         slot_setup_obj = getattr(autopilot, "slot_setup", None)

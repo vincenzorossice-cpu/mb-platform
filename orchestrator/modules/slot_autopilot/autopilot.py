@@ -169,6 +169,9 @@ class SlotAutoPilot:
                 self._total_steps += result.data.attempts
                 self._min_bet_verified = result.data.min_bet_verified
                 self._current_bet = result.data.final_bet
+                note_bet = getattr(self.ocr_reader, "note_bet", None)
+                if callable(note_bet) and result.data.final_bet is not None:
+                    note_bet(result.data.final_bet)         # ultimo valore noto della puntata, per tutta la sessione
                 if any(name not in _UNASSISTED_STRATEGIES for name in result.data.strategy_sequence):
                     self._assisted = True
                 if result.data.min_bet_verified:

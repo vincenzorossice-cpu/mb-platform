@@ -7,6 +7,7 @@ from decimal import Decimal
 from typing import Optional
 
 from orchestrator.modules.slot_autopilot.config import AutoPilotConfig
+from orchestrator.modules.slot_autopilot.slot_map import TurboInfo
 
 _DEFAULT_PERIOD = 6.0
 _MAX_BET_RESTARTS = 3              # riavvii dopo un cambio di puntata per sessione
@@ -31,6 +32,7 @@ class SpeedupController:
         self._autospin_off = False
         self._autospin_pending = False       # l'esplorazione dell'autospin aspetta la fine della misura del turbo
         self._bet_restarts = 0
+        self._recoveries = 0
         self._turbo_phase: Optional[str] = None        # None | "before" | "after"
         self._turbo_info = None
         self._times_before: list = []
@@ -96,6 +98,15 @@ class SpeedupController:
             self._times_before.append(seconds)
             if len(self._times_before) >= need:
                 found = self.setup.explore_turbo(self.device_id, self.slot_name)
+                if not found.success:
+                    self._turbo_phase = None
+                    if found.error_code == "TURBO_MENU_STUCK":
+                        self.log.error("Turbo: un menu aperto dal turbo copre lo SPIN e non si chiude: lo salvo come "
+                                       "assente e proseguo senza.")
+                        self.setup.save_turbo(self.slot_name, TurboInfo(status="absent", attempts=1))
+                    else:
+                        self.log.info("Turbo: esplorazione non riuscita (%s)", found.error_code)
+                    return self._after_turbo()
                 if found.success and found.data.status == "present":
                     self._turbo_info, self._turbo_phase = found.data, "after"
                     self.log.info("Turbo: trovato e attivato, misuro i prossimi %d spin", self.config.speedup_measure_spins)
@@ -123,6 +134,28 @@ class SpeedupController:
             self._autospin_pending = False
             return self._explore_autospin()
         return None
+
+    def recover_blocked_spin(self) -> bool:
+        """Lo SPIN non risponde (spin senza effetto di fila). Se c'e' un menu aperto dal turbo lo si chiude; se non si
+        chiude si disattiva il turbo (salvato 'assente'). True = vale la pena riprovare uno spin."""
+        if not self.usable or self._recoveries >= 2:
+            return False
+        manager = getattr(getattr(self.setup, "explorer", None), "turbo_manager", None)
+        if manager is None:
+            return False
+        self._recoveries += 1
+        state = manager.close_open_menu(self.device_id)
+        if state == "closed":
+            return True
+        if state == "stuck":
+            info = self._turbo_info or self.setup.turbo_info(self.slot_name)
+            if info is not None and info.status == "present":
+                manager.disable_turbo(self.device_id, info)
+            self.setup.save_turbo(self.slot_name, TurboInfo(status="absent", attempts=1))
+            self._turbo_phase = None
+            self.log.error("Turbo: il menu non si chiude, turbo disattivato e salvato come assente.")
+            return True
+        return False
 
     @property
     def measuring_turbo(self) -> bool:

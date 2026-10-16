@@ -29,8 +29,10 @@ _SYSTEM = (
 class TurboManager:
     def __init__(self, screen_reader, touch_injector, ocr_reader=None, ask: Optional[Callable] = None,
                  press_back: Optional[Callable[[], object]] = None, sleep: Callable[[float], None] = time.sleep,
-                 min_gain: float = 0.2):
+                 min_gain: float = 0.2, ready_probe: Optional[Callable[[str], Optional[bool]]] = None):
         self.tools = ScreenTools(screen_reader, touch_injector, ocr_reader, ask, sleep)
+        self.tools.press_back = press_back
+        self.tools.ready_probe = ready_probe        # path -> True se il pulsante SPIN e' visibile e pronto
         self.press_back = press_back
         self.sleep = sleep
         self.min_gain = min_gain
@@ -38,14 +40,17 @@ class TurboManager:
     # ---- ricerca e attivazione --------------------------------------------------------------------------------------
     def explore_turbo(self, device_id: str, spin_point: Optional[tuple], previous: Optional[TurboInfo] = None
                       ) -> Result[TurboInfo]:
-        """Cerca il turbo (principale, poi menu) e lo ATTIVA. Ritorna `present` non verificato con la sequenza di
-        tocchi; la verifica e' `conclude` con i tempi misurati dalla sessione. Nessun candidato: `absent`."""
+        """Cerca il turbo (principale, poi menu) e lo ATTIVA, lasciando la slot LIBERA (nessun menu aperto sullo SPIN).
+        Ritorna `present` non verificato con la sequenza di tocchi; la verifica e' `conclude` con i tempi misurati dalla
+        sessione. Nessun candidato: `absent`. Un tocco che apre un menu non e' un interruttore: si richiude e si passa
+        oltre; se non si richiude, fail TURBO_MENU_STUCK."""
         attempts = previous.attempts if previous is not None else 0
         first = self.tools.shot(device_id)
         if first is None:
             return Result.fail("screenshot fallito", "TURBO_SCREENSHOT_FAILED")
         for level in ("main", "menu"):
             sequence, shot = [], first
+            menu = None
             if level == "menu":
                 menu = self._menu_point(first, spin_point)
                 if menu is None:
@@ -56,17 +61,26 @@ class TurboManager:
                 sequence.append({"x": menu[0], "y": menu[1], "wait": SETTLE_SECONDS, "note": "apre menu"})
             for point in self._candidates(shot, spin_point):
                 changed, _, after = self.tools.tap_changes(device_id, point[0], point[1])
-                if not changed:
+                if not changed or after is None:
                     continue                                 # nessun effetto visibile: non e' un interruttore
+                if level == "main" and not self.tools.screen_free(after, first.path):
+                    # Ha aperto un menu (es. Ultra Play) che copre lo SPIN: non e' un interruttore.
+                    logger.info("Turbo: il tocco ha aperto un menu, non e' un interruttore: chiudo")
+                    if not self.tools.restore_screen(device_id, first.path, extra_taps=((point[0], point[1]),)):
+                        return Result.fail("menu aperto dal candidato e non richiudibile", "TURBO_MENU_STUCK")
+                    continue
                 sequence.append({"x": point[0], "y": point[1], "wait": SETTLE_SECONDS, "note": "turbo"})
+                if level == "menu" and not self.tools.restore_screen(
+                        device_id, first.path, extra_taps=((menu[0], menu[1]),)):
+                    logger.warning("Turbo: menu aperto blocca SPIN e non si chiude: lo annullo")
+                    self._undo(device_id, sequence, first.path, menu_is_open=True)
+                    return Result.fail("menu del turbo non richiudibile", "TURBO_MENU_STUCK")
                 logger.info("Turbo: candidato attivato (%s), misuro il tempo dei prossimi spin", level)
                 return Result.ok(TurboInfo(status="present", location=level, button_coords=list(point),
                                            type="toggle", verified=False, touch_sequence=sequence, attempts=attempts))
             if level == "menu":                              # niente nel menu: lo si richiude
-                self.tools.tap(device_id, sequence[0]["x"], sequence[0]["y"])
-                self.sleep(SETTLE_SECONDS)
-                if self.press_back is not None:
-                    self.press_back()
+                if not self.tools.restore_screen(device_id, first.path, extra_taps=((menu[0], menu[1]),)):
+                    return Result.fail("menu aperto e non richiudibile", "TURBO_MENU_STUCK")
         logger.info("Turbo: non trovato su questa slot")
         return Result.ok(TurboInfo(status="absent", attempts=attempts))
 
@@ -88,20 +102,52 @@ class TurboManager:
             unique.append(point)
         return unique[:3]
 
-    def enable_turbo(self, device_id: str, info: TurboInfo) -> bool:
-        """Riesegue la sequenza salvata (a inizio sessione, slot appena caricata: il turbo parte spento)."""
-        if info.status != "present" or not info.verified or not info.touch_sequence:
-            return False
-        for step in info.touch_sequence:
+    def _replay(self, device_id: str, sequence: list) -> None:
+        for step in sequence:
             self.tools.tap(device_id, step["x"], step["y"])
             self.sleep(float(step.get("wait", SETTLE_SECONDS)))
+
+    def _menu_icon(self, info: TurboInfo) -> tuple:
+        first = (info.touch_sequence or [None])[0]
+        return ((first["x"], first["y"]),) if info.location == "menu" and first else ()
+
+    def enable_turbo(self, device_id: str, info: TurboInfo) -> bool:
+        """Riesegue la sequenza salvata (a inizio sessione, slot appena caricata: il turbo parte spento) e lascia la slot
+        libera (se il turbo sta in un menu, lo richiude)."""
+        if info.status != "present" or not info.verified or not info.touch_sequence:
+            return False
+        baseline = self.tools.shot(device_id)
+        self._replay(device_id, info.touch_sequence)
+        if baseline is not None and not self.tools.restore_screen(device_id, baseline.path, self._menu_icon(info)):
+            logger.warning("Turbo: dopo l'attivazione un menu resta aperto e non si chiude.")
         return True
 
     def disable_turbo(self, device_id: str, info: TurboInfo) -> None:
-        """Annulla un turbo attivato in esplorazione (secondo tocco sull'interruttore; poi chiude il menu)."""
-        for step in reversed(info.touch_sequence or []):
-            self.tools.tap(device_id, step["x"], step["y"])
-            self.sleep(float(step.get("wait", SETTLE_SECONDS)))
+        """Annulla un turbo attivato: stessa sequenza in avanti (apre il menu se serve, tocca l'interruttore) e poi
+        richiude. Mai la sequenza al contrario: il menu e' gia' chiuso e i tocchi cadrebbero sul gioco."""
+        baseline = self.tools.shot(device_id)
+        self._undo(device_id, list(info.touch_sequence or []), baseline.path if baseline is not None else None,
+                   self._menu_icon(info))
+
+    def _undo(self, device_id: str, sequence: list, baseline_path: Optional[str], extra_taps: tuple = (),
+              menu_is_open: bool = False) -> None:
+        """Rifa i tocchi dell'attivazione (l'interruttore e' un toggle) e richiude. Se il menu e' ancora aperto si tocca
+        solo l'interruttore; altrimenti si riapre il menu come la prima volta."""
+        if not sequence:
+            return
+        steps = [s for s in sequence if s.get("note") != "apre menu"] if menu_is_open else sequence
+        self._replay(device_id, steps)
+        self.tools.restore_screen(device_id, baseline_path, extra_taps or tuple(
+            (s["x"], s["y"]) for s in sequence if s.get("note") == "apre menu"))
+
+    def close_open_menu(self, device_id: str) -> str:
+        """Rete di sicurezza: lo SPIN non si trova. 'free' = lo SPIN c'e' (il problema non e' un menu aperto, o non si sa),
+        'closed' = c'era un menu e l'ho chiuso (Chiudi/X, Back), 'stuck' = non si chiude."""
+        shot = self.tools.shot(device_id)
+        if shot is None or self.tools.ready_probe is None or self.tools.ready_probe(shot.path) is not False:
+            return "free"
+        logger.info("Turbo: menu aperto blocca SPIN, chiudo menu")
+        return "closed" if self.tools.restore_screen(device_id, None) else "stuck"
 
     # ---- misura ----------------------------------------------------------------------------------------------------
     @staticmethod

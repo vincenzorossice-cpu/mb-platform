@@ -370,8 +370,19 @@ class TestUnreadableBetAfterSelection:
 
         assert result.success and result.data.final_bet == Decimal("0.10")
 
-    def test_a_bet_that_stays_unreadable_is_reported_as_such(self):
+    def test_a_bet_that_stays_unreadable_after_a_successful_tap_trusts_the_tap(self, caplog):
         selector, _, _ = _selector()
+        provider = _provider(_context(MAIN_BOXES, posta=None), _context(MAIN_BOXES, posta=None))
+
+        with caplog.at_level("WARNING"):
+            result = selector.select_from_open_menu("dev", "shining", _context(MENU_BOXES), provider, (788, 1775))
+
+        assert result.success and result.data.final_bet == Decimal("0.10") and result.data.proven is False
+        assert "Puntata non leggibile via OCR, uso valore appena impostato: 0.10" in caplog.text
+
+    def test_a_bet_that_stays_unreadable_is_an_error_if_the_tap_itself_failed(self):
+        selector, _, verifier = _selector()
+        verifier.verified_tap.return_value = Result.fail("tap", "TAP_FAILED")
         provider = _provider(_context(MAIN_BOXES, posta=None), _context(MAIN_BOXES, posta=None))
 
         result = selector.select_from_open_menu("dev", "shining", _context(MENU_BOXES), provider, (788, 1775))

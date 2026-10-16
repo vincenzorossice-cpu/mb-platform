@@ -11,6 +11,100 @@ from orchestrator.core.result import Result
 
 logger = logging.getLogger(__name__)
 
+# Oltre questo importo non e' una puntata: sono jackpot (milioni, migliaia) o saldi. Le puntate vanno da centesimi a
+# decine di euro.
+MAX_BET_VALUE = 1000.0
+MIN_BET_VALUE = 0.01
+MAX_BALANCE_VALUE = 100000.0   # in demo i saldi vanno da 0 a 100.000; sopra sono jackpot (milioni)
+BALANCE_JUMP_RATIO = 10.0      # un saldo che salta a piu' di 10x il precedente non e' un saldo (e' un contatore jackpot)
+_AMBIGUOUS_MIN_VALUES = 3   # tre o piu' importi plausibili vicino alle etichette: e' una griglia di scelte, non LA puntata
+
+
+def choose_bet(candidates: list, label_count: int = 1, last_tapped_bet: Optional[float] = None) -> Optional[float]:
+    """La puntata tra importi plausibili (MIN_BET_VALUE..MAX_BET_VALUE, gia' filtrati). Un solo valore distinto = quello.
+    Piu' valori con piu' etichette, o una riga di 3+ valori, sono una GRIGLIA DI SCELTE (0.10 0.20 0.30...): non si
+    sa quale e' selezionata e non si indovina; l'unica prova e' il valore appena toccato, se tra i candidati."""
+    values = sorted({round(float(v), 2) for v in candidates if MIN_BET_VALUE <= float(v) <= MAX_BET_VALUE})
+    if not values:
+        return None
+    if len(values) == 1:
+        return values[0]
+    ambiguous = label_count >= 2 or len(values) >= _AMBIGUOUS_MIN_VALUES
+    if not ambiguous:
+        return None if last_tapped_bet is None else (
+            round(float(last_tapped_bet), 2) if round(float(last_tapped_bet), 2) in values else None)
+    if last_tapped_bet is not None and round(float(last_tapped_bet), 2) in values:
+        return round(float(last_tapped_bet), 2)
+    return None
+
+
+def is_jackpot_balance(value: float, last_saldo: Optional[float] = None) -> bool:
+    """True se `value` non puo' essere il saldo: oltre MAX_BALANCE_VALUE quando il precedente era sotto (o non c'e'), o
+    oltre 10x il saldo precedente."""
+    if value is None:
+        return False
+    if last_saldo is not None and last_saldo > 0 and value > BALANCE_JUMP_RATIO * last_saldo:
+        return True
+    return value > MAX_BALANCE_VALUE and (last_saldo is None or last_saldo < MAX_BALANCE_VALUE)
+
+
+def parse_saldo(ocr_texts: list, last_saldo: Optional[float] = None) -> Optional[float]:
+    """Saldo dai soli testi OCR: ha la priorita' il primo importo DOPO l'etichetta (SALDO/BALANCE/CREDIT...); i jackpot
+    (contatori enormi in alto) non sono mai il saldo. Senza etichetta, tra i candidati plausibili quello piu' vicino al
+    saldo precedente (o l'unico). Solo jackpot e un saldo precedente noto: quello."""
+    texts = [str(t) for t in (ocr_texts or [])]
+
+    def amount(text: str) -> Optional[float]:
+        run = find_amount_run(text)
+        try:
+            return float(run) if run is not None else None
+        except ValueError:
+            return None
+
+    labels = ("SALDO", "BALANCE", "CREDIT")
+    for index, text in enumerate(texts):
+        if any(label in text.upper() for label in labels):
+            inline = amount(text)
+            if inline is not None and not is_jackpot_balance(inline, last_saldo):
+                return inline
+            for after in texts[index + 1:]:
+                value = amount(after)
+                if value is not None and value >= 0 and not is_jackpot_balance(value, last_saldo):
+                    return value
+            break
+    candidates = []
+    for text in texts:
+        value = amount(text)
+        if value is not None and value >= 0 and not is_jackpot_balance(value, last_saldo):
+            candidates.append(value)
+    if candidates:
+        if last_saldo is not None:
+            return min(candidates, key=lambda v: abs(v - last_saldo))
+        return candidates[0] if len(set(candidates)) == 1 else None
+    return last_saldo
+
+
+def parse_bet(ocr_texts: list, last_tapped_bet: Optional[float] = None) -> Optional[float]:
+    """Puntata dai soli testi OCR (senza posizioni): esclude i jackpot e i saldi (> MAX_BET_VALUE) e non indovina tra
+    le celle di una griglia. `label_count` = quante volte compare un'etichetta di puntata."""
+    labels = 0
+    candidates = []
+    for text in ocr_texts or []:
+        upper = str(text).upper()
+        if any(word in upper for word in SlotOCRReader._POSTA_LABELS):
+            labels += 1
+        run = find_amount_run(str(text))
+        if run is None:
+            continue
+        try:
+            value = float(run)
+        except ValueError:
+            continue
+        if MIN_BET_VALUE <= value <= MAX_BET_VALUE and not any(
+                word in upper for word in SlotOCRReader._SALDO_LABELS + SlotOCRReader._VINCITA_LABELS):
+            candidates.append(value)
+    return choose_bet(candidates, labels, last_tapped_bet)
+
 
 @dataclass
 class OCRBox:
@@ -81,6 +175,8 @@ class SlotOCRReader:
         if url and not url.endswith("/ocr"):
             url += "/ocr"
         self._ocr_url = url or None
+        self.last_known_bet: Optional[float] = None    # ultima puntata letta (o impostata) in questa sessione
+        self._bet_fallback_logs = 0
         try:
             self._ocr_timeout = float(ocr_timeout or os.environ.get("OCR_TIMEOUT") or self._DEFAULT_REMOTE_TIMEOUT)
         except ValueError:
@@ -270,6 +366,7 @@ class SlotOCRReader:
         }
 
         label_coords = {"saldo": None, "posta": None, "vincita": None}
+        posta_labels = []   # TUTTE le etichette di puntata: una griglia di scelte ne ha una per colonna
         resolved = {"saldo": False, "posta": False, "vincita": False}
         detections = []  # (text_upper, x, y) per la passata di fallback
 
@@ -292,6 +389,7 @@ class SlotOCRReader:
                 label_coords["saldo"] = (x, y)
             if any(kw in text_upper for kw in self._POSTA_LABELS):
                 label_coords["posta"] = (x, y)
+                posta_labels.append((x, y))
             if any(kw in text_upper for kw in self._VINCITA_LABELS):
                 label_coords["vincita"] = (x, y)
 
@@ -309,7 +407,8 @@ class SlotOCRReader:
                     state["saldo"] = amount
                     resolved["saldo"] = True
                 elif any(kw in text_upper for kw in self._POSTA_LABELS):
-                    state["posta"] = amount
+                    if MIN_BET_VALUE <= amount <= MAX_BET_VALUE:      # un jackpot non e' mai una puntata
+                        state["posta"] = amount
                     resolved["posta"] = True
                 elif any(kw in text_upper for kw in self._VINCITA_LABELS):
                     state["vincita"] = amount
@@ -322,26 +421,51 @@ class SlotOCRReader:
         for key in ("saldo", "posta", "vincita"):
             if resolved[key] or label_coords[key] is None:
                 continue
-            label_x, label_y = label_coords[key]
-            best_amount, best_dist, best_at = None, None, None
+            labels = posta_labels if key == "posta" else [label_coords[key]]
+            found = []   # (importo, x, y, distanza_in_x_dalla_etichetta_piu_vicina)
             for text_upper, x, y in detections:
-                if abs(y - label_y) >= self._LABEL_Y_TOLERANCE:
-                    continue
                 if any(kw in text_upper for kw in self._ALL_AMOUNT_LABELS):
                     continue  # non riusare il testo di un'altra label come importo
                 if (x, y) in used:
                     continue
-                amount = self._extract_amount(text_upper)
-                if amount is None:
+                near = [abs(x - lx) for lx, ly in labels if abs(y - ly) < self._LABEL_Y_TOLERANCE]
+                if not near:
                     continue
-                dist = abs(x - label_x)
-                if best_dist is None or dist < best_dist:
-                    best_amount, best_dist, best_at = amount, dist, (x, y)
-            if best_amount is not None:
-                state[key] = best_amount
-                used.add(best_at)
+                amount = self._extract_amount(text_upper)
+                if amount is None or (key == "posta" and not MIN_BET_VALUE <= amount <= MAX_BET_VALUE):
+                    continue  # un jackpot o un saldo non sono mai la puntata
+                found.append((amount, x, y, min(near)))
+            if not found:
+                continue
+            if key == "posta":
+                values = {round(item[0], 2) for item in found}
+                if len(values) >= 2 and (len(posta_labels) >= 2 or len(values) >= _AMBIGUOUS_MIN_VALUES):
+                    # Una griglia di scelte (0.10 0.20 0.30... con un'etichetta per colonna): non si sa quale e'
+                    # selezionata, e scegliere "la piu' vicina all'ultima etichetta" sarebbe a caso.
+                    logger.info("OCR: %d valori di puntata (%s) e %d etichette: griglia di scelte, non indovino.",
+                                len(values), sorted(values), len(posta_labels))
+                    continue
+            amount, x, y, _ = min(found, key=lambda item: item[3])
+            state[key] = amount
+            used.add((x, y))
 
+        if state["posta"] is not None:
+            self.last_known_bet = state["posta"]
+        elif posta_labels and self.last_known_bet is not None:
+            # Griglia di scelte (o cella non distinguibile): l'OCR non sa quale e' selezionata, la puntata e' quella che
+            # si sa. Solo se c'e' un'etichetta di puntata a schermo: senza, non e' una schermata di gioco.
+            state["posta"] = self.last_known_bet
+            self._bet_fallback_logs += 1
+            if self._bet_fallback_logs % 20 == 1:
+                logger.warning("Puntata non leggibile via OCR, uso ultimo valore noto: %.2f", self.last_known_bet)
         return state
+
+    def note_bet(self, value) -> None:
+        """La puntata e' stata impostata/verificata da chi chiama: vale come ultimo valore noto."""
+        try:
+            self.last_known_bet = float(value) if value is not None else self.last_known_bet
+        except (TypeError, ValueError):
+            pass
 
     def read_text_boxes(self, screenshot_path: str) -> Result[list]:
         """Come read_slot_state, ma espone il bounding box completo (non solo

@@ -14,7 +14,7 @@ from orchestrator.modules.provider_profile.autopilot_memory import (
     save_autopilot_flag,
     save_autopilot_value,
 )
-from orchestrator.modules.slot_autopilot.bet_menu import BetMenuSelector, _looks_like_menu, menu_amounts
+from orchestrator.modules.slot_autopilot.bet_menu import BetMenuSelector, _looks_like_menu, menu_amounts, visible_grid
 from orchestrator.modules.slot_autopilot.config import AutoPilotConfig
 from orchestrator.modules.slot_autopilot.frame_diff import diff_score
 from orchestrator.modules.slot_autopilot.locator import ElementLocator
@@ -168,6 +168,16 @@ class BetController:
                 aborted_reason=None, outcome="unchanged_already_min",
             ))
 
+        grid = visible_grid(getattr(context, "text_boxes", []) or []) if self.menu_selector is not None else []
+        if starting_bet is None and grid:
+            # Griglia di scelte sempre visibile (es. Shining Crown): le celle sono lette dall'OCR, quindi il tocco non e'
+            # alla cieca. Si sceglie la piu' bassa e ci si fida del tocco se la puntata resta illeggibile.
+            chosen = self.menu_selector.select_from_visible_grid(
+                device_id, slot_name, context, context_provider, target=self._trusted_min(slot_name))
+            if chosen.success:
+                return self._menu_result(device_id, slot_name, episode_id, starting_bet, chosen.data,
+                                         ["grid"], 1)
+            logger.warning("set_min_bet: griglia di puntate non utilizzabile (%s): %s", chosen.error_code, chosen.error)
         if starting_bet is None:
             # Senza la puntata leggibile nessun tocco e' verificabile: e' quando un tocco alla cieca
             # ha gia' giocato uno spin. Meglio fermarsi che tirare a indovinare.
@@ -1160,6 +1170,12 @@ class BetController:
 
     def _read_bet(self, context) -> Optional[Decimal]:
         value = context.slot_ocr_state.get("posta") if context else None
+        if value is None and context is not None and self.menu_selector is not None \
+                and visible_grid(getattr(context, "text_boxes", []) or []):
+            recent = self.menu_selector.recent_tapped_bet(getattr(context, "slot_name", ""))
+            if recent is not None and recent <= Decimal("1"):
+                logger.warning("Puntata non leggibile via OCR, uso valore appena impostato: %.2f", recent)
+                return recent
         return Decimal(str(value)) if value is not None else None
 
     def _log_step(self, episode_id, step_index, slot_name, device_id, strategy_used,

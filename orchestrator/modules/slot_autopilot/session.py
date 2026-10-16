@@ -795,6 +795,12 @@ def _play_session(
             ambient_forced = 0
         if spin_result.data.outcome == "no_effect":
             consecutive_no_effect += 1
+            if consecutive_no_effect >= MAX_CONSECUTIVE_NO_EFFECT_SPINS and speed.recover_blocked_spin():
+                log.warning("%d spin senza effetto: un menu aperto dal turbo copriva lo SPIN, l'ho chiuso: riprovo.",
+                            consecutive_no_effect)
+                consecutive_no_effect = 0
+                spin_index -= 1
+                continue
             if consecutive_no_effect >= MAX_CONSECUTIVE_NO_EFFECT_SPINS:
                 log.error(
                     "%d spin di fila senza effetto: il tasto spin non e' stato trovato. Mi fermo "

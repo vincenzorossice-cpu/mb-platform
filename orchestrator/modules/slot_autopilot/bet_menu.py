@@ -92,6 +92,36 @@ def menu_amounts(text_boxes: list) -> list:
     return cells
 
 
+_BET_LABEL_WORDS = ("POSTA", "PUNTATA", "BET", "STAKE")
+_GRID_ROW_TOLERANCE_PX = 40
+_GRID_MIN_CELLS = 4
+_RECENT_TAP_SECONDS = 15.0     # un valore appena toccato vale come puntata attuale solo per poco
+
+
+def visible_grid(text_boxes: list) -> list:
+    """[(valore, (cx, cy))] di una GRIGLIA DI SCELTE sempre visibile (Shining Crown: 0.10 0.20 0.30 0.40 0.50 con
+    un'etichetta PUNTATA sotto ogni cella): almeno 4 importi distinti, solo-importo, plausibili come puntata
+    (0.01-1000), sulla stessa riga. A differenza di `menu_amounts` NON scarta le celle vicine alle etichette (qui
+    stanno proprio li'). Vuota se non c'e' un'etichetta di puntata o la riga e' troppo corta."""
+    from orchestrator.modules.slot_ocr.reader import MAX_BET_VALUE, MIN_BET_VALUE
+    if not any(any(word in box.text.upper() for word in _BET_LABEL_WORDS) for box in text_boxes):
+        return []
+    cells = []
+    for box in text_boxes:
+        if not _STANDALONE_AMOUNT.match(box.text):
+            continue
+        parsed = parse_amount(box.text)
+        if not parsed.success or not Decimal(str(MIN_BET_VALUE)) <= parsed.data <= Decimal(str(MAX_BET_VALUE)):
+            continue
+        cells.append((parsed.data, (round((box.bbox[0] + box.bbox[2]) / 2), round((box.bbox[1] + box.bbox[3]) / 2))))
+    best = []
+    for _, (_, cy) in cells:
+        row = [item for item in cells if abs(item[1][1] - cy) <= _GRID_ROW_TOLERANCE_PX]
+        if len(row) > len(best):
+            best = row
+    return best if len({value for value, _ in best}) >= _GRID_MIN_CELLS else []
+
+
 def _looks_like_menu(cells: list) -> bool:
     return len({value for value, _ in cells}) >= _MIN_MENU_CELLS
 
@@ -111,6 +141,7 @@ class BetMenuSelector:
         # schermo). Spento di default: lo accende la radice di composizione.
         self.scroll_probe = scroll_probe
         self._dead_toggles = {}
+        self.last_tap: Optional[tuple] = None      # (slot, valore, istante) dell'ultima cella toccata
         self.locator = locator
         self.verifier = verifier
         # Opzionale: se la puntata riletta dopo la scelta non e' leggibile o non torna, Sol guarda lo schermo
@@ -217,6 +248,48 @@ class BetMenuSelector:
             return False        # gia' usata con successo in una sessione precedente
         return True
 
+    def recent_tapped_bet(self, slot_name: str, max_age: float = _RECENT_TAP_SECONDS) -> Optional[Decimal]:
+        """Il valore della cella toccata da pochi secondi (per una lettura illeggibile subito dopo), o None."""
+        if self.last_tap is None or self.last_tap[0] != slot_name:
+            return None
+        return self.last_tap[1] if time.monotonic() - self.last_tap[2] <= max_age else None
+
+    def select_from_visible_grid(
+        self, device_id: str, slot_name: str, context, context_provider: Callable[[], Result],
+        target: Optional[Decimal] = None,
+    ) -> Result[MenuSelection]:
+        """Griglia di scelte SEMPRE visibile (nessun menu da aprire o chiudere): un solo tocco sulla cella piu' bassa (o
+        su quella del minimo noto), poi si legge la puntata; se l'OCR non sa dire quale cella e' selezionata ci si
+        fida del tocco appena fatto. Mai scorrimenti ne' tocchi "fuori dal pannello"."""
+        cells = visible_grid(getattr(context, "text_boxes", []) or [])
+        if not cells:
+            return Result.fail("No visible grid of selectable bets", "BET_GRID_NOT_FOUND")
+        wanted = [item for item in cells if target is not None and item[0] == target]
+        lowest, (cell_x, cell_y) = wanted[0] if wanted else min(cells, key=lambda item: item[0])
+        logger.info("bet menu: griglia di puntate visibile %s, tocco %s a (%d,%d)",
+                    sorted({v for v, _ in cells}), lowest, cell_x, cell_y)
+        tapped = self.verifier.verified_tap(device_id, cell_x, cell_y, Expectation(kind="screen_changed"))
+        if not getattr(tapped, "success", False):
+            return Result.fail("The tap on the bet cell failed", "MENU_TAP_FAILED")
+        self.last_tap = (slot_name, lowest, time.monotonic())
+        after = self._fresh(context_provider)
+        seen = after.slot_ocr_state.get("posta") if after is not None else None
+        if seen is None and self.supervisor is not None:
+            seen = self.supervisor.read_bet(device_id)
+        if seen is not None:
+            read_bet = Decimal(str(seen))
+            if read_bet == lowest:
+                logger.info("Puntata letta: %.2f, attesa: %.2f (griglia visibile), OK", read_bet, lowest)
+                return Result.ok(MenuSelection(final_bet=read_bet, lowest_listed=lowest, toggle_strategy="grid"))
+            if read_bet < lowest and read_bet <= _MAX_ACCEPTED_LOWER_BET:
+                logger.warning("bet menu: letta %s piu' bassa dell'attesa %s: tengo la letta.", read_bet, lowest)
+                return Result.ok(MenuSelection(final_bet=read_bet, lowest_listed=lowest, toggle_strategy="grid"))
+            return Result.fail(f"Bet after grid selection is {read_bet}, expected {lowest}", "MENU_SELECTION_NOT_CONFIRMED")
+        if lowest > _MAX_ACCEPTED_LOWER_BET:
+            return Result.fail(f"Bet after grid selection cannot be read (expected {lowest})", "MENU_SELECTION_UNREADABLE")
+        logger.warning("Puntata non leggibile via OCR, uso valore appena impostato: %.2f", lowest)
+        return Result.ok(MenuSelection(final_bet=lowest, lowest_listed=lowest, toggle_strategy="grid"))
+
     def select_from_open_menu(
         self, device_id: str, slot_name: str, context, context_provider: Callable[[], Result],
         toggle_xy: Optional[tuple] = None, target: Optional[Decimal] = None,
@@ -253,8 +326,11 @@ class BetMenuSelector:
         logger.info("bet menu: valori letti %s, cerco %s%s: tocco a (%d,%d)", sorted({v for v, _ in cells}), lowest,
                     " (puntata dichiarata)" if wanted_cells else " (la piu' bassa letta)", cell_x, cell_y)
         after = None
+        tap_ok = False
         for attempt in range(_MAX_PICK_ATTEMPTS):
-            self.verifier.verified_tap(device_id, cell_x, cell_y, Expectation(kind="screen_changed"))
+            tapped = self.verifier.verified_tap(device_id, cell_x, cell_y, Expectation(kind="screen_changed"))
+            tap_ok = bool(getattr(tapped, "success", False))
+            self.last_tap = (slot_name, lowest, time.monotonic())
             after = self._fresh(context_provider)
             if after is None:
                 return Result.fail("Cannot read the screen after selecting the bet", "MENU_CONTEXT_ERROR")
@@ -294,6 +370,14 @@ class BetMenuSelector:
             if seen is not None:
                 logger.info("bet menu: la lettura locale dice %s, il supervisore vede %s (atteso %s).", bet, seen, lowest)
                 bet = seen
+        if bet is None and tap_ok and lowest <= _MAX_ACCEPTED_LOWER_BET:
+            # Appena toccata la cella `lowest`: se l'OCR non sa dire quale e' selezionata ci si fida del tocco. Restano
+            # Bet Watch e il calo del saldo a ogni spin come controlli indipendenti.
+            logger.warning("Puntata non leggibile via OCR, uso valore appena impostato: %.2f", lowest)
+            return Result.ok(MenuSelection(
+                final_bet=lowest, lowest_listed=lowest, proven=False,
+                toggle_strategy=toggle.strategy_name if toggle is not None else "hitl",
+            ))
         if bet is None:
             return Result.fail(
                 f"Bet after menu selection cannot be read (expected {lowest})", "MENU_SELECTION_UNREADABLE",

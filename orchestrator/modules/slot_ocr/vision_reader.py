@@ -14,6 +14,9 @@ from PIL import Image
 from orchestrator.core.amount_format import find_amount_run
 from orchestrator.core.openai_compat import create_with_param_fallback
 from orchestrator.core.openai_retry import call_with_rate_limit_retry
+from orchestrator.modules.slot_ocr.reader import (
+    BALANCE_JUMP_RATIO as BALANCE_RATIO, MAX_BALANCE_VALUE as MAX_BALANCE, MAX_BET_VALUE, is_jackpot_balance,
+)       # oltre: jackpot o saldo, mai una puntata
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +121,9 @@ class VisionAmountReader:
         credit = data.get("credit_text", data.get("credit"))
         bet = data.get("bet_text", data.get("bet"))
         result = {"saldo": _to_amount(credit), "posta": _to_amount(bet)}
+        if result["posta"] is not None and result["posta"] > MAX_BET_VALUE:
+            logger.warning("lettura per visione: puntata %s oltre %s (un jackpot?): la scarto.", result["posta"], MAX_BET_VALUE)
+            result["posta"] = None
         logger.info("lettura per visione: saldo=%s (testo %r) puntata=%s (testo %r) [%.1f s]",
                     result["saldo"], credit, result["posta"], bet, call_seconds)
         if len(self._cache) >= 4:
@@ -188,6 +194,8 @@ class ResilientOCRReader:
         self.vision_reasons = {}  # motivo -> chiamate di visione
         # Ultimo valore fidato per campo (concordato tra i due lettori o coerente con la storia).
         self._trusted = {"saldo": None, "posta": None}
+        self._balance_discarded = False
+        self._balance_source = None
 
     def set_spin_mode(self, active: bool) -> None:
         """Durante gli spin, se l'OCR ha dimostrato di non leggere gli importi di questa slot, la lettura
@@ -216,6 +224,63 @@ class ResilientOCRReader:
         return getattr(self.__dict__["ocr"], name)
 
     def read_slot_state(self, screenshot_path: str) -> dict:
+        self._balance_discarded = False
+        state = self._read_inner(screenshot_path)
+        if state.get("saldo") is None and self._balance_discarded and self._trusted.get("saldo") is not None:
+            # Il saldo letto era un jackpot e nessuna altra fonte lo ha dato: l'ultimo saldo fidato, non un buco.
+            logger.warning("Saldo non leggibile, uso ultimo saldo noto: %s", self._trusted["saldo"])
+            state = dict(state)
+            state["saldo"] = self._trusted["saldo"]
+            self._note_balance_source("ultimo noto", state["saldo"])
+        elif state.get("saldo") is not None:
+            self._note_balance_source("per visione" if "saldo" in self._vision_fields else "dopo etichetta SALDO:",
+                                      state["saldo"])
+        return state
+
+    def _note_balance_source(self, source: str, value) -> None:
+        """Una riga solo quando cambia DA DOVE arriva il saldo (non a ogni spin)."""
+        if source != self._balance_source:
+            self._balance_source = source
+            logger.info("Saldo letto: %s (%s)", value, source)
+
+    def _clean_balance(self, value, where: str):
+        """Un saldo che e' un jackpot (oltre 100.000, o oltre 10x l'ultimo saldo fidato) non entra mai nel lettore:
+        ne' come lettura, ne' come riferimento fidato, ne' per accordo di OCR e visione."""
+        if value is None:
+            return None
+        trusted = self._trusted.get("saldo")
+        if is_jackpot_balance(value, trusted):
+            reason = "> 10× precedente" if trusted and value > BALANCE_RATIO * trusted else f"> {int(MAX_BALANCE)}"
+            logger.warning("Saldo scartato: %.2f (jackpot, %s) [%s]", value, reason, where)
+            self._balance_discarded = True
+            return None
+        return value
+
+    def _ocr_state(self, path: str) -> dict:
+        state = self.ocr.read_slot_state(path)
+        if isinstance(state, dict) and state.get("saldo") is not None:
+            state = dict(state)
+            state["saldo"] = self._clean_balance(state["saldo"], "OCR")
+        return state
+
+    def _vision_read(self, path: str) -> dict:
+        seen = self.vision.read(path)
+        if isinstance(seen, dict) and seen.get("saldo") is not None:
+            seen = dict(seen)
+            seen["saldo"] = self._clean_balance(seen["saldo"], "visione")
+        return seen
+
+    def note_bet(self, value) -> None:
+        note = getattr(self.ocr, "note_bet", None)
+        if callable(note):
+            note(value)
+        if value is not None:
+            try:
+                self._trusted["posta"] = float(value)
+            except (TypeError, ValueError):
+                pass
+
+    def _read_inner(self, screenshot_path: str) -> dict:
         self.reads += 1
         if self.vision is not None and self._spin_mode and self._ocr_useless_for_amounts and self._self_checked:
             self._useless_reads += 1
@@ -225,11 +290,11 @@ class ResilientOCRReader:
                      "is_active": False, "raw_texts": []}
             started = time.monotonic()
             self._count_vision("ocr_inutile")
-            merged = self._combine(empty, self.vision.read(screenshot_path))
+            merged = self._combine(empty, self._vision_read(screenshot_path))
             logger.info("lettura importi (solo visione, OCR saltato): %.1f s", time.monotonic() - started)
             return merged
         ocr_started = time.monotonic()
-        state = self.ocr.read_slot_state(screenshot_path)
+        state = self._ocr_state(screenshot_path)
         ocr_seconds = time.monotonic() - ocr_started
         if self.vision is None:
             return state
@@ -238,7 +303,7 @@ class ResilientOCRReader:
             self._ocr_useless_for_amounts = state.get("saldo") is None and state.get("posta") is None
             self._log_raw_ocr(state)
             self._count_vision("prima_lettura")
-            return self._first_read(state, self.vision.read(screenshot_path))
+            return self._first_read(state, self._vision_read(screenshot_path))
         self._log_raw_ocr(state)
         if self._can_reuse_trusted_bet(state):
             # La puntata non cambia durante gli spin e l'OCR non la legge: la lettura verificata vale, senza una
@@ -263,7 +328,7 @@ class ResilientOCRReader:
             self._bet_skips = 0
             self._count_vision(reason)
             vision_started = time.monotonic()
-            merged = self._combine(state, self.vision.read(screenshot_path))
+            merged = self._combine(state, self._vision_read(screenshot_path))
             logger.info("lettura importi: OCR %.1f s, visione %.1f s", ocr_seconds, time.monotonic() - vision_started)
             return merged
         for key in _KEYS:
@@ -315,17 +380,17 @@ class ResilientOCRReader:
             return None
         if not path:
             return None
-        second = self.ocr.read_slot_state(path)
+        second = self._ocr_state(path)
         return second if not self._incomplete(second) else None
 
     def _reprobe_ocr(self, screenshot_path: str) -> dict:
         """In modo 'OCR inutile': la prima lettura puo' essere caduta su una schermata senza importi (caricamento).
         Ogni _REPROBE_EVERY letture si legge anche con l'OCR; dopo _REPROBE_NEEDED controlli in cui legge saldo e
         puntata concordi con la visione, si torna all'OCR."""
-        state = self.ocr.read_slot_state(screenshot_path)
+        state = self._ocr_state(screenshot_path)
         self._log_raw_ocr(state)
         self._count_vision("ocr_inutile")
-        seen = self.vision.read(screenshot_path)
+        seen = self._vision_read(screenshot_path)
         agrees = all(state.get(key) is not None and seen.get(key) is not None
                      and _within(state[key], seen[key], self.tolerance) for key in _KEYS)
         self._probe_agreements = self._probe_agreements + 1 if agrees else 0
@@ -369,6 +434,8 @@ class ResilientOCRReader:
         for key in _KEYS:
             ocr_value, vision_value = state.get(key), seen.get(key)
             if vision_value is None:
+                if ocr_value is not None:
+                    self._trusted[key] = ocr_value   # unica fonte plausibile (la visione e' muta o era un jackpot)
                 continue                      # la visione non dice nulla: resta l'OCR
             if ocr_value is not None and _within(ocr_value, vision_value, self.tolerance):
                 merged[key] = self._trusted[key] = ocr_value
@@ -408,7 +475,7 @@ class ResilientOCRReader:
         if "read" not in second:
             time.sleep(self._confirm_delay)
             path = self._capture()
-            second["read"] = self.vision.read(path) if path else None
+            second["read"] = self._vision_read(path) if path else None
         if second["read"] is None:
             return None
         again = second["read"].get(key)
@@ -419,6 +486,10 @@ class ResilientOCRReader:
     def _sane(merged: dict) -> dict:
         """Una puntata che non e' minore del saldo e' un errore di lettura (credito letto come puntata)."""
         bet, balance = merged.get("posta"), merged.get("saldo")
+        if bet is not None and bet > MAX_BET_VALUE:
+            logger.warning("puntata %s oltre %s: e' un jackpot o un saldo, non una puntata: la scarto.", bet, MAX_BET_VALUE)
+            merged = dict(merged)
+            merged["posta"] = bet = None
         if bet is not None and balance is not None and bet >= balance:
             logger.warning("puntata %s non inferiore al saldo %s: la scarto.", bet, balance)
             merged = dict(merged)

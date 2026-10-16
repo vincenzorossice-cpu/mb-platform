@@ -28,6 +28,8 @@ UNLIMITED_WORDS = ("ILLIMITATO", "ILLIMITATI", "INFINITO", "INFINITE", "UNLIMITE
 LIMIT_WORDS = ("LIMITE", "LIMIT", "PERDITA", "LOSS")
 
 SETTLE_SECONDS = 1.5
+CLOSE_WORDS = ("CHIUDI", "CLOSE", "X", "\u2715", "\u00d7")
+PANEL_DIFF = 0.12                   # oltre questa differenza dalla schermata di prima e' rimasto un menu/pannello aperto
 MAX_TAPS = 10                       # tocchi totali dell'esplorazione
 CANDIDATES_PER_LEVEL = 3
 SCREEN_CHANGED = 0.02               # differenza dopo un tocco oltre cui "lo schermo e' cambiato"
@@ -99,6 +101,8 @@ class ScreenTools:
         self.ask = ask
         self.sleep = sleep
         self._boxes_cache = (None, [])
+        self.ready_probe = None          # path -> True (SPIN pronto) | False (coperto/occupato) | None (non si sa)
+        self.press_back = None           # () -> qualsiasi: il tasto Back di Android
 
     def shot(self, device_id: str) -> Optional[Shot]:
         result = self.screen_reader._screenshot(device_id)
@@ -159,6 +163,47 @@ class ScreenTools:
                 found.append(((x1 + x2) // 2, (y1 + y2) // 2, text))
         return found
 
+    def screen_free(self, shot: Shot, baseline_path: Optional[str]) -> bool:
+        """La slot e' di nuovo utilizzabile? Prima la freccia dello spin (se si sa leggere), altrimenti la schermata e'
+        quasi quella di prima. Senza nessuno dei due segnali non si puo' dire: si considera libera."""
+        if self.ready_probe is not None:
+            try:
+                ready = self.ready_probe(shot.path)
+            except Exception:
+                ready = None
+            if ready is not None:
+                return bool(ready)
+        if baseline_path is None:
+            return True
+        diff = diff_score(baseline_path, shot.path)
+        return bool(diff.success and diff.data < PANEL_DIFF)
+
+    def restore_screen(self, device_id: str, baseline_path: Optional[str], extra_taps: tuple = ()) -> bool:
+        """Chiude cio' che e' rimasto aperto (menu, pannello): parole Chiudi/X, poi Back, poi i tocchi indicati (l'icona
+        che l'aveva aperto). Mai un tocco cieco "fuori dal menu". True se la slot e' libera."""
+        shot = self.shot(device_id)
+        if shot is None or self.screen_free(shot, baseline_path):
+            return True
+        for x, y, _ in self.words(shot, CLOSE_WORDS)[:2]:
+            self.tap(device_id, x, y)
+            self.sleep(SETTLE_SECONDS)
+            shot = self.shot(device_id)
+            if shot is not None and self.screen_free(shot, baseline_path):
+                return True
+        if self.press_back is not None:
+            self.press_back()
+            self.sleep(SETTLE_SECONDS)
+            shot = self.shot(device_id)
+            if shot is not None and self.screen_free(shot, baseline_path):
+                return True
+        for x, y in extra_taps:
+            self.tap(device_id, x, y)
+            self.sleep(SETTLE_SECONDS)
+            shot = self.shot(device_id)
+            if shot is not None and self.screen_free(shot, baseline_path):
+                return True
+        return False
+
     def sol_points(self, shot: Shot, system: str, user: str) -> dict:
         """Punti indicati da Sol (coordinate 0-1000) in pixel: {nome: (x, y)}."""
         if self.ask is None:
@@ -191,6 +236,7 @@ class AutoSpinManager:
                  default_period: float = 6.0, popup_guard=None,
                  before_start: Optional[Callable[[], Optional[str]]] = None):
         self.tools = ScreenTools(screen_reader, touch_injector, ocr_reader, ask, sleep)
+        self.tools.press_back = press_back
         self.button = button
         self.bet_watch = bet_watch
         self.ask_operator = ask_operator
@@ -205,6 +251,20 @@ class AutoSpinManager:
 
     # ---- esplorazione --------------------------------------------------------------------------------------------------
     def explore_autospin(self, device_id: str, slot_name: str, spin_point: Optional[tuple],
+                         bet_panel_point: Optional[tuple] = None, previous: Optional[AutospinInfo] = None
+                         ) -> Result[AutospinInfo]:
+        """Come `_explore`, e alla fine la slot deve essere libera: nessun menu o pannello rimasto aperto sullo SPIN."""
+        baseline = self.tools.shot(device_id)
+        result = self._explore(device_id, slot_name, spin_point, bet_panel_point, previous)
+        if baseline is not None and result.success:
+            self.tools.ready_probe = (lambda path: self._ready(slot_name, Shot(path, baseline.size), spin_point)
+                                      if self.button is not None else None)
+            if not self.tools.restore_screen(device_id, baseline.path):
+                logger.warning("Autospin: un menu o pannello resta aperto dopo l'esplorazione e non si chiude.")
+            self.tools.ready_probe = None
+        return result
+
+    def _explore(self, device_id: str, slot_name: str, spin_point: Optional[tuple],
                          bet_panel_point: Optional[tuple] = None, previous: Optional[AutospinInfo] = None
                          ) -> Result[AutospinInfo]:
         """Cerca l'autospin: schermata principale, poi menu, poi pannello puntata (mai oltre due livelli). Result con
