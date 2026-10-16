@@ -188,7 +188,8 @@ class AutoSpinManager:
                  bet_watch=None, ask_operator: Optional[Callable[[str], str]] = None,
                  press_back: Optional[Callable[[], object]] = None, sleep: Callable[[float], None] = time.sleep,
                  clock: Callable[[], float] = time.monotonic, sample_interval: int = 15, period_safety: float = 1.2,
-                 default_period: float = 6.0):
+                 default_period: float = 6.0, popup_guard=None,
+                 before_start: Optional[Callable[[], Optional[str]]] = None):
         self.tools = ScreenTools(screen_reader, touch_injector, ocr_reader, ask, sleep)
         self.button = button
         self.bet_watch = bet_watch
@@ -199,6 +200,8 @@ class AutoSpinManager:
         self.sample_interval = max(1, int(sample_interval))
         self.period_safety = max(1.0, float(period_safety))
         self.default_period = default_period
+        self.popup_guard = popup_guard           # PopupGuard: i popup (raddoppio!) si chiudono col pulsante giusto
+        self.before_start = before_start         # () -> None (via libera) | motivo: puntata verificata, nessun popup
 
     # ---- esplorazione --------------------------------------------------------------------------------------------------
     def explore_autospin(self, device_id: str, slot_name: str, spin_point: Optional[tuple],
@@ -479,6 +482,11 @@ class AutoSpinManager:
                        period: float) -> Result[AutospinRun]:
         if not info.usable():
             return Result.fail("autospin non utilizzabile (non verificato)", "AUTOSPIN_NOT_USABLE")
+        if self.before_start is not None:
+            blocker = self.before_start()
+            if blocker:
+                logger.warning("Autospin: non parte (%s)", blocker)
+                return Result.fail(blocker, "AUTOSPIN_PREFLIGHT")
         for step in info.touch_sequence or []:
             self.tools.tap(device_id, step["x"], step["y"])
             self.sleep(float(step.get("wait", SETTLE_SECONDS)))
@@ -540,6 +548,27 @@ class AutoSpinManager:
                 return gained
         return self._time_spins(run, elapsed)
 
+    def _close_popup(self, device_id: str, slot_name: str) -> bool:
+        """Chiude il popup che ha fermato l'autospin. Con la guardia: raddoppio -> SOLO Raccogli. Senza guardia il
+        tocco al centro e' ammesso solo se l'OCR non vede parole di raddoppio (il centro potrebbe essere "Raddoppia")."""
+        if self.popup_guard is not None:
+            outcome = self.popup_guard.clear(device_id, slot_name, suspect=True)
+            if not outcome.success:
+                return False
+            if outcome.data.closed:
+                return True
+        shot = self.tools.shot(device_id)
+        if shot is None:
+            return True
+        from orchestrator.modules.slot_autopilot.popup_guard import GAMBLE_WORDS, _has
+        if any(_has(str(getattr(b, "text", "")), GAMBLE_WORDS) for b in self.tools.boxes(shot)):
+            logger.warning("Autospin: parole di raddoppio a schermo e nessuna guardia: non tocco il centro.")
+            return False
+        self.tools.tap(device_id, shot.size[0] // 2, shot.size[1] // 2)
+        self.sleep(SETTLE_SECONDS)
+        logger.info("Autospin: schermo fermo (popup?), tocco al centro e ricontrollo")
+        return True
+
     def stop_autospin(self, device_id: str, slot_name: str, info: AutospinInfo, spin_point: Optional[tuple]
                       ) -> Result[bool]:
         point = info.stop_coords if info.stop_method in ("tap_stop", "tap_button") and info.stop_coords else spin_point
@@ -566,7 +595,8 @@ class AutoSpinManager:
         disponibili), poi lo ferma con fermata verificata. Gestisce giri fissi finiti, popup e riavvii."""
         started = self.start_autospin(device_id, slot_name, info, spin_point, period)
         if not started.success:
-            return CycleResult("start_failed", message=started.error or "")
+            return CycleResult("preflight_failed" if started.error_code == "AUTOSPIN_PREFLIGHT" else "start_failed",
+                               message=started.error or "")
         run = started.data
         credited_spins = 0
         reason, message = "budget", ""
@@ -594,18 +624,17 @@ class AutoSpinManager:
                 break
             if report.state == "stalled_blocked" and not popup_tried:
                 popup_tried = True
-                shot = self.tools.shot(device_id)
-                if shot is not None:
-                    self.tools.tap(device_id, shot.size[0] // 2, shot.size[1] // 2)
-                    self.sleep(SETTLE_SECONDS)
-                    logger.info("Autospin: schermo fermo (popup?), tocco al centro e ricontrollo")
+                if not self._close_popup(device_id, slot_name):
+                    reason, message = "needs_attention", "popup che non si chiude senza rischi"
+                    break
                 continue
             logger.info("Autospin: %s, riavvio" % ("fermato da popup" if (report.state == "stalled_blocked" or popup_tried)
                                                    else "ciclo completato"))
             restarted = self.restart_autospin(device_id, slot_name, run, spin_point)
             popup_tried = False
             if not restarted.success:
-                reason, message = "needs_attention", restarted.error or "riavvio fallito"
+                reason = "preflight_failed" if restarted.error_code == "AUTOSPIN_PREFLIGHT" else "needs_attention"
+                message = restarted.error or "riavvio fallito"
                 break
             run = restarted.data
         stopped = self.stop_autospin(device_id, slot_name, info, spin_point)

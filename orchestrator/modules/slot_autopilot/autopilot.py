@@ -97,6 +97,7 @@ class SlotAutoPilot:
         self.profile_builder = profile_builder
         self.bet_watch = BetWatch()
         self.autospin_manager = None       # AutoSpinManager (radice di composizione); None = niente autospin
+        self.gamble_guard = None           # PopupGuard: popup di raddoppio (solo Raccogli) e di vincita
         self._ambient_checked = False       # la maschera delle animazioni ambientali e' gia' stata caricata/appresa
 
         self._profile = None
@@ -228,11 +229,31 @@ class SlotAutoPilot:
         else:
             logger.info("Animazioni ambientali: nessuna cella da ignorare.")
 
+    def _autospin_preflight(self, device_id: str) -> Optional[str]:
+        """L'autospin parte SOLO con la puntata verificata al minimo, nessun popup e la cella di puntata confermata.
+        Ritorna None (via libera) o il motivo per cui non si parte."""
+        guard = self.gamble_guard
+        if guard is not None:
+            cleared = guard.clear(device_id, self.config.slot_name, suspect=True)
+            if not cleared.success:
+                return f"popup aperto che non si chiude ({cleared.error_code})"
+        bet = self.set_min_bet(device_id)          # rilegge la puntata via OCR, la abbassa se serve, riapprende Bet Watch
+        if not (bet.success and bet.data.min_bet_verified):
+            return "puntata non verificata al minimo"
+        if guard is not None and guard.inspect(device_id, self.config.slot_name).kind is not None:
+            return "popup ancora presente"
+        if self.bet_watch.active:
+            shot = self.screen_reader._screenshot(device_id)
+            if shot.success and self.bet_watch.check(shot.data) is True:
+                return "la cella di puntata selezionata non e' quella verificata"
+        return None
+
     def autospin_cycle(self, device_id: str, info, bet, played_budget, spins_budget: int, period: float):
         """Un ciclo di autospin con monitoraggio a campione (vedi AutoSpinManager.run_cycle)."""
         manager = self.autospin_manager
         if manager is None:
             return None
+        manager.before_start = lambda: self._autospin_preflight(device_id)      # a ogni avvio e riavvio
         spin_point = None
         setup = getattr(self, "slot_setup", None)
         if setup is not None:

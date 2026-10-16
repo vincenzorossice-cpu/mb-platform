@@ -166,6 +166,22 @@ class SlotSetup:
         saved = self.memory.save(slot_map)
         return Result.ok(True) if saved.success else Result.fail(saved.error, saved.error_code)
 
+    def gamble_info(self, slot_name: str):
+        """((x, y), firma) del pulsante Raccogli del popup di raddoppio gia' imparato, o None."""
+        slot_map = self._maps.get(slot_name)
+        if slot_map is None or not slot_map.gamble_popup or not slot_map.collect_coords:
+            return None
+        return tuple(slot_map.collect_coords), slot_map.gamble_signature
+
+    def save_gamble(self, slot_name: str, coords, signature) -> Result[bool]:
+        slot_map = self._maps.get(slot_name)
+        if slot_map is None:
+            return Result.ok(False)
+        slot_map.gamble_popup, slot_map.collect_coords = True, [int(coords[0]), int(coords[1])]
+        slot_map.gamble_signature = list(signature) if signature else slot_map.gamble_signature
+        saved = self.memory.save(slot_map)
+        return Result.ok(True) if saved.success else Result.fail(saved.error, saved.error_code)
+
     def explore_autospin(self, device_id: str, slot_name: str) -> Result:
         """Esplora l'autospin una volta per slot (e per schermo), SOLO in demo e dopo la puntata minima. Una mappa gia'
         con esito (present/absent) o con troppi tentativi a vuoto non si riesplora. Salva l'esito nella mappa."""

@@ -131,6 +131,9 @@ class SlotWarden:
         self.free_spin_confirmations = 0
         self.popup_probe = popup_probe          # probe(path) -> True se lo schermo mostra un popup di vincita (OCR)
         self._hint: Optional[str] = None        # avviso per la prossima chiamata a Sol
+        # Guardia dei popup (PopupGuard): il popup di RADDOPPIO si chiude prima di ogni altra logica, toccando solo Raccogli.
+        self.gamble_guard = None
+        self.gamble_collected = False           # la sessione deve rileggere la puntata (il popup puo' averla cambiata)
 
     # ---- ingresso -------------------------------------------------------------------------------------------------
     def handle(self, device_id: str, slot_name: str, trigger: str, history: Optional[list] = None) -> str:
@@ -147,6 +150,10 @@ class SlotWarden:
             if incident_calls >= self.max_calls_per_incident or self.calls >= self.max_calls:
                 logger.warning("Vigile: budget di chiamate finito per questo episodio.")
                 return "give_up" if not self._can_ask() else self._ask_or_finish(device_id, slot_name, "budget finito")
+            if self.gamble_guard is not None:
+                cleared = self._clear_gamble(device_id, slot_name)
+                if cleared == "resume":
+                    return "resume"
             shot = self._screenshot(device_id)
             if shot is None:
                 return "give_up"
@@ -207,6 +214,18 @@ class SlotWarden:
             if ineffective >= 3:
                 return self._operator_or_give_up(device_id, slot_name, "le azioni non cambiano lo schermo")
             self.sleep(1.0)
+
+    def _clear_gamble(self, device_id: str, slot_name: str) -> Optional[str]:
+        """Prima di tutto: un popup di raddoppio vincita? Si tocca SOLO Raccogli (mai Raddoppia). 'resume' se chiuso."""
+        try:
+            outcome = self.gamble_guard.clear(device_id, slot_name, suspect=True)
+        except Exception as exc:
+            logger.warning("Vigile: controllo del popup di raddoppio fallito: %s", exc)
+            return None
+        if outcome.success and outcome.data.closed and outcome.data.kind == "gamble":
+            self.gamble_collected = True
+            return "resume"
+        return None
 
     # ---- azioni ---------------------------------------------------------------------------------------------------
     def _act(self, device_id: str, slot_name: str, decision: Decision, before_path: str) -> bool:

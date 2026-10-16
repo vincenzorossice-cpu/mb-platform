@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Optional
 
+from orchestrator.modules.slot_autopilot.config import AutoPilotConfig
+from orchestrator.modules.slot_autopilot.popup_guard import PopupGuard
 from orchestrator.modules.slot_autopilot.speedup_controller import SpeedupController
 
 logger = logging.getLogger(__name__)
@@ -314,6 +316,39 @@ def _check_lost(autopilot, device_id: str) -> str:
     return verdict if isinstance(verdict, str) else "unknown"
 
 
+def _after_win(autopilot, spin, device_id: str, slot_name: str, log, help_state: dict) -> str:
+    """Dopo una vincita: un popup di raddoppio blocca la slot e puo' cambiare la puntata. Ritorna 'ok', 'recheck'
+    (rileggere la puntata prima del prossimo spin) o 'stop' (popup che non si chiude senza rischi, nessun aiuto)."""
+    config = getattr(autopilot, "config", None)
+    guard = getattr(autopilot, "gamble_guard", None)
+    bet = getattr(spin, "bet_amount", None)
+    if not isinstance(config, AutoPilotConfig) or not isinstance(bet, Decimal) or bet <= 0:
+        return "ok"
+    win = getattr(spin, "win_amount", None)
+    if not isinstance(win, Decimal):
+        before, after = getattr(spin, "balance_before", None), getattr(spin, "balance_after", None)
+        win = (after - before + bet) if isinstance(before, Decimal) and isinstance(after, Decimal) else Decimal("0")
+    if win <= 0:
+        return "ok"
+    result = "ok"
+    if isinstance(guard, PopupGuard) and win >= bet * Decimal(str(config.gamble_check_min_win_bets)):
+        cleared = guard.clear(device_id, slot_name, suspect=True)
+        if cleared.success and cleared.data.closed:
+            log.info("Vincita %s: popup chiuso (%s), rileggo la puntata.", win, cleared.data.kind)
+            result = "recheck"
+        elif not cleared.success:
+            log.error("Dopo la vincita %s c'e' un popup che non chiudo senza rischi (%s).", win, cleared.error_code)
+            if _ask_operator(autopilot, device_id, "un popup (raddoppio vincita?) blocca la slot: chiudilo tu "
+                             "(Raccogli) e premi INVIO.", log, help_state) != "retry":
+                return "stop"
+            result = "recheck"
+    if win >= bet * Decimal(str(config.force_bet_recheck_multiple)):
+        log.info("Vincita %s (>= %sx la puntata): rileggo la puntata prima del prossimo spin.", win,
+                 config.force_bet_recheck_multiple)
+        result = "recheck"
+    return result
+
+
 def _check_bet_window(recent: list, spin, autopilot, device_id: str, log) -> Decimal:
     """Puntata creduta piu' alta di quella vera: se in BET_WINDOW spin di fila il calo massimo di saldo e' sotto il
     60% della puntata creduta (una puntata persa darebbe un calo pari alla puntata), si rilegge la puntata dallo
@@ -477,12 +512,17 @@ def _play_session(
         fs["total"] += fs["done"]
         fs.update(on=False, done=0, run=0, start=None)
 
+    pending = {"bet": False}               # puntata da rileggere prima del prossimo spin (dopo un popup di raddoppio)
+
     def incident(trigger: str) -> str:
         """Il vigile (Sol, poi l'operatore in testo libero) chiarisce cosa succede. 'none' = nessun vigile; 'resume' =
         si puo' tornare a giocare; 'stop' = l'operatore vuole fermarsi; 'give_up' = nessuno l'ha risolto."""
         if warden is None:
             return "none"
         verdict = warden.handle(device_id, slot_name, trigger, list(events))
+        if getattr(warden, "gamble_collected", False) is True:
+            warden.gamble_collected = False
+            pending["bet"] = True           # il popup di raddoppio puo' aver cambiato la puntata: si rilegge prima di spinnare
         if verdict == "resume":
             clear = getattr(getattr(autopilot, "spin_controller", None), "clear_anomaly", None)
             if callable(clear):
@@ -557,6 +597,15 @@ def _play_session(
                     failed, stop_reason = True, "BET_NOT_VERIFIED"
                     break
             continue
+        if pending["bet"]:
+            pending["bet"] = False
+            log.info("Dopo il popup di raddoppio rileggo la puntata prima del prossimo spin.")
+            recheck = autopilot.set_min_bet(device_id)
+            recent_spins.clear()
+            if not (recheck.success and recheck.data.min_bet_verified):
+                log.error("Impossibile riverificare la puntata dopo il popup: mi fermo senza spinnare.")
+                failed, stop_reason = True, "BET_NOT_VERIFIED"
+                break
         spin_index += 1
         started = time.monotonic()
         controller = getattr(autopilot, "spin_controller", None)
@@ -821,7 +870,16 @@ def _play_session(
                 button_status_shown = True
                 log.info("Pulsante spin: %s", status)
             log.info("%s", progress_line(spin_index, spin_result.data, total_played, target, seconds))
-            speed.note_spin(seconds)
+            speed_stop = speed.note_spin(seconds)
+            if speed_stop:
+                failed, stop_reason = True, speed_stop
+                break
+            after_win = _after_win(autopilot, spin_result.data, device_id, slot_name, log, help_state)
+            if after_win == "stop":
+                failed, stop_reason = True, "POPUP_NOT_CLOSED"
+                break
+            if after_win == "recheck":
+                pending["bet"] = True
         elif spin_result.data.outcome == "blocked":
             if spin_result.data.violated_invariant == "UNSAFE_SCREEN_STATE":
                 if busy_since is None:

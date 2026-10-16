@@ -133,7 +133,7 @@ def _autopilot_for(setup, **config):
 
 def test_prepare_uses_a_saved_autospin_without_exploring(tmp_path):
     world = World(tmp_path)
-    setup = _setup(tmp_path, world, autospin=_good_autospin())
+    setup = _setup(tmp_path, world, autospin=_good_autospin(), turbo=TurboInfo(status="absent"))
     controller = SpeedupController(_autopilot_for(setup), setup, "d", "Slot", Decimal("3"), logging.getLogger("t"))
 
     assert controller.prepare() is None and controller.autospin is not None and world.taps == []
@@ -141,7 +141,7 @@ def test_prepare_uses_a_saved_autospin_without_exploring(tmp_path):
 
 def test_an_unstoppable_autospin_stops_the_session_loudly(tmp_path):
     world = World(tmp_path, kind="main", stop="never")
-    setup = _setup(tmp_path, world)
+    setup = _setup(tmp_path, world, turbo=TurboInfo(status="absent"))
     controller = SpeedupController(_autopilot_for(setup), setup, "d", "Slot", Decimal("3"), logging.getLogger("t"))
 
     assert controller.prepare() == "AUTOSPIN_NOT_STOPPED"
@@ -149,7 +149,7 @@ def test_an_unstoppable_autospin_stops_the_session_loudly(tmp_path):
 
 def test_absent_autospin_logs_and_goes_on_manually(tmp_path, caplog):
     world = World(tmp_path, kind="none")
-    setup = _setup(tmp_path, world)
+    setup = _setup(tmp_path, world, turbo=TurboInfo(status="absent"))
     controller = SpeedupController(_autopilot_for(setup), setup, "d", "Slot", Decimal("3"), logging.getLogger("t"))
 
     with caplog.at_level(logging.INFO):
@@ -262,10 +262,11 @@ def test_autospin_disabled_in_the_config_keeps_the_manual_behaviour(tmp_path):
 
 def test_a_changed_bet_during_the_autospin_rereads_it_and_goes_manual(tmp_path):
     cycle = CycleResult("bet_changed", 12, Decimal("1.2"), True, 1, "la cella di puntata selezionata e' cambiata")
-    autopilot, result = _session(tmp_path, [cycle], [_spin(index=i) for i in range(1, 30)])
+    after = CycleResult("threshold", 10, Decimal("1.0"), True, 1)
+    autopilot, result = _session(tmp_path, [cycle, after], [_spin(index=i) for i in range(1, 30)])
 
     assert autopilot.set_min_bet.call_count == 2                                # iniziale + dopo l'autospin
-    assert autopilot.autospin_cycle.call_count == 1 and result.target_reached
+    assert autopilot.autospin_cycle.call_count == 2 and result.target_reached   # poi l'autospin RIPARTE
 
 
 def test_an_autospin_that_does_not_stop_ends_the_session_with_an_error(tmp_path):

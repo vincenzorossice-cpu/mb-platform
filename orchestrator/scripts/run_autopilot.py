@@ -32,6 +32,7 @@ from orchestrator.modules.slot_autopilot.bet_controller import BetController
 from orchestrator.modules.slot_autopilot.bet_menu import BetMenuSelector
 from orchestrator.modules.slot_autopilot.config import AutoPilotConfig
 from orchestrator.modules.slot_autopilot.locator import ElementLocator
+from orchestrator.modules.slot_autopilot.popup_guard import PopupGuard
 from orchestrator.modules.slot_autopilot.spin_button import SpinButtonState
 from orchestrator.modules.slot_autopilot.spin_controller import SpinController
 from orchestrator.modules.slot_autopilot.supervisor import SlotSupervisor
@@ -69,7 +70,7 @@ _CONSOLE_INFO_LOGGERS = (
     "orchestrator.modules.slot_autopilot.slot_setup", "orchestrator.modules.slot_autopilot.slot_explorer",
     "orchestrator.modules.slot_autopilot.slot_intro", "orchestrator.quick_stop",
     "orchestrator.modules.slot_autopilot.autospin_manager", "orchestrator.modules.slot_autopilot.turbo_manager",
-    "orchestrator.modules.slot_autopilot.speedup_controller",
+    "orchestrator.modules.slot_autopilot.speedup_controller", "orchestrator.modules.slot_autopilot.popup_guard",
     "orchestrator.modules.slot_ocr.reader",
 )
 _HARMLESS_WARNING_PATTERNS = (".*pin_memory.*", ".*quantize_per_tensor.*")
@@ -234,6 +235,9 @@ def build_autopilot_for(
         bet_controller=bet_controller, spin_controller=spin_controller, step_logger=step_logger,
         profile_builder=ProfileBuilder(profiles_dir=config.profiles_dir, memory_dir=config.slot_memory_dir),
     )
+    # Popup di raddoppio vincita: si chiude SOLO con Raccogli (mai Raddoppia). OCR semplice; Sol e la memoria della
+    # mappa si collegano sotto, se ci sono.
+    autopilot.gamble_guard = PopupGuard(screen_reader, touch_injector, ocr_reader=getattr(ocr_reader, "ocr", ocr_reader))
     if gpt_client is not None and "gpt" in strategies and os.environ.get("SLOT_MAP", "1").strip().lower() not in ("0", "false", "no"):
         # "Learn once, remember forever": mappa verificata della slot (Sol la esplora la prima volta, poi zero GPT).
         # explore_demo: l'esplorazione puo' toccare lo spin per verificarlo (solo in demo, mai con soldi veri).
@@ -246,6 +250,9 @@ def build_autopilot_for(
             known_min_bet=config.known_min_bet, demo=explore_demo, gpt_client=gpt_client,
         )
         autopilot.slot_setup.button = spin_controller.button       # per ricordare/azzerare il metodo dello spin
+        autopilot.gamble_guard.ask = autopilot_explorer._ask
+        autopilot.gamble_guard.saved = autopilot.slot_setup.gamble_info
+        autopilot.gamble_guard.save = autopilot.slot_setup.save_gamble
         # Autospin e turbo: si esplorano (solo in demo) dopo la puntata minima; senza mappa non c'e' dove ricordarli.
         press_back = (lambda: adb_input.press_back(device_id))
         autopilot.autospin_manager = autopilot_explorer.autospin_manager = AutoSpinManager(
@@ -253,6 +260,7 @@ def build_autopilot_for(
             ask=autopilot_explorer._ask, button=spin_controller.button, bet_watch=autopilot.bet_watch,
             ask_operator=input if enable_hitl else None, press_back=press_back,
             sample_interval=config.autospin_sample_interval, period_safety=config.autospin_period_safety,
+            popup_guard=autopilot.gamble_guard,
         )
         autopilot_explorer.turbo_manager = TurboManager(
             screen_reader, touch_injector, ocr_reader=getattr(ocr_reader, "ocr", ocr_reader),
@@ -291,6 +299,7 @@ def build_autopilot_for(
             add_note=slot_setup_obj.add_note if slot_setup_obj is not None else None,
             ask_text=input if enable_hitl else None, popup_probe=warden_popup_probe,
         )
+        autopilot.warden.gamble_guard = autopilot.gamble_guard         # il popup di raddoppio prima di ogni altra logica
         if slot_setup_obj is not None:
             spin_controller.verified_spin_point = slot_setup_obj.verified_spin_point
             spin_controller.quick_stop_state = slot_setup_obj          # Quick Stop: esito provato e ricordato nella mappa

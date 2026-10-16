@@ -113,6 +113,10 @@ class AutoPilotConfig:
     autospin_stop_threshold: float = 0.9
     autospin_period_safety: float = 1.2        # il periodo del giro si moltiplica: meglio sottostimare i giri fatti
     # Turbo: 5 spin senza e 5 con, il turbo vale se il tempo scende almeno del 20%.
+    # Popup di raddoppio vincita: si cerca solo dopo vincite di almeno N volte la puntata (0 = ogni vincita; un controllo
+    # costa uno screenshot e una lettura OCR). Dopo vincite di almeno M volte la puntata si rilegge SEMPRE la puntata.
+    gamble_check_min_win_bets: float = 2.0
+    force_bet_recheck_multiple: float = 5.0
     turbo_enabled: bool = True
     speedup_measure_spins: int = 5
     turbo_min_gain: float = 0.2

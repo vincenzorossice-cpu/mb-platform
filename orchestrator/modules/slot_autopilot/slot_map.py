@@ -179,6 +179,9 @@ class SlotMap:
     spin_pending: bool = False                      # soldi veri: punto di Sol non ancora provato, lo conferma il 1o spin
     autospin: Optional[AutospinInfo] = None         # None = mai esplorato (unknown)
     turbo: Optional[TurboInfo] = None
+    gamble_popup: bool = False                      # la slot propone di raddoppiare le vincite (popup con Raccogli)
+    collect_coords: Optional[list] = None           # dove toccare "Raccogli" (mai "Raddoppia")
+    gamble_signature: Optional[list] = None         # impronta dello schermo del popup, per riconoscerlo senza GPT
 
     def key(self) -> str:
         return f"{self.screen[0]}x{self.screen[1]}"
@@ -242,6 +245,8 @@ class SlotMap:
                     "arrow", "color", "luminance", "patch", "frame_zone") else None,
                 bet_scroll_direction=data.get("bet_scroll_direction") if data.get("bet_scroll_direction") in ("left", "right") else None,
                 autospin=AutospinInfo.parse(data.get("autospin")), turbo=TurboInfo.parse(data.get("turbo")),
+                gamble_popup=bool(data.get("gamble_popup", False)), collect_coords=_xy(data.get("collect_coords")),
+                gamble_signature=[int(v) for v in data["gamble_signature"]] if isinstance(data.get("gamble_signature"), list) else None,
             )
         except (KeyError, TypeError, ValueError):
             return None
